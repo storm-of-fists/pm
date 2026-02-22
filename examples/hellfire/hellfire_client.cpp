@@ -24,11 +24,6 @@
 
 using namespace pm;
 
-// DrawQueue/DrawRect come from pm_sdl. With Queue removed from kernel,
-// pm_sdl should define DrawRect and use EventBuf<DrawRect>:
-//   using DrawQueue = EventBuf<DrawRect>;
-// Until pm_sdl is updated, provide the typedef here:
-using DrawQueue = EventBuf<DrawRect>;
 
 // =============================================================================
 // Child process management
@@ -244,7 +239,7 @@ struct ClientNetState {
 void menu_init(Pm& pm) {
     auto* menu = pm.state<MenuState>("menu");
     auto* net  = pm.state<NetSys>("net");
-    auto* keys_q = pm.state<EventBuf<int>>("keys");
+    auto* keys_q = pm.state<KeyQueue>("keys");
 
     pm.schedule("menu/input", Phase::INPUT + 2.f, [menu, net, keys_q](TaskContext& ctx) {
         menu->cursor_blink += ctx.dt();
@@ -443,7 +438,7 @@ void client_net_init(Pm& pm) {
     });
 
     // --- Game key handling (pause, restart, back to menu) ---
-    auto* keys_q = pm.state<EventBuf<int>>("keys");
+    auto* keys_q = pm.state<KeyQueue>("keys");
     pm.schedule("game_keys", Phase::INPUT + 1.f, [cn, net, menu, keys_q](TaskContext& ctx) {
         if (menu->phase != GamePhase::PLAYING) return;
         for (auto key : *keys_q) {

@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(make run:*)",
-      "Bash(g++:*)"
+      "Bash(g++:*)",
+      "Bash(wsl:*)"
     ]
   }
 }
