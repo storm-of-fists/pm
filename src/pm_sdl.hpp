@@ -163,18 +163,18 @@ namespace pm
         {
             auto draw_q = pm.queue<DrawRect>("draw");
 
-            pm.schedule("sdl/input", Pm::Phase::INPUT, [](Pm &pm)
+            pm.schedule("sdl/input", pm::Phase::INPUT, [](Ctx &ctx)
                         {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
-                if (ev.type == SDL_QUIT) pm.quit();
+                if (ev.type == SDL_QUIT) ctx.quit();
                 if (ev.type == SDL_KEYDOWN && ev.key.repeat == 0)
-                    pm.queue<int>("keys")->push(ev.key.keysym.sym);
+                    ctx.queue<int>("keys")->push(ev.key.keysym.sym);
                 if (ev.type == SDL_KEYUP)
-                    pm.queue<int>("keys")->push(-(int)ev.key.keysym.sym);
+                    ctx.queue<int>("keys")->push(-(int)ev.key.keysym.sym);
             } });
 
-            pm.schedule("sdl/render", Pm::Phase::RENDER, [this, draw_q](Pm &pm)
+            pm.schedule("sdl/render", pm::Phase::RENDER, [this, draw_q](Ctx &)
                         {
             SDL_SetRenderDrawColor(renderer, clear_color.r, clear_color.g, clear_color.b, 255);
             SDL_RenderClear(renderer);

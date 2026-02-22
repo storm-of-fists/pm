@@ -1,16 +1,18 @@
 # PM — Process Manager build system
 # Usage:
 #   make              Build everything (dev)
-#   make dev          Build hellfire (debug, fast compile)
+#   make dev          Build client + server (debug)
+#   make server       Build server only (no SDL)
+#   make client       Build client only
 #   make test         Build and run tests
-#   make release      Build hellfire (optimized)
+#   make release      Build client + server (optimized)
 #   make clean        Remove build artifacts
 
 CXX       := g++
 CXXFLAGS  := -std=c++17 -Wall -Wextra -Wpedantic
-INCLUDES  := -Isrc
+INCLUDES  := -Isrc -Iexamples/hellfire
 
-# SDL2 (only needed for hellfire)
+# SDL2 (client only)
 SDL_CFLAGS  := $(shell sdl2-config --cflags 2>/dev/null)
 SDL_LDFLAGS := $(shell sdl2-config --libs 2>/dev/null)
 
@@ -33,58 +35,59 @@ TEST_DIR    := tests
 EXAMPLE_DIR := examples/hellfire
 
 # Sources
-HEADERS     := $(wildcard $(SRC_DIR)/*.hpp)
-TEST_SRC    := $(TEST_DIR)/test.cpp
-HELLFIRE_SRC:= $(EXAMPLE_DIR)/hellfire.cpp
+HEADERS      := $(wildcard $(SRC_DIR)/*.hpp) $(EXAMPLE_DIR)/hellfire_common.hpp
+SERVER_SRC   := $(EXAMPLE_DIR)/hellfire_server.cpp
+CLIENT_SRC   := $(EXAMPLE_DIR)/hellfire_client.cpp
+TEST_SRC     := $(TEST_DIR)/test.cpp
 
-# Targets
-TEST_BIN    := $(BUILD_DIR)/test
-DEV_BIN     := $(BUILD_DIR)/hellfire_dev
-RELEASE_BIN := $(BUILD_DIR)/hellfire
-
-# ── Profiles ─────────────────────────────────────────────────────────────────
-
+# Profiles
 DEV_FLAGS     := -O0 -g -DDEBUG
 RELEASE_FLAGS := -O3 -DNDEBUG -march=native -flto
 
 # ── Rules ────────────────────────────────────────────────────────────────────
 
-.PHONY: all dev test release clean run run-release
+.PHONY: all dev server client test release clean run
 
 all: dev test
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
-# Dev build — fast compile, debug symbols, assertions on
-dev: $(DEV_BIN)
+dev: $(BUILD_DIR)/hellfire_server $(BUILD_DIR)/hellfire_client
+	@echo "  Built: client + server (dev)"
 
-$(DEV_BIN): $(HELLFIRE_SRC) $(HEADERS) | $(BUILD_DIR)
+server: $(BUILD_DIR)/hellfire_server
+
+client: $(BUILD_DIR)/hellfire_client
+
+# Server — no SDL
+$(BUILD_DIR)/hellfire_server: $(SERVER_SRC) $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(DEV_FLAGS) $(INCLUDES) -o $@ $< $(NET_LDFLAGS)
+
+# Client — needs SDL
+$(BUILD_DIR)/hellfire_client: $(CLIENT_SRC) $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(DEV_FLAGS) $(INCLUDES) $(SDL_CFLAGS) -o $@ $< $(SDL_LDFLAGS) $(NET_LDFLAGS)
-	@echo "  Built: $@ (dev)"
 
-# Test — build and run
-test: $(TEST_BIN)
+# Test
+test: $(BUILD_DIR)/test
 	@echo "──────────────────────────────"
-	@$(TEST_BIN)
+	@$(BUILD_DIR)/test
 
-$(TEST_BIN): $(TEST_SRC) $(HEADERS) | $(BUILD_DIR)
+$(BUILD_DIR)/test: $(TEST_SRC) $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(DEV_FLAGS) $(INCLUDES) -o $@ $<
-	@echo "  Built: $@ (test)"
 
-# Release — full optimizations, LTO, no debug
-release: $(RELEASE_BIN)
+# Release
+release: $(BUILD_DIR)/hellfire_server_rel $(BUILD_DIR)/hellfire_client_rel
+	@echo "  Built: client + server (release)"
 
-$(RELEASE_BIN): $(HELLFIRE_SRC) $(HEADERS) | $(BUILD_DIR)
+$(BUILD_DIR)/hellfire_server_rel: $(SERVER_SRC) $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(RELEASE_FLAGS) $(INCLUDES) -o $@ $< $(NET_LDFLAGS)
+
+$(BUILD_DIR)/hellfire_client_rel: $(CLIENT_SRC) $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(RELEASE_FLAGS) $(INCLUDES) $(SDL_CFLAGS) -o $@ $< $(SDL_LDFLAGS) $(NET_LDFLAGS)
-	@echo "  Built: $@ (release)"
 
-# Convenience runners
 run: dev
-	$(DEV_BIN)
-
-run-release: release
-	$(RELEASE_BIN)
+	$(BUILD_DIR)/hellfire_client
 
 clean:
 	rm -rf $(BUILD_DIR)
