@@ -1,9 +1,15 @@
 {
   "permissions": {
     "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(wsl:*)",
       "Bash(make run:*)",
       "Bash(g++:*)",
-      "Bash(wsl:*)"
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)"
     ]
   }
 }

@@ -5,14 +5,14 @@
 // NetSys is a plain state struct managing:
 //   - Peer management (connect/disconnect, peer slots, peer ranges)
 //   - Heartbeat + timeout (auto-disconnect dead peers)
-//   - Per-pool sync tracking: change-tracked (sparse) or full-sync (dense)
+//   - Per-pool sync tracking: change-tracked (sparse synced[] + pending list)
 //   - Per-peer outbox with pre-serialized entries (no scanning in flush)
 //   - MTU-aware packet splitting
 //   - Reliable removals with send-count expiry
 //   - Reliable message channel (resend until acked, dedup on recv)
 //   - Ordered custom packet helpers (per-peer sequence tracking)
 //   - Clock sync (server_time in PktSync, client estimates offset)
-//   - Pool bind() for one-call serialization registration
+//   - Pool bind() / bind_send() / bind_recv() for serialization registration
 //   - Interest management with hysteresis
 //   - Send rate throttling
 //   - Generic recv dispatch by packet type
@@ -231,30 +231,19 @@ static inline bool seq_after(uint16_t a, uint16_t b) { return (int16_t)(a - b) >
 // =============================================================================
 // PoolSyncState — Per-pool sync tracking
 //
-// Two modes:
-//   Change-tracked (default): Sparse synced[] + pending list.
-//     Only visits dirty entities. O(dirty) per flush.
-//     Best for: pools with mostly static data (buildings, terrain).
-//
-//   Full-sync: Dense-parallel synced_dense[] mirroring Pool's dense arrays.
-//     Iterates entire pool sequentially. O(all) per flush, but cache-friendly.
-//     No change hook, no pending list overhead.
-//     Best for: pools where everything moves every frame (monsters, bullets).
-//
-// The mode is set by bind_send / bind_send_full on NetSys.
+// Change-tracked: sparse synced[] bitmask + pending list.
+// Only entities that called notify_change() (or were just added/removed) are
+// transmitted. O(dirty) per flush.
+// Installed automatically by bind_send().
 // =============================================================================
 struct PoolSyncState
 {
     uint32_t pool_id = 0;
-    bool full_sync = false;
 
-    // --- Change-tracked mode (sparse) ---
+    // --- Change-tracked state ---
     std::vector<uint64_t> synced;
     std::vector<Id> pending;
     std::vector<uint8_t> pending_flag;
-
-    // --- Full-sync mode (dense-parallel) ---
-    std::vector<uint64_t> synced_dense;
 
     // === Change-tracked mode API ===
 
@@ -294,13 +283,6 @@ struct PoolSyncState
         uint32_t idx = id_index(id);
         if (idx >= synced.size()) return false;
         return (synced[idx] & (1ULL << peer)) != 0;
-    }
-
-    void sync_all(uint8_t peer)
-    {
-        uint64_t bit = 1ULL << peer;
-        for (auto &s : synced)
-            s |= bit;
     }
 
     template <typename T, typename F>
@@ -356,67 +338,6 @@ struct PoolSyncState
     {
         pending.clear();
         std::fill(pending_flag.begin(), pending_flag.end(), 0);
-    }
-
-    // === Full-sync mode API ===
-
-    // Swap hook handler — mirrors Pool's swap-remove on synced_dense.
-    // Install via pool->set_swap_hook(on_pool_swap, &sync_state).
-    static void on_pool_swap(void* ctx, uint32_t removed_di, uint32_t last_di)
-    {
-        auto* ss = static_cast<PoolSyncState*>(ctx);
-        auto& sd = ss->synced_dense;
-        if (sd.empty() || last_di >= sd.size()) return;
-        if (removed_di != last_di && removed_di < sd.size())
-            sd[removed_di] = sd[last_di];
-        sd.pop_back();
-    }
-
-    // Iterate all pool entries, call fn for those unsynced to peer.
-    // Sequential dense reads — cache-friendly.
-    template <typename T, typename F>
-    void each_unsynced_full(Pool<T>* pool, uint8_t peer, uint64_t remote_mask, F&& fn)
-    {
-        size_t n = pool->items.size();
-        if (synced_dense.size() < n)
-            synced_dense.resize(n, 0);
-        else if (synced_dense.size() > n)
-            synced_dense.resize(n);
-
-        uint64_t bit = 1ULL << peer;
-        for (size_t di = 0; di < n; di++)
-        {
-            uint64_t s = synced_dense[di];
-            if (remote_mask && (s & remote_mask) == remote_mask)
-                continue;
-            if (!(s & bit))
-                fn(pool->dense_ids[di], pool->items[di], di);
-        }
-    }
-
-    void mark_synced_dense(uint8_t peer, size_t dense_idx)
-    {
-        if (dense_idx < synced_dense.size())
-            synced_dense[dense_idx] |= (1ULL << peer);
-    }
-
-    void clear_synced_dense(uint8_t peer, size_t dense_idx)
-    {
-        if (dense_idx < synced_dense.size())
-            synced_dense[dense_idx] &= ~(1ULL << peer);
-    }
-
-    bool is_synced_dense(uint8_t peer, size_t dense_idx) const
-    {
-        if (dense_idx >= synced_dense.size()) return false;
-        return (synced_dense[dense_idx] & (1ULL << peer)) != 0;
-    }
-
-    void sync_all_dense(uint8_t peer)
-    {
-        uint64_t bit = 1ULL << peer;
-        for (auto& s : synced_dense)
-            s |= bit;
     }
 
 private:
@@ -687,7 +608,6 @@ struct NetSys {
     struct SyncRegistryEntry {
         PoolSyncState* state;
         std::function<void()> repend_fn;
-        std::function<void()> clear_pending_fn;
     };
     std::unordered_map<uint32_t, SyncRegistryEntry> sync_registry;
 
@@ -966,18 +886,18 @@ struct NetSys {
     }
 
     // --- bind_send(): change-tracked send (sparse synced[], pending list) ---
-    // Best for pools where a minority of entries change each frame.
+    // Entities are only transmitted when they call notify_change() or are newly
+    // added/removed. Install a change hook via Pool::set_change_hook before use,
+    // or call notify_change() manually each frame for always-moving entities.
     template <typename T, typename WriteFn, typename InterestFn = std::nullptr_t>
     void bind_send(Pm& pm, Pool<T>* pool, const char* task_name,
                    WriteFn write_fn, InterestFn interest_fn = nullptr, float hysteresis = 0.f) {
 
         auto* ss = get_sync_state(pool->pool_id);
-        ss->full_sync = false;
 
         sync_registry[pool->pool_id] = {
             ss,
-            [ss, pool]() { ss->repend_all(pool); },
-            [ss]() { ss->clear_pending(); }
+            [ss, pool]() { ss->repend_all(pool); }
         };
 
         pool->set_change_hook([](void* ctx, Id id) {
@@ -1020,96 +940,6 @@ struct NetSys {
             if (remote_mask == 0)
                 ss->clear_pending();
         });
-    }
-
-    // --- bind_send_full(): full-sync send (dense iteration every frame) ---
-    // Best for pools where most/all entries change every frame.
-    // No change hook, no pending list. Every in-range entity sent every frame.
-    // synced_dense[] tracks "in view" state per peer (only used with interest).
-    template <typename T, typename WriteFn, typename InterestFn = std::nullptr_t>
-    void bind_send_full(Pm& pm, Pool<T>* pool, const char* task_name,
-                        WriteFn write_fn, InterestFn interest_fn = nullptr, float hysteresis = 0.f) {
-
-        auto* ss = get_sync_state(pool->pool_id);
-        ss->full_sync = true;
-
-        sync_registry[pool->pool_id] = {
-            ss,
-            [ss, pool]() {
-                // On new peer connect: clear viewing state so everything re-enters
-                ss->synced_dense.assign(pool->items.size(), 0);
-            },
-            [ss]() {
-                std::fill(ss->synced_dense.begin(), ss->synced_dense.end(), 0);
-            }
-        };
-
-        // Install swap hook so synced_dense mirrors Pool's swap-remove
-        pool->set_swap_hook(PoolSyncState::on_pool_swap, ss);
-
-        pm.schedule(task_name, Phase::NET_SEND, [this, pool, ss, write_fn, interest_fn, hysteresis](TaskContext& ctx) {
-            if (!should_send) return;
-            constexpr bool has_interest = !std::is_same_v<InterestFn, std::nullptr_t>;
-
-            for (uint8_t p : remote_peers()) {
-                size_t n = pool->items.size();
-
-                if constexpr (has_interest) {
-                    // Interest mode: track "in view" via synced_dense, send everything in range
-                    if (ss->synced_dense.size() < n) ss->synced_dense.resize(n, 0);
-                    else if (ss->synced_dense.size() > n) ss->synced_dense.resize(n);
-                    uint64_t bit = 1ULL << p;
-
-                    for (size_t di = 0; di < n; di++) {
-                        Id id = pool->dense_ids[di];
-                        if (ctx.is_removing_entity(id)) continue;
-
-                        bool was_viewing = (ss->synced_dense[di] & bit) != 0;
-                        float margin = was_viewing ? hysteresis : 0.f;
-                        bool in_view = interest_fn(ctx, p, id, pool->items[di], margin);
-
-                        if (in_view) {
-                            uint8_t buf[MAX_ENTRY_SIZE];
-                            uint16_t sz = write_fn(id, pool->items[di], buf);
-                            push(p, pool->pool_id, buf, sz);
-                            ss->synced_dense[di] |= bit;
-                        } else if (was_viewing) {
-                            ss->synced_dense[di] &= ~bit;
-                            peer_net[p].pending_removals.push_back({pool->pool_id, id});
-                        }
-                    }
-                } else {
-                    // No interest: send everything, no tracking needed
-                    for (size_t di = 0; di < n; di++) {
-                        Id id = pool->dense_ids[di];
-                        if (ctx.is_removing_entity(id)) continue;
-                        uint8_t buf[MAX_ENTRY_SIZE];
-                        uint16_t sz = write_fn(id, pool->items[di], buf);
-                        push(p, pool->pool_id, buf, sz);
-                    }
-                }
-            }
-        });
-    }
-
-    // --- bind(): convenience — registers both send and recv (change-tracked) ---
-    template <typename T, typename WriteFn, typename ReadFn,
-              typename InterestFn = std::nullptr_t>
-    void bind(Pm& pm, Pool<T>* pool, const char* task_name,
-              WriteFn write_fn, ReadFn read_fn,
-              InterestFn interest_fn = nullptr, float hysteresis = 0.f) {
-        bind_recv(pool, read_fn);
-        bind_send(pm, pool, task_name, write_fn, interest_fn, hysteresis);
-    }
-
-    // --- bind_full(): convenience — registers both send (full-sync) and recv ---
-    template <typename T, typename WriteFn, typename ReadFn,
-              typename InterestFn = std::nullptr_t>
-    void bind_full(Pm& pm, Pool<T>* pool, const char* task_name,
-                   WriteFn write_fn, ReadFn read_fn,
-                   InterestFn interest_fn = nullptr, float hysteresis = 0.f) {
-        bind_recv(pool, read_fn);
-        bind_send_full(pm, pool, task_name, write_fn, interest_fn, hysteresis);
     }
 
     // --- Flush: MTU-aware packet building for one peer (sync data only) ---

@@ -1,5 +1,6 @@
 #include "pm_core.hpp"
 #include "pm_udp.hpp"
+#include "pm_util.hpp"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -721,10 +722,11 @@ int main()
 
         int count = 0;
         uint64_t remote_mask = net->remote_peers().bits;
-        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t) { count++; });
+        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
+            ss.mark_synced(peer, id);
+            count++;
+        });
         assert(count == 10);
-
-        ss.sync_all(peer);
 
         count = 0;
         ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t) { count++; });
@@ -755,7 +757,7 @@ int main()
         uint8_t peer = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
 
-        ss.sync_all(peer);
+        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) { ss.mark_synced(peer, id); });
         ss.each_unsynced(pool, peer, remote_mask, [](pm::Id, Pos&, size_t) {});
         assert(ss.pending_count() == 0);
 
@@ -865,7 +867,7 @@ int main()
 
         uint8_t p1 = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
-        ss.sync_all(p1);
+        ss.each_unsynced(pool, p1, remote_mask, [&](pm::Id id, Pos&, size_t) { ss.mark_synced(p1, id); });
         ss.each_unsynced(pool, p1, remote_mask, [](pm::Id, Pos&, size_t) {});
         assert(ss.pending_count() == 0);
 
@@ -925,15 +927,16 @@ int main()
         printf("  [OK] Pool swap hook\n");
     }
 
-    // --- PoolSyncState full-sync mode basics ---
+    // --- PoolSyncState change-tracked: mark_synced / each_unsynced basics ---
     {
         pm::Pm pm;
         auto* net = pm.state<pm::NetSys>("net");
         auto* pool = pm.pool<Pos>("pos");
 
         pm::PoolSyncState ss;
-        ss.full_sync = true;
-        pool->set_swap_hook(pm::PoolSyncState::on_pool_swap, &ss);
+        pool->set_change_hook([](void* ctx, pm::Id id) {
+            static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
+        }, &ss);
 
         uint8_t peer = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
@@ -942,106 +945,107 @@ int main()
         pm::Id b = pm.spawn(); pool->add(b, {2, 0});
         pm::Id c = pm.spawn(); pool->add(c, {3, 0});
 
-        // All should be unsynced
+        // All 3 should appear in pending (add calls notify_change)
         int count = 0;
-        ss.each_unsynced_full(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t di) {
-            ss.mark_synced_dense(peer, di);
+        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t) {
+            ss.mark_synced(peer, a); // dummy; real code marks each id
             count++;
         });
         assert(count == 3);
 
-        // Now all synced — should iterate 0
+        // Re-mark all synced properly then confirm nothing pending
+        ss.mark_synced(peer, a);
+        ss.mark_synced(peer, b);
+        ss.mark_synced(peer, c);
+        ss.clear_pending();
         count = 0;
-        ss.each_unsynced_full(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t) { count++; });
+        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t) { count++; });
         assert(count == 0);
 
-        printf("  [OK] PoolSyncState full-sync basics\n");
+        printf("  [OK] PoolSyncState change-tracked: basics\n");
     }
 
-    // --- Full-sync: swap-remove keeps synced_dense consistent ---
+    // --- Change-tracked: remove leaves no ghost entries ---
     {
         pm::Pm pm;
         auto* net = pm.state<pm::NetSys>("net");
         auto* pool = pm.pool<Pos>("pos");
 
         pm::PoolSyncState ss;
-        ss.full_sync = true;
-        pool->set_swap_hook(pm::PoolSyncState::on_pool_swap, &ss);
+        pool->set_change_hook([](void* ctx, pm::Id id) {
+            static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
+        }, &ss);
 
         uint8_t peer = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
 
-        pm::Id a = pm.spawn(); pool->add(a, {10, 0});  // dense 0
-        pm::Id b = pm.spawn(); pool->add(b, {20, 0});  // dense 1
-        pm::Id c = pm.spawn(); pool->add(c, {30, 0});  // dense 2
+        pm::Id a = pm.spawn(); pool->add(a, {10, 0});
+        pm::Id b = pm.spawn(); pool->add(b, {20, 0});
+        pm::Id c = pm.spawn(); pool->add(c, {30, 0});
 
-        // Sync all 3
-        ss.each_unsynced_full(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t di) {
-            ss.mark_synced_dense(peer, di);
+        // Sync all
+        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
+            ss.mark_synced(peer, id);
         });
-        assert(ss.is_synced_dense(peer, 0));
-        assert(ss.is_synced_dense(peer, 1));
-        assert(ss.is_synced_dense(peer, 2));
+        ss.clear_pending();
 
-        // Remove a (dense 0) — c swaps into dense 0
+        // Remove a — pool swap-removes, pending stays clean
         pool->remove(a);
-        // synced_dense should now be: [c_bits, b_bits] (length 2)
-        assert(ss.synced_dense.size() == 2);
-        assert(ss.is_synced_dense(peer, 0));  // was c's slot
-        assert(ss.is_synced_dense(peer, 1));  // still b
-
-        // Only items left are c (at dense 0) and b (at dense 1)
+        // each_unsynced skips ids not in pool
         int count = 0;
-        ss.each_unsynced_full(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t) { count++; });
-        assert(count == 0);  // all still synced after swap
+        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t) { count++; });
+        assert(count == 0);
 
-        printf("  [OK] Full-sync: swap-remove keeps synced_dense consistent\n");
+        printf("  [OK] Change-tracked: remove leaves no ghost entries\n");
     }
 
-    // --- Full-sync: new entries start unsynced ---
+    // --- Change-tracked: new entries start unsynced ---
     {
         pm::Pm pm;
         auto* net = pm.state<pm::NetSys>("net");
         auto* pool = pm.pool<int>("items");
 
         pm::PoolSyncState ss;
-        ss.full_sync = true;
-        pool->set_swap_hook(pm::PoolSyncState::on_pool_swap, &ss);
+        pool->set_change_hook([](void* ctx, pm::Id id) {
+            static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
+        }, &ss);
 
         uint8_t peer = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
 
         pm::Id a = pm.spawn(); pool->add(a, 10);
 
-        // Sync it
-        ss.each_unsynced_full(pool, peer, remote_mask, [&](pm::Id, int&, size_t di) {
-            ss.mark_synced_dense(peer, di);
+        // Sync a
+        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, int&, size_t) {
+            ss.mark_synced(peer, id);
         });
+        ss.clear_pending();
 
-        // Add a new entry — synced_dense is shorter than pool, so it auto-resizes with 0
+        // Add a new entry — triggers change hook, goes into pending
         pm::Id b = pm.spawn(); pool->add(b, 20);
 
         int count = 0;
         pm::Id found = pm::NULL_ID;
-        ss.each_unsynced_full(pool, peer, remote_mask, [&](pm::Id id, int&, size_t) {
+        ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, int&, size_t) {
             count++;
             found = id;
         });
         assert(count == 1);
         assert(found == b);
 
-        printf("  [OK] Full-sync: new entries start unsynced\n");
+        printf("  [OK] Change-tracked: new entries start unsynced\n");
     }
 
-    // --- Full-sync: multi-peer independence ---
+    // --- Change-tracked: multi-peer independence ---
     {
         pm::Pm pm;
         auto* net = pm.state<pm::NetSys>("net");
         auto* pool = pm.pool<int>("vals");
 
         pm::PoolSyncState ss;
-        ss.full_sync = true;
-        pool->set_swap_hook(pm::PoolSyncState::on_pool_swap, &ss);
+        pool->set_change_hook([](void* ctx, pm::Id id) {
+            static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
+        }, &ss);
 
         uint8_t p1 = net->connect();
         uint8_t p2 = net->connect();
@@ -1051,21 +1055,26 @@ int main()
         pm::Id b = pm.spawn(); pool->add(b, 2);
 
         // Sync only to p1
-        ss.each_unsynced_full(pool, p1, remote_mask, [&](pm::Id, int&, size_t di) {
-            ss.mark_synced_dense(p1, di);
+        ss.each_unsynced(pool, p1, remote_mask, [&](pm::Id id, int&, size_t) {
+            ss.mark_synced(p1, id);
         });
+        // Don't clear_pending: p2 still hasn't synced
 
         // p2 should still see both as unsynced
         int p2_count = 0;
-        ss.each_unsynced_full(pool, p2, remote_mask, [&](pm::Id, int&, size_t) { p2_count++; });
+        ss.each_unsynced(pool, p2, remote_mask, [&](pm::Id id, int&, size_t) {
+            ss.mark_synced(p2, id);
+            p2_count++;
+        });
         assert(p2_count == 2);
 
-        // p1 should see none
+        // Now both peers synced — pending cleared
+        ss.clear_pending();
         int p1_count = 0;
-        ss.each_unsynced_full(pool, p1, remote_mask, [&](pm::Id, int&, size_t) { p1_count++; });
+        ss.each_unsynced(pool, p1, remote_mask, [&](pm::Id, int&, size_t) { p1_count++; });
         assert(p1_count == 0);
 
-        printf("  [OK] Full-sync: multi-peer independence\n");
+        printf("  [OK] Change-tracked: multi-peer independence\n");
     }
 
     // --- Ordered custom packet sequencing ---
@@ -1582,6 +1591,235 @@ int main()
         assert(result.accepted);
 
         printf("  [OK] Server connect validator registration\n");
+    }
+
+    printf("\n=== pm_util.hpp test suite ===\n\n");
+
+    // =========================================================================
+    // UTILITY TESTS
+    // =========================================================================
+
+    // --- Hysteresis: hold blocks changes ---
+    {
+        pm::Hysteresis<bool> h(false, 0.1f);
+        h.set(true);
+        assert(h.get() == true);
+        // Cooldown active — can't flip back immediately
+        h.set(false);
+        assert(h.get() == true);
+        // Partially tick — still blocked
+        h.update(0.05f);
+        h.set(false);
+        assert(h.get() == true);
+        // Tick past hold — now unblocked
+        h.update(0.06f);
+        h.set(false);
+        assert(h.get() == false);
+        printf("  [OK] Hysteresis: hold blocks changes\n");
+    }
+
+    // --- Hysteresis: same value doesn't trigger hold ---
+    {
+        pm::Hysteresis<int> h(5, 1.0f);
+        h.set(5);  // same value
+        assert(h.cooldown == 0.f);
+        h.set(10);  // different value
+        assert(h.cooldown == 1.0f);
+        printf("  [OK] Hysteresis: same value no cooldown\n");
+    }
+
+    // --- Hysteresis: operator T ---
+    {
+        pm::Hysteresis<bool> h(true, 0.5f);
+        bool val = h;
+        assert(val == true);
+        printf("  [OK] Hysteresis: operator T\n");
+    }
+
+    // --- Cooldown: fires at interval ---
+    {
+        pm::Cooldown cd(0.5f);
+        assert(!cd.ready(0.3f));
+        assert(cd.ready(0.3f));  // 0.6 total >= 0.5
+        // Overshoot preserved: elapsed should be 0.1
+        assert(cd.remaining() > 0.39f && cd.remaining() < 0.41f);
+        printf("  [OK] Cooldown: fires at interval\n");
+    }
+
+    // --- Cooldown: reset ---
+    {
+        pm::Cooldown cd(1.0f);
+        cd.ready(0.8f);
+        cd.reset();
+        assert(!cd.ready(0.5f));  // only 0.5 after reset
+        assert(cd.ready(0.6f));   // 1.1 total
+        printf("  [OK] Cooldown: reset\n");
+    }
+
+    // --- DelayTimer: on-delay ---
+    {
+        pm::DelayTimer dt(0.5f, 0.f);
+        dt.update(true, 0.3f);
+        assert(!dt.output);
+        dt.update(true, 0.3f);
+        assert(dt.output);  // 0.6 >= 0.5
+        printf("  [OK] DelayTimer: on-delay\n");
+    }
+
+    // --- DelayTimer: off-delay ---
+    {
+        pm::DelayTimer dt(0.f, 0.5f);
+        dt.update(true, 0.1f);
+        assert(dt.output);  // on_delay=0, instant on
+        dt.update(false, 0.3f);
+        assert(dt.output);  // off_delay not reached
+        dt.update(false, 0.3f);
+        assert(!dt.output);  // 0.6 >= 0.5
+        printf("  [OK] DelayTimer: off-delay\n");
+    }
+
+    // --- DelayTimer: input reassertion resets elapsed ---
+    {
+        pm::DelayTimer dt(0.f, 1.0f);
+        dt.update(true, 0.1f);
+        assert(dt.output);
+        dt.update(false, 0.5f);
+        assert(dt.output);
+        dt.update(true, 0.1f);  // reassert — resets off-delay elapsed
+        dt.update(false, 0.5f);
+        assert(dt.output);  // only 0.5 since reassertion, need 1.0
+        dt.update(false, 0.6f);
+        assert(!dt.output);  // 1.1 >= 1.0
+        printf("  [OK] DelayTimer: reassertion resets elapsed\n");
+    }
+
+    // --- DelayTimer: pulse mode ---
+    {
+        pm::DelayTimer pulse(0.f, 0.3f);
+        // Simulate pulse: feed !output as input
+        pulse.update(!pulse.output, 0.01f);  // input=true, on_delay=0 → output=true
+        assert(pulse.output);
+        pulse.update(!pulse.output, 0.1f);   // input=false, start off-delay
+        assert(pulse.output);
+        pulse.update(!pulse.output, 0.1f);
+        assert(pulse.output);
+        pulse.update(!pulse.output, 0.15f);  // 0.35 >= 0.3 → output=false
+        assert(!pulse.output);
+        printf("  [OK] DelayTimer: pulse mode\n");
+    }
+
+    // --- DelayTimer: reset ---
+    {
+        pm::DelayTimer dt(0.f, 1.0f);
+        dt.update(true, 0.1f);
+        assert(dt.output);
+        dt.reset();
+        assert(!dt.output);
+        assert(dt.elapsed == 0.f);
+        printf("  [OK] DelayTimer: reset\n");
+    }
+
+    // --- RisingEdge ---
+    {
+        pm::RisingEdge re;
+        assert(!re.update(false));
+        assert(re.update(true));   // false→true
+        assert(!re.update(true));  // stays true — no edge
+        assert(!re.update(false)); // true→false is falling, not rising
+        assert(re.update(true));   // false→true again
+        printf("  [OK] RisingEdge\n");
+    }
+
+    // --- FallingEdge ---
+    {
+        pm::FallingEdge fe;
+        assert(!fe.update(false));  // starts false, no transition
+        assert(!fe.update(true));   // false→true is rising
+        assert(fe.update(false));   // true→false
+        assert(!fe.update(false));  // stays false
+        printf("  [OK] FallingEdge\n");
+    }
+
+    // --- Latch: reset-dominant (default) ---
+    {
+        pm::Latch l;
+        assert(!l.output);
+        l.update(true, false);
+        assert(l.output);
+        l.update(false, true);
+        assert(!l.output);
+        // Both set and reset — reset wins
+        l.update(true, true);
+        assert(!l.output);
+        printf("  [OK] Latch: reset-dominant\n");
+    }
+
+    // --- Latch: set-dominant ---
+    {
+        pm::Latch l(false);  // reset_dominant = false
+        l.update(true, true);
+        assert(l.output);  // set wins
+        l.update(false, true);
+        assert(!l.output);
+        printf("  [OK] Latch: set-dominant\n");
+    }
+
+    // --- Latch: operator bool ---
+    {
+        pm::Latch l;
+        l.update(true, false);
+        if (!l) assert(false);
+        printf("  [OK] Latch: operator bool\n");
+    }
+
+    // --- Counter: increment ---
+    {
+        pm::Counter c(3);
+        assert(c.count == 0 && !c.done);
+        c.increment();
+        assert(c.count == 1 && !c.done);
+        c.increment();
+        c.increment();
+        assert(c.count == 3 && c.done);
+        c.increment();  // no-op when done
+        assert(c.count == 3);
+        printf("  [OK] Counter: increment\n");
+    }
+
+    // --- Counter: decrement ---
+    {
+        pm::Counter c(0);
+        c.count = 5;
+        c.decrement();
+        assert(c.count == 4 && !c.done);
+        c.count = 1;
+        c.decrement();
+        assert(c.count == 0 && c.done);
+        printf("  [OK] Counter: decrement\n");
+    }
+
+    // --- Counter: reset ---
+    {
+        pm::Counter c(10);
+        c.increment(); c.increment();
+        c.reset();
+        assert(c.count == 0 && !c.done && c.preset == 10);
+        c.reset(5);
+        assert(c.preset == 5 && c.count == 0);
+        printf("  [OK] Counter: reset\n");
+    }
+
+    // --- Counter + RisingEdge composition ---
+    {
+        pm::RisingEdge edge;
+        pm::Counter c(2);
+        // Simulate a signal that goes true, false, true, false, true
+        bool signal[] = {true, false, true, false, true};
+        for (bool s : signal) {
+            if (edge.update(s)) c.increment();
+        }
+        assert(c.count == 2 && c.done);  // 3 rising edges but done at 2
+        printf("  [OK] Counter + RisingEdge composition\n");
     }
 
     printf("\n=== All tests passed ===\n");

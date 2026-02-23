@@ -1,0 +1,1 @@
+/usr/bin/c++ -g CMakeFiles/pm_tests.dir/test.cpp.o -o ../pm_tests 

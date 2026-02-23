@@ -1,12 +1,15 @@
 // hellfire_client.cpp — Client for hellfire (renders, sends input, spawns local server for hosting)
-// Build: g++ -std=c++17 -O3 -o hellfire_client hellfire_client.cpp $(sdl2-config --cflags --libs)
-// Run:   ./hellfire_client
+// Build: cmake --preset debug && cmake --build build --target hellfire_client
+// Run:   ./build/hellfire_client
 
 #include "pm_core.hpp"
 #include "pm_math.hpp"
 #include "pm_udp.hpp"
 #include "pm_sdl.hpp"
+#include "pm_sprite.hpp"
+#include "pm_util.hpp"
 #include "pm_debug.hpp"
+#include "pm_mod.hpp"
 #include "hellfire_common.hpp"
 #include <cstdio>
 #include <cstring>
@@ -28,24 +31,6 @@ using namespace pm;
 // =============================================================================
 // Child process management
 // =============================================================================
-
-static std::string exe_dir() {
-#ifdef _WIN32
-    char buf[MAX_PATH];
-    GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    std::string s(buf);
-    auto pos = s.find_last_of("\\/");
-    return (pos != std::string::npos) ? s.substr(0, pos + 1) : "./";
-#else
-    char buf[1024];
-    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (len <= 0) return "./";
-    buf[len] = 0;
-    std::string s(buf);
-    auto pos = s.rfind('/');
-    return (pos != std::string::npos) ? s.substr(0, pos + 1) : "./";
-#endif
-}
 
 struct ChildProcess {
 #ifdef _WIN32
@@ -97,6 +82,17 @@ struct ChildProcess {
 static ChildProcess g_server_process;
 
 // =============================================================================
+// SpriteStore — loaded sprites (one per shared SDL renderer lifetime)
+// =============================================================================
+struct SpriteStore {
+    Sprite player_front;
+    Sprite player_back;
+    // Per-player facing: true = front sprite (toward camera), false = back sprite (away).
+    Hysteresis<bool> facing[4];
+    float prev_y[4] = {};
+};
+
+// =============================================================================
 // Client game state (receive-only mirror)
 // =============================================================================
 struct ClientState {
@@ -106,6 +102,9 @@ struct ClientState {
     bool game_over = false, win = false, paused = false;
     uint16_t round = 0;
     float level_flash = 0.f;
+    // Server-side diagnostic info (updated via PKT_DBG once/sec)
+    uint16_t srv_monsters = 0, srv_bullets = 0;
+    float srv_ms = 0.f;
 };
 
 // =============================================================================
@@ -122,6 +121,8 @@ struct MenuState {
     float cursor_blink = 0;
     bool show_players = false;
     bool is_host_client = false;
+    bool disconnected = false;          // show "server disconnected" banner on menu
+    bool needs_disconnect_cleanup = false; // signal stale_cleanup to remove entities
 
     // Roster
     PlayerInfo roster[4]{};
@@ -319,7 +320,16 @@ void menu_init(Pm& pm) {
     pm.schedule("menu/draw", Phase::HUD + 1.f, [menu, draw_q_ref](TaskContext& ctx) {
         bool blink = ((int)(menu->cursor_blink * 3.f)) % 2 == 0;
 
-        if (menu->phase == GamePhase::MENU) { menu->draw_menu(draw_q_ref, blink); return; }
+        if (menu->phase == GamePhase::MENU) {
+            menu->draw_menu(draw_q_ref, blink);
+            if (menu->disconnected) {
+                // "disconnected" = 12 chars × 4px × scale 2 = 96px wide; center at W/2-48
+                int bx = W/2 - 52, by = H - 64;
+                draw_q_ref->push({(float)bx, (float)by, 104.f, 16.f, 60, 10, 10, 220});
+                push_str(draw_q_ref, "disconnected", bx + 4, by + 4, 2, 255, 100, 80);
+            }
+            return;
+        }
         if (menu->phase == GamePhase::LOBBY) { menu->draw_lobby(draw_q_ref, menu->is_host_client); return; }
         if (menu->show_players) menu->draw_player_list(draw_q_ref, 0.8f);
     });
@@ -344,6 +354,7 @@ void client_net_init(Pm& pm) {
     net->protocol_version = 1;
     net->on_connected([menu](NetSys& n, uint8_t peer_id, const uint8_t* payload, uint16_t size) {
         printf("[client] assigned peer %d\n", peer_id);
+        menu->disconnected = false;
         // ACK payload contains roster
         if (size >= sizeof(PktRoster)) {
             PktRoster pkt; memcpy(&pkt, payload, sizeof(pkt));
@@ -353,6 +364,20 @@ void client_net_init(Pm& pm) {
     net->on_connect_denied([](NetSys&, uint8_t reason) {
         if (reason == 0) printf("[client] connection timed out\n");
         else printf("[client] connection denied (reason %d)\n", reason);
+    });
+    net->on_disconnect([menu, cn](NetSys& n, uint8_t peer_id) {
+        if (peer_id != 0) return;  // only care about server (slot 0)
+        if (menu->phase == GamePhase::MENU) return;
+        printf("[client] lost connection to server\n");
+        n.conn_state = NetSys::ConnState::DISCONNECTED;
+        n.connect_ip = nullptr;
+        if (menu->is_host_client) { g_server_process.kill(); menu->is_host_client = false; }
+        menu->phase = GamePhase::MENU;
+        menu->field = 0;
+        menu->roster_count = 0;
+        menu->disconnected = true;
+        menu->needs_disconnect_cleanup = true;
+        cn->gs = ClientState{};
     });
 
     // --- Packet handlers ---
@@ -364,6 +389,14 @@ void client_net_init(Pm& pm) {
 
     net->on_recv(PKT_START, [menu](TaskContext&, const uint8_t*, int, struct sockaddr_in&) {
         menu->phase = GamePhase::PLAYING;
+    });
+
+    net->on_recv(PKT_DBG, [cn](TaskContext&, const uint8_t* buf, int n, struct sockaddr_in&) {
+        if (n < (int)sizeof(PktDbg)) return;
+        PktDbg pkt; memcpy(&pkt, buf, sizeof(pkt));
+        cn->gs.srv_monsters = pkt.monsters;
+        cn->gs.srv_bullets  = pkt.bullets;
+        cn->gs.srv_ms       = pkt.ms_per_tick;
     });
 
     net->on_state_recv(STATE_ID_GAME, [cn](TaskContext& ctx, const uint8_t* buf, uint16_t) {
@@ -407,8 +440,21 @@ void client_net_init(Pm& pm) {
             return;
         }
         if (net->conn_state != NetSys::ConnState::CONNECTED) return;
+
+        // Keep server connection alive in lobby — remote_peers() excludes self (slot 0 = server),
+        // so the framework heartbeat never fires on a client. Without this the server times out the
+        // host after peer_timeout seconds and reallocates slot 0 to the next joiner.
+        if (net->should_send && menu->phase == GamePhase::LOBBY) {
+            PktHeartbeat hb{};
+            net->send_to(0, &hb, sizeof(hb));
+        }
+
         if (!net->should_send || menu->phase != GamePhase::PLAYING) return;
-        if (cn->gs.paused) return;
+        if (cn->gs.paused) {
+            PktHeartbeat hb{};
+            net->send_to(0, &hb, sizeof(hb));
+            return;
+        }
 
         const uint8_t* k = SDL_GetKeyboardState(nullptr);
         Input in{};
@@ -472,6 +518,13 @@ void client_net_init(Pm& pm) {
 
     // --- Client-side staleness cleanup ---
     pm.schedule("stale_cleanup", Phase::CLEANUP, [cn, menu](TaskContext& ctx) {
+        if (menu->needs_disconnect_cleanup) {
+            for (auto [id, m, _] : cn->monsters->each()) ctx.remove_entity(id);
+            for (auto [id, b, _] : cn->bullets->each())  ctx.remove_entity(id);
+            for (int i = 0; i < 4; i++) cn->peer_ids[i] = NULL_ID;
+            menu->needs_disconnect_cleanup = false;
+            return;
+        }
         if (menu->phase != GamePhase::PLAYING || cn->gs.paused) return;
         float dt = ctx.dt();
         for (auto [id, b, _] : cn->bullets->each())  { b.lifetime += dt; if (b.lifetime > 2.f) ctx.remove_entity(id); }
@@ -498,25 +551,71 @@ void draw_init(Pm& pm) {
         snprintf(b, n, "%s  lvl:%d  score:%d",
             cn->gs.game_over?"OVER":"running", cn->gs.current_level+1, cn->gs.score);
     });
+    debug->add_stat("server", [cn](char* b, int n) {
+        snprintf(b, n, "srv mon:%d bul:%d %.1fms",
+            cn->gs.srv_monsters, cn->gs.srv_bullets, cn->gs.srv_ms);
+    });
 
-    auto* draw_q = pm.state<DrawQueue>("draw");
+    auto* draw_q  = pm.state<DrawQueue>("draw");
+    auto* sdl     = pm.state<SdlSystem>("sdl");
+    auto* sprites = pm.state<SpriteStore>("sprites");
 
-    // --- Draw players ---
+    // --- Load player sprites ---
+    IMG_Init(IMG_INIT_PNG);
+    {
+        std::string base = exe_dir() + "resources/";
+        sprites->player_front.load(sdl->renderer, base + "connor-front.png");
+        sprites->player_back.load(sdl->renderer,  base + "connor-back.png");
+        for (auto& f : sprites->facing) f = Hysteresis<bool>(false, 0.1f);
+    }
+
+    // --- Hot-reload sprites if files change on disk (runs ~1Hz) ---
+    pm.schedule("sprite/hotreload", Phase::HUD, [sdl, sprites](TaskContext& ctx) {
+        static float timer = 0.f;
+        timer += ctx.dt();
+        if (timer < 1.f) return;
+        timer = 0.f;
+        if (sprites->player_front.changed()) { printf("[sprite] reloading player_front\n"); sprites->player_front.reload(sdl->renderer); }
+        if (sprites->player_back.changed())  { printf("[sprite] reloading player_back\n");  sprites->player_back.reload(sdl->renderer); }
+    });
+
+    // --- Draw player HP bars (DrawQueue rects — rendered at Phase::RENDER behind sprites) ---
     pm.schedule("draw_players", Phase::DRAW - 1.f, [cn, menu, draw_q](TaskContext& ctx) {
         if (menu->phase != GamePhase::PLAYING) return;
         int pi = 0;
         for (auto& p : cn->players->items) {
-            if (p.alive) {
-                float hs = PLAYER_SIZE * 0.5f;
-                if (!(p.invuln > 0 && ((int)(cn->gs.time * 15)) % 2 == 0)) {
-                    draw_q->push({p.pos.x-hs-1, p.pos.y-hs-1, PLAYER_SIZE+2, PLAYER_SIZE+2, 255, 255, 255, 255});
-                    draw_q->push({p.pos.x-hs, p.pos.y-hs, PLAYER_SIZE, PLAYER_SIZE, p.r, p.g, p.b, 255});
-                }
-            }
             float bx = (pi%2==0) ? 10.f : (float)(W-170); float by = (pi<2) ? 10.f : 28.f;
             float pct = p.hp / PLAYER_HP;
             draw_q->push({bx, by, 160, 14, 40, 40, 50, 255});
             draw_q->push({bx+1, by+1, 158*pct, 12, (uint8_t)(p.r*pct+255*(1-pct)), (uint8_t)(p.g*pct), (uint8_t)(p.b*pct), 255});
+            pi++;
+        }
+    });
+
+    // --- Draw player sprites (after DrawQueue flush, before present) ---
+    pm.schedule("sprite/players", Phase::RENDER + 0.5f, [cn, menu, sdl, sprites](TaskContext& ctx) {
+        if (menu->phase != GamePhase::PLAYING) return;
+        int pi = 0;
+        for (auto& p : cn->players->items) {
+            // Facing: front = moving down (toward camera), back = moving up (away).
+            float dy = p.pos.y - sprites->prev_y[pi];
+            sprites->facing[pi].update(ctx.dt());
+            if      (dy >  0.5f) sprites->facing[pi].set(true);
+            else if (dy < -0.5f) sprites->facing[pi].set(false);
+            sprites->prev_y[pi] = p.pos.y;
+
+            if (p.alive && !(p.invuln > 0 && ((int)(cn->gs.time * 15)) % 2 == 0)) {
+                Sprite& spr = sprites->facing[pi] ? sprites->player_front : sprites->player_back;
+                if (spr) {
+                    spr.draw_centered(sdl->renderer, p.pos.x, p.pos.y, PLAYER_SIZE);
+                } else {
+                    SDL_Rect dst = {(int)(p.pos.x - PLAYER_SIZE*0.5f), (int)(p.pos.y - PLAYER_SIZE*0.5f),
+                                    (int)PLAYER_SIZE, (int)PLAYER_SIZE};
+                    SDL_SetRenderDrawBlendMode(sdl->renderer, SDL_BLENDMODE_NONE);
+                    SDL_SetRenderDrawColor(sdl->renderer, p.r, p.g, p.b, 255);
+                    SDL_RenderFillRect(sdl->renderer, &dst);
+                }
+            }
             pi++;
         }
     });
@@ -603,8 +702,16 @@ int main(int, char**) {
     auto* debug = pm.state<DebugOverlay>("debug");
     debug_init(pm, debug);
 
+    ModLoader mods;
+    mods.watch(exe_dir() + "mods/example_mod.so");
+    mods.load_all(pm);
+    pm.schedule("mods/poll", Phase::INPUT - 5.f, [&mods](TaskContext& ctx) {
+        mods.poll(ctx.pm());
+    });
+
     pm.run();
 
+    mods.unload_all(pm);
     g_server_process.kill();
 
     return 0;

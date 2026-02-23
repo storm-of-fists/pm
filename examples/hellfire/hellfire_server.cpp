@@ -5,6 +5,7 @@
 #include "pm_core.hpp"
 #include "pm_math.hpp"
 #include "pm_udp.hpp"
+#include "pm_spatial_grid.hpp"
 #include "hellfire_common.hpp"
 #include <cstdio>
 #include <cstring>
@@ -35,6 +36,11 @@ struct ServerState {
     // Player entities
     Pool<Player>* players = nullptr;
     Id peer_ids[4] = {NULL_ID, NULL_ID, NULL_ID, NULL_ID};
+
+    // Spatial grid for monster broad-phase — rebuilt each collision tick.
+    // Cell size 64px; at max load (400 monsters, 900×700 world) averages ~2–3
+    // monsters per cell so each bullet query touches only a handful of entities.
+    SpatialGrid monster_grid{W, H, 64};
 
     void add_player(Pm& pm, uint8_t peer) {
         if (peer >= 4 || peer_ids[peer] != NULL_ID) return;
@@ -113,7 +119,7 @@ void server_init(Pm& pm) {
 
     // --- Sync bindings (send only — server never receives pool sync) ---
     // Monsters + bullets move every frame → full-sync mode (dense iteration, no change hook)
-    net->bind_send_full(pm, mp, "monster_sync", write_monster,
+    net->bind_send(pm, mp, "monster_sync", write_monster,
         [gs](TaskContext&, uint8_t peer, Id, const Monster& m, float margin) -> bool {
             if (peer >= 4) return true;
             auto* p = gs->players->get(gs->peer_ids[peer]);
@@ -121,7 +127,7 @@ void server_init(Pm& pm) {
             return dist(m.pos, p->pos) <= INTEREST_RADIUS * (1.f + margin);
         }, 0.3f);
 
-    net->bind_send_full(pm, bp, "bullet_sync", write_bullet);
+    net->bind_send(pm, bp, "bullet_sync", write_bullet);
 
     // --- Connection handshake ---
     net->protocol_version = 1;
@@ -288,20 +294,36 @@ void server_init(Pm& pm) {
     }, 0.f, true);
 
     // --- Collision ---
+    // Conservative query radius: max possible monster collision threshold.
+    // Bullet-vs-monster exact check is done inside the query callback.
+    static constexpr float MON_QUERY_R = PBULLET_SIZE + MONSTER_MAX_SZ * 0.65f;
+
     pm.schedule("collision", Phase::COLLIDE, [gs, mp, bp, net](TaskContext& ctx) {
         if (!gs->started || gs->game_over) return;
         float pr = PLAYER_SIZE * 0.5f;
+
+        // Build monster grid for this frame (O(monsters)).
+        gs->monster_grid.clear();
+        for (auto [mid, m, _] : mp->each())
+            if (!ctx.is_removing_entity(mid))
+                gs->monster_grid.insert(mid, m.pos);
+
+        // Player bullets vs monsters — O(bullets × few) instead of O(b × m).
         for (auto [bid, b, _] : bp->each()) {
             if (!b.player_owned || ctx.is_removing_entity(bid)) continue;
-            for (auto [mid, m, _2] : mp->each()) {
-                if (ctx.is_removing_entity(mid)) continue;
-                if (dist(b.pos, m.pos) < b.size + m.size*0.5f) {
-                    net->tracked_remove(ctx, mp, mid);
-                    net->tracked_remove(ctx, bp, bid);
-                    gs->score += 10; gs->kills++; break;
-                }
-            }
+            bool hit = false;
+            gs->monster_grid.query(b.pos, MON_QUERY_R, [&](Id mid, Vec2) {
+                if (hit || ctx.is_removing_entity(mid)) return;
+                const Monster* m = mp->get(mid);
+                if (!m || dist(b.pos, m->pos) >= b.size + m->size * 0.5f) return;
+                net->tracked_remove(ctx, mp, mid);
+                net->tracked_remove(ctx, bp, bid);
+                gs->score += 10; gs->kills++;
+                hit = true;
+            });
         }
+
+        // Players vs enemy bullets and monster contact — O(p × b/m), already cheap.
         for (int i = 0; i < 4; i++) {
             auto* p = gs->players->get(gs->peer_ids[i]);
             if (!p || !p->alive || p->invuln > 0) continue;
@@ -315,6 +337,7 @@ void server_init(Pm& pm) {
                 if (dist(m.pos, p->pos) < m.size*0.5f + pr) { p->hp -= CONTACT_DMG; p->invuln = PLAYER_INVULN*0.5f; }
             if (p->hp <= 0) { p->hp = 0; p->alive = false; }
         }
+
         bool any = false;
         for (auto& p : gs->players->items) if (p.alive) any = true;
         if (!any && !gs->players->items.empty()) {
@@ -343,6 +366,20 @@ void server_init(Pm& pm) {
         }
         memcpy(buf, &pkt, sizeof(pkt));
         return sizeof(pkt);
+    });
+
+    // --- Debug info broadcast — once per second to all connected clients ---
+    pm.schedule("debug_send", Phase::HUD, [mp, bp, net](TaskContext& ctx) {
+        static float timer = 0.f;
+        timer += ctx.dt();
+        if (timer < 1.f) return;
+        timer -= 1.f;
+        PktDbg pkt{};
+        pkt.monsters    = (uint16_t)mp->items.size();
+        pkt.bullets     = (uint16_t)bp->items.size();
+        pkt.ms_per_tick = ctx.dt() * 1000.f;
+        for (uint8_t p : net->remote_peers())
+            net->send_to(p, &pkt, sizeof(pkt));
     });
 
     // --- Status print ---

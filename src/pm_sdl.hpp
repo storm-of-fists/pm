@@ -16,10 +16,39 @@
 #pragma once
 #include "pm_core.hpp"
 #include <SDL2/SDL.h>
+#include <string>
 #include <vector>
+#ifdef _WIN32
+#  include <windows.h>
+#else
+#  include <unistd.h>
+#endif
 
 namespace pm
 {
+
+// ─── exe_dir ──────────────────────────────────────────────────────────────────
+// Returns the directory containing the running binary, with trailing slash.
+// Use as a base for resource paths: exe_dir() + "resources/sprite.png"
+
+inline std::string exe_dir()
+{
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    std::string s(buf);
+    auto pos = s.find_last_of("\\/");
+    return (pos != std::string::npos) ? s.substr(0, pos + 1) : "./";
+#else
+    char buf[1024];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len <= 0) return "./";
+    buf[len] = '\0';
+    std::string s(buf);
+    auto pos = s.rfind('/');
+    return (pos != std::string::npos) ? s.substr(0, pos + 1) : "./";
+#endif
+}
 
 // ─── Draw Queue ───────────────────────────────────────────────────────────────
 
@@ -181,11 +210,16 @@ inline void sdl_init(Pm &pm, SdlSystem *sdl)
         }
     });
 
+    // Phase::RENDER     — clear background + flush DrawQueue (solid rects, text)
+    // Phase::RENDER+0.5 — open slot for sprite/texture draws (game code)
+    // Phase::RENDER+1   — present
     pm.schedule("sdl/render", Phase::RENDER, [sdl, draw_q](TaskContext &) {
         SDL_SetRenderDrawColor(sdl->renderer, sdl->clear_color.r, sdl->clear_color.g, sdl->clear_color.b, 255);
         SDL_RenderClear(sdl->renderer);
         render_draw_queue(sdl->renderer, draw_q);
         draw_q->clear();
+    });
+    pm.schedule("sdl/present", Phase::RENDER + 1.f, [sdl](TaskContext &) {
         SDL_RenderPresent(sdl->renderer);
     });
 }

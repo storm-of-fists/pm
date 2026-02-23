@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -g -shared  -o example_mod.so CMakeFiles/example_mod.dir/mods/example_mod.cpp.o 

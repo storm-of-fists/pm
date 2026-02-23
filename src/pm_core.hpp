@@ -26,6 +26,7 @@
 #include <thread>
 #include <cstdint>
 #include <type_traits>
+#include <typeinfo>
 #include <stdexcept>
 
 // =============================================================================
@@ -114,17 +115,12 @@ struct Result
 };
 
 // =============================================================================
-// Fast RTTI-free type IDs
+// Type IDs — cross-SO safe via typeid name hash
 // =============================================================================
-inline size_t next_type_id()
-{
-    static size_t counter = 0;
-    return ++counter;
-}
 template <typename T>
 inline size_t get_type_id()
 {
-    static size_t id = next_type_id();
+    static const size_t id = std::hash<std::string_view>{}(typeid(T).name());
     return id;
 }
 
@@ -617,43 +613,44 @@ public:
         for (uint16_t oi = 0; oi < (uint16_t)task_order_indices.size(); ++oi)
         {
             uint16_t ti = task_order_indices[oi];
-            Task &t = task_list[ti];
-            if (!t.active || !t.fn)
+            // Access task_list[ti] by index throughout — never hold a reference
+            // across a task call, because schedule()/push_back may reallocate.
+            if (!task_list[ti].active || !task_list[ti].fn)
                 continue;
-            if (t.pauseable && paused && !stepping_active)
+            if (task_list[ti].pauseable && paused && !stepping_active)
                 continue;
 
-            auto exec_t = [&]()
+            auto exec_t = [&, ti]()
             {
                 auto t0 = std::chrono::steady_clock::now();
                 TaskContext ctx(*this);
-                Result r = t.fn(ctx);
-                t.record(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+                Result r = task_list[ti].fn(ctx);
+                task_list[ti].record(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
                 if (!r)
                 {
-                    t.active = false;
-                    fault_list.push_back(std::string(name_str(t.name)) + ": " + r.error);
+                    task_list[ti].active = false;
+                    fault_list.push_back(std::string(name_str(task_list[ti].name)) + ": " + r.error);
                     tasks_dirty = true;
                 }
             };
 
-            if (t.hz > 0)
+            if (task_list[ti].hz > 0)
             {
-                t.accum += raw_dt;
-                float interval = 1.0f / t.hz;
-                if (t.accum > interval * 5.0f)
-                    t.accum = interval * 5.0f;
-                while (t.accum >= interval && t.active)
+                task_list[ti].accum += raw_dt;
+                float interval = 1.0f / task_list[ti].hz;
+                if (task_list[ti].accum > interval * 5.0f)
+                    task_list[ti].accum = interval * 5.0f;
+                while (task_list[ti].accum >= interval && task_list[ti].active)
                 {
-                    t.accum -= interval;
-                    active_task = t.name;
+                    task_list[ti].accum -= interval;
+                    active_task = task_list[ti].name;
                     exec_t();
                     active_task = NULL_NAME;
                 }
             }
             else
             {
-                active_task = t.name;
+                active_task = task_list[ti].name;
                 exec_t();
                 active_task = NULL_NAME;
             }
@@ -921,6 +918,18 @@ public:
             }
     }
     void stop_task(const char *name) { stop_task(intern(name)); }
+
+    void unschedule(NameId name)
+    {
+        for (auto &t : task_list)
+            if (t.name == name)
+            {
+                t.fn = {};
+                t.active = false;
+                tasks_dirty = true;
+            }
+    }
+    void unschedule(const char *name) { unschedule(intern(name)); }
 
     // ====== POOLS ======
     template <typename T>

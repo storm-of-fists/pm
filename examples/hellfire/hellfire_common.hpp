@@ -31,7 +31,7 @@ struct EventBuf {
 // Constants
 // =============================================================================
 static constexpr int W = 900, H = 700;
-static constexpr float PLAYER_SPEED = 280, PLAYER_SIZE = 14, PLAYER_HP = 100;
+static constexpr float PLAYER_SPEED = 280, PLAYER_SIZE = 64, PLAYER_HP = 100;
 static constexpr float PLAYER_COOLDOWN = 0.12f, PLAYER_INVULN = 0.4f;
 static constexpr float PBULLET_SPEED = 750, PBULLET_SIZE = 4, PBULLET_LIFE = 1.5f;
 static constexpr float MBULLET_SPEED = 220, MBULLET_SIZE = 5, MBULLET_LIFE = 4.0f;
@@ -87,7 +87,7 @@ struct PlayerInfo {
 #pragma pack(push, 1)
 enum PktType : uint8_t {
     PKT_INPUT=0, PKT_STATE=1, PKT_JOIN=2, PKT_WELCOME=3,
-    PKT_ROSTER=4, PKT_START=5, PKT_PAUSE=6, PKT_RESTART=7
+    PKT_ROSTER=4, PKT_START=5, PKT_PAUSE=6, PKT_RESTART=7, PKT_DBG=8
 };
 
 struct PktInput   { uint8_t type=PKT_INPUT; uint8_t peer; float dx,dy,ax,ay; uint8_t shooting; };
@@ -105,6 +105,7 @@ struct PktRoster {
 struct PktStart   { uint8_t type=PKT_START; };
 struct PktPause   { uint8_t type=PKT_PAUSE; };
 struct PktRestart { uint8_t type=PKT_RESTART; };
+struct PktDbg     { uint8_t type=PKT_DBG; uint16_t monsters, bullets; float ms_per_tick; };
 
 struct MonSync { Id id; int16_t x,y,vx,vy; uint8_t sz,r,g,b; };
 struct BulSync { Id id; int16_t x,y,vx,vy; uint8_t sz,po; };
