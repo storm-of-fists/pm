@@ -14,20 +14,20 @@ game logic at runtime).
 
 ## Architecture
 
-### Framework headers (`src/`)
+### Framework headers (`src/pm/`)
 | Header | Purpose |
 |--------|---------|
 | `pm_core.hpp` | Kernel: Pm scheduler, Pool<T>, State<T>, TaskContext, ECS |
 | `pm_math.hpp` | Vec2, distance, normalize, Rng (xorshift32) |
 | `pm_udp.hpp` | Networked sync: NetSys, peer management, reliable messaging, pool sync |
-| `pm_sdl.hpp` | SDL2 window/renderer, DrawQueue, KeyQueue, pixel font, exe_dir() |
+| `pm_sdl.hpp` | SDL3 window/renderer, DrawQueue, KeyQueue, pixel font, exe_dir() |
 | `pm_sprite.hpp` | PNG sprite loading, hot-reload via mtime polling, centered drawing |
 | `pm_debug.hpp` | Debug overlay: FPS, task table, entity stats, faults |
 | `pm_util.hpp` | PLC helpers: Hysteresis, Cooldown, DelayTimer, edges, Latch, Counter |
 | `pm_mod.hpp` | Mod hot-reload: ModLoader watches .so files, dlopen/dlclose on mtime change |
 | `pm_spatial_grid.hpp` | Spatial hashing for collision queries |
 
-### Example game (`examples/hellfire/`)
+### Example game (`src/examples/hellfire/`)
 - `hellfire_common.hpp` — shared types (Player, Monster, Bullet, packets)
 - `hellfire_server.cpp` — authoritative server (no SDL, headless)
 - `hellfire_client.cpp` — rendering client with lobby, sprites, debug overlay
@@ -62,6 +62,8 @@ cmake --build build --target pm_tests
 cmake --build build --target example_mod  # rebuild mod .so for hot-reload
 ctest --test-dir build -V   # run tests
 ```
+**Do NOT `rm -rf build`** — SDL3 and SDL3_image are built from source via FetchContent
+and take a long time to rebuild. To reconfigure, just re-run `cmake --preset debug`.
 
 ## Key patterns
 - `pm.state<T>("name")` — singleton state, returns same pointer on re-fetch

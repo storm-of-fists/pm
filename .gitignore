@@ -1,5 +1,6 @@
-# Prerequisites
-*.d
+# Build directories (CMake presets)
+build/
+build-release/
 
 # Compiled Object files
 *.slo
@@ -22,10 +23,6 @@
 *.dylib
 *.dll
 
-# Fortran module files
-*.mod
-*.smod
-
 # Compiled Static libraries
 *.lai
 *.la
@@ -37,5 +34,6 @@
 *.out
 *.app
 
-# debug information files
+# Debug information / dependency files
 *.dwo
+*.d

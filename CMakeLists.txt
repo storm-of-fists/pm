@@ -8,19 +8,27 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 # compile_commands.json for clangd / VSCode IntelliSense
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-Wall -Wextra -Wpedantic)
+# SDL3 + SDL3_image — built from source via FetchContent
+include(FetchContent)
 
-# SDL2 — modern cmake config (ships with SDL2 >= 2.0.12)
-find_package(SDL2 REQUIRED)
+FetchContent_Declare(SDL3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG        release-3.4.2
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(SDL3)
 
-# SDL2_image — no cmake config; use pkg-config
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(SDL2_IMAGE REQUIRED IMPORTED_TARGET SDL2_image)
+FetchContent_Declare(SDL3_image
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL_image.git
+    GIT_TAG        release-3.4.0
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(SDL3_image)
 
 # Platform networking
 if(WIN32)
     set(NET_LIBS ws2_32)
 endif()
 
-add_subdirectory(examples/hellfire)
-add_subdirectory(tests)
+enable_testing()
+
+add_subdirectory(src/examples/hellfire)
+add_subdirectory(src/tests)
