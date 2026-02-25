@@ -4,7 +4,7 @@
 // Rebuild while the game is running to see the change live:
 //   cmake --build build --target example_mod
 
-#include "pm_core.hpp"
+#include "hellfire_common.hpp"
 #include "pm_sdl.hpp"
 
 using namespace pm;

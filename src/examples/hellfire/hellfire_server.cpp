@@ -119,7 +119,7 @@ void server_init(Pm& pm) {
 
     // --- Sync bindings (send only — server never receives pool sync) ---
     // Monsters + bullets move every frame → full-sync mode (dense iteration, no change hook)
-    net->bind_send(pm, mp, "monster_sync", write_monster,
+    net->bind_send(pm, mp, "monster_sync", Phase::NET_SEND, write_monster,
         [gs](TaskContext&, uint8_t peer, Id, const Monster& m, float margin) -> bool {
             if (peer >= 4) return true;
             auto* p = gs->players->get(gs->peer_ids[peer]);
@@ -127,7 +127,7 @@ void server_init(Pm& pm) {
             return dist(m.pos, p->pos) <= INTEREST_RADIUS * (1.f + margin);
         }, 0.3f);
 
-    net->bind_send(pm, bp, "bullet_sync", write_bullet);
+    net->bind_send(pm, bp, "bullet_sync", Phase::NET_SEND, write_bullet);
 
     // --- Connection handshake ---
     net->protocol_version = 1;
@@ -211,7 +211,7 @@ void server_init(Pm& pm) {
                 bp->add(ctx.spawn(), Bullet{p->pos, aim*PBULLET_SPEED, PBULLET_LIFE, PBULLET_SIZE, true});
             }
         }
-    }, 0.f, true);
+    }, true);
 
     // --- Spawning ---
     pm.schedule("spawn", Phase::SIMULATE - 2.f, [gs, net, mp, bp](TaskContext& ctx) {
@@ -254,13 +254,13 @@ void server_init(Pm& pm) {
             gs->spawn_accum -= 1.f;
             spawn_monster(pm, mp, gs);
         }
-    }, 0.f, true);
+    }, true);
 
     // --- Monster AI ---
     pm.schedule("monster_ai", Phase::SIMULATE + 1.f, [gs, mp, bp](TaskContext& ctx) {
         if (!gs->started || gs->game_over) return;
         float dt = ctx.dt();
-        for (auto [id, m, _] : mp->each()) {
+        mp->each_mut([&](Monster& m) {
             Vec2 tgt = m.pos; float best = 1e9f;
             for (auto& p : gs->players->items)
                 if (p.alive && dist(m.pos, p.pos) < best) { best = dist(m.pos, p.pos); tgt = p.pos; }
@@ -277,21 +277,19 @@ void server_init(Pm& pm) {
                 bp->add(ctx.spawn(), Bullet{m.pos, aim*MBULLET_SPEED, MBULLET_LIFE, MBULLET_SIZE, false});
             }
             m.pos += m.vel * dt;
-            mp->notify_change(id);
-        }
-    }, 0.f, true);
+        }, Parallel::Off);
+    }, true);
 
     // --- Bullet physics ---
     pm.schedule("bullet_physics", Phase::SIMULATE, [gs, net, bp](TaskContext& ctx) {
         if (!gs->started || gs->game_over) return;
         float dt = ctx.dt();
-        for (auto [id, b, _] : bp->each()) {
+        bp->each_mut([&](Id id, Bullet& b) {
             b.pos += b.vel * dt;
             b.lifetime -= dt;
-            bp->notify_change(id);
             if (b.lifetime <= 0) { net->tracked_remove(ctx, bp, id); }
-        }
-    }, 0.f, true);
+        }, Parallel::Off);
+    }, true);
 
     // --- Collision ---
     // Conservative query radius: max possible monster collision threshold.
@@ -304,16 +302,16 @@ void server_init(Pm& pm) {
 
         // Build monster grid for this frame (O(monsters)).
         gs->monster_grid.clear();
-        for (auto [mid, m, _] : mp->each())
-            if (!ctx.is_removing_entity(mid))
-                gs->monster_grid.insert(mid, m.pos);
+        mp->each([&](Id mid, const Monster& m) {
+            gs->monster_grid.insert(mid, m.pos);
+        }, Parallel::Off);
 
         // Player bullets vs monsters — O(bullets × few) instead of O(b × m).
-        for (auto [bid, b, _] : bp->each()) {
-            if (!b.player_owned || ctx.is_removing_entity(bid)) continue;
+        bp->each([&](Id bid, const Bullet& b) {
+            if (!b.player_owned) return;
             bool hit = false;
             gs->monster_grid.query(b.pos, MON_QUERY_R, [&](Id mid, Vec2) {
-                if (hit || ctx.is_removing_entity(mid)) return;
+                if (hit) return;
                 const Monster* m = mp->get(mid);
                 if (!m || dist(b.pos, m->pos) >= b.size + m->size * 0.5f) return;
                 net->tracked_remove(ctx, mp, mid);
@@ -321,20 +319,21 @@ void server_init(Pm& pm) {
                 gs->score += 10; gs->kills++;
                 hit = true;
             });
-        }
+        }, Parallel::Off);
 
         // Players vs enemy bullets and monster contact — O(p × b/m), already cheap.
         for (int i = 0; i < 4; i++) {
             auto* p = gs->players->get(gs->peer_ids[i]);
             if (!p || !p->alive || p->invuln > 0) continue;
-            for (auto [bid, b, _] : bp->each()) {
-                if (!b.player_owned && !ctx.is_removing_entity(bid) && dist(b.pos, p->pos) < b.size + pr) {
+            bp->each([&](Id bid, const Bullet& b) {
+                if (!b.player_owned && dist(b.pos, p->pos) < b.size + pr) {
                     p->hp -= BULLET_DMG; p->invuln = PLAYER_INVULN;
                     net->tracked_remove(ctx, bp, bid);
                 }
-            }
-            for (auto [mid, m, _] : mp->each())
+            }, Parallel::Off);
+            mp->each([&](const Monster& m) {
                 if (dist(m.pos, p->pos) < m.size*0.5f + pr) { p->hp -= CONTACT_DMG; p->invuln = PLAYER_INVULN*0.5f; }
+            }, Parallel::Off);
             if (p->hp <= 0) { p->hp = 0; p->alive = false; }
         }
 
@@ -345,19 +344,21 @@ void server_init(Pm& pm) {
             net->clear_pool(ctx, mp);
             net->clear_pool(ctx, bp);
         }
-    }, 0.f, true);
+    }, true);
 
     // --- Cleanup OOB ---
     pm.schedule("cleanup", Phase::CLEANUP, [gs, mp, bp, net](TaskContext& ctx) {
         if (!gs->started) return;
-        for (auto [id, m, _] : mp->each())
+        mp->each([&](Id id, const Monster& m) {
             if (m.pos.x<-100||m.pos.x>W+100||m.pos.y<-100||m.pos.y>H+100) { net->tracked_remove(ctx, mp, id); }
-        for (auto [id, b, _] : bp->each())
+        }, Parallel::Off);
+        bp->each([&](Id id, const Bullet& b) {
             if (b.pos.x<-50||b.pos.x>W+50||b.pos.y<-50||b.pos.y>H+50) { net->tracked_remove(ctx, bp, id); }
-    }, 0.f, true);
+        }, Parallel::Off);
+    }, true);
 
     // --- Broadcast game state via state sync ---
-    net->bind_state_send(pm, STATE_ID_GAME, "state_send", [gs, net](TaskContext& ctx, uint8_t* buf) -> uint16_t {
+    net->bind_state_send(pm, STATE_ID_GAME, "state_send", Phase::NET_SEND, [gs, net](TaskContext& ctx, uint8_t* buf) -> uint16_t {
         if (!gs->started) return 0;
         PktState pkt{PKT_STATE, net->net_frame, gs->time, gs->score, gs->kills, (uint8_t)ctx.is_paused(), gs->game_over, 0, gs->round};
         for (int i = 0; i < 4; i++) {
@@ -413,7 +414,7 @@ int main(int argc, char** argv) {
     net->set_dedicated();
     net->port = port;
     net->start();
-    net_init(pm, net);
+    net_init(pm, net, Phase::NET_RECV, Phase::NET_SEND);
 
     server_init(pm);
 

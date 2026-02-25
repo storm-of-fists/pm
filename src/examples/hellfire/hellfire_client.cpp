@@ -518,8 +518,8 @@ void client_net_init(Pm& pm) {
                     menu->roster_count = 0;
                     cn->gs = ClientState{};
                     Pm& pm = ctx.pm();
-                    for (auto [id, m, _] : cn->monsters->each()) pm.remove_entity(id);
-                    for (auto [id, b, _] : cn->bullets->each()) pm.remove_entity(id);
+                    cn->monsters->each([&](Id id, const Monster&) { pm.remove_entity(id); }, Parallel::Off);
+                    cn->bullets->each([&](Id id, const Bullet&) { pm.remove_entity(id); }, Parallel::Off);
                     for (int i = 0; i < 4; i++) cn->peer_ids[i] = NULL_ID;
                 }
                 else if (menu->is_host_client) {
@@ -538,16 +538,16 @@ void client_net_init(Pm& pm) {
     // --- Client-side staleness cleanup ---
     pm.schedule("stale_cleanup", Phase::CLEANUP, [cn, menu](TaskContext& ctx) {
         if (menu->needs_disconnect_cleanup) {
-            for (auto [id, m, _] : cn->monsters->each()) ctx.remove_entity(id);
-            for (auto [id, b, _] : cn->bullets->each())  ctx.remove_entity(id);
+            cn->monsters->each([&](Id id, const Monster&) { ctx.remove_entity(id); }, Parallel::Off);
+            cn->bullets->each([&](Id id, const Bullet&) { ctx.remove_entity(id); }, Parallel::Off);
             for (int i = 0; i < 4; i++) cn->peer_ids[i] = NULL_ID;
             menu->needs_disconnect_cleanup = false;
             return;
         }
         if (menu->phase != GamePhase::PLAYING || cn->gs.paused) return;
         float dt = ctx.dt();
-        for (auto [id, b, _] : cn->bullets->each())  { b.lifetime += dt; if (b.lifetime > 2.f) ctx.remove_entity(id); }
-        for (auto [id, m, _] : cn->monsters->each()) { m.shoot_timer += dt; if (m.shoot_timer > 2.f) ctx.remove_entity(id); }
+        cn->bullets->each_mut([&](Id id, Bullet& b)  { b.lifetime += dt; if (b.lifetime > 2.f) ctx.remove_entity(id); }, Parallel::Off);
+        cn->monsters->each_mut([&](Id id, Monster& m) { m.shoot_timer += dt; if (m.shoot_timer > 2.f) ctx.remove_entity(id); }, Parallel::Off);
     });
 }
 
@@ -743,17 +743,17 @@ int main(int, char**) {
 
     auto* sdl = pm.state<SdlSystem>("sdl");
     sdl->open("hellfire", W, H);
-    sdl_init(pm, sdl);
+    sdl_init(pm, sdl, Phase::INPUT, Phase::RENDER);
 
     auto* net = pm.state<NetSys>("net");
-    net_init(pm, net);
+    net_init(pm, net, Phase::NET_RECV, Phase::NET_SEND);
 
     menu_init(pm);
     client_net_init(pm);
     draw_init(pm);
 
     auto* debug = pm.state<DebugOverlay>("debug");
-    debug_init(pm, debug);
+    debug_init(pm, debug, Phase::INPUT, Phase::HUD);
 
     ModLoader mods;
     mods.watch(exe_dir() + "mods/example_mod.so");

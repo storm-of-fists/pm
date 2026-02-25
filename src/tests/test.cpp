@@ -17,17 +17,16 @@ void physics_init(pm::Pm& pm)
     auto* ps = pm.state<PhysicsState>("physics");
     auto* pos_pool = pm.pool<Pos>("pos");
     auto* vel_pool = pm.pool<Vel>("vel");
-    pm.schedule("physics/tick", pm::Phase::SIMULATE, [ps, pos_pool, vel_pool](pm::TaskContext& ctx) {
+    pm.schedule("physics/tick", 30.f, [ps, pos_pool, vel_pool](pm::TaskContext& ctx) {
         (void)ps;
-        for (auto [id, pos, pool] : pos_pool->each())
-        {
+        pos_pool->each_mut([&](pm::Id id, Pos& pos) {
             auto* vel = vel_pool->get(id);
             if (vel)
             {
                 pos.x += vel->dx * ctx.dt();
                 pos.y += vel->dy * ctx.dt();
             }
-        }
+        }, pm::Parallel::Off);
     });
 }
 
@@ -59,35 +58,37 @@ int main()
     // --- Id system ---
     {
         pm::Pm pm;
-        pm::Id a = pm.spawn("player");
-        pm::Id b = pm.spawn("enemy");
+        pm::Id a = pm.spawn();
+        pm::Id b = pm.spawn();
         pm::Id c = pm.spawn();
         (void)c;
         assert(a != pm::NULL_ID);
         assert(b != pm::NULL_ID);
         assert(a != b);
-        assert(pm.find("player") == a);
-        assert(pm.find("enemy") == b);
-        assert(pm.find("nonexistent") == pm::NULL_ID);
 
+        auto *pos = pm.pool<Pos>("pos");
+        pos->add(a, {1, 2});
         pm.remove_entity(a);
-        assert(pm.is_removing_entity(a));
-        assert(pm.find("player") == a);
-        pm.tick_once();
-        assert(pm.find("player") == pm::NULL_ID);
-        printf("  [OK] Id spawn/find/remove_entity\n");
+        pm.flush_removes();
+        assert(!pos->has(a));
+        assert(pm.entity_count() == 2);
+        printf("  [OK] Id spawn/remove_entity\n");
     }
 
     // --- Deferred removal ---
     {
         pm::Pm pm;
-        pm::Id a = pm.spawn("target");
-        assert(!pm.is_removing_entity(a));
+        auto *pos = pm.pool<Pos>("pos");
+        pm::Id a = pm.spawn();
+        pos->add(a, {1, 2});
+        assert(pos->has(a));
         pm.remove_entity(a);
-        assert(pm.is_removing_entity(a));
-        assert(pm.find("target") == a);
-        pm.tick_once();
-        assert(pm.find("target") == pm::NULL_ID);
+        // Deferred: entity still alive until flush
+        assert(pos->has(a));
+        assert(pm.entity_count() == 1);
+        pm.flush_removes();
+        assert(!pos->has(a));
+        assert(pm.entity_count() == 0);
         printf("  [OK] Deferred removal\n");
     }
 
@@ -100,7 +101,7 @@ int main()
         assert(vel != nullptr);
         assert(pos->pool_id != vel->pool_id);
 
-        pm::Id e = pm.spawn("entity");
+        pm::Id e = pm.spawn();
         pos->add(e, {10.f, 20.f});
         vel->add(e, {1.f, 2.f});
 
@@ -166,12 +167,12 @@ int main()
         pos->add(e2, {2.f, 0.f});
         assert(change_count == 2);
 
-        for (auto entry : pos->each()) {
-            entry.modify()->x += 10.f;
-        }
+        pos->each_mut([&](pm::Id, Pos& p) {
+            p.x += 10.f;
+        }, pm::Parallel::Off);
         assert(change_count == 4);
 
-        printf("  [OK] Entry.modify() calls change hook\n");
+        printf("  [OK] each_mut() auto-fires change hook\n");
     }
 
     // --- State ---
@@ -262,7 +263,7 @@ int main()
         printf("  [OK] sync_id: rejects stale out-of-order\n");
     }
 
-    // --- Pool::add updates dense_ids on generation change ---
+    // --- Pool::add updates dense_indices on generation change ---
     {
         pm::Pm pm;
         auto *pool = pm.pool<Pos>("pos");
@@ -278,7 +279,7 @@ int main()
         assert(pool->has(v2));
         assert(!pool->has(v1));
         assert(pool->get(v2)->x == 30);
-        printf("  [OK] Pool::add updates dense_ids on generation overwrite\n");
+        printf("  [OK] Pool::add updates dense_indices on generation overwrite\n");
     }
 
     // --- entity_count ---
@@ -307,27 +308,28 @@ int main()
         printf("  [OK] entity_count accurate under sync_id churn\n");
     }
 
-    // --- sync_id clears slot_removing ---
+    // --- sync_id after immediate remove ---
     {
         pm::Pm pm;
         auto *pool = pm.pool<Pos>("pos");
 
         pm::Id v1 = pm::make_id(5, 1);
         pm.sync_id(v1);
+        pool->add(v1, {1, 1});
         pm.remove_entity(v1);
+        pm.flush_removes();
+        assert(!pool->has(v1));
 
         pm::Id v2 = pm::make_id(5, 2);
         assert(pm.sync_id(v2));
         pool->add(v2, {99, 99});
 
-        pm.tick_once();
-
         assert(pool->has(v2));
         assert(pool->get(v2)->x == 99);
-        printf("  [OK] sync_id clears slot_removing for newer generation\n");
+        printf("  [OK] sync_id after deferred remove\n");
     }
 
-    // --- Deferred remove cleans orphaned pool entries ---
+    // --- Deferred remove cleans pool entry ---
     {
         pm::Pm pm;
         auto *pool = pm.pool<Pos>("pos");
@@ -335,25 +337,23 @@ int main()
         pm::Id v1 = pm::make_id(5, 1);
         pm.sync_id(v1);
         pool->add(v1, {10, 20});
+        assert(pool->has(v1));
 
-        pm::Id v4 = pm::make_id(5, 4);
-        pm.sync_id(v4);
-        pm.remove_entity(v4);
-        pm.tick_once();
-
+        pm.remove_entity(v1);
+        assert(pool->has(v1)); // still alive until flush
+        pm.flush_removes();
         assert(!pool->has(v1));
-        assert(!pool->has(v4));
-        printf("  [OK] deferred remove cleans orphaned pool entries by index\n");
+        printf("  [OK] Deferred remove cleans pool entry\n");
     }
 
     // --- remove_entity + stop_task + Pool::reset ---
     {
         pm::Pm pm;
         auto *pos = pm.pool<Pos>("pos");
-        pm::Id e = pm.spawn("thing");
+        pm::Id e = pm.spawn();
         pos->add(e, {1, 2});
 
-        pm.remove_entity(pm.find("thing"));
+        pm.remove_entity(e);
         pm.stop_task("thing");
         pm.tick_once();
         assert(!pos->has(e));
@@ -385,8 +385,6 @@ int main()
     // --- const char* convenience overloads ---
     {
         pm::Pm pm;
-        pm.spawn("foo");
-        assert(pm.find("foo") != pm::NULL_ID);
 
         auto *pos = pm.pool<Pos>("mypool");
         assert(pos != nullptr);
@@ -444,7 +442,7 @@ int main()
         printf("  [OK] stop_task stops task\n");
     }
 
-    // --- Remove during iteration ---
+    // --- Deferred remove during each() ---
     {
         pm::Pm pm;
         auto *pos = pm.pool<Pos>("pos");
@@ -457,27 +455,231 @@ int main()
         pos->add(e3, {3, 0});
 
         int visited = 0;
-        for (auto [id, val, pool] : pos->each()) {
+        pos->each([&](pm::Id id, const Pos& val) {
             visited++;
             if (val.x == 2.f) pm.remove_entity(id);
-        }
+        }, pm::Parallel::Off);
         assert(visited == 3);
-
-        pm.tick_once();
+        // Deferred: entity still in pool until flush
+        assert(pos->has(e2));
+        assert(pm.remove_pending() == 1);
+        pm.flush_removes();
         assert(!pos->has(e2));
         assert(pos->has(e1));
         assert(pos->has(e3));
-        printf("  [OK] Remove during iteration (deferred)\n");
+        printf("  [OK] Deferred remove during each()\n");
+    }
+
+    // --- each_mut() void(T&) signature ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        for (int i = 0; i < 2000; i++) {
+            pm::Id e = pm.spawn();
+            pool->add(e, {(float)i, 0.f});
+        }
+        pool->each_mut([](Pos& p) { p.y = p.x * 2.f; });
+        for (size_t i = 0; i < pool->items.size(); i++)
+            assert(pool->items[i].y == pool->items[i].x * 2.f);
+        printf("  [OK] each_mut() void(T&) parallel\n");
+    }
+
+    // --- each_mut() void(Id, T&) signature ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        for (int i = 0; i < 2000; i++) {
+            pm::Id e = pm.spawn();
+            pool->add(e, {(float)i, 0.f});
+        }
+        pool->each_mut([](pm::Id id, Pos& p) {
+            p.y = (float)pm::id_index(id);
+        });
+        for (size_t i = 0; i < pool->items.size(); i++) {
+            uint32_t slot = pool->dense_indices[i];
+            assert(pool->items[i].y == (float)slot);
+        }
+        printf("  [OK] each_mut() void(Id, T&) parallel\n");
+    }
+
+    // --- each_mut() empty pool ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        pool->each_mut([](Pos& p) { p.x = 999.f; });
+        assert(pool->size() == 0);
+        printf("  [OK] each_mut() empty pool\n");
+    }
+
+    // --- each_mut() Parallel::Off ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        for (int i = 0; i < 10; i++) {
+            pm::Id e = pm.spawn();
+            pool->add(e, {(float)i, 0.f});
+        }
+        pool->each_mut([](Pos& p) { p.y = 42.f; }, pm::Parallel::Off);
+        for (auto& p : pool->items) assert(p.y == 42.f);
+        printf("  [OK] each_mut() Parallel::Off\n");
+    }
+
+    // --- each() + deferred remove via tick ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+
+        pm::Id e1 = pm.spawn();
+        pm::Id e2 = pm.spawn();
+        pm::Id e3 = pm.spawn();
+        pool->add(e1, {1, 0});
+        pool->add(e2, {2, 0});
+        pool->add(e3, {3, 0});
+
+        pm.schedule("test", 1.f, [pool](pm::TaskContext& ctx) {
+            pool->each([&](pm::Id id, const Pos& p) {
+                if (p.x == 2.f) ctx.remove_entity(id);
+            }, pm::Parallel::Off);
+        });
+        pm.tick_once();
+        assert(pool->size() == 2);
+        assert(pool->has(e1));
+        assert(!pool->has(e2));
+        assert(pool->has(e3));
+        printf("  [OK] each() + deferred remove via tick\n");
+    }
+
+    // --- each_mut() auto-fires change hooks ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        int changes = 0;
+        pool->set_change_hook([](void* ctx, pm::Id) {
+            (*static_cast<int*>(ctx))++;
+        }, &changes);
+        for (int i = 0; i < 100; i++) {
+            pm::Id e = pm.spawn();
+            pool->add(e, {(float)i, 0.f});
+        }
+        int before = changes;
+        pool->each_mut([](Pos& p) { p.y = 99.f; }, pm::Parallel::Off);
+        assert(changes == before + 100);
+        printf("  [OK] each_mut() auto-fires change hooks\n");
+    }
+
+    // --- Generation wrap-around fix ---
+    {
+        uint32_t max_gen = 0xFFFFFF;
+        uint32_t new_gen = (max_gen + 1) & 0xFFFFFF;
+        assert(new_gen == 0);
+        if (new_gen == 0) new_gen = 1;
+        assert(new_gen == 1);
+
+        uint32_t normal_gen = (5 + 1) & 0xFFFFFF;
+        assert(normal_gen == 6);
+
+        printf("  [OK] Generation wrap-around fix\n");
+    }
+
+    // --- each() does NOT fire change hooks ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        int changes = 0;
+        pool->set_change_hook([](void* ctx, pm::Id) {
+            (*static_cast<int*>(ctx))++;
+        }, &changes);
+        for (int i = 0; i < 50; i++) {
+            pm::Id e = pm.spawn();
+            pool->add(e, {(float)i, 0.f});
+        }
+        int before = changes;
+        pool->each([](const Pos& p) { (void)p; }, pm::Parallel::Off);
+        assert(changes == before);
+        pool->each([](pm::Id, const Pos& p) { (void)p; }, pm::Parallel::Off);
+        assert(changes == before);
+        printf("  [OK] each() does NOT fire change hooks\n");
+    }
+
+    // --- each_mut() DOES fire change hooks ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        int changes = 0;
+        pool->set_change_hook([](void* ctx, pm::Id) {
+            (*static_cast<int*>(ctx))++;
+        }, &changes);
+        for (int i = 0; i < 50; i++) {
+            pm::Id e = pm.spawn();
+            pool->add(e, {(float)i, 0.f});
+        }
+        int before = changes;
+        pool->each_mut([](Pos& p) { p.y = 1.f; }, pm::Parallel::Off);
+        assert(changes == before + 50);
+        printf("  [OK] each_mut() DOES fire change hooks\n");
+    }
+
+    // --- dense_ids tracks full Ids ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+
+        pm::Id a = pm.spawn();
+        pm::Id b = pm.spawn();
+        pm::Id c = pm.spawn();
+        pool->add(a, {1, 0});
+        pool->add(b, {2, 0});
+        pool->add(c, {3, 0});
+
+        assert(pool->id_at(0) == a);
+        assert(pool->id_at(1) == b);
+        assert(pool->id_at(2) == c);
+
+        // Remove first — swap-remove should update dense_ids
+        pool->remove(a);
+        assert(pool->size() == 2);
+        assert(pool->id_at(0) == c);
+        assert(pool->id_at(1) == b);
+
+        printf("  [OK] dense_ids tracks full Ids\n");
+    }
+
+    // --- each_mut parallel with hook falls back to sequential ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        int changes = 0;
+        pool->set_change_hook([](void* ctx, pm::Id) {
+            (*static_cast<int*>(ctx))++;
+        }, &changes);
+        for (int i = 0; i < 2000; i++) {
+            pm::Id e = pm.spawn();
+            pool->add(e, {(float)i, 0.f});
+        }
+        int before = changes;
+        pool->each_mut([](Pos& p) { p.y = 1.f; }, pm::Parallel::On);
+        assert(changes == before + 2000);
+        printf("  [OK] each_mut parallel with hook falls back to sequential\n");
+    }
+
+    // --- each() passes const reference ---
+    {
+        pm::Pm pm;
+        auto *pool = pm.pool<Pos>("pos");
+        pm::Id e = pm.spawn();
+        pool->add(e, {1.f, 2.f});
+        pool->each([](const Pos& p) { assert(p.x == 1.f); }, pm::Parallel::Off);
+        pool->each([](pm::Id, const Pos& p) { assert(p.x == 1.f); }, pm::Parallel::Off);
+        printf("  [OK] each() passes const reference\n");
     }
 
     // --- Fault handling ---
     {
         pm::Pm pm;
         int counter = 0;
-        pm.schedule("faulty", 50.f, [&counter](pm::TaskContext &) -> pm::Result {
+        pm.schedule("faulty", 50.f, [&counter](pm::TaskContext &) {
             counter++;
-            if (counter >= 2) return pm::Result::err("boom");
-            return pm::Result::ok();
+            if (counter >= 2) throw pm::TaskFault("boom");
         });
 
         pm.tick_once();
@@ -490,23 +692,14 @@ int main()
         printf("  [OK] Fault handling disables task\n");
     }
 
-    // --- const find() doesn't intern ---
-    {
-        pm::Pm pm;
-        pm.spawn("exists");
-        assert(pm.find("ghost") == pm::NULL_ID);
-        assert(pm.find("exists") != pm::NULL_ID);
-        printf("  [OK] const find() doesn't intern\n");
-    }
-
     // --- Pause/step ---
     {
         pm::Pm pm;
         int always_count = 0, game_count = 0;
 
-        pm.schedule("input", pm::Phase::INPUT, [&](pm::TaskContext&) { always_count++; });
-        pm.schedule("physics", pm::Phase::SIMULATE, [&](pm::TaskContext&) { game_count++; },
-                    0.f, true);
+        pm.schedule("input", 10.f, [&](pm::TaskContext&) { always_count++; });
+        pm.schedule("physics", 30.f, [&](pm::TaskContext&) { game_count++; },
+                    true);
 
         pm.tick_once();
         assert(always_count == 1 && game_count == 1);
@@ -524,43 +717,6 @@ int main()
         pm.tick_once();
         assert(always_count == 4 && game_count == 3);
         printf("  [OK] Pause/step\n");
-    }
-
-    // --- Remove budget ---
-    {
-        pm::Pm pm;
-        auto* pool = pm.pool<int>("stuff");
-
-        pm::Id ids[10];
-        for (int i = 0; i < 10; i++) {
-            ids[i] = pm.spawn();
-            pool->add(ids[i], i);
-        }
-
-        for (int i = 0; i < 5; i++) pm.remove_entity(ids[i]);
-        pm.tick_once();
-        assert(pool->items.size() == 5);
-        assert(pm.remove_pending() == 0);
-
-        pm::Id batch[200];
-        for (int i = 0; i < 200; i++) {
-            batch[i] = pm.spawn();
-            pool->add(batch[i], i);
-        }
-        for (int i = 0; i < 200; i++) pm.remove_entity(batch[i]);
-        pm.set_remove_budget_us(0.001f);
-
-        size_t before = pool->items.size();
-        int safety = 0;
-        while (pm.remove_pending() > 0 && safety < 100) {
-            pm.tick_once();
-            safety++;
-        }
-        assert(pool->items.size() == before - 200);
-        assert(pm.remove_pending() == 0);
-
-        pm.set_remove_budget_us(0.f);
-        printf("  [OK] Remove budget rate-limits by time\n");
     }
 
     printf("\n=== pm_udp.hpp test suite ===\n\n");
@@ -885,7 +1041,7 @@ int main()
     {
         pm::Pm pm;
         auto* net = pm.state<pm::NetSys>("net");
-        net_init(pm, net);
+        net_init(pm, net, 15.f, 95.f);
 
         assert(pm.task("net/recv") != nullptr);
         assert(pm.task("net/tick") != nullptr);

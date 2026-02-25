@@ -328,7 +328,7 @@ struct PoolSyncState
 		std::fill(pending_flag.begin(), pending_flag.end(), 0);
 		for (size_t i = 0; i < pool->items.size(); i++)
 		{
-			Id id = pool->dense_ids[i];
+			Id id = pool->id_at(i);
 			uint32_t idx = id_index(id);
 			pending_add(idx, id);
 		}
@@ -705,10 +705,10 @@ struct NetSys {
 
 	template<typename T>
 	void clear_pool(TaskContext& ctx, Pool<T>* pool) {
-		for (auto [id, val, _] : pool->each()) {
+		pool->each([&](Id id, const T&) {
 			track_removal(pool->pool_id, id);
 			ctx.remove_entity(id);
-		}
+		}, Parallel::Off);
 	}
 
 	// Batch pending removals into reliable messages, grouped by pool_id.
@@ -789,8 +789,8 @@ struct NetSys {
 	// bind_state_send: register a task that serializes state and pushes to all peers every tick.
 	// WriteFn signature: uint16_t(TaskContext& ctx, uint8_t* out_buf) — returns bytes written (0 = skip).
 	template<typename WriteFn>
-	void bind_state_send(Pm& pm, uint32_t state_id, const char* task_name, WriteFn write_fn) {
-		pm.schedule(task_name, Phase::NET_SEND, [this, state_id, write_fn](TaskContext& ctx) {
+	void bind_state_send(Pm& pm, uint32_t state_id, const char* task_name, float priority, WriteFn write_fn) {
+		pm.schedule(task_name, priority, [this, state_id, write_fn](TaskContext& ctx) {
 			if (!should_send) return;
 			uint8_t buf[MAX_STATE_SIZE];
 			uint16_t sz = write_fn(ctx, buf);
@@ -890,7 +890,7 @@ struct NetSys {
 	// added/removed. Install a change hook via Pool::set_change_hook before use,
 	// or call notify_change() manually each frame for always-moving entities.
 	template <typename T, typename WriteFn, typename InterestFn = std::nullptr_t>
-	void bind_send(Pm& pm, Pool<T>* pool, const char* task_name,
+	void bind_send(Pm& pm, Pool<T>* pool, const char* task_name, float priority,
 				   WriteFn write_fn, InterestFn interest_fn = nullptr, float hysteresis = 0.f) {
 
 		auto* ss = get_sync_state(pool->pool_id);
@@ -906,7 +906,7 @@ struct NetSys {
 
 		ss->repend_all(pool);
 
-		pm.schedule(task_name, Phase::NET_SEND, [this, pool, ss, write_fn, interest_fn, hysteresis](TaskContext& ctx) {
+		pm.schedule(task_name, priority, [this, pool, ss, write_fn, interest_fn, hysteresis](TaskContext& ctx) {
 			if (!should_send) return;
 			constexpr bool has_interest = !std::is_same_v<InterestFn, std::nullptr_t>;
 
@@ -915,9 +915,8 @@ struct NetSys {
 			for (uint8_t p : remote_peers()) {
 				if constexpr (has_interest) {
 					for (size_t di = 0; di < pool->items.size(); di++) {
-						Id id = pool->dense_ids[di];
+						Id id = pool->id_at(di);
 						if (!ss->is_synced_to(p, id)) continue;
-						if (ctx.is_removing_entity(id)) continue;
 						if (!interest_fn(ctx, p, id, pool->items[di], hysteresis)) {
 							ss->mark_unsynced_for(p, id);
 							peer_net[p].pending_removals.push_back({pool->pool_id, id});
@@ -926,7 +925,6 @@ struct NetSys {
 				}
 
 				ss->each_unsynced(pool, p, remote_mask, [&](Id id, T& val, size_t) {
-					if (ctx.is_removing_entity(id)) return;
 					if constexpr (has_interest) {
 						if (!interest_fn(ctx, p, id, val, 0.f)) return;
 					}
@@ -1050,9 +1048,9 @@ private:
 //   net/tick  — timekeeping, send rate, heartbeat, timeout, connect retry
 //   net/flush — MTU sync packets, state packets, reliable removal batches, resend
 // =============================================================================
-inline void net_init(Pm& pm, NetSys* net)
+inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 {
-	pm.schedule("net/recv", Phase::NET_RECV, [net](TaskContext& ctx) {
+	pm.schedule("net/recv", recv_phase, [net](TaskContext& ctx) {
 		if (net->sock.sock == INVALID_SOCKET) return;
 		struct sockaddr_in src{}; int n; uint8_t buf[16384];
 
@@ -1242,7 +1240,7 @@ inline void net_init(Pm& pm, NetSys* net)
 		}
 	});
 
-	pm.schedule("net/tick", Phase::NET_SEND - 10.f, [net](TaskContext& ctx) {
+	pm.schedule("net/tick", send_phase - 10.f, [net](TaskContext& ctx) {
 		net->local_time += ctx.dt();
 		net->should_send = false;
 
@@ -1292,7 +1290,7 @@ inline void net_init(Pm& pm, NetSys* net)
 		}
 	});
 
-	pm.schedule("net/flush", Phase::NET_SEND + 5.f, [net](TaskContext&) {
+	pm.schedule("net/flush", send_phase + 5.f, [net](TaskContext&) {
 		if (!net->should_send) {
 			for (uint8_t p : net->remote_peers()) net->peer_net[p].clear_frame();
 			return;

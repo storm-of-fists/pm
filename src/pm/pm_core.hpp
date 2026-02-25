@@ -2,7 +2,7 @@
 //
 // THE RULE OF 3 VERBS:
 // 1. Data: pm.pool<T>(), pm.state<T>()
-// 2. Ids: pm.spawn(), pm.find(name), pm.remove_entity(id)
+// 2. Ids: pm.spawn(), pm.remove_entity(id)
 // 3. Scheduling: pm.schedule(name, priority, fn)
 //
 // INIT PATTERN:
@@ -24,6 +24,9 @@
 #include <cassert>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 #include <cstdint>
 #include <type_traits>
 #include <typeinfo>
@@ -107,12 +110,107 @@ public:
 	}
 };
 
-struct Result
+struct TaskFault : std::exception
 {
-	const char *error = nullptr;
-	static Result ok() { return {nullptr}; }
-	static Result err(const char *msg) { return {msg}; }
-	explicit operator bool() const { return error == nullptr; }
+	std::string msg;
+	explicit TaskFault(std::string m) : msg(std::move(m)) {}
+	const char *what() const noexcept override { return msg.c_str(); }
+};
+
+// =============================================================================
+// Parallel — execution mode for Pool<T>::each()
+// =============================================================================
+enum class Parallel { Auto, Off, On };
+
+// =============================================================================
+// ThreadPool — barrier-based chunk dispatch for parallel iteration
+// =============================================================================
+struct ThreadPool
+{
+	std::vector<std::thread> workers;
+	std::mutex mtx;
+	std::condition_variable cv;
+	std::condition_variable done_cv;
+
+	std::function<void(size_t, size_t)> work_fn;
+	size_t work_total = 0;
+	uint32_t work_gen = 0;
+
+	std::atomic<uint32_t> remaining{0};
+	std::exception_ptr captured_exception;
+	bool shutdown = false;
+	uint32_t num_threads = 0;
+
+	void start(uint32_t n)
+	{
+		num_threads = n;
+		for (uint32_t i = 0; i < n; i++)
+			workers.emplace_back([this, i, n]() { run(i, n); });
+	}
+
+	~ThreadPool()
+	{
+		{ std::lock_guard<std::mutex> lk(mtx); shutdown = true; }
+		cv.notify_all();
+		for (auto &w : workers) w.join();
+	}
+
+	void dispatch(size_t count, std::function<void(size_t, size_t)> fn)
+	{
+		captured_exception = nullptr;
+		{
+			std::lock_guard<std::mutex> lk(mtx);
+			work_fn = std::move(fn);
+			work_total = count;
+			remaining.store(num_threads, std::memory_order_relaxed);
+			work_gen++;
+		}
+		cv.notify_all();
+
+		std::unique_lock<std::mutex> lk(mtx);
+		done_cv.wait(lk, [&] { return remaining.load(std::memory_order_acquire) == 0; });
+
+		if (captured_exception)
+		{
+			auto e = captured_exception;
+			captured_exception = nullptr;
+			std::rethrow_exception(e);
+		}
+	}
+
+private:
+	void run(uint32_t id, uint32_t n)
+	{
+		uint32_t local_gen = 0;
+		while (true)
+		{
+			std::unique_lock<std::mutex> lk(mtx);
+			cv.wait(lk, [&] { return shutdown || work_gen != local_gen; });
+			if (shutdown) return;
+			local_gen = work_gen;
+
+			size_t total = work_total;
+			auto fn = work_fn;
+			lk.unlock();
+
+			size_t chunk = (total + n - 1) / n;
+			size_t begin = std::min(static_cast<size_t>(id) * chunk, total);
+			size_t end = std::min(begin + chunk, total);
+
+			try
+			{
+				if (begin < end) fn(begin, end);
+			}
+			catch (...)
+			{
+				std::lock_guard<std::mutex> elk(mtx);
+				if (!captured_exception) captured_exception = std::current_exception();
+			}
+
+			if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+				done_cv.notify_one();
+		}
+	}
 };
 
 // =============================================================================
@@ -130,11 +228,21 @@ inline size_t get_type_id()
 // =============================================================================
 using Id = uint64_t;
 constexpr Id NULL_ID = 0xFFFFFFFFFFFFFFFFULL;
-constexpr uint32_t NULL_INDEX = 0xFFFFFFFF;
+constexpr uint32_t NULL_INDEX = 0x00FFFFFF;
 
-inline uint32_t id_index(Id id) { return static_cast<uint32_t>(id & 0xFFFFFFFFULL); }
-inline uint32_t id_generation(Id id) { return static_cast<uint32_t>(id >> 32); }
-inline Id make_id(uint32_t idx, uint32_t gen) { return (static_cast<uint64_t>(gen) << 32) | idx; }
+// Id layout: [63..40] 24-bit index, [39..16] 24-bit generation, [15..0] 16-bit flags
+inline uint32_t id_index(Id id) { return static_cast<uint32_t>((id >> 40) & 0xFFFFFF); }
+inline uint32_t id_generation(Id id) { return static_cast<uint32_t>((id >> 16) & 0xFFFFFF); }
+inline uint16_t id_flags(Id id) { return static_cast<uint16_t>(id & 0xFFFF); }
+inline Id make_id(uint32_t idx, uint32_t gen, uint16_t flags = 0)
+{
+	return (static_cast<uint64_t>(idx & 0xFFFFFF) << 40)
+		 | (static_cast<uint64_t>(gen & 0xFFFFFF) << 16)
+		 | flags;
+}
+
+constexpr uint16_t ID_FLAG_FREE = 0x0001;
+inline bool id_is_free(Id slot) { return (slot & ID_FLAG_FREE) != 0; }
 
 template <typename T>
 class Pool;
@@ -163,9 +271,8 @@ class PoolBase
 public:
 	virtual ~PoolBase() = default;
 	uint32_t pool_id = 0;
+	const std::vector<Id> *kernel_slots = nullptr; // set by Pm::pool<T>()
 	virtual void remove(Id id) = 0;
-	virtual void remove_by_index(uint32_t idx) = 0;
-	virtual Id id_at_index(uint32_t idx) const = 0;
 	virtual void clear_all() = 0;
 	virtual void shrink_to_fit() = 0;
 };
@@ -186,7 +293,8 @@ class Pool : public PoolBase
 {
 public:
 	std::vector<T> items;
-	std::vector<Id> dense_ids;
+	std::vector<uint32_t> dense_indices;  // slot index per dense entry
+	std::vector<Id> dense_ids;            // full Id per dense entry (cached for O(1) id_at)
 	std::vector<uint32_t> sparse_indices;
 
 	// --- Change notification hook (optional) ---
@@ -219,6 +327,12 @@ public:
 		if (change_fn) change_fn(change_ctx, id);
 	}
 
+	// Full Id for a given dense position (O(1) direct lookup)
+	Id id_at(size_t dense_idx) const
+	{
+		return dense_ids[dense_idx];
+	}
+
 	// --- Sparse set operations ---
 
 	T *add(Id id, T val = T{})
@@ -230,6 +344,7 @@ public:
 		if (sparse_indices[idx] != NULL_INDEX)
 		{
 			uint32_t dense_idx = sparse_indices[idx];
+			dense_indices[dense_idx] = idx;
 			dense_ids[dense_idx] = id;
 			items[dense_idx] = std::move(val);
 			notify_change(id);
@@ -238,6 +353,7 @@ public:
 
 		uint32_t dense_idx = static_cast<uint32_t>(items.size());
 		sparse_indices[idx] = dense_idx;
+		dense_indices.push_back(idx);
 		dense_ids.push_back(id);
 		items.push_back(std::move(val));
 
@@ -252,52 +368,41 @@ public:
 			return;
 
 		uint32_t dense_idx = sparse_indices[idx];
-		if (dense_ids[dense_idx] != id)
+		if (dense_indices[dense_idx] != idx)
 			return;
 
 		uint32_t last_dense_idx = static_cast<uint32_t>(items.size() - 1);
-		Id last_id = dense_ids[last_dense_idx];
+		uint32_t last_slot_idx = dense_indices[last_dense_idx];
 
 		if (swap_fn) swap_fn(swap_ctx, dense_idx, last_dense_idx);
 
 		if (dense_idx != last_dense_idx)
 		{
 			items[dense_idx] = std::move(items[last_dense_idx]);
-			dense_ids[dense_idx] = last_id;
-			sparse_indices[id_index(last_id)] = dense_idx;
+			dense_indices[dense_idx] = last_slot_idx;
+			dense_ids[dense_idx] = dense_ids[last_dense_idx];
+			sparse_indices[last_slot_idx] = dense_idx;
 		}
 
 		sparse_indices[idx] = NULL_INDEX;
 		items.pop_back();
+		dense_indices.pop_back();
 		dense_ids.pop_back();
-	}
-
-	void remove_by_index(uint32_t idx) override
-	{
-		if (idx >= sparse_indices.size() || sparse_indices[idx] == NULL_INDEX)
-			return;
-		uint32_t dense_idx = sparse_indices[idx];
-		remove(dense_ids[dense_idx]);
-	}
-
-	Id id_at_index(uint32_t idx) const override
-	{
-		if (idx >= sparse_indices.size() || sparse_indices[idx] == NULL_INDEX)
-			return NULL_ID;
-		return dense_ids[sparse_indices[idx]];
 	}
 
 	void clear_all() override
 	{
-		for (Id id : dense_ids)
-			sparse_indices[id_index(id)] = NULL_INDEX;
+		for (uint32_t idx : dense_indices)
+			sparse_indices[idx] = NULL_INDEX;
 		items.clear();
+		dense_indices.clear();
 		dense_ids.clear();
 	}
 
 	void shrink_to_fit() override
 	{
 		items.shrink_to_fit();
+		dense_indices.shrink_to_fit();
 		dense_ids.shrink_to_fit();
 	}
 
@@ -312,9 +417,17 @@ public:
 	T *get(Id id)
 	{
 		uint32_t idx = id_index(id);
-		if (idx < sparse_indices.size() && sparse_indices[idx] != NULL_INDEX && dense_ids[sparse_indices[idx]] == id)
-			return &items[sparse_indices[idx]];
-		return nullptr;
+		if (idx >= sparse_indices.size() || sparse_indices[idx] == NULL_INDEX)
+			return nullptr;
+		uint32_t dense_idx = sparse_indices[idx];
+		// Validate generation via kernel slots
+		if (kernel_slots)
+		{
+			Id slot = (*kernel_slots)[idx];
+			if (id_generation(slot) != id_generation(id) || id_is_free(slot))
+				return nullptr;
+		}
+		return &items[dense_idx];
 	}
 	const T *get(Id id) const { return const_cast<Pool *>(this)->get(id); }
 
@@ -323,57 +436,19 @@ public:
 
 	Handle<T> handle(Id id) { return {id, this}; }
 
-	// --- Iteration ---
+	// --- Iteration (lambda form, auto-parallelizes) ---
+	// Defined out-of-line after Pm class.
+	// each():     void(const T&) or void(Id, const T&) — read-only, no change hooks
+	// each_mut(): void(T&) or void(Id, T&) — mutable, fires change hooks
+	Pm *kernel = nullptr; // set by Pm::pool<T>()
 
-	struct Entry
-	{
-		Id id;
-		T &value;
-		Pool<T> *pool;
-		T *modify()
-		{
-			pool->notify_change(id);
-			return &value;
-		}
-	};
-	struct ConstEntry
-	{
-		Id id;
-		const T &value;
-	};
+	static constexpr size_t PARALLEL_THRESHOLD = 1024;
 
-	struct Iterator
-	{
-		Pool *p;
-		size_t i;
-		Entry operator*() { return {p->dense_ids[i], p->items[i], p}; }
-		Iterator &operator++() { ++i; return *this; }
-		bool operator!=(const Iterator &o) const { return i != o.i; }
-	};
-	struct ConstIterator
-	{
-		const Pool *p;
-		size_t i;
-		ConstEntry operator*() const { return {p->dense_ids[i], p->items[i]}; }
-		ConstIterator &operator++() { ++i; return *this; }
-		bool operator!=(const ConstIterator &o) const { return i != o.i; }
-	};
+	template <typename F>
+	void each(F &&fn, Parallel p = Parallel::Auto);
 
-	struct Range
-	{
-		Pool *p;
-		Iterator begin() { return {p, 0}; }
-		Iterator end() { return {p, p->items.size()}; }
-	};
-	struct ConstRange
-	{
-		const Pool *p;
-		ConstIterator begin() const { return {p, 0}; }
-		ConstIterator end() const { return {p, p->items.size()}; }
-	};
-
-	Range each() { return {this}; }
-	ConstRange each() const { return {this}; }
+	template <typename F>
+	void each_mut(F &&fn, Parallel p = Parallel::Auto);
 };
 
 // =============================================================================
@@ -413,12 +488,8 @@ public:
 	float dt() const;
 	uint64_t tick_count() const;
 
-	Id spawn(NameId name = NULL_NAME);
-	Id spawn(const char *name);
-	Id find(NameId name) const;
-	Id find(const char *name) const;
+	Id spawn();
 	void remove_entity(Id id);
-	bool is_removing_entity(Id id) const;
 	bool sync_id(Id id);
 
 	void quit();
@@ -438,11 +509,11 @@ public:
 struct Task
 {
 	NameId name = NULL_NAME;
-	float priority = 0, hz = 0, accum = 0;
+	float priority = 0;
 	bool active = true;
 	bool pauseable = false;
 
-	std::function<Result(TaskContext &)> fn;
+	std::function<void(TaskContext &)> fn;
 
 	uint64_t runs = 0, last_us = 0, max_us = 0;
 
@@ -456,20 +527,6 @@ struct Task
 };
 
 // =============================================================================
-// Phase — Suggested priority constants for common task ordering
-// =============================================================================
-struct Phase
-{
-	static constexpr float INPUT = 10.f;
-	static constexpr float NET_RECV = 15.f;
-	static constexpr float SIMULATE = 30.f;
-	static constexpr float COLLIDE = 50.f;
-	static constexpr float CLEANUP = 55.f;
-	static constexpr float DRAW = 70.f;
-	static constexpr float HUD = 80.f;
-	static constexpr float RENDER = 90.f;
-	static constexpr float NET_SEND = 95.f;
-};
 
 // =============================================================================
 // Pm Kernel
@@ -478,16 +535,11 @@ class Pm
 {
 	NameTable name_table;
 
-	std::vector<uint32_t> id_gen;
+	std::vector<Id> m_slots;        // One packed Id per entity slot (index, gen, flags)
 	std::vector<uint32_t> free_ids;
-	std::vector<uint8_t> slot_free;
-	std::vector<NameId> id_to_name;
-	std::vector<Id> name_to_id;
-
-	std::vector<uint8_t> slot_removing;
-	std::vector<Id> deferred_removes;
-	size_t remove_cursor = 0;
-	float remove_budget = 0.f;
+	std::vector<Id> pending_removes;
+	std::mutex remove_mtx;
+	std::unique_ptr<ThreadPool> m_thread_pool;
 
 	std::vector<Task> task_list;
 	std::vector<uint16_t> task_order_indices;
@@ -508,9 +560,6 @@ class Pm
 		size_t type_id = 0;
 	};
 	std::vector<StateEntry> state_entries;
-
-	std::vector<std::unique_ptr<PoolBase>> pool_graveyard;
-	std::vector<std::unique_ptr<StateBase>> state_graveyard;
 
 	float loop_rate = 0.f, raw_dt = 0.f;
 	uint64_t tick = 0;
@@ -534,6 +583,20 @@ public:
 
 	~Pm() = default;
 
+	// ====== THREAD POOL (lazy-init) ======
+	ThreadPool *thread_pool()
+	{
+		if (!m_thread_pool)
+		{
+			uint32_t n = std::thread::hardware_concurrency();
+			if (n == 0) n = 4;
+			if (n > 32) n = 32;
+			m_thread_pool = std::make_unique<ThreadPool>();
+			m_thread_pool->start(n);
+		}
+		return m_thread_pool.get();
+	}
+
 	// ====== NAME INTERNING ======
 	NameId intern(const char *s) { return name_table.intern(s); }
 	const char *name_str(NameId id) const { return name_table.str(id); }
@@ -541,9 +604,6 @@ public:
 
 	// ====== CORE TIMELINE ======
 	void set_loop_rate(float hz) { loop_rate = hz; }
-	void set_remove_budget_us(float us) { remove_budget = us; }
-	float remove_budget_us() const { return remove_budget; }
-	size_t remove_pending() const { return deferred_removes.size() - remove_cursor; }
 
 	uint32_t frame_spawns() const { return spawns_this_frame; }
 	uint32_t frame_removes() const { return removes_this_frame; }
@@ -622,191 +682,85 @@ public:
 			{
 				auto t0 = std::chrono::steady_clock::now();
 				TaskContext ctx(*this);
-				Result r = task_list[ti].fn(ctx);
-				task_list[ti].record(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
-				if (!r)
+				try
+				{
+					task_list[ti].fn(ctx);
+				}
+				catch (const TaskFault &e)
 				{
 					task_list[ti].active = false;
-					fault_list.push_back(std::string(name_str(task_list[ti].name)) + ": " + r.error);
+					fault_list.push_back(std::string(name_str(task_list[ti].name)) + ": " + e.what());
 					tasks_dirty = true;
 				}
+				task_list[ti].record(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
 			};
 
-			if (task_list[ti].hz > 0)
-			{
-				task_list[ti].accum += raw_dt;
-				float interval = 1.0f / task_list[ti].hz;
-				if (task_list[ti].accum > interval * 5.0f)
-					task_list[ti].accum = interval * 5.0f;
-				while (task_list[ti].accum >= interval && task_list[ti].active)
-				{
-					task_list[ti].accum -= interval;
-					active_task = task_list[ti].name;
-					exec_t();
-					active_task = NULL_NAME;
-				}
-			}
-			else
-			{
-				active_task = task_list[ti].name;
-				exec_t();
-				active_task = NULL_NAME;
-			}
+			active_task = task_list[ti].name;
+			exec_t();
+			active_task = NULL_NAME;
 		}
 
-		// Process deferred entity removes (time-budgeted, cursor-based)
-		{
-			auto remove_start = std::chrono::steady_clock::now();
-			size_t total = deferred_removes.size();
-
-			while (remove_cursor < total)
-			{
-				Id id = deferred_removes[remove_cursor];
-				uint32_t idx = id_index(id);
-
-				if (idx < id_gen.size() && id_gen[idx] == id_generation(id))
-				{
-					if (idx < id_to_name.size() && id_to_name[idx] != NULL_NAME)
-					{
-						NameId nid = id_to_name[idx];
-						if (nid < name_to_id.size() && name_to_id[nid] == id)
-							name_to_id[nid] = NULL_ID;
-						id_to_name[idx] = NULL_NAME;
-					}
-
-					id_gen[idx]++;
-					if (id_gen[idx] == 0)
-						id_gen[idx] = 1;
-
-					slot_free[idx] = 1;
-					free_ids.push_back(idx);
-					slot_removing[idx] = 0;
-
-					uint32_t current_gen = id_gen[idx];
-					for (PoolBase *p : pool_by_id)
-					{
-						if (!p) continue;
-						p->remove(id);
-						Id pid = p->id_at_index(idx);
-						if (pid != NULL_ID && id_generation(pid) < current_gen)
-							p->remove_by_index(idx);
-					}
-					removes_this_frame++;
-					alive_count--;
-				}
-				else if (idx < id_gen.size() && id_gen[idx] > id_generation(id))
-				{
-					uint32_t current_gen = id_gen[idx];
-					for (PoolBase *p : pool_by_id)
-					{
-						if (!p) continue;
-						Id pid = p->id_at_index(idx);
-						if (pid != NULL_ID && id_generation(pid) < current_gen)
-							p->remove_by_index(idx);
-					}
-					slot_removing[idx] = 0;
-				}
-
-				++remove_cursor;
-
-				if (remove_budget > 0.f && (remove_cursor & 15) == 0)
-				{
-					float elapsed = std::chrono::duration<float, std::micro>(
-										std::chrono::steady_clock::now() - remove_start)
-										.count();
-					if (elapsed >= remove_budget)
-						break;
-				}
-			}
-
-			if (remove_cursor == total)
-			{
-				deferred_removes.clear();
-				remove_cursor = 0;
-			}
-		}
-
+		flush_removes();
 		stepping_active = false;
 	}
 
 	// ====== IDS ======
-	Id spawn(NameId name = NULL_NAME)
+	Id spawn()
 	{
 		uint32_t idx = UINT32_MAX;
 		while (!free_ids.empty())
 		{
 			uint32_t candidate = free_ids.back();
 			free_ids.pop_back();
-			if (slot_free[candidate])
+			if (id_is_free(m_slots[candidate]))
 			{
-				slot_free[candidate] = 0;
 				idx = candidate;
 				break;
 			}
 		}
 		if (idx == UINT32_MAX)
 		{
-			idx = static_cast<uint32_t>(id_gen.size());
-			id_gen.push_back(1);
-			slot_free.push_back(0);
-			slot_removing.push_back(0);
-			id_to_name.push_back(NULL_NAME);
+			idx = static_cast<uint32_t>(m_slots.size());
+			m_slots.push_back(make_id(idx, 1, ID_FLAG_FREE));
 		}
-		Id id = make_id(idx, id_gen[idx]);
+		uint32_t gen = id_generation(m_slots[idx]);
+		m_slots[idx] = make_id(idx, gen); // clear free flag
 		spawns_this_frame++;
 		alive_count++;
-		if (name != NULL_NAME)
-		{
-			if (name >= name_to_id.size())
-				name_to_id.resize(name + 1, NULL_ID);
-			name_to_id[name] = id;
-			id_to_name[idx] = name;
-		}
-		return id;
-	}
-
-	Id spawn(const char *name)
-	{
-		if (!name || !name[0])
-			return spawn(NULL_NAME);
-		return spawn(intern(name));
-	}
-
-	Id find(NameId name) const
-	{
-		if (name == NULL_NAME || name >= name_to_id.size())
-			return NULL_ID;
-		return name_to_id[name];
-	}
-
-	Id find(const char *name) const
-	{
-		NameId nid = name_table.find(name);
-		if (nid == NULL_NAME)
-			return NULL_ID;
-		return find(nid);
+		return make_id(idx, gen);
 	}
 
 	void remove_entity(Id id)
 	{
-		uint32_t idx = id_index(id);
-		if (idx >= id_gen.size() || id_gen[idx] != id_generation(id))
-			return;
-		if (slot_removing[idx] == 0)
-		{
-			slot_removing[idx] = 1;
-			deferred_removes.push_back(id);
-		}
+		std::lock_guard<std::mutex> lk(remove_mtx);
+		pending_removes.push_back(id);
 	}
 
-	bool is_removing_entity(Id id) const
+	uint32_t remove_pending() const { return static_cast<uint32_t>(pending_removes.size()); }
+
+	void flush_removes()
 	{
-		uint32_t idx = id_index(id);
-		if (idx >= id_gen.size() || id_gen[idx] != id_generation(id))
-			return true;
-		if (idx < slot_removing.size())
-			return slot_removing[idx] == 1;
-		return false;
+		for (Id id : pending_removes)
+		{
+			uint32_t idx = id_index(id);
+			if (idx >= m_slots.size()) continue;
+			if (id_generation(m_slots[idx]) != id_generation(id)) continue;
+			if (id_is_free(m_slots[idx])) continue;
+
+			uint32_t new_gen = (id_generation(id) + 1) & 0xFFFFFF;
+			if (new_gen == 0) new_gen = 1;
+			m_slots[idx] = make_id(idx, new_gen, ID_FLAG_FREE);
+
+			for (PoolBase *p : pool_by_id)
+			{
+				if (p) p->remove(id);
+			}
+
+			free_ids.push_back(idx);
+			removes_this_frame++;
+			alive_count--;
+		}
+		pending_removes.clear();
 	}
 
 	bool sync_id(Id id)
@@ -817,28 +771,23 @@ public:
 		if (idx > MAX_SYNC_INDEX)
 			return false;
 
-		if (idx >= id_gen.size())
+		if (idx >= m_slots.size())
 		{
-			uint32_t old_size = static_cast<uint32_t>(id_gen.size());
-			id_gen.resize(idx + 1, 0);
-			slot_free.resize(idx + 1, 1);
-			slot_removing.resize(idx + 1, 0);
-			id_to_name.resize(idx + 1, NULL_NAME);
-
-			for (uint32_t i = old_size; i < idx; ++i)
-				free_ids.push_back(i);
+			uint32_t old_size = static_cast<uint32_t>(m_slots.size());
+			m_slots.resize(idx + 1, make_id(0, 0, ID_FLAG_FREE));
+			for (uint32_t i = old_size; i <= idx; ++i)
+			{
+				m_slots[i] = make_id(i, 0, ID_FLAG_FREE);
+				if (i < idx) free_ids.push_back(i);
+			}
 		}
 
-		if (id_gen[idx] > gen)
+		uint32_t current_gen = id_generation(m_slots[idx]);
+		if (current_gen > gen)
 			return false;
 
-		if (id_gen[idx] == gen && idx < slot_removing.size() && slot_removing[idx])
-			return false;
-
-		id_gen[idx] = gen;
-		slot_removing[idx] = 0;
-		if (slot_free[idx]) alive_count++;
-		slot_free[idx] = 0;
+		if (id_is_free(m_slots[idx])) alive_count++;
+		m_slots[idx] = make_id(idx, gen); // clear free flag
 		return true;
 	}
 
@@ -856,33 +805,22 @@ public:
 
 	// ====== SCHEDULING ======
 	template <typename F>
-	void schedule(NameId name, float priority, F &&fn, float hz = 0.f, bool pauseable = false)
+	void schedule(NameId name, float priority, F &&fn, bool pauseable = false)
 	{
 		Task t;
 		t.name = name;
 		t.priority = priority;
-		t.hz = hz;
 		t.pauseable = pauseable;
 
-		t.fn = [f = std::forward<F>(fn)](TaskContext &ctx) -> Result
-		{
-			using Ret = decltype(f(ctx));
-			if constexpr (std::is_same_v<Ret, Result>)
-				return f(ctx);
-			else
-			{
-				f(ctx);
-				return Result::ok();
-			}
-		};
+		t.fn = [f = std::forward<F>(fn)](TaskContext &ctx) { f(ctx); };
 		task_list.push_back(std::move(t));
 		tasks_dirty = true;
 	}
 
 	template <typename F>
-	void schedule(const char *name, float priority, F &&fn, float hz = 0.f, bool pauseable = false)
+	void schedule(const char *name, float priority, F &&fn, bool pauseable = false)
 	{
-		schedule(intern(name), priority, std::forward<F>(fn), hz, pauseable);
+		schedule(intern(name), priority, std::forward<F>(fn), pauseable);
 	}
 
 	const std::vector<Task> &tasks() const { return task_list; }
@@ -940,6 +878,8 @@ public:
 		{
 			auto p = std::make_unique<Pool<T>>();
 			p->pool_id = next_pool_id++;
+			p->kernel_slots = &m_slots;
+			p->kernel = this;
 			r.type_id = get_type_id<T>();
 
 			if (p->pool_id >= pool_by_id.size())
@@ -973,32 +913,91 @@ public:
 	template <typename T>
 	T *state(const char *name) { return state<T>(intern(name)); }
 
-	// ====== RETIRE — Unregister + deflate, object stays alive ======
-	void retire_pool(NameId name)
-	{
-		if (name >= pool_entries.size()) return;
-		auto &r = pool_entries[name];
-		if (!r.pool) return;
-
-		pool_by_id[r.pool->pool_id] = nullptr;
-		r.pool->clear_all();
-		r.pool->shrink_to_fit();
-		pool_graveyard.push_back(std::move(r.pool));
-		r.type_id = 0;
-	}
-	void retire_pool(const char *name) { retire_pool(intern(name)); }
-
-	void retire_state(NameId name)
-	{
-		if (name >= state_entries.size()) return;
-		auto &r = state_entries[name];
-		if (!r.state) return;
-
-		state_graveyard.push_back(std::move(r.state));
-		r.type_id = 0;
-	}
-	void retire_state(const char *name) { retire_state(intern(name)); }
 };
+
+// =============================================================================
+// Pool<T>::each — read-only iteration, no change hooks
+// Signatures: void(const T&) or void(Id, const T&)
+// =============================================================================
+template <typename T>
+template <typename F>
+void Pool<T>::each(F &&fn, Parallel p)
+{
+	size_t n = items.size();
+	if (n == 0) return;
+
+	bool use_parallel = (p == Parallel::On)
+		|| (p == Parallel::Auto && n >= PARALLEL_THRESHOLD && kernel);
+	if (p == Parallel::Off) use_parallel = false;
+
+	if (use_parallel && kernel)
+	{
+		auto *tp = kernel->thread_pool();
+		tp->dispatch(n, [this, &fn](size_t begin, size_t end) {
+			for (size_t i = begin; i < end; i++)
+			{
+				if constexpr (std::is_invocable_v<F, Id, const T &>)
+					fn(id_at(i), static_cast<const T &>(items[i]));
+				else
+					fn(static_cast<const T &>(items[i]));
+			}
+		});
+	}
+	else
+	{
+		for (size_t i = 0; i < n; i++)
+		{
+			if constexpr (std::is_invocable_v<F, Id, const T &>)
+				fn(id_at(i), static_cast<const T &>(items[i]));
+			else
+				fn(static_cast<const T &>(items[i]));
+		}
+	}
+}
+
+// =============================================================================
+// Pool<T>::each_mut — mutable iteration, fires change hooks
+// Signatures: void(T&) or void(Id, T&)
+// If change_fn is installed and parallel requested, falls back to sequential.
+// =============================================================================
+template <typename T>
+template <typename F>
+void Pool<T>::each_mut(F &&fn, Parallel p)
+{
+	size_t n = items.size();
+	if (n == 0) return;
+
+	bool use_parallel = (p == Parallel::On)
+		|| (p == Parallel::Auto && n >= PARALLEL_THRESHOLD && kernel);
+	if (p == Parallel::Off) use_parallel = false;
+	if (change_fn) use_parallel = false;
+
+	if (use_parallel && kernel)
+	{
+		auto *tp = kernel->thread_pool();
+		tp->dispatch(n, [this, &fn](size_t begin, size_t end) {
+			for (size_t i = begin; i < end; i++)
+			{
+				if constexpr (std::is_invocable_v<F, Id, T &>)
+					fn(id_at(i), items[i]);
+				else
+					fn(items[i]);
+			}
+		});
+	}
+	else
+	{
+		for (size_t i = 0; i < n; i++)
+		{
+			Id eid = id_at(i);
+			if constexpr (std::is_invocable_v<F, Id, T &>)
+				fn(eid, items[i]);
+			else
+				fn(items[i]);
+			if (change_fn) change_fn(change_ctx, eid);
+		}
+	}
+}
 
 // =============================================================================
 // TaskContext inline implementations
@@ -1006,12 +1005,9 @@ public:
 inline Pm &TaskContext::pm() { return *owner; }
 inline float TaskContext::dt() const { return owner->dt(); }
 inline uint64_t TaskContext::tick_count() const { return owner->tick_count(); }
-inline Id TaskContext::spawn(NameId name) { return owner->spawn(name); }
-inline Id TaskContext::spawn(const char *name) { return owner->spawn(name); }
-inline Id TaskContext::find(NameId name) const { return owner->find(name); }
-inline Id TaskContext::find(const char *name) const { return owner->find(name); }
+inline Id TaskContext::spawn() { return owner->spawn(); }
 inline void TaskContext::remove_entity(Id id) { owner->remove_entity(id); }
-inline bool TaskContext::is_removing_entity(Id id) const { return owner->is_removing_entity(id); }
+
 inline bool TaskContext::sync_id(Id id) { return owner->sync_id(id); }
 inline void TaskContext::quit() { owner->quit(); }
 inline bool TaskContext::is_running() const { return owner->is_running(); }

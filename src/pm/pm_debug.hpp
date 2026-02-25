@@ -16,7 +16,7 @@
 //
 // Usage:
 //   auto* debug = pm.state<DebugOverlay>("debug");
-//   debug_init(pm, debug);
+//   debug_init(pm, debug, Phase::INPUT, Phase::HUD);
 //
 // Depends: pm_core.hpp, pm_sdl.hpp
 
@@ -127,11 +127,11 @@ inline void rpad(DrawQueue* q, const char* text, int col_x, int col_w,
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
-inline void debug_init(Pm& pm, DebugOverlay* debug) {
+inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud_phase) {
 	auto* keys_q = pm.state<KeyQueue>("keys");
 	auto* draw_q = pm.state<DrawQueue>("draw");
 
-	pm.schedule("debug/input", Phase::INPUT + 3.f, [debug, keys_q](TaskContext& ctx) {
+	pm.schedule("debug/input", input_phase + 3.f, [debug, keys_q](TaskContext& ctx) {
 		for (auto key : *keys_q) {
 			if (key <= 0) continue;
 
@@ -159,7 +159,7 @@ inline void debug_init(Pm& pm, DebugOverlay* debug) {
 		}
 	});
 
-	pm.schedule("debug/sample", Phase::HUD + 4.f, [debug](TaskContext& ctx) {
+	pm.schedule("debug/sample", hud_phase + 4.f, [debug](TaskContext& ctx) {
 		if (!debug->visible) return;
 		Pm& pm = ctx.pm();
 
@@ -178,7 +178,7 @@ inline void debug_init(Pm& pm, DebugOverlay* debug) {
 		}
 	});
 
-	pm.schedule("debug/draw", Phase::HUD + 5.f, [debug, draw_q](TaskContext& ctx) {
+	pm.schedule("debug/draw", hud_phase + 5.f, [debug, draw_q](TaskContext& ctx) {
 		if (!debug->visible) return;
 		Pm& pm = ctx.pm();
 		int sc = 2;
@@ -321,9 +321,9 @@ inline void debug_init(Pm& pm, DebugOverlay* debug) {
 		// Entities + draw stats
 		{
 			char buf[128];
-			snprintf(buf, sizeof(buf), "entities:%u  +%u/-%u  pending:%zu  draws:%zu",
+			snprintf(buf, sizeof(buf), "entities:%u  +%u/-%u  draws:%zu",
 				pm.entity_count(), pm.frame_spawns(), pm.frame_removes(),
-				pm.remove_pending(), draw_q->size());
+				draw_q->size());
 			push_str(draw_q, buf, x0, y, sc, 180, 200, 255);
 			y += rh;
 		}

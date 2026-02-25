@@ -28,6 +28,22 @@ struct EventBuf {
 };
 
 // =============================================================================
+// Phase — Task priority constants for hellfire execution order
+// =============================================================================
+struct Phase
+{
+    static constexpr float INPUT    = 10.f;
+    static constexpr float NET_RECV = 15.f;
+    static constexpr float SIMULATE = 30.f;
+    static constexpr float COLLIDE  = 50.f;
+    static constexpr float CLEANUP  = 55.f;
+    static constexpr float DRAW     = 70.f;
+    static constexpr float HUD      = 80.f;
+    static constexpr float RENDER   = 90.f;
+    static constexpr float NET_SEND = 95.f;
+};
+
+// =============================================================================
 // Constants
 // =============================================================================
 static constexpr int W = 900, H = 700;
