@@ -18,7 +18,7 @@
 //   - Generic recv dispatch by packet type
 //
 // Usage:
-//   auto* net = pm.state<NetSys>("net");
+//   auto* net = pm.state_get<NetSys>("net");
 //   net->port = 7777;
 //   net_init(pm, net);
 //
@@ -356,7 +356,7 @@ private:
 // =============================================================================
 // NetSys — UDP network sync transport + peer management
 //
-// Plain state struct. Created via pm.state<NetSys>("net").
+// Plain state struct. Created via pm.state_get<NetSys>("net").
 // Call net_init(pm, net) after configuration to register tasks.
 // =============================================================================
 struct NetSys {
@@ -700,14 +700,14 @@ struct NetSys {
 
 	void tracked_remove(Pm& pm, PoolBase* pool, Id id) {
 		track_removal(pool->pool_id, id);
-		pm.remove_entity(id);
+		pm.id_remove(id);
 	}
 
 	template<typename T>
 	void clear_pool(Pm& pm, Pool<T>* pool) {
 		pool->each([&](Id id, const T&) {
 			track_removal(pool->pool_id, id);
-			pm.remove_entity(id);
+			pm.id_remove(id);
 		}, Parallel::Off);
 	}
 
@@ -790,7 +790,7 @@ struct NetSys {
 	// WriteFn signature: uint16_t(Pm& pm, uint8_t* out_buf) — returns bytes written (0 = skip).
 	template<typename WriteFn>
 	void bind_state_send(Pm& pm, uint32_t state_id, const char* task_name, float priority, WriteFn write_fn) {
-		pm.schedule(task_name, priority, [this, state_id, write_fn](Pm& pm) {
+		pm.task_add(task_name, priority, [this, state_id, write_fn](Pm& pm) {
 			if (!should_send) return;
 			uint8_t buf[MAX_STATE_SIZE];
 			uint16_t sz = write_fn(pm, buf);
@@ -879,8 +879,8 @@ struct NetSys {
 			[](Pm& pm, const uint8_t* data, uint16_t count) {
 				for (uint16_t i = 0; i < count; i++) {
 					Id id; memcpy(&id, data + i * sizeof(Id), sizeof(Id));
-					pm.sync_id(id);
-					pm.remove_entity(id);
+					pm.id_sync(id);
+					pm.id_remove(id);
 				}
 			});
 	}
@@ -906,7 +906,7 @@ struct NetSys {
 
 		ss->repend_all(pool);
 
-		pm.schedule(task_name, priority, [this, pool, ss, write_fn, interest_fn, hysteresis](Pm& pm) {
+		pm.task_add(task_name, priority, [this, pool, ss, write_fn, interest_fn, hysteresis](Pm& pm) {
 			(void)pm;
 			if (!should_send) return;
 			constexpr bool has_interest = !std::is_same_v<InterestFn, std::nullptr_t>;
@@ -1051,7 +1051,7 @@ private:
 // =============================================================================
 inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 {
-	pm.schedule("net/recv", recv_phase, [net](Pm& pm) {
+	pm.task_add("net/recv", recv_phase, [net](Pm& pm) {
 		if (net->sock.sock == INVALID_SOCKET) return;
 		struct sockaddr_in src{}; int n; uint8_t buf[16384];
 
@@ -1241,19 +1241,19 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 		}
 	});
 
-	pm.schedule("net/tick", send_phase - 10.f, [net](Pm& pm) {
-		net->local_time += pm.dt();
+	pm.task_add("net/tick", send_phase - 10.f, [net](Pm& pm) {
+		net->local_time += pm.loop_dt();
 		net->should_send = false;
 
 		// --- Client connect retry/timeout ---
 		if (net->conn_state == NetSys::ConnState::CONNECTING) {
-			net->connect_elapsed += pm.dt();
+			net->connect_elapsed += pm.loop_dt();
 			if (net->connect_elapsed >= net->connect_timeout) {
 				net->conn_state = NetSys::ConnState::DISCONNECTED;
 				if (net->connect_denied_callback)
 					net->connect_denied_callback(*net, 0); // reason 0 = timeout
 			} else {
-				net->connect_timer += pm.dt();
+				net->connect_timer += pm.loop_dt();
 				if (net->connect_timer >= net->connect_retry_interval) {
 					net->connect_timer = 0.f;
 					net->send_connect_req();
@@ -1262,7 +1262,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 		}
 
 		for (uint8_t p : net->remote_peers()) {
-			net->peer_net[p].snapshot_age = std::min(net->peer_net[p].snapshot_age + pm.dt(), 0.2f);
+			net->peer_net[p].snapshot_age = std::min(net->peer_net[p].snapshot_age + pm.loop_dt(), 0.2f);
 
 			// Timeout: disconnect peers we haven't heard from
 			if (net->peer_net[p].last_recv_time > 0.f &&
@@ -1272,7 +1272,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 		}
 
 		if (net->sock.sock != INVALID_SOCKET) {
-			net->send_timer += pm.dt();
+			net->send_timer += pm.loop_dt();
 			if (net->send_timer >= net->send_rate) {
 				net->send_timer -= net->send_rate;
 				net->should_send = true;
@@ -1291,7 +1291,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 		}
 	});
 
-	pm.schedule("net/flush", send_phase + 5.f, [net](Pm&) {
+	pm.task_add("net/flush", send_phase + 5.f, [net](Pm&) {
 		if (!net->should_send) {
 			for (uint8_t p : net->remote_peers()) net->peer_net[p].clear_frame();
 			return;

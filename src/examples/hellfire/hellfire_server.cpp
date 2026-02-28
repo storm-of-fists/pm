@@ -44,7 +44,7 @@ struct ServerState {
 
     void add_player(Pm& pm, uint8_t peer) {
         if (peer >= 4 || peer_ids[peer] != NULL_ID) return;
-        peer_ids[peer] = pm.spawn();
+        peer_ids[peer] = pm.id_add();
         players->add(peer_ids[peer], Player{{SPAWN_X[peer], SPAWN_Y[peer]}, PLAYER_HP, 0, 0, true,
                   PCOL[peer][0], PCOL[peer][1], PCOL[peer][2]});
     }
@@ -102,18 +102,18 @@ static void spawn_monster(Pm& pm, Pool<Monster>* pool, ServerState* gs) {
     else if (hue < 0.7f) { m.r = 255; m.g = 60;  m.b = 120; }
     else if (hue < 0.85f){ m.r = 200; m.g = 50;  m.b = 200; }
     else                 { m.r = 255; m.g = 200; m.b = 50;  }
-    pool->add(pm.spawn(), m);
+    pool->add(pm.id_add(), m);
 }
 
 // =============================================================================
 // server_init — register all server tasks
 // =============================================================================
 void server_init(Pm& pm) {
-    auto* gs  = pm.state<ServerState>("server");
-    gs->players = pm.pool<Player>("players");
-    auto* mp  = pm.pool<Monster>("monsters");
-    auto* bp  = pm.pool<Bullet>("bullets");
-    auto* net = pm.state<NetSys>("net");
+    auto* gs  = pm.state_get<ServerState>("server");
+    gs->players = pm.pool_get<Player>("players");
+    auto* mp  = pm.pool_get<Monster>("monsters");
+    auto* bp  = pm.pool_get<Bullet>("bullets");
+    auto* net = pm.state_get<NetSys>("net");
 
     // --- Sync bindings (send only — server never receives pool sync) ---
     // Monsters + bullets move every frame → full-sync mode (dense iteration, no change hook)
@@ -174,20 +174,20 @@ void server_init(Pm& pm) {
     });
 
     net->on_recv(PKT_PAUSE, [](Pm& pm, const uint8_t*, int, struct sockaddr_in&) {
-        pm.toggle_pause();
+        pm.paused = !pm.paused;
     });
 
     net->on_recv(PKT_RESTART, [gs, net, mp, bp](Pm& pm, const uint8_t*, int, struct sockaddr_in&) {
         if (!gs->game_over) return;
         gs->reset_game(pm, net, mp, bp);
-        pm.resume();
+        pm.paused = false;
         printf("[server] game restarted\n");
     });
 
     // --- Player movement + shooting ---
-    pm.schedule("player_move", Phase::SIMULATE - 1.f, [gs, bp](Pm& pm) {
+    pm.task_add("player_move", Phase::SIMULATE - 1.f, [gs, bp](Pm& pm) {
         if (!gs->started || gs->game_over) return;
-        float dt = pm.dt();
+        float dt = pm.loop_dt();
         for (int pi = 0; pi < 4; pi++) {
             auto* p = gs->players->get(gs->peer_ids[pi]);
             if (!p || !p->alive) continue;
@@ -205,15 +205,15 @@ void server_init(Pm& pm) {
                 p->cooldown = PLAYER_COOLDOWN;
                 Vec2 aim = norm(Vec2{in.ax, in.ay} - p->pos);
                 if (len(aim) < 0.001f) aim = {1, 0};
-                bp->add(pm.spawn(), Bullet{p->pos, aim*PBULLET_SPEED, PBULLET_LIFE, PBULLET_SIZE, true});
+                bp->add(pm.id_add(), Bullet{p->pos, aim*PBULLET_SPEED, PBULLET_LIFE, PBULLET_SIZE, true});
             }
         }
     }, true);
 
     // --- Spawning ---
-    pm.schedule("spawn", Phase::SIMULATE - 2.f, [gs, net, mp, bp](Pm& pm) {
+    pm.task_add("spawn", Phase::SIMULATE - 2.f, [gs, net, mp, bp](Pm& pm) {
         if (!gs->started || gs->game_over) return;
-        float dt = pm.dt();
+        float dt = pm.loop_dt();
         gs->time += dt;
         const LevelDef& lvl = LEVELS[gs->current_level];
         if (gs->level_hold > 0.f) { gs->level_hold -= dt; return; }
@@ -252,9 +252,9 @@ void server_init(Pm& pm) {
     }, true);
 
     // --- Monster AI ---
-    pm.schedule("monster_ai", Phase::SIMULATE + 1.f, [gs, mp, bp](Pm& pm) {
+    pm.task_add("monster_ai", Phase::SIMULATE + 1.f, [gs, mp, bp](Pm& pm) {
         if (!gs->started || gs->game_over) return;
-        float dt = pm.dt();
+        float dt = pm.loop_dt();
         mp->each_mut([&](Monster& m) {
             Vec2 tgt = m.pos; float best = 1e9f;
             for (auto& p : gs->players->items)
@@ -269,16 +269,16 @@ void server_init(Pm& pm) {
                 float sp = gs->rng.rfr(-0.15f, 0.15f);
                 float cs = cosf(sp), sn = sinf(sp);
                 Vec2 aim = {dir.x*cs - dir.y*sn, dir.x*sn + dir.y*cs};
-                bp->add(pm.spawn(), Bullet{m.pos, aim*MBULLET_SPEED, MBULLET_LIFE, MBULLET_SIZE, false});
+                bp->add(pm.id_add(), Bullet{m.pos, aim*MBULLET_SPEED, MBULLET_LIFE, MBULLET_SIZE, false});
             }
             m.pos += m.vel * dt;
         }, Parallel::Off);
     }, true);
 
     // --- Bullet physics ---
-    pm.schedule("bullet_physics", Phase::SIMULATE, [gs, net, bp](Pm& pm) {
+    pm.task_add("bullet_physics", Phase::SIMULATE, [gs, net, bp](Pm& pm) {
         if (!gs->started || gs->game_over) return;
-        float dt = pm.dt();
+        float dt = pm.loop_dt();
         bp->each_mut([&](Id id, Bullet& b) {
             b.pos += b.vel * dt;
             b.lifetime -= dt;
@@ -291,7 +291,7 @@ void server_init(Pm& pm) {
     // Bullet-vs-monster exact check is done inside the query callback.
     static constexpr float MON_QUERY_R = PBULLET_SIZE + MONSTER_MAX_SZ * 0.65f;
 
-    pm.schedule("collision", Phase::COLLIDE, [gs, mp, bp, net](Pm& pm) {
+    pm.task_add("collision", Phase::COLLIDE, [gs, mp, bp, net](Pm& pm) {
         if (!gs->started || gs->game_over) return;
         float pr = PLAYER_SIZE * 0.5f;
 
@@ -342,7 +342,7 @@ void server_init(Pm& pm) {
     }, true);
 
     // --- Cleanup OOB ---
-    pm.schedule("cleanup", Phase::CLEANUP, [gs, mp, bp, net](Pm& pm) {
+    pm.task_add("cleanup", Phase::CLEANUP, [gs, mp, bp, net](Pm& pm) {
         if (!gs->started) return;
         mp->each([&](Id id, const Monster& m) {
             if (m.pos.x<-100||m.pos.x>W+100||m.pos.y<-100||m.pos.y>H+100) { net->tracked_remove(pm, mp, id); }
@@ -355,7 +355,7 @@ void server_init(Pm& pm) {
     // --- Broadcast game state via state sync ---
     net->bind_state_send(pm, STATE_ID_GAME, "state_send", Phase::NET_SEND, [gs, net](Pm& pm, uint8_t* buf) -> uint16_t {
         if (!gs->started) return 0;
-        PktState pkt{PKT_STATE, net->net_frame, gs->time, gs->score, gs->kills, (uint8_t)pm.is_paused(), gs->game_over, 0, gs->round, {}};
+        PktState pkt{PKT_STATE, net->net_frame, gs->time, gs->score, gs->kills, (uint8_t)pm.paused, gs->game_over, 0, gs->round, {}};
         for (int i = 0; i < 4; i++) {
             auto* p = gs->players->get(gs->peer_ids[i]);
             if (p) { pkt.p[pkt.pcnt++] = {p->pos.x, p->pos.y, p->hp, (uint8_t)p->alive}; }
@@ -365,23 +365,23 @@ void server_init(Pm& pm) {
     });
 
     // --- Debug info broadcast — once per second to all connected clients ---
-    pm.schedule("debug_send", Phase::HUD, [mp, bp, net](Pm& pm) {
+    pm.task_add("debug_send", Phase::HUD, [mp, bp, net](Pm& pm) {
         static float timer = 0.f;
-        timer += pm.dt();
+        timer += pm.loop_dt();
         if (timer < 1.f) return;
         timer -= 1.f;
         PktDbg pkt{};
         pkt.monsters    = (uint16_t)mp->items.size();
         pkt.bullets     = (uint16_t)bp->items.size();
-        pkt.ms_per_tick = pm.dt() * 1000.f;
+        pkt.ms_per_tick = pm.loop_dt() * 1000.f;
         for (uint8_t p : net->remote_peers())
             net->send_to(p, &pkt, sizeof(pkt));
     });
 
     // --- Status print ---
-    pm.schedule("status", Phase::HUD, [gs, mp, bp](Pm& pm) {
+    pm.task_add("status", Phase::HUD, [gs, mp, bp](Pm& pm) {
         static float accum = 0;
-        accum += pm.dt();
+        accum += pm.loop_dt();
         if (accum < 5.f) return;
         accum = 0;
         if (gs->started) {
@@ -403,9 +403,9 @@ int main(int argc, char** argv) {
     printf("[server] starting on port %d\n", port);
 
     Pm pm;
-    pm.set_loop_rate(60);
+    pm.loop_rate = 60;
 
-    auto* net = pm.state<NetSys>("net");
+    auto* net = pm.state_get<NetSys>("net");
     net->set_dedicated();
     net->port = port;
     net->start();
@@ -413,6 +413,6 @@ int main(int argc, char** argv) {
 
     server_init(pm);
 
-    pm.run();
+    pm.loop_run();
     return 0;
 }

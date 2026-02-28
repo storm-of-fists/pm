@@ -14,17 +14,17 @@ struct PhysicsState { float gravity = -9.8f; };
 
 void physics_init(pm::Pm& pm)
 {
-    auto* ps = pm.state<PhysicsState>("physics");
-    auto* pos_pool = pm.pool<Pos>("pos");
-    auto* vel_pool = pm.pool<Vel>("vel");
-    pm.schedule("physics/tick", 30.f, [ps, pos_pool, vel_pool](pm::Pm& pm) {
+    auto* ps = pm.state_get<PhysicsState>("physics");
+    auto* pos_pool = pm.pool_get<Pos>("pos");
+    auto* vel_pool = pm.pool_get<Vel>("vel");
+    pm.task_add("physics/tick", 30.f, [ps, pos_pool, vel_pool](pm::Pm& pm) {
         (void)ps;
         pos_pool->each_mut([&](pm::Id id, Pos& pos) {
             auto* vel = vel_pool->get(id);
             if (vel)
             {
-                pos.x += vel->dx * pm.dt();
-                pos.y += vel->dy * pm.dt();
+                pos.x += vel->dx * pm.loop_dt();
+                pos.y += vel->dy * pm.loop_dt();
             }
         }, pm::Parallel::Off);
     });
@@ -58,50 +58,50 @@ int main()
     // --- Id system ---
     {
         pm::Pm pm;
-        pm::Id a = pm.spawn();
-        pm::Id b = pm.spawn();
-        pm::Id c = pm.spawn();
+        pm::Id a = pm.id_add();
+        pm::Id b = pm.id_add();
+        pm::Id c = pm.id_add();
         (void)c;
         assert(a != pm::NULL_ID);
         assert(b != pm::NULL_ID);
         assert(a != b);
 
-        auto *pos = pm.pool<Pos>("pos");
+        auto *pos = pm.pool_get<Pos>("pos");
         pos->add(a, {1, 2});
-        pm.remove_entity(a);
-        pm.flush_removes();
+        pm.id_remove(a);
+        pm.id_process_removes();
         assert(!pos->has(a));
-        assert(pm.entity_count() == 2);
-        printf("  [OK] Id spawn/remove_entity\n");
+        assert(pm.id_count() == 2);
+        printf("  [OK] Id id_add/id_remove\n");
     }
 
     // --- Deferred removal ---
     {
         pm::Pm pm;
-        auto *pos = pm.pool<Pos>("pos");
-        pm::Id a = pm.spawn();
+        auto *pos = pm.pool_get<Pos>("pos");
+        pm::Id a = pm.id_add();
         pos->add(a, {1, 2});
         assert(pos->has(a));
-        pm.remove_entity(a);
+        pm.id_remove(a);
         // Deferred: entity still alive until flush
         assert(pos->has(a));
-        assert(pm.entity_count() == 1);
-        pm.flush_removes();
+        assert(pm.id_count() == 1);
+        pm.id_process_removes();
         assert(!pos->has(a));
-        assert(pm.entity_count() == 0);
+        assert(pm.id_count() == 0);
         printf("  [OK] Deferred removal\n");
     }
 
     // --- Pool basics ---
     {
         pm::Pm pm;
-        auto *pos = pm.pool<Pos>("pos");
-        auto *vel = pm.pool<Vel>("vel");
+        auto *pos = pm.pool_get<Pos>("pos");
+        auto *vel = pm.pool_get<Vel>("vel");
         assert(pos != nullptr);
         assert(vel != nullptr);
         assert(pos->pool_id != vel->pool_id);
 
-        pm::Id e = pm.spawn();
+        pm::Id e = pm.id_add();
         pos->add(e, {10.f, 20.f});
         vel->add(e, {1.f, 2.f});
 
@@ -117,17 +117,17 @@ int main()
     // --- Entity→pool remove ---
     {
         pm::Pm pm;
-        auto *pos = pm.pool<Pos>("pos");
-        auto *vel = pm.pool<Vel>("vel");
-        auto *hp = pm.pool<Health>("health");
+        auto *pos = pm.pool_get<Pos>("pos");
+        auto *vel = pm.pool_get<Vel>("vel");
+        auto *hp = pm.pool_get<Health>("health");
 
-        pm::Id e = pm.spawn();
+        pm::Id e = pm.id_add();
         pos->add(e, {1, 2});
         vel->add(e, {3, 4});
         hp->add(e, {50});
 
-        pm.remove_entity(e);
-        pm.tick_once();
+        pm.id_remove(e);
+        pm.loop_once();
 
         assert(!pos->has(e));
         assert(!vel->has(e));
@@ -135,23 +135,10 @@ int main()
         printf("  [OK] Entity→pool remove\n");
     }
 
-    // --- Handle ---
-    {
-        pm::Pm pm;
-        auto *pos = pm.pool<Pos>("pos");
-        pm::Id e = pm.spawn();
-        pos->add(e, {42.f, 99.f});
-
-        pm::Handle<Pos> h = pos->handle(e);
-        assert(h);
-        assert(h->x == 42.f);
-        printf("  [OK] Handle\n");
-    }
-
     // --- Entry.modify() calls change hook ---
     {
         pm::Pm pm;
-        auto *pos = pm.pool<Pos>("pos");
+        auto *pos = pm.pool_get<Pos>("pos");
 
         int change_count = 0;
         pos->set_change_hook([](void* ctx, pm::Id) {
@@ -159,11 +146,11 @@ int main()
             (*count)++;
         }, &change_count);
 
-        pm::Id e1 = pm.spawn();
+        pm::Id e1 = pm.id_add();
         pos->add(e1, {1.f, 0.f});
         assert(change_count == 1);
 
-        pm::Id e2 = pm.spawn();
+        pm::Id e2 = pm.id_add();
         pos->add(e2, {2.f, 0.f});
         assert(change_count == 2);
 
@@ -179,9 +166,9 @@ int main()
     {
         pm::Pm pm;
         physics_init(pm);
-        auto *ps = pm.state<PhysicsState>("physics");
+        auto *ps = pm.state_get<PhysicsState>("physics");
         assert(ps->gravity == -9.8f);
-        assert(pm.task("physics/tick") != nullptr);
+        assert(pm.task_get("physics/tick") != nullptr);
         printf("  [OK] State + init function\n");
     }
 
@@ -189,12 +176,12 @@ int main()
     {
         pm::Pm pm;
         struct Config { int width = 0; int height = 0; };
-        auto* cfg = pm.state<Config>("config");
+        auto* cfg = pm.state_get<Config>("config");
         cfg->width = 1920;
         cfg->height = 1080;
 
         // Re-fetch returns same instance
-        auto* cfg2 = pm.state<Config>("config");
+        auto* cfg2 = pm.state_get<Config>("config");
         assert(cfg2 == cfg);
         assert(cfg2->width == 1920);
         printf("  [OK] State with re-fetch\n");
@@ -204,76 +191,76 @@ int main()
     {
         pm::Pm pm;
         int counter = 0;
-        pm.schedule("test/count", 50.f, [&counter](pm::Pm &) { counter++; });
-        pm.tick_once();
+        pm.task_add("test/count", 50.f, [&counter](pm::Pm &) { counter++; });
+        pm.loop_once();
         assert(counter == 1);
-        pm.tick_once();
+        pm.loop_once();
         assert(counter == 2);
         printf("  [OK] Scheduler\n");
     }
 
-    // --- sync_id ---
+    // --- id_sync ---
     {
         pm::Pm pm;
         pm::Id remote_id = pm::make_id(42, 7);
-        pm.sync_id(remote_id);
+        pm.id_sync(remote_id);
 
-        auto *pos = pm.pool<Pos>("pos");
+        auto *pos = pm.pool_get<Pos>("pos");
         pos->add(remote_id, {1, 2});
         assert(pos->has(remote_id));
-        printf("  [OK] sync_id\n");
+        printf("  [OK] id_sync\n");
     }
 
-    // --- sync_id: remove+resync cycle ---
+    // --- id_sync: remove+resync cycle ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
 
         for (uint32_t gen = 1; gen <= 100; gen++) {
             pm::Id id = pm::make_id(5, gen);
-            pm.sync_id(id);
+            pm.id_sync(id);
             pool->add(id, {(float)gen, 0});
-            assert(pm.entity_count() < 1000000);
-            pm.remove_entity(id);
-            pm.tick_once();
+            assert(pm.id_count() < 1000000);
+            pm.id_remove(id);
+            pm.loop_once();
         }
-        assert(pm.entity_count() < 100);
-        printf("  [OK] sync_id: remove+resync no free_ids leak\n");
+        assert(pm.id_count() < 100);
+        printf("  [OK] id_sync: remove+resync no free_ids leak\n");
     }
 
-    // --- sync_id: rejects stale ---
+    // --- id_sync: rejects stale ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
 
         pm::Id id_v1 = pm::make_id(5, 1);
-        assert(pm.sync_id(id_v1) == true);
+        assert(pm.id_sync(id_v1) == true);
         pool->add(id_v1, {1, 2});
 
-        pm.remove_entity(id_v1);
-        pm.tick_once();
+        pm.id_remove(id_v1);
+        pm.loop_once();
 
-        assert(pm.sync_id(id_v1) == false);
+        assert(pm.id_sync(id_v1) == false);
 
         pm::Id id_v2 = pm::make_id(5, 2);
-        assert(pm.sync_id(id_v2) == true);
+        assert(pm.id_sync(id_v2) == true);
         pool->add(id_v2, {3, 4});
         assert(pool->has(id_v2));
 
-        printf("  [OK] sync_id: rejects stale out-of-order\n");
+        printf("  [OK] id_sync: rejects stale out-of-order\n");
     }
 
     // --- Pool::add updates dense_indices on generation change ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
 
         pm::Id v1 = pm::make_id(5, 1);
-        pm.sync_id(v1);
+        pm.id_sync(v1);
         pool->add(v1, {10, 20});
 
         pm::Id v2 = pm::make_id(5, 2);
-        pm.sync_id(v2);
+        pm.id_sync(v2);
         pool->add(v2, {30, 40});
 
         assert(pool->has(v2));
@@ -282,99 +269,99 @@ int main()
         printf("  [OK] Pool::add updates dense_indices on generation overwrite\n");
     }
 
-    // --- entity_count ---
+    // --- id_count ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
 
         for (uint32_t i = 0; i < 10; i++) {
             pm::Id id = pm::make_id(i * 3, 1);
-            pm.sync_id(id);
+            pm.id_sync(id);
             pool->add(id, {(float)i, 0});
         }
-        assert(pm.entity_count() == 10);
+        assert(pm.id_count() == 10);
 
         for (uint32_t i = 0; i < 5; i++)
-            pm.remove_entity(pm::make_id(i * 3, 1));
-        pm.tick_once();
-        assert(pm.entity_count() == 5);
+            pm.id_remove(pm::make_id(i * 3, 1));
+        pm.loop_once();
+        assert(pm.id_count() == 5);
 
         for (uint32_t i = 0; i < 5; i++) {
             pm::Id id = pm::make_id(i * 3, 2);
-            pm.sync_id(id);
+            pm.id_sync(id);
             pool->add(id, {(float)i + 100, 0});
         }
-        assert(pm.entity_count() == 10);
-        printf("  [OK] entity_count accurate under sync_id churn\n");
+        assert(pm.id_count() == 10);
+        printf("  [OK] id_count accurate under id_sync churn\n");
     }
 
-    // --- sync_id after immediate remove ---
+    // --- id_sync after immediate remove ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
 
         pm::Id v1 = pm::make_id(5, 1);
-        pm.sync_id(v1);
+        pm.id_sync(v1);
         pool->add(v1, {1, 1});
-        pm.remove_entity(v1);
-        pm.flush_removes();
+        pm.id_remove(v1);
+        pm.id_process_removes();
         assert(!pool->has(v1));
 
         pm::Id v2 = pm::make_id(5, 2);
-        assert(pm.sync_id(v2));
+        assert(pm.id_sync(v2));
         pool->add(v2, {99, 99});
 
         assert(pool->has(v2));
         assert(pool->get(v2)->x == 99);
-        printf("  [OK] sync_id after deferred remove\n");
+        printf("  [OK] id_sync after deferred remove\n");
     }
 
     // --- Deferred remove cleans pool entry ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
 
         pm::Id v1 = pm::make_id(5, 1);
-        pm.sync_id(v1);
+        pm.id_sync(v1);
         pool->add(v1, {10, 20});
         assert(pool->has(v1));
 
-        pm.remove_entity(v1);
+        pm.id_remove(v1);
         assert(pool->has(v1)); // still alive until flush
-        pm.flush_removes();
+        pm.id_process_removes();
         assert(!pool->has(v1));
         printf("  [OK] Deferred remove cleans pool entry\n");
     }
 
-    // --- remove_entity + stop_task + Pool::reset ---
+    // --- id_remove + task_stop + Pool::reset ---
     {
         pm::Pm pm;
-        auto *pos = pm.pool<Pos>("pos");
-        pm::Id e = pm.spawn();
+        auto *pos = pm.pool_get<Pos>("pos");
+        pm::Id e = pm.id_add();
         pos->add(e, {1, 2});
 
-        pm.remove_entity(e);
-        pm.stop_task("thing");
-        pm.tick_once();
+        pm.id_remove(e);
+        pm.task_stop("thing");
+        pm.loop_once();
         assert(!pos->has(e));
 
-        pm::Id e2 = pm.spawn();
+        pm::Id e2 = pm.id_add();
         pos->add(e2, {3, 4});
         pos->reset();
         assert(pos->items.size() == 0);
 
-        pm::Id e3 = pm.spawn();
+        pm::Id e3 = pm.id_add();
         pos->add(e3, {5, 6});
         assert(pos->has(e3));
-        printf("  [OK] remove_entity + stop_task + Pool::reset\n");
+        printf("  [OK] id_remove + task_stop + Pool::reset\n");
     }
 
     // --- add() overwrite ---
     {
         pm::Pm pm;
-        auto *pos = pm.pool<Pos>("pos");
+        auto *pos = pm.pool_get<Pos>("pos");
 
-        pm::Id e = pm.spawn();
+        pm::Id e = pm.id_add();
         pos->add(e, {1, 2});
         pos->add(e, {5, 6});
         assert(pos->get(e)->x == 5.f);
@@ -386,27 +373,27 @@ int main()
     {
         pm::Pm pm;
 
-        auto *pos = pm.pool<Pos>("mypool");
+        auto *pos = pm.pool_get<Pos>("mypool");
         assert(pos != nullptr);
 
-        auto *s = pm.state<PhysicsState>("mystate");
+        auto *s = pm.state_get<PhysicsState>("mystate");
         assert(s != nullptr);
 
-        pm.schedule("mytask", 50.f, [](pm::Pm &) {});
-        assert(pm.task("mytask") != nullptr);
+        pm.task_add("mytask", 50.f, [](pm::Pm &) {});
+        assert(pm.task_get("mytask") != nullptr);
         printf("  [OK] const char* overloads\n");
     }
 
     // --- Type safety ---
     {
         pm::Pm pm1;
-        pm1.pool<Pos>("pos");
-        auto *pos2 = pm1.pool<Pos>("pos");
+        pm1.pool_get<Pos>("pos");
+        auto *pos2 = pm1.pool_get<Pos>("pos");
         assert(pos2 != nullptr);
 
         pm::Pm pm2;
-        pm2.state<PhysicsState>("phys");
-        auto *s2 = pm2.state<PhysicsState>("phys");
+        pm2.state_get<PhysicsState>("phys");
+        auto *s2 = pm2.state_get<PhysicsState>("phys");
         assert(s2 != nullptr);
         printf("  [OK] Type safety (same-type re-fetch)\n");
     }
@@ -415,41 +402,41 @@ int main()
     {
         pm::Pm pm;
         int counter_a = 0, counter_b = 0;
-        pm.schedule("task_a", 50.f, [&counter_a](pm::Pm &) { counter_a++; });
-        pm.schedule("task_b", 60.f, [&counter_b](pm::Pm &) { counter_b++; });
+        pm.task_add("task_a", 50.f, [&counter_a](pm::Pm &) { counter_a++; });
+        pm.task_add("task_b", 60.f, [&counter_b](pm::Pm &) { counter_b++; });
 
-        pm.tick_once();
+        pm.loop_once();
         assert(counter_a == 1 && counter_b == 1);
 
-        pm.stop_task("task_a");
-        pm.tick_once();
+        pm.task_stop("task_a");
+        pm.loop_once();
         assert(counter_a == 1 && counter_b == 2);
         printf("  [OK] Task stopping\n");
     }
 
-    // --- stop_task standalone ---
+    // --- task_stop standalone ---
     {
         pm::Pm pm;
         int counter = 0;
-        pm.schedule("mysys", 50.f, [&counter](pm::Pm &) { counter++; });
+        pm.task_add("mysys", 50.f, [&counter](pm::Pm &) { counter++; });
 
-        pm.tick_once();
+        pm.loop_once();
         assert(counter == 1);
 
-        pm.stop_task("mysys");
-        pm.tick_once();
+        pm.task_stop("mysys");
+        pm.loop_once();
         assert(counter == 1);
-        printf("  [OK] stop_task stops task\n");
+        printf("  [OK] task_stop stops task\n");
     }
 
     // --- Deferred remove during each() ---
     {
         pm::Pm pm;
-        auto *pos = pm.pool<Pos>("pos");
+        auto *pos = pm.pool_get<Pos>("pos");
 
-        pm::Id e1 = pm.spawn();
-        pm::Id e2 = pm.spawn();
-        pm::Id e3 = pm.spawn();
+        pm::Id e1 = pm.id_add();
+        pm::Id e2 = pm.id_add();
+        pm::Id e3 = pm.id_add();
         pos->add(e1, {1, 0});
         pos->add(e2, {2, 0});
         pos->add(e3, {3, 0});
@@ -457,13 +444,13 @@ int main()
         int visited = 0;
         pos->each([&](pm::Id id, const Pos& val) {
             visited++;
-            if (val.x == 2.f) pm.remove_entity(id);
+            if (val.x == 2.f) pm.id_remove(id);
         }, pm::Parallel::Off);
         assert(visited == 3);
         // Deferred: entity still in pool until flush
         assert(pos->has(e2));
-        assert(pm.remove_pending() == 1);
-        pm.flush_removes();
+        assert(pm.id_pending_removes() == 1);
+        pm.id_process_removes();
         assert(!pos->has(e2));
         assert(pos->has(e1));
         assert(pos->has(e3));
@@ -473,9 +460,9 @@ int main()
     // --- each_mut() void(T&) signature ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
         for (int i = 0; i < 2000; i++) {
-            pm::Id e = pm.spawn();
+            pm::Id e = pm.id_add();
             pool->add(e, {(float)i, 0.f});
         }
         pool->each_mut([](Pos& p) { p.y = p.x * 2.f; });
@@ -487,9 +474,9 @@ int main()
     // --- each_mut() void(Id, T&) signature ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
         for (int i = 0; i < 2000; i++) {
-            pm::Id e = pm.spawn();
+            pm::Id e = pm.id_add();
             pool->add(e, {(float)i, 0.f});
         }
         pool->each_mut([](pm::Id id, Pos& p) {
@@ -505,7 +492,7 @@ int main()
     // --- each_mut() empty pool ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
         pool->each_mut([](Pos& p) { p.x = 999.f; });
         assert(pool->size() == 0);
         printf("  [OK] each_mut() empty pool\n");
@@ -514,9 +501,9 @@ int main()
     // --- each_mut() Parallel::Off ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
         for (int i = 0; i < 10; i++) {
-            pm::Id e = pm.spawn();
+            pm::Id e = pm.id_add();
             pool->add(e, {(float)i, 0.f});
         }
         pool->each_mut([](Pos& p) { p.y = 42.f; }, pm::Parallel::Off);
@@ -527,21 +514,21 @@ int main()
     // --- each() + deferred remove via tick ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
 
-        pm::Id e1 = pm.spawn();
-        pm::Id e2 = pm.spawn();
-        pm::Id e3 = pm.spawn();
+        pm::Id e1 = pm.id_add();
+        pm::Id e2 = pm.id_add();
+        pm::Id e3 = pm.id_add();
         pool->add(e1, {1, 0});
         pool->add(e2, {2, 0});
         pool->add(e3, {3, 0});
 
-        pm.schedule("test", 1.f, [pool](pm::Pm& pm) {
+        pm.task_add("test", 1.f, [pool](pm::Pm& pm) {
             pool->each([&](pm::Id id, const Pos& p) {
-                if (p.x == 2.f) pm.remove_entity(id);
+                if (p.x == 2.f) pm.id_remove(id);
             }, pm::Parallel::Off);
         });
-        pm.tick_once();
+        pm.loop_once();
         assert(pool->size() == 2);
         assert(pool->has(e1));
         assert(!pool->has(e2));
@@ -552,13 +539,13 @@ int main()
     // --- each_mut() auto-fires change hooks ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
         int changes = 0;
         pool->set_change_hook([](void* ctx, pm::Id) {
             (*static_cast<int*>(ctx))++;
         }, &changes);
         for (int i = 0; i < 100; i++) {
-            pm::Id e = pm.spawn();
+            pm::Id e = pm.id_add();
             pool->add(e, {(float)i, 0.f});
         }
         int before = changes;
@@ -584,13 +571,13 @@ int main()
     // --- each() does NOT fire change hooks ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
         int changes = 0;
         pool->set_change_hook([](void* ctx, pm::Id) {
             (*static_cast<int*>(ctx))++;
         }, &changes);
         for (int i = 0; i < 50; i++) {
-            pm::Id e = pm.spawn();
+            pm::Id e = pm.id_add();
             pool->add(e, {(float)i, 0.f});
         }
         int before = changes;
@@ -604,13 +591,13 @@ int main()
     // --- each_mut() DOES fire change hooks ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
         int changes = 0;
         pool->set_change_hook([](void* ctx, pm::Id) {
             (*static_cast<int*>(ctx))++;
         }, &changes);
         for (int i = 0; i < 50; i++) {
-            pm::Id e = pm.spawn();
+            pm::Id e = pm.id_add();
             pool->add(e, {(float)i, 0.f});
         }
         int before = changes;
@@ -622,11 +609,11 @@ int main()
     // --- dense_ids tracks full Ids ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
 
-        pm::Id a = pm.spawn();
-        pm::Id b = pm.spawn();
-        pm::Id c = pm.spawn();
+        pm::Id a = pm.id_add();
+        pm::Id b = pm.id_add();
+        pm::Id c = pm.id_add();
         pool->add(a, {1, 0});
         pool->add(b, {2, 0});
         pool->add(c, {3, 0});
@@ -647,13 +634,13 @@ int main()
     // --- each_mut parallel with hook falls back to sequential ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
+        auto *pool = pm.pool_get<Pos>("pos");
         int changes = 0;
         pool->set_change_hook([](void* ctx, pm::Id) {
             (*static_cast<int*>(ctx))++;
         }, &changes);
         for (int i = 0; i < 2000; i++) {
-            pm::Id e = pm.spawn();
+            pm::Id e = pm.id_add();
             pool->add(e, {(float)i, 0.f});
         }
         int before = changes;
@@ -665,8 +652,8 @@ int main()
     // --- each() passes const reference ---
     {
         pm::Pm pm;
-        auto *pool = pm.pool<Pos>("pos");
-        pm::Id e = pm.spawn();
+        auto *pool = pm.pool_get<Pos>("pos");
+        pm::Id e = pm.id_add();
         pool->add(e, {1.f, 2.f});
         pool->each([](const Pos& p) { assert(p.x == 1.f); }, pm::Parallel::Off);
         pool->each([](pm::Id, const Pos& p) { assert(p.x == 1.f); }, pm::Parallel::Off);
@@ -677,17 +664,17 @@ int main()
     {
         pm::Pm pm;
         int counter = 0;
-        pm.schedule("faulty", 50.f, [&counter](pm::Pm &) {
+        pm.task_add("faulty", 50.f, [&counter](pm::Pm &) {
             counter++;
             if (counter >= 2) throw pm::TaskFault("boom");
         });
 
-        pm.tick_once();
+        pm.loop_once();
         assert(counter == 1);
-        pm.tick_once();
+        pm.loop_once();
         assert(counter == 2);
-        assert(pm.faults().size() == 1);
-        pm.tick_once();
+        assert(pm.task_faults().size() == 1);
+        pm.loop_once();
         assert(counter == 2);
         printf("  [OK] Fault handling disables task\n");
     }
@@ -697,24 +684,24 @@ int main()
         pm::Pm pm;
         int always_count = 0, game_count = 0;
 
-        pm.schedule("input", 10.f, [&](pm::Pm&) { always_count++; });
-        pm.schedule("physics", 30.f, [&](pm::Pm&) { game_count++; },
+        pm.task_add("input", 10.f, [&](pm::Pm&) { always_count++; });
+        pm.task_add("physics", 30.f, [&](pm::Pm&) { game_count++; },
                     true);
 
-        pm.tick_once();
+        pm.loop_once();
         assert(always_count == 1 && game_count == 1);
 
-        pm.pause();
-        pm.tick_once();
+        pm.paused = true;
+        pm.loop_once();
         assert(always_count == 2 && game_count == 1);
 
-        pm.request_step();
-        pm.tick_once();
+        pm.loop_step();
+        pm.loop_once();
         assert(always_count == 3 && game_count == 2);
-        assert(pm.is_paused());
+        assert(pm.paused);
 
-        pm.resume();
-        pm.tick_once();
+        pm.paused = false;
+        pm.loop_once();
         assert(always_count == 4 && game_count == 3);
         printf("  [OK] Pause/step\n");
     }
@@ -728,7 +715,7 @@ int main()
     // --- PeerRange iteration ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         uint8_t p1 = net->connect();
         uint8_t p2 = net->connect();
@@ -761,7 +748,7 @@ int main()
     // --- Peer metadata ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         assert(net->peer(0).id == 0);
         assert(net->peer(0).connected == true);
@@ -782,7 +769,7 @@ int main()
     // --- Peer lifecycle hooks ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         std::vector<std::pair<char, uint8_t>> events;
 
         net->on_connect([&](pm::NetSys&, uint8_t id) { events.push_back({'C', id}); });
@@ -805,7 +792,7 @@ int main()
     // --- set_peer_id ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         assert(net->peer_slots() & 1);
 
@@ -829,7 +816,7 @@ int main()
     // --- PoolSyncState basics ---
     {
         pm::Pm pm;
-        auto* pool = pm.pool<int>("items");
+        auto* pool = pm.pool_get<int>("items");
 
         pm::PoolSyncState ss;
         ss.pool_id = pool->pool_id;
@@ -838,9 +825,9 @@ int main()
             static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
         }, &ss);
 
-        pm::Id a = pm.spawn(); pool->add(a, 10);
-        pm::Id b = pm.spawn(); pool->add(b, 20);
-        pm::Id c = pm.spawn(); pool->add(c, 30);
+        pm::Id a = pm.id_add(); pool->add(a, 10);
+        pm::Id b = pm.id_add(); pool->add(b, 20);
+        pm::Id c = pm.id_add(); pool->add(c, 30);
 
         assert(!ss.is_synced_to(1, a));
         assert(!ss.is_synced_to(1, b));
@@ -861,8 +848,8 @@ int main()
     // --- PoolSyncState each_unsynced ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<Pos>("pos");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<Pos>("pos");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
@@ -872,7 +859,7 @@ int main()
         uint8_t peer = net->connect();
 
         for (int i = 0; i < 10; i++) {
-            pm::Id e = pm.spawn();
+            pm::Id e = pm.id_add();
             pool->add(e, {(float)i, 0});
         }
 
@@ -895,8 +882,8 @@ int main()
     // --- Pending list compaction ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<Pos>("pos");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<Pos>("pos");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
@@ -905,7 +892,7 @@ int main()
 
         pm::Id ids[100];
         for (int i = 0; i < 100; i++) {
-            ids[i] = pm.spawn();
+            ids[i] = pm.id_add();
             pool->add(ids[i], {(float)i, 0});
         }
         assert(ss.pending_count() == 100);
@@ -937,8 +924,8 @@ int main()
     // --- Interest management: unsync_for + re-sync ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<float>("positions");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<float>("positions");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
@@ -948,9 +935,9 @@ int main()
         uint8_t p1 = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
 
-        pm::Id near1 = pm.spawn(); pool->add(near1, 50.f);
-        pm::Id near2 = pm.spawn(); pool->add(near2, 100.f);
-        pm::Id far1  = pm.spawn(); pool->add(far1, 900.f);
+        pm::Id near1 = pm.id_add(); pool->add(near1, 50.f);
+        pm::Id near2 = pm.id_add(); pool->add(near2, 100.f);
+        pm::Id far1  = pm.id_add(); pool->add(far1, 900.f);
 
         float interest_radius = 200.f;
         float peer_pos = 80.f;
@@ -981,16 +968,16 @@ int main()
     // --- Sync tracking immune to swap-remove ---
     {
         pm::Pm pm;
-        auto* pool = pm.pool<Pos>("pos");
+        auto* pool = pm.pool_get<Pos>("pos");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
             static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
         }, &ss);
 
-        pm::Id a = pm.spawn();
-        pm::Id b = pm.spawn();
-        pm::Id c = pm.spawn();
+        pm::Id a = pm.id_add();
+        pm::Id b = pm.id_add();
+        pm::Id c = pm.id_add();
         pool->add(a, {1, 0});
         pool->add(b, {2, 0});
         pool->add(c, {3, 0});
@@ -1010,16 +997,16 @@ int main()
     // --- repend_all on connect ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<Pos>("pos");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<Pos>("pos");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
             static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
         }, &ss);
 
-        pm::Id a = pm.spawn(); pool->add(a, {1, 2});
-        pm::Id b = pm.spawn(); pool->add(b, {3, 4});
+        pm::Id a = pm.id_add(); pool->add(a, {1, 2});
+        pm::Id b = pm.id_add(); pool->add(b, {3, 4});
 
         uint8_t p1 = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
@@ -1040,19 +1027,19 @@ int main()
     // --- net_init registers tasks ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         net_init(pm, net, 15.f, 95.f);
 
-        assert(pm.task("net/recv") != nullptr);
-        assert(pm.task("net/tick") != nullptr);
-        assert(pm.task("net/flush") != nullptr);
+        assert(pm.task_get("net/recv") != nullptr);
+        assert(pm.task_get("net/tick") != nullptr);
+        assert(pm.task_get("net/flush") != nullptr);
         printf("  [OK] net_init registers tasks\n");
     }
 
     // --- Pool swap hook ---
     {
         pm::Pm pm;
-        auto* pool = pm.pool<Pos>("pos");
+        auto* pool = pm.pool_get<Pos>("pos");
 
         // Track swaps
         struct SwapLog { uint32_t removed, last; };
@@ -1062,9 +1049,9 @@ int main()
             swaps.push_back({removed_di, last_di});
         }, nullptr);
 
-        pm::Id a = pm.spawn(); pool->add(a, {1, 0});  // dense 0
-        pm::Id b = pm.spawn(); pool->add(b, {2, 0});  // dense 1
-        pm::Id c = pm.spawn(); pool->add(c, {3, 0});  // dense 2
+        pm::Id a = pm.id_add(); pool->add(a, {1, 0});  // dense 0
+        pm::Id b = pm.id_add(); pool->add(b, {2, 0});  // dense 1
+        pm::Id c = pm.id_add(); pool->add(c, {3, 0});  // dense 2
 
         pool->remove(a);  // swap: dense[0] gets dense[2], pop
         assert(swaps.size() == 1);
@@ -1086,8 +1073,8 @@ int main()
     // --- PoolSyncState change-tracked: mark_synced / each_unsynced basics ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<Pos>("pos");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<Pos>("pos");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
@@ -1097,9 +1084,9 @@ int main()
         uint8_t peer = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
 
-        pm::Id a = pm.spawn(); pool->add(a, {1, 0});
-        pm::Id b = pm.spawn(); pool->add(b, {2, 0});
-        pm::Id c = pm.spawn(); pool->add(c, {3, 0});
+        pm::Id a = pm.id_add(); pool->add(a, {1, 0});
+        pm::Id b = pm.id_add(); pool->add(b, {2, 0});
+        pm::Id c = pm.id_add(); pool->add(c, {3, 0});
 
         // All 3 should appear in pending (add calls notify_change)
         int count = 0;
@@ -1124,8 +1111,8 @@ int main()
     // --- Change-tracked: remove leaves no ghost entries ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<Pos>("pos");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<Pos>("pos");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
@@ -1135,9 +1122,9 @@ int main()
         uint8_t peer = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
 
-        pm::Id a = pm.spawn(); pool->add(a, {10, 0});
-        pm::Id b = pm.spawn(); pool->add(b, {20, 0});
-        pm::Id c = pm.spawn(); pool->add(c, {30, 0});
+        pm::Id a = pm.id_add(); pool->add(a, {10, 0});
+        pm::Id b = pm.id_add(); pool->add(b, {20, 0});
+        pm::Id c = pm.id_add(); pool->add(c, {30, 0});
 
         // Sync all
         ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
@@ -1158,8 +1145,8 @@ int main()
     // --- Change-tracked: new entries start unsynced ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<int>("items");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<int>("items");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
@@ -1169,7 +1156,7 @@ int main()
         uint8_t peer = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
 
-        pm::Id a = pm.spawn(); pool->add(a, 10);
+        pm::Id a = pm.id_add(); pool->add(a, 10);
 
         // Sync a
         ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, int&, size_t) {
@@ -1178,7 +1165,7 @@ int main()
         ss.clear_pending();
 
         // Add a new entry — triggers change hook, goes into pending
-        pm::Id b = pm.spawn(); pool->add(b, 20);
+        pm::Id b = pm.id_add(); pool->add(b, 20);
 
         int count = 0;
         pm::Id found = pm::NULL_ID;
@@ -1195,8 +1182,8 @@ int main()
     // --- Change-tracked: multi-peer independence ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<int>("vals");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<int>("vals");
 
         pm::PoolSyncState ss;
         pool->set_change_hook([](void* ctx, pm::Id id) {
@@ -1207,8 +1194,8 @@ int main()
         uint8_t p2 = net->connect();
         uint64_t remote_mask = net->remote_peers().bits;
 
-        pm::Id a = pm.spawn(); pool->add(a, 1);
-        pm::Id b = pm.spawn(); pool->add(b, 2);
+        pm::Id a = pm.id_add(); pool->add(a, 1);
+        pm::Id b = pm.id_add(); pool->add(b, 2);
 
         // Sync only to p1
         ss.each_unsynced(pool, p1, remote_mask, [&](pm::Id id, int&, size_t) {
@@ -1236,7 +1223,7 @@ int main()
     // --- Ordered custom packet sequencing ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         uint8_t p = net->connect();
 
         // next_send_seq increments
@@ -1257,7 +1244,7 @@ int main()
     // --- Reliable message dedup ring ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         auto& pn = net->peer_net[0];
 
@@ -1289,7 +1276,7 @@ int main()
     // --- Reliable message outbox + ack ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         uint8_t p = net->connect();
 
         // Send a reliable message
@@ -1323,7 +1310,7 @@ int main()
     // --- send_reliable_all broadcasts to all remote peers ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         uint8_t p1 = net->connect();
         uint8_t p2 = net->connect();
 
@@ -1341,7 +1328,7 @@ int main()
     // --- find_peer_by_addr ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         uint8_t p = net->connect();
 
         struct sockaddr_in addr{};
@@ -1364,7 +1351,7 @@ int main()
     // --- Clock sync fields ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         net->local_time = 10.0f;
         net->clock_offset = 5.0f;  // server is 5s ahead
@@ -1429,15 +1416,15 @@ int main()
     // --- Reliable removal batching ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<int>("items");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<int>("items");
 
         uint8_t p = net->connect();
 
         // Track some removals
-        pm::Id a = pm.spawn(); pool->add(a, 1);
-        pm::Id b = pm.spawn(); pool->add(b, 2);
-        pm::Id c = pm.spawn(); pool->add(c, 3);
+        pm::Id a = pm.id_add(); pool->add(a, 1);
+        pm::Id b = pm.id_add(); pool->add(b, 2);
+        pm::Id c = pm.id_add(); pool->add(c, 3);
 
         net->track_removal(pool->pool_id, a);
         net->track_removal(pool->pool_id, b);
@@ -1470,14 +1457,14 @@ int main()
     // --- tracked_remove + clear_pool use reliable removals ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
-        auto* pool = pm.pool<int>("vals");
+        auto* net = pm.state_get<pm::NetSys>("net");
+        auto* pool = pm.pool_get<int>("vals");
 
         uint8_t p1 = net->connect();
         uint8_t p2 = net->connect();
 
-        pm::Id a = pm.spawn(); pool->add(a, 10);
-        pm::Id b = pm.spawn(); pool->add(b, 20);
+        pm::Id a = pm.id_add(); pool->add(a, 10);
+        pm::Id b = pm.id_add(); pool->add(b, 20);
 
         // tracked_remove buffers for all remote peers
         net->track_removal(pool->pool_id, a);
@@ -1490,7 +1477,7 @@ int main()
     // --- State sync push + PktStateSync wire format ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         uint8_t p = net->connect();
 
         uint8_t data[] = {1, 2, 3, 4, 5};
@@ -1519,7 +1506,7 @@ int main()
     // --- push_state_all broadcasts to all remote peers ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         uint8_t p1 = net->connect();
         uint8_t p2 = net->connect();
 
@@ -1536,7 +1523,7 @@ int main()
     // --- on_state_recv registration ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         bool called = false;
         net->on_state_recv(42, [&](pm::Pm&, const uint8_t*, uint16_t) {
@@ -1550,7 +1537,7 @@ int main()
     // --- clear_frame clears state_outbox too ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         uint8_t p = net->connect();
 
         uint8_t data = 1;
@@ -1565,7 +1552,7 @@ int main()
     // --- alloc_peer_slot finds first free slot ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         // Self is 0, so first free is 1
         assert(net->alloc_peer_slot() == 1);
@@ -1588,7 +1575,7 @@ int main()
     // --- activate_peer fires callbacks ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         int cb_count = 0;
         uint8_t cb_peer = 255;
@@ -1624,7 +1611,7 @@ int main()
     // --- request_connect sets client state ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
         // Don't actually send (no socket) — just test state setup
         // Manually set up state without calling request_connect (which needs socket)
         net->set_client();
@@ -1687,7 +1674,7 @@ int main()
     // --- Cached ACK stored in Peer on activation ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         // Fresh peer has no cached ACK
         assert(net->peers_arr[1].ack_size == 0);
@@ -1715,7 +1702,7 @@ int main()
     // --- ConnState transitions ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         // Default is DISCONNECTED (client hasn't called request_connect)
         assert(net->conn_state == pm::NetSys::ConnState::DISCONNECTED);
@@ -1732,7 +1719,7 @@ int main()
     // --- Server connect validator registration ---
     {
         pm::Pm pm;
-        auto* net = pm.state<pm::NetSys>("net");
+        auto* net = pm.state_get<pm::NetSys>("net");
 
         bool called = false;
         net->connect_validator = [&](uint8_t, struct sockaddr_in&, const uint8_t*, uint16_t) {
@@ -1978,6 +1965,11 @@ int main()
         printf("  [OK] Counter + RisingEdge composition\n");
     }
 
-    printf("\n=== All tests passed ===\n");
+    printf("\n=== All tests passed ===\n\n");
+
+    // Run benchmarks after all tests pass
+    extern void run_benchmarks();
+    run_benchmarks();
+
     return 0;
 }

@@ -15,7 +15,7 @@
 //   debug->add_size("pool_name", []{ return pool->items.size(); });
 //
 // Usage:
-//   auto* debug = pm.state<DebugOverlay>("debug");
+//   auto* debug = pm.state_get<DebugOverlay>("debug");
 //   debug_init(pm, debug, Phase::INPUT, Phase::HUD);
 //
 // Depends: pm_core.hpp, pm_sdl.hpp
@@ -128,10 +128,10 @@ inline void rpad(DrawQueue* q, const char* text, int col_x, int col_w,
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud_phase) {
-	auto* keys_q = pm.state<KeyQueue>("keys");
-	auto* draw_q = pm.state<DrawQueue>("draw");
+	auto* keys_q = pm.state_get<KeyQueue>("keys");
+	auto* draw_q = pm.state_get<DrawQueue>("draw");
 
-	pm.schedule("debug/input", input_phase + 3.f, [debug, keys_q](Pm& pm) {
+	pm.task_add("debug/input", input_phase + 3.f, [debug, keys_q](Pm& pm) {
 		for (auto key : *keys_q) {
 			if (key <= 0) continue;
 
@@ -139,7 +139,7 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 				debug->visible = !debug->visible;
 				if (debug->visible) {
 					debug->rings.clear();
-					pm.reset_task_stats();
+					pm.task_reset_stats();
 					debug->fps = 0; debug->frame_ms = 0;
 					debug->fps_accum = 0; debug->fps_frames = 0;
 				}
@@ -149,35 +149,35 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 
 			if (key == SDLK_R && (SDL_GetModState() & SDL_KMOD_CTRL)) {
 				debug->rings.clear();
-				pm.reset_task_stats();
+				pm.task_reset_stats();
 				debug->fps = 0; debug->frame_ms = 0;
 				debug->fps_accum = 0; debug->fps_frames = 0;
 			}
 
 			if (key == SDLK_F10)
-				pm.request_step();
+				pm.loop_step();
 		}
 	});
 
-	pm.schedule("debug/sample", hud_phase + 4.f, [debug](Pm& pm) {
+	pm.task_add("debug/sample", hud_phase + 4.f, [debug](Pm& pm) {
 		if (!debug->visible) return;
 
 		debug->fps_frames++;
-		debug->fps_accum += pm.dt();
+		debug->fps_accum += pm.loop_dt();
 		if (debug->fps_accum >= 0.5f) {
 			debug->fps = (float)debug->fps_frames / debug->fps_accum;
 			debug->fps_frames = 0;
 			debug->fps_accum = 0;
 		}
-		debug->frame_ms = pm.dt() * 1000.f;
+		debug->frame_ms = pm.loop_dt() * 1000.f;
 
-		for (auto& t : pm.tasks()) {
+		for (auto& t : pm.task_list) {
 			if (!t.active) continue;
 			debug->rings[t.name].push(t.last_us);
 		}
 	});
 
-	pm.schedule("debug/draw", hud_phase + 5.f, [debug, draw_q](Pm& pm) {
+	pm.task_add("debug/draw", hud_phase + 5.f, [debug, draw_q](Pm& pm) {
 		if (!debug->visible) return;
 		int sc = 2;
 		int cw = 4 * sc;
@@ -196,9 +196,9 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		int col_max    = col_med  + 9 * cw;
 		int panel_w    = col_max  + 9 * cw + pad;
 
-		auto& all_tasks = pm.tasks();
+		auto& all_tasks = pm.task_list;
 		int task_rows  = (int)all_tasks.size();
-		int fault_rows = pm.faults().empty() ? 0 : 1 + (int)pm.faults().size();
+		int fault_rows = pm.task_faults().empty() ? 0 : 1 + (int)pm.task_faults().size();
 
 		// All tasks sorted by priority (active and inactive)
 		std::vector<size_t> sorted_idx;
@@ -224,10 +224,10 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		{
 			char buf[96];
 			const char* state = "";
-			if (pm.is_paused() && pm.stepping()) state = "  |step|";
-			else if (pm.is_paused())             state = "  |paused|";
+			if (pm.paused && pm.loop_stepping()) state = "  |step|";
+			else if (pm.paused)                  state = "  |paused|";
 			snprintf(buf, sizeof(buf), "fps:%.0f  dt:%.1f ms  tick:%llu%s",
-				debug->fps, debug->frame_ms, (unsigned long long)pm.tick_count(), state);
+				debug->fps, debug->frame_ms, (unsigned long long)pm.loop_count(), state);
 			push_str(draw_q, buf, x0, y, sc, 140, 220, 140);
 			y += rh;
 		}
@@ -253,13 +253,13 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		uint64_t total_step = 0, total_med = 0;
 		for (size_t idx : sorted_idx) {
 			auto& t = all_tasks[idx];
-			const char* name = pm.name_str(t.name);
-			bool running = t.active && !(t.pauseable && pm.is_paused());
+			const char* name = pm.name_get(t.name);
+			bool running = t.active && !(t.pauseable && pm.paused);
 
 			// Status
 			const char* sts; uint8_t sr, sg, sb;
 			if      (!t.active)                          { sts = "er"; sr=255; sg=80;  sb=80;  }
-			else if (t.pauseable && pm.is_paused())      { sts = "ps"; sr=220; sg=160; sb=60;  }
+			else if (t.pauseable && pm.paused)            { sts = "ps"; sr=220; sg=160; sb=60;  }
 			else                                         { sts = "ok"; sr=120; sg=200; sb=120; }
 			push_str(draw_q, sts, col_status, y, sc, sr, sg, sb);
 
@@ -320,7 +320,7 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		{
 			char buf[128];
 			snprintf(buf, sizeof(buf), "entities:%u  +%u/-%u  draws:%zu",
-				pm.entity_count(), pm.frame_spawns(), pm.frame_removes(),
+				pm.id_count(), pm.loop_spawns(), pm.loop_removes(),
 				draw_q->size());
 			push_str(draw_q, buf, x0, y, sc, 180, 200, 255);
 			y += rh;
@@ -344,10 +344,10 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		}
 
 		// Fault list
-		if (!pm.faults().empty()) {
+		if (!pm.task_faults().empty()) {
 			push_str(draw_q, "faults:", x0, y, sc, 255, 80, 80);
 			y += rh;
-			for (auto& f : pm.faults()) {
+			for (auto& f : pm.task_faults()) {
 				push_str(draw_q, f.c_str(), x0 + cw, y, sc, 255, 130, 110, 38);
 				y += rh;
 			}

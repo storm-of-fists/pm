@@ -137,7 +137,7 @@ static inline uint16_t write_monster(Id id, const Monster& m, uint8_t* out) {
 static inline void read_monsters(Pm& pm, Pool<Monster>* pool, const uint8_t* data, uint16_t count) {
     for (uint16_t i = 0; i < count; i++) {
         MonSync ms; memcpy(&ms, data + i * sizeof(MonSync), sizeof(ms));
-        if (!pm.sync_id(ms.id)) continue;
+        if (!pm.id_sync(ms.id)) continue;
         pool->add(ms.id, Monster{{(float)ms.x, (float)ms.y}, {(float)ms.vx, (float)ms.vy}, 0, (float)ms.sz, ms.r, ms.g, ms.b});
     }
 }
@@ -148,7 +148,7 @@ static inline uint16_t write_bullet(Id id, const Bullet& b, uint8_t* out) {
 static inline void read_bullets(Pm& pm, Pool<Bullet>* pool, const uint8_t* data, uint16_t count) {
     for (uint16_t i = 0; i < count; i++) {
         BulSync bs; memcpy(&bs, data + i * sizeof(BulSync), sizeof(bs));
-        if (!pm.sync_id(bs.id)) continue;
+        if (!pm.id_sync(bs.id)) continue;
         pool->add(bs.id, Bullet{{(float)bs.x, (float)bs.y}, {(float)bs.vx, (float)bs.vy}, 0, (float)bs.sz, bs.po!=0});
     }
 }

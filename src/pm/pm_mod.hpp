@@ -7,17 +7,17 @@
 //     Called after dlopen. Register tasks, access pools/state here.
 //
 //   extern "C" void pm_mod_unload(Pm& pm);
-//     Called before dlclose. Must unschedule ALL tasks and remove
+//     Called before dlclose. Must task_stop ALL tasks and remove
 //     any callbacks registered with other systems (debug, net, etc).
 //
 // Usage:
 //   ModLoader mods;
 //   mods.watch(exe_dir() + "mods/my_mod.so");
 //   mods.load_all(pm);
-//   pm.schedule("mods/poll", Phase::INPUT - 5.f, [&mods](Pm& pm) {
-//       mods.poll(ctx.pm);
+//   pm.task_add("mods/poll", Phase::INPUT - 5.f, [&mods](Pm& pm) {
+//       mods.poll(pm);
 //   });
-//   pm.run();
+//   pm.loop_run();
 //   mods.unload_all(pm);
 //
 // Hot-reload: rebuild the .so while the game is running.

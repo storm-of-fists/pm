@@ -21,8 +21,7 @@ the project root.
 ```bash
 cmake --preset dev          # configure (once), build dir: build/
 cmake --build build         # build all targets
-ctest --test-dir build -V   # run tests
-./build/pm_bench            # run benchmarks
+ctest --test-dir build -V   # run tests + benchmarks
 ```
 
 Individual targets:
@@ -31,7 +30,6 @@ Individual targets:
 cmake --build build --target hellfire_client
 cmake --build build --target hellfire_server
 cmake --build build --target pm_tests
-cmake --build build --target pm_bench
 cmake --build build --target example_mod    # rebuild mod .so for hot-reload
 ```
 
@@ -67,14 +65,14 @@ re-run `cmake --preset dev`.
 Pm pm;
 
 // Singleton state
-auto* cfg = pm.state<Config>("config");
+auto* cfg = pm.state_get<Config>("config");
 
 // Sparse-set component pool
-auto* pos = pm.pool<Pos>("pos");
+auto* pos = pm.pool_get<Pos>("pos");
 
 // Task scheduling (runs lowest priority first)
-pm.schedule("physics", 30.f, [pos](Pm& pm) {
-    float dt = pm.dt();
+pm.task_add("physics", 30.f, [pos](Pm& pm) {
+    float dt = pm.loop_dt();
     pos->each_mut([dt](Pos& p) {
         p.x += p.vx * dt;
         p.y += p.vy * dt;
@@ -82,30 +80,30 @@ pm.schedule("physics", 30.f, [pos](Pm& pm) {
 });
 
 // Entity lifecycle
-Id id = pm.spawn();
+Id id = pm.id_add();
 pos->add(id, {10.f, 20.f});
-pm.remove_entity(id);  // deferred, flushed at end of tick
+pm.id_remove(id);  // deferred, flushed at end of tick
 
 // Run game loop
-pm.set_loop_rate(60);
-pm.run();
+pm.loop_rate = 60;
+pm.loop_run();
 ```
 
 ### Init-time capture
 
 Fetch pools, states, and other pointers **during init** and capture them in the lambda
-closure. Don't call `pool<T>()` or `state<T>()` inside a task — those are init-time
-operations. Tasks receive `Pm&` directly, giving access to per-frame info (`dt()`, `spawn()`,
-`remove_entity()`) and everything else.
+closure. Don't call `pool_get<T>()` or `state_get<T>()` inside a task — those are init-time
+operations. Tasks receive `Pm&` directly, giving access to per-frame info (`loop_dt()`, `id_add()`,
+`id_remove()`) and everything else.
 
 ```cpp
 void physics_init(Pm& pm) {
-    auto* pos = pm.pool<Pos>("pos");   // capture at init
-    auto* vel = pm.pool<Vel>("vel");
+    auto* pos = pm.pool_get<Pos>("pos");   // capture at init
+    auto* vel = pm.pool_get<Vel>("vel");
 
-    pm.schedule("physics", 30.f, [pos, vel](Pm& pm) {
+    pm.task_add("physics", 30.f, [pos, vel](Pm& pm) {
         // Good: pos/vel already captured, no lookup per frame
-        float dt = pm.dt();
+        float dt = pm.loop_dt();
         pos->each_mut([dt](Pos& p) { p.x += p.vx * dt; });
     });
 }
@@ -113,19 +111,19 @@ void physics_init(Pm& pm) {
 
 Quick reference:
 
-- `pm.state<T>("name")` — singleton state, returns same pointer on re-fetch
-- `pm.pool<T>("name")` — sparse-set component pool
-- `pm.schedule("name", priority, lambda)` — register a task
-- `pm.spawn()` — immediate entity creation (returns Id). NOT thread-safe in parallel
+- `pm.state_get<T>("name")` — singleton state, returns same pointer on re-fetch
+- `pm.pool_get<T>("name")` — sparse-set component pool
+- `pm.task_add("name", priority, lambda)` — register a task
+- `pm.id_add()` — immediate entity creation (returns Id). NOT thread-safe in parallel
   `each`/`each_mut` (vector reallocation race). Future: deferred spawn queue or mutex.
-- `pm.remove_entity(id)` — deferred removal (flushed at end of `tick_once()`)
+- `pm.id_remove(id)` — deferred removal (flushed at end of `loop_once()`)
 - `pool->each([](const T&) { ... })` — read-only iteration, no change hooks
 - `pool->each_mut([](T&) { ... })` — mutable iteration, fires change hooks
-- Tasks receive `Pm& pm` with `pm.dt()`, `pm.quit()`, `pm.spawn()`, etc.
+- Tasks receive `Pm& pm` with `pm.loop_dt()`, `pm.loop_quit()`, `pm.id_add()`, etc.
 - Networking: `net->on_recv(type, handler)`, `net->send_to(peer, data, size)`
-- All time is `float` seconds (matches `pm.dt()`)
+- All time is `float` seconds (matches `pm.loop_dt()`)
 - Mods: `.so` files exporting `extern "C" pm_mod_load(Pm&)` / `pm_mod_unload(Pm&)`
-- `pm.unschedule("name")` — remove a task (nulls fn + deactivates, safe for dlclose)
+- `pm.task_stop("name")` — stop a task (clears fn + deactivates, safe for dlclose)
 
 ### Iteration: `each()` / `each_mut()`
 
@@ -155,18 +153,18 @@ pool->each_mut(fn, Parallel::On, 8);                // force parallel, limit to 
 - Third parameter `threads` (default 0 = all workers) limits how many threads are active
   for that specific call. Workers beyond the limit wake but skip work. Useful for tuning
   per-pool: heavy compute benefits from all cores, light work is better with fewer.
-- `pm.set_thread_count(n)` controls how many worker threads are created (clamped to
-  `hardware_concurrency()`). 0 = auto. Must be called before first parallel each.
+- `pm.thread_count = n` controls how many worker threads are created (clamped to
+  `hardware_concurrency()`). 0 = auto. Must be set before first parallel each.
 - `continue` in old range-for becomes `return` in lambda
 - Writes to `T&`: safe (your chunk in `each_mut`). Reads via `get()`: safe.
-  `remove_entity()`: safe (deferred).
-- `spawn()`/`add()` in parallel `each`/`each_mut`: NOT safe (vector reallocation race).
-  Future: deferred spawn queue (like `remove_entity`) or mutex-protected spawn.
+  `id_remove()`: safe (deferred).
+- `id_add()`/`add()` in parallel `each`/`each_mut`: NOT safe (vector reallocation race).
+  Future: deferred spawn queue (like `id_remove`) or mutex-protected spawn.
 
 ### Networking
 
 ```cpp
-auto* net = pm.state<NetSys>("net");
+auto* net = pm.state_get<NetSys>("net");
 net->port = 9998;
 net->start();
 net_init(pm, net, Phase::NET_RECV, Phase::NET_SEND);
@@ -183,10 +181,10 @@ net->bind_send(pm, pool, "sync_name", Phase::NET_SEND, write_fn);
 ```cpp
 // In your .so mod:
 extern "C" void pm_mod_load(Pm& pm) {
-    pm.schedule("mod_task", 50.f, [](Pm& pm) { /* ... */ });
+    pm.task_add("mod_task", 50.f, [](Pm& pm) { /* ... */ });
 }
 extern "C" void pm_mod_unload(Pm& pm) {
-    pm.unschedule("mod_task");
+    pm.task_stop("mod_task");
 }
 ```
 
@@ -209,9 +207,9 @@ cache entry across all pools that contain the entity.
 
 ### Deferred removes
 
-`remove_entity(id)` queues the Id (mutex-protected, thread-safe). Entities stay alive
+`id_remove(id)` queues the Id (mutex-protected, thread-safe). Entities stay alive
 and iterable for the rest of the frame. All queued removes flush at the end of
-`tick_once()` after all tasks complete. Double-removes are harmless (second is stale,
+`loop_once()` after all tasks complete. Double-removes are harmless (second is stale,
 skipped). Spawns are immediate (append to end of dense arrays); `each()` snapshots
 pool size at start so newly spawned entities are not visited.
 
@@ -224,10 +222,7 @@ and game-specific roadmap.
 ## Benchmarks
 
 ~90 benchmarks covering kernel operations and real game workloads. Built with `-O2`.
-
-```bash
-./build/pm_bench                    # run all, prints table + writes CSV
-```
+Benchmarks run automatically after tests pass via `ctest --test-dir build -V`.
 
 Results are written to `benchmarks/latest.csv` (git-tracked) for regression comparison.
 
@@ -237,7 +232,7 @@ Results are written to `benchmarks/latest.csv` (git-tracked) for regression comp
 |-------|-----------|----------------|
 | Pool ops | 26 | add, get, has, remove, each, each_mut, clear, mixed |
 | State ops | 2 | fetch, create |
-| Entity/kernel | 7 | spawn, flush_removes, entity churn |
+| Entity/kernel | 7 | id_add, id_process_removes, entity churn |
 | Integrated workloads | 6 | game tick, multi-archetype, join patterns, sustained churn |
 | Thread scaling | 3 workloads x N threads | scaling behavior across core counts |
 | Spatial grid | 6 | insert, query (small/large radius), full frame rebuild+query |
@@ -252,18 +247,20 @@ Results are written to `benchmarks/latest.csv` (git-tracked) for regression comp
 
 | Operation | ns/op |
 |-----------|------:|
-| `pool->get(id)` | 1.6 |
-| `pm.spawn()` | 1.7 |
-| `each()` trivial (100k, seq) | 0.4 |
-| `each()` trig (100k, parallel) | 5.4 |
-| Monster AI (400, seq) | 17 |
-| Collision frame (400m + 600b) | 55 |
-| Server tick level 5 | 0.12ms total |
-| Cooldown::ready | 0.5 |
+| `pool->get(id)` | ~2 |
+| `pm.id_add()` | 1.5 |
+| `pool->remove(id)` | ~9 |
+| `each()` trivial (100k, seq) | ~0.5 |
+| `each()` trig (100k, parallel) | ~6 |
+| `id_process_removes` (10k, 8 pools) | ~38 |
+| Monster AI (400, seq) | ~7 |
+| Collision frame (400m + 600b) | ~28 |
+| Server tick level 5 | 0.06ms total |
+| Cooldown::ready | ~0.5 |
 
 ## Tests
 
-94 tests covering Pool, State, Entity, ECS, parallel iteration, ThreadPool, and deferred removes.
+94 tests + ~90 benchmarks in a single binary. Tests run first; benchmarks run after all tests pass.
 
 ```bash
 cmake --build build --target pm_tests
@@ -274,7 +271,7 @@ ctest --test-dir build -V
 
 ### Phase 1 — Kernel cleanup (DONE)
 - ~~Id slots: bitpacked `uint64_t`, `m_slots` vector~~
-- ~~Deferred removes: `remove_entity()` queues, `flush_removes()` after all tasks~~
+- ~~Deferred removes: `id_remove()` queues, `id_process_removes()` after all tasks~~
 - ~~Lambda `each()` with auto-parallel, ThreadPool~~
 - ~~Single-owner generation: Pool stores indices only~~
 - ~~Permanent pools/states via `unique_ptr`~~
@@ -292,7 +289,7 @@ ctest --test-dir build -V
     so passing a bad lambda produces a clean error instead of template noise. Internal dispatch
     stays `if constexpr` (handles two valid signatures per method). ~4 lines.
   - **Concept constraints on init functions:** `sdl_init`, `net_init`, `debug_init` and
-    `pm.schedule()` take callable parameters — constrain with `std::invocable`.
+    `pm.task_add()` take callable parameters — constrain with `std::invocable`.
   - **`std::span` in networking API:** replace `const void* data, int/uint16_t len` pairs in
     `pm_udp.hpp` (~10 functions: `send_to`, `broadcast`, `push`, `send_reliable`, etc.) with
     `std::span<const uint8_t>`. Touches all callsites in hellfire server/client — standalone
@@ -313,10 +310,11 @@ ctest --test-dir build -V
   (`./test --test-case="*orphan*"`).
 - **Fuzz testing:** network recv path + mod loading via libFuzzer/AFL. Finds buffer overreads,
   malformed packets, truncated crashes.
-- **Benchmark suite:** custom timing (no external deps), ns/op, CSV output to
+- **Benchmark suite:** median-of-5 timing harness (no external deps), ns/op, CSV output to
   `benchmarks/latest.csv` (git-tracked) for regression tracking. ~90 benchmarks across
   kernel ops, thread scaling, and hellfire game workloads (spatial grid, collision, AI,
-  bullet churn, PLC utils, full server tick simulation).
+  bullet churn, PLC utils, full server tick simulation). Destructive benchmarks (remove,
+  flush, clear) use a setup/work split pattern — setup runs un-timed before each timed run.
 - **Deterministic replay:** record inputs (packets, player inputs, RNG seeds). Replay = bug
   report. RNG already seeded (`Rng{42}`), just need input stream capture.
 - **Compile time tracking:** `-ftime-trace` (Clang), visualize in Chrome tracing, track in CI.
@@ -325,12 +323,12 @@ ctest --test-dir build -V
   `-g1` for function names in stack traces. Module tag identifies which mod crashed.
 
 **Architecture:**
-- **Multi-runner model:** named threads with own tick loops. `pm.schedule("runner", "task",
+- **Multi-runner model:** named threads with own tick loops. `pm.task_add("runner", "task",
   priority, fn)`. Runners auto-vivify — first task on a name creates the thread.
 - **Module system:** named ownership groups. `pm.module("name")` tags all registered tasks,
   pools, queue handlers. `pm.unload_module("name")` tears down everything tagged. No tiered
   system/mod distinction. Hot reload: dlclose old → unload_module → dlopen new → re-register.
-- **Pool snapshots:** `pm.pool<T>("name", {.snapshot = true})`. Double-buffered dense arrays.
+- **Pool snapshots:** `pm.pool_get<T>("name", {.snapshot = true})`. Double-buffered dense arrays.
   Writer mutates live array normally. `swap_snapshot()` at end of frame atomically swaps.
   Reader runners get `span<const T>` over the frozen copy — no locks, one frame latency.
   2x memory cost, only enable for cross-runner pools.
@@ -362,7 +360,7 @@ General-purpose entity-to-entity relationship module. Built on top of the framew
 games that don't need it pay nothing.
 ```cpp
 struct Rel { Id from; Id to; NameId type; };  // "parent_of", "held_by", "targets"
-auto* rels = pm.pool<Rel>("relationships");
+auto* rels = pm.pool_get<Rel>("relationships");
 rels->from(entity_a, "parent_of");   // forward lookup
 rels->to(entity_b, "held_by");      // reverse lookup
 ```

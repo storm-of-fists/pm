@@ -245,7 +245,7 @@ struct ClientNetState {
 
     void add_player(Pm& pm, uint8_t peer) {
         if (peer >= 4 || peer_ids[peer] != NULL_ID) return;
-        peer_ids[peer] = pm.spawn();
+        peer_ids[peer] = pm.id_add();
         players->add(peer_ids[peer], Player{{SPAWN_X[peer], SPAWN_Y[peer]}, PLAYER_HP, 0, 0, true,
                   PCOL[peer][0], PCOL[peer][1], PCOL[peer][2]});
     }
@@ -255,12 +255,12 @@ struct ClientNetState {
 // menu_init — title screen + lobby input/draw
 // =============================================================================
 void menu_init(Pm& pm) {
-    auto* menu = pm.state<MenuState>("menu");
-    auto* net  = pm.state<NetSys>("net");
-    auto* keys_q = pm.state<KeyQueue>("keys");
+    auto* menu = pm.state_get<MenuState>("menu");
+    auto* net  = pm.state_get<NetSys>("net");
+    auto* keys_q = pm.state_get<KeyQueue>("keys");
 
-    pm.schedule("menu/input", Phase::INPUT + 2.f, [menu, net, keys_q](Pm& pm) {
-        menu->cursor_blink += pm.dt();
+    pm.task_add("menu/input", Phase::INPUT + 2.f, [menu, net, keys_q](Pm& pm) {
+        menu->cursor_blink += pm.loop_dt();
 
         if (menu->phase == GamePhase::PLAYING) {
             for (auto key : *keys_q) {
@@ -333,8 +333,8 @@ void menu_init(Pm& pm) {
         }
     });
 
-    auto* draw_q_ref = pm.state<DrawQueue>("draw");
-    pm.schedule("menu/draw", Phase::HUD + 1.f, [menu, draw_q_ref](Pm&) {
+    auto* draw_q_ref = pm.state_get<DrawQueue>("draw");
+    pm.task_add("menu/draw", Phase::HUD + 1.f, [menu, draw_q_ref](Pm&) {
         bool blink = ((int)(menu->cursor_blink * 3.f)) % 2 == 0;
 
         if (menu->phase == GamePhase::MENU) {
@@ -356,12 +356,12 @@ void menu_init(Pm& pm) {
 // client_net_init — send input, receive state
 // =============================================================================
 void client_net_init(Pm& pm) {
-    auto* cn   = pm.state<ClientNetState>("client_net");
-    cn->players  = pm.pool<Player>("players");
-    cn->monsters = pm.pool<Monster>("monsters");
-    cn->bullets  = pm.pool<Bullet>("bullets");
-    auto* net  = pm.state<NetSys>("net");
-    auto* menu = pm.state<MenuState>("menu");
+    auto* cn   = pm.state_get<ClientNetState>("client_net");
+    cn->players  = pm.pool_get<Player>("players");
+    cn->monsters = pm.pool_get<Monster>("monsters");
+    cn->bullets  = pm.pool_get<Bullet>("bullets");
+    auto* net  = pm.state_get<NetSys>("net");
+    auto* menu = pm.state_get<MenuState>("menu");
 
     // --- Pool sync (recv only — client never sends pool data) ---
     net->bind_recv(cn->monsters, read_monsters);
@@ -446,8 +446,8 @@ void client_net_init(Pm& pm) {
     });
 
     // --- Send input to server ---
-    auto* cam = pm.state<Camera>("camera");
-    pm.schedule("client_send", Phase::NET_SEND, [cn, net, menu, cam](Pm& pm) {
+    auto* cam = pm.state_get<Camera>("camera");
+    pm.task_add("client_send", Phase::NET_SEND, [cn, net, menu, cam](Pm& pm) {
         if (net->sock.sock == INVALID_SOCKET) return;
 
         // Initiate connection handshake if not yet connecting/connected
@@ -487,7 +487,7 @@ void client_net_init(Pm& pm) {
 
         auto* p = cn->players->get(cn->peer_ids[net->peer_id()]);
         if (p && p->alive) {
-            float dt = pm.dt();
+            float dt = pm.loop_dt();
             Vec2 move = {in.dx, in.dy};
             float ml = len(move);
             if (ml > 0.001f) move = move * (1.f / ml);
@@ -503,8 +503,8 @@ void client_net_init(Pm& pm) {
     });
 
     // --- Game key handling (pause, restart, back to menu) ---
-    auto* keys_q = pm.state<KeyQueue>("keys");
-    pm.schedule("game_keys", Phase::INPUT + 1.f, [cn, net, menu, keys_q](Pm& pm) {
+    auto* keys_q = pm.state_get<KeyQueue>("keys");
+    pm.task_add("game_keys", Phase::INPUT + 1.f, [cn, net, menu, keys_q](Pm& pm) {
         if (menu->phase != GamePhase::PLAYING) return;
         for (auto key : *keys_q) {
             if (key <= 0) continue;
@@ -517,8 +517,8 @@ void client_net_init(Pm& pm) {
                     menu->username.clear();
                     menu->roster_count = 0;
                     cn->gs = ClientState{};
-                    cn->monsters->each([&](Id id, const Monster&) { pm.remove_entity(id); }, Parallel::Off);
-                    cn->bullets->each([&](Id id, const Bullet&) { pm.remove_entity(id); }, Parallel::Off);
+                    cn->monsters->each([&](Id id, const Monster&) { pm.id_remove(id); }, Parallel::Off);
+                    cn->bullets->each([&](Id id, const Bullet&) { pm.id_remove(id); }, Parallel::Off);
                     for (int i = 0; i < 4; i++) cn->peer_ids[i] = NULL_ID;
                 }
                 else if (menu->is_host_client) {
@@ -535,18 +535,18 @@ void client_net_init(Pm& pm) {
     });
 
     // --- Client-side staleness cleanup ---
-    pm.schedule("stale_cleanup", Phase::CLEANUP, [cn, menu](Pm& pm) {
+    pm.task_add("stale_cleanup", Phase::CLEANUP, [cn, menu](Pm& pm) {
         if (menu->needs_disconnect_cleanup) {
-            cn->monsters->each([&](Id id, const Monster&) { pm.remove_entity(id); }, Parallel::Off);
-            cn->bullets->each([&](Id id, const Bullet&) { pm.remove_entity(id); }, Parallel::Off);
+            cn->monsters->each([&](Id id, const Monster&) { pm.id_remove(id); }, Parallel::Off);
+            cn->bullets->each([&](Id id, const Bullet&) { pm.id_remove(id); }, Parallel::Off);
             for (int i = 0; i < 4; i++) cn->peer_ids[i] = NULL_ID;
             menu->needs_disconnect_cleanup = false;
             return;
         }
         if (menu->phase != GamePhase::PLAYING || cn->gs.paused) return;
-        float dt = pm.dt();
-        cn->bullets->each_mut([&](Id id, Bullet& b)  { b.lifetime += dt; if (b.lifetime > 2.f) pm.remove_entity(id); }, Parallel::Off);
-        cn->monsters->each_mut([&](Id id, Monster& m) { m.shoot_timer += dt; if (m.shoot_timer > 2.f) pm.remove_entity(id); }, Parallel::Off);
+        float dt = pm.loop_dt();
+        cn->bullets->each_mut([&](Id id, Bullet& b)  { b.lifetime += dt; if (b.lifetime > 2.f) pm.id_remove(id); }, Parallel::Off);
+        cn->monsters->each_mut([&](Id id, Monster& m) { m.shoot_timer += dt; if (m.shoot_timer > 2.f) pm.id_remove(id); }, Parallel::Off);
     });
 }
 
@@ -554,10 +554,10 @@ void client_net_init(Pm& pm) {
 // draw_init — all rendering
 // =============================================================================
 void draw_init(Pm& pm) {
-    auto* cn    = pm.state<ClientNetState>("client_net");
-    auto* menu  = pm.state<MenuState>("menu");
-    auto* net   = pm.state<NetSys>("net");
-    auto* debug = pm.state<DebugOverlay>("debug");
+    auto* cn    = pm.state_get<ClientNetState>("client_net");
+    auto* menu  = pm.state_get<MenuState>("menu");
+    auto* net   = pm.state_get<NetSys>("net");
+    auto* debug = pm.state_get<DebugOverlay>("debug");
 
     debug->add_size("players", [cn]{ return cn->players->items.size(); });
     debug->add_size("monsters", [cn]{ return cn->monsters->items.size(); });
@@ -574,9 +574,9 @@ void draw_init(Pm& pm) {
             cn->gs.srv_monsters, cn->gs.srv_bullets, cn->gs.srv_ms);
     });
 
-    auto* draw_q  = pm.state<DrawQueue>("draw");
-    auto* sdl     = pm.state<SdlSystem>("sdl");
-    auto* sprites = pm.state<SpriteStore>("sprites");
+    auto* draw_q  = pm.state_get<DrawQueue>("draw");
+    auto* sdl     = pm.state_get<SdlSystem>("sdl");
+    auto* sprites = pm.state_get<SpriteStore>("sprites");
 
     // --- Load player sprites ---
     {
@@ -587,9 +587,9 @@ void draw_init(Pm& pm) {
     }
 
     // --- Hot-reload sprites if files change on disk (runs ~1Hz) ---
-    pm.schedule("sprite/hotreload", Phase::HUD, [sdl, sprites](Pm& pm) {
+    pm.task_add("sprite/hotreload", Phase::HUD, [sdl, sprites](Pm& pm) {
         static float timer = 0.f;
-        timer += pm.dt();
+        timer += pm.loop_dt();
         if (timer < 1.f) return;
         timer = 0.f;
         if (sprites->player_front.changed()) { printf("[sprite] reloading player_front\n"); sprites->player_front.reload(sdl->renderer); }
@@ -597,12 +597,12 @@ void draw_init(Pm& pm) {
     });
 
     // --- Camera: zoom input + follow local player ---
-    auto* cam   = pm.state<Camera>("camera");
-    auto* wheel = pm.state<float>("wheel");
-    auto* keys_q2 = pm.state<KeyQueue>("keys");
-    pm.schedule("camera/update", Phase::INPUT + 3.f, [cam, wheel, keys_q2, cn, net, menu](Pm& pm) {
+    auto* cam   = pm.state_get<Camera>("camera");
+    auto* wheel = pm.state_get<float>("wheel");
+    auto* keys_q2 = pm.state_get<KeyQueue>("keys");
+    pm.task_add("camera/update", Phase::INPUT + 3.f, [cam, wheel, keys_q2, cn, net, menu](Pm& pm) {
         if (menu->phase != GamePhase::PLAYING) return;
-        float dt = pm.dt();
+        float dt = pm.loop_dt();
 
         // Zoom input: mouse wheel + PgUp/PgDown
         float zoom_ticks = *wheel;
@@ -627,7 +627,7 @@ void draw_init(Pm& pm) {
     });
 
     // --- Draw player HP bars (DrawQueue rects — rendered at Phase::RENDER behind sprites) ---
-    pm.schedule("draw_players", Phase::DRAW - 1.f, [cn, menu, draw_q](Pm&) {
+    pm.task_add("draw_players", Phase::DRAW - 1.f, [cn, menu, draw_q](Pm&) {
         if (menu->phase != GamePhase::PLAYING) return;
         int pi = 0;
         for (auto& p : cn->players->items) {
@@ -640,13 +640,13 @@ void draw_init(Pm& pm) {
     });
 
     // --- Draw player sprites (after DrawQueue flush, before present) ---
-    pm.schedule("sprite/players", Phase::RENDER + 0.5f, [cn, menu, sdl, sprites, cam](Pm& pm) {
+    pm.task_add("sprite/players", Phase::RENDER + 0.5f, [cn, menu, sdl, sprites, cam](Pm& pm) {
         if (menu->phase != GamePhase::PLAYING) return;
         int pi = 0;
         for (auto& p : cn->players->items) {
             // Facing: front = moving down (toward camera), back = moving up (away).
             float dy = p.pos.y - sprites->prev_y[pi];
-            sprites->facing[pi].update(pm.dt());
+            sprites->facing[pi].update(pm.loop_dt());
             if      (dy >  0.5f) sprites->facing[pi].set(true);
             else if (dy < -0.5f) sprites->facing[pi].set(false);
             sprites->prev_y[pi] = p.pos.y;
@@ -669,7 +669,7 @@ void draw_init(Pm& pm) {
     });
 
     // --- Draw monsters ---
-    pm.schedule("draw_monsters", Phase::DRAW + 1.f, [cn, net, menu, draw_q, cam](Pm&) {
+    pm.task_add("draw_monsters", Phase::DRAW + 1.f, [cn, net, menu, draw_q, cam](Pm&) {
         if (menu->phase != GamePhase::PLAYING) return;
         float age = cn->gs.paused ? 0.f : net->snapshot_age(0);
         for (auto& m : cn->monsters->items) {
@@ -683,7 +683,7 @@ void draw_init(Pm& pm) {
     });
 
     // --- Draw bullets ---
-    pm.schedule("draw_bullets", Phase::DRAW, [cn, net, menu, draw_q, cam](Pm&) {
+    pm.task_add("draw_bullets", Phase::DRAW, [cn, net, menu, draw_q, cam](Pm&) {
         if (menu->phase != GamePhase::PLAYING) return;
         float age = cn->gs.paused ? 0.f : net->snapshot_age(0);
         for (auto& b : cn->bullets->items) {
@@ -698,13 +698,13 @@ void draw_init(Pm& pm) {
     });
 
     // --- HUD ---
-    pm.schedule("hud", Phase::HUD, [cn, menu, draw_q](Pm& pm) {
+    pm.task_add("hud", Phase::HUD, [cn, menu, draw_q](Pm& pm) {
         if (menu->phase != GamePhase::PLAYING) return;
         auto* gs = &cn->gs;
         { char b[64]; snprintf(b, sizeof(b), "score: %d  %s", gs->score, LEVELS[gs->current_level].name);
           push_str(draw_q, b, 8, 8, 2, 200, 200, 200); }
         if (gs->level_flash > 0.f) {
-            gs->level_flash -= pm.dt();
+            gs->level_flash -= pm.loop_dt();
             uint8_t a = (uint8_t)(std::min(gs->level_flash, 1.f) * 255);
             draw_q->push({0, (float)H/2-20, (float)W, 36, 0, 0, 0, (uint8_t)(a*0.7f)});
             char lb[32]; snprintf(lb, sizeof(lb), "%s", LEVELS[gs->current_level].name);
@@ -740,28 +740,28 @@ int main(int, char**) {
     Pm pm;
     // No set_loop_rate() — SDL vsync paces frames
 
-    auto* sdl = pm.state<SdlSystem>("sdl");
+    auto* sdl = pm.state_get<SdlSystem>("sdl");
     sdl->open("hellfire", W, H);
     sdl_init(pm, sdl, Phase::INPUT, Phase::RENDER);
 
-    auto* net = pm.state<NetSys>("net");
+    auto* net = pm.state_get<NetSys>("net");
     net_init(pm, net, Phase::NET_RECV, Phase::NET_SEND);
 
     menu_init(pm);
     client_net_init(pm);
     draw_init(pm);
 
-    auto* debug = pm.state<DebugOverlay>("debug");
+    auto* debug = pm.state_get<DebugOverlay>("debug");
     debug_init(pm, debug, Phase::INPUT, Phase::HUD);
 
     ModLoader mods;
     mods.watch(exe_dir() + "mods/example_mod.so");
     mods.load_all(pm);
-    pm.schedule("mods/poll", Phase::INPUT - 5.f, [&mods](Pm& pm) {
+    pm.task_add("mods/poll", Phase::INPUT - 5.f, [&mods](Pm& pm) {
         mods.poll(pm);
     });
 
-    pm.run();
+    pm.loop_run();
 
     mods.unload_all(pm);
     g_server_process.kill();

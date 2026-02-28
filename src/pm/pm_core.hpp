@@ -1,9 +1,9 @@
 // pm_core.hpp — Process Manager kernel (pure ECS)
 //
 // THE RULE OF 3 VERBS:
-// 1. Data: pm.pool<T>(), pm.state<T>()
-// 2. Ids: pm.spawn(), pm.remove_entity(id)
-// 3. Scheduling: pm.schedule(name, priority, fn)
+// 1. Data: pm.pool_get<T>(), pm.state_get<T>()
+// 2. Ids: pm.id_add(), pm.id_remove(id)
+// 3. Scheduling: pm.task_add(name, priority, fn)
 //
 // INIT PATTERN:
 // Plain functions register tasks, pools, and state during setup.
@@ -256,18 +256,6 @@ inline bool id_is_free(Id slot) { return (slot & ID_FLAG_FREE) != 0; }
 template <typename T>
 class Pool;
 
-template <typename T>
-struct Handle
-{
-	Id id = NULL_ID;
-	Pool<T> *pool = nullptr;
-
-	T *get() const { return pool ? pool->get(id) : nullptr; }
-	T *operator->() const { return get(); }
-	T &operator*() const { return *get(); }
-	explicit operator bool() const { return get() != nullptr; }
-};
-
 // =============================================================================
 // Core Interfaces
 // =============================================================================
@@ -280,7 +268,7 @@ class PoolBase
 public:
 	virtual ~PoolBase() = default;
 	uint32_t pool_id = 0;
-	const std::vector<Id> *kernel_slots = nullptr; // set by Pm::pool<T>()
+	const std::vector<Id> *kernel_slots = nullptr; // set by Pm::pool_get<T>()
 	virtual void remove(Id id) = 0;
 	virtual void clear_all() = 0;
 	virtual void shrink_to_fit() = 0;
@@ -290,7 +278,7 @@ public:
 // Pool<T> — Contiguous DOD Sparse Set
 //
 // Pure data container. No lifecycle methods.
-// Created via pm.pool<T>("name"). Pm wires up entity→pool removal.
+// Created via pm.pool_get<T>("name"). Pm wires up entity→pool removal.
 //
 // Optional change hook: set via set_change_hook() to get notified when
 // entries are added or modified. Used by the network layer (pm_udp) to
@@ -443,13 +431,11 @@ public:
 	bool has(Id id) const { return get(id) != nullptr; }
 	size_t size() const { return items.size(); }
 
-	Handle<T> handle(Id id) { return {id, this}; }
-
 	// --- Iteration (lambda form, auto-parallelizes) ---
 	// Defined out-of-line after Pm class.
 	// each():     void(const T&) or void(Id, const T&) — read-only, no change hooks
 	// each_mut(): void(T&) or void(Id, T&) — mutable, fires change hooks
-	Pm *kernel = nullptr; // set by Pm::pool<T>()
+	Pm *kernel = nullptr; // set by Pm::pool_get<T>()
 
 	static constexpr size_t PARALLEL_THRESHOLD = 1024;
 
@@ -508,49 +494,53 @@ struct Task
 // =============================================================================
 class Pm
 {
-	NameTable name_table;
+	NameTable _name_table;
 
-	std::vector<Id> m_slots;        // One packed Id per entity slot (index, gen, flags)
-	std::vector<uint32_t> free_ids;
-	std::vector<Id> pending_removes;
-	std::mutex remove_mtx;
-	std::unique_ptr<ThreadPool> m_thread_pool;
-	uint32_t m_thread_count = 0; // 0 = auto (hardware_concurrency, capped at 32)
+	std::vector<Id> _slots;        // One packed Id per entity slot (index, gen, flags)
+	std::vector<uint32_t> _free_ids;
+	std::vector<Id> _pending_removes;
+	std::mutex _remove_mtx;
+	std::unique_ptr<ThreadPool> _thread_pool;
 
-	std::vector<Task> task_list;
-	std::vector<uint16_t> task_order_indices;
-	bool tasks_dirty = false;
+	std::vector<uint16_t> _task_order_indices;
+	bool _tasks_dirty = false;
 
 	struct PoolEntry
 	{
 		std::unique_ptr<PoolBase> pool;
 		size_t type_id = 0;
 	};
-	std::vector<PoolEntry> pool_entries;
-	std::vector<PoolBase *> pool_by_id;
-	uint32_t next_pool_id = 0;
+	std::vector<PoolEntry> _pool_entries;
+	std::vector<PoolBase *> _pool_by_id;
+	uint32_t _next_pool_id = 0;
 
 	struct StateEntry
 	{
 		std::unique_ptr<StateBase> state;
 		size_t type_id = 0;
 	};
-	std::vector<StateEntry> state_entries;
+	std::vector<StateEntry> _state_entries;
 
-	float loop_rate = 0.f, raw_dt = 0.f;
-	uint64_t tick = 0;
-	bool running = true, stepping_active = false, paused = false, step_requested = false;
-	NameId active_task = NULL_NAME;
-	std::chrono::steady_clock::time_point last_time = std::chrono::steady_clock::now();
-	std::vector<std::string> fault_list;
+	float _raw_dt = 0.f;
+	uint64_t _tick = 0;
+	bool _running = true, _stepping_active = false, _step_requested = false;
+	NameId _active_task = NULL_NAME;
+	std::chrono::steady_clock::time_point _last_time = std::chrono::steady_clock::now();
+	std::vector<std::string> _fault_list;
 
-	uint32_t spawns_this_frame = 0;
-	uint32_t removes_this_frame = 0;
-	uint32_t alive_count = 0;
+	uint32_t _spawns_this_frame = 0;
+	uint32_t _removes_this_frame = 0;
+	uint32_t _alive_count = 0;
 
 	static constexpr uint32_t MAX_SYNC_INDEX = 1000000;
 
 public:
+	// --- Public members ---
+	std::vector<Task> task_list;
+	float loop_rate = 0.f;
+	bool paused = false;
+	uint32_t thread_count = 0; // 0 = auto (hardware_concurrency). Set before first parallel each.
+
 	Pm() = default;
 	Pm(const Pm &) = delete;
 	Pm &operator=(const Pm &) = delete;
@@ -561,74 +551,64 @@ public:
 
 	// ====== THREAD POOL (lazy-init) ======
 
-	// Set worker thread count. Must be called before any parallel each/each_mut.
-	// 0 = auto (hardware_concurrency, capped at processor count).
-	// Clamped to [1, hardware_concurrency] — never exceeds actual cores.
-	void set_thread_count(uint32_t n)
-	{
-		uint32_t hw = std::thread::hardware_concurrency();
-		if (hw == 0) hw = 4;
-		m_thread_count = (n == 0) ? 0 : std::min(n, hw);
-	}
-
 	ThreadPool *thread_pool()
 	{
-		if (!m_thread_pool)
+		if (!_thread_pool)
 		{
-			uint32_t n = m_thread_count;
+			uint32_t n = thread_count;
 			if (n == 0)
 			{
 				n = std::thread::hardware_concurrency();
 				if (n == 0) n = 4;
 			}
-			m_thread_pool = std::make_unique<ThreadPool>();
-			m_thread_pool->start(n);
+			else
+			{
+				uint32_t hw = std::thread::hardware_concurrency();
+				if (hw == 0) hw = 4;
+				n = std::min(n, hw);
+			}
+			_thread_pool = std::make_unique<ThreadPool>();
+			_thread_pool->start(n);
 		}
-		return m_thread_pool.get();
+		return _thread_pool.get();
 	}
 
 	// ====== NAME INTERNING ======
-	NameId intern(const char *s) { return name_table.intern(s); }
-	const char *name_str(NameId id) const { return name_table.str(id); }
-	NameTable &names() { return name_table; }
+	NameId name_new(const char *s) { return _name_table.intern(s); }
+	const char *name_get(NameId id) const { return _name_table.str(id); }
+	NameTable &name_table() { return _name_table; }
 
 	// ====== CORE TIMELINE ======
-	void set_loop_rate(float hz) { loop_rate = hz; }
 
-	uint32_t frame_spawns() const { return spawns_this_frame; }
-	uint32_t frame_removes() const { return removes_this_frame; }
-	uint32_t entity_count() const { return alive_count; }
-	void quit() { running = false; }
-	bool is_running() const { return running; }
-	float dt() const { return raw_dt; }
-	uint64_t tick_count() const { return tick; }
-	uint64_t *tick_ptr() { return &tick; }
+	uint32_t loop_spawns() const { return _spawns_this_frame; }
+	uint32_t loop_removes() const { return _removes_this_frame; }
+	uint32_t id_count() const { return _alive_count; }
+	void loop_quit() { _running = false; }
+	bool loop_running() const { return _running; }
+	float loop_dt() const { return _raw_dt; }
+	uint64_t loop_count() const { return _tick; }
 
-	const std::vector<std::string> &faults() const { return fault_list; }
-	bool stepping() const { return stepping_active; }
-	bool is_paused() const { return paused; }
-	void pause() { paused = true; }
-	void resume() { paused = false; }
-	void toggle_pause() { paused = !paused; }
-	void request_step() { step_requested = true; }
-	NameId current_task() const { return active_task; }
+	const std::vector<std::string> &task_faults() const { return _fault_list; }
+	bool loop_stepping() const { return _stepping_active; }
+	void loop_step() { _step_requested = true; }
+	NameId task_current() const { return _active_task; }
 
-	// Run the main loop until quit() is called.
-	void run()
+	// Run the main loop until loop_quit() is called.
+	void loop_run()
 	{
-		while (running)
-			tick_once();
+		while (_running)
+			loop_once();
 	}
 
 	// Execute one frame: sleep to rate, run tasks, process removes.
-	void tick_once()
+	void loop_once()
 	{
 		auto now = std::chrono::steady_clock::now();
 
 		if (loop_rate > 0.f)
 		{
 			float target_us = 1e6f / loop_rate;
-			float elapsed_us = std::chrono::duration<float, std::micro>(now - last_time).count();
+			float elapsed_us = std::chrono::duration<float, std::micro>(now - _last_time).count();
 			if (elapsed_us < target_us)
 			{
 				auto sleep_us = (int)(target_us - elapsed_us);
@@ -638,34 +618,34 @@ public:
 			now = std::chrono::steady_clock::now();
 		}
 
-		raw_dt = std::min(std::chrono::duration<float>(now - last_time).count(), 0.1f);
-		last_time = now;
-		tick++;
-		spawns_this_frame = 0;
-		removes_this_frame = 0;
+		_raw_dt = std::min(std::chrono::duration<float>(now - _last_time).count(), 0.1f);
+		_last_time = now;
+		_tick++;
+		_spawns_this_frame = 0;
+		_removes_this_frame = 0;
 
-		stepping_active = step_requested;
-		step_requested = false;
+		_stepping_active = _step_requested;
+		_step_requested = false;
 
-		if (tasks_dirty)
+		if (_tasks_dirty)
 		{
-			task_order_indices.clear();
+			_task_order_indices.clear();
 			for (uint16_t i = 0; i < (uint16_t)task_list.size(); i++)
 				if (task_list[i].active)
-					task_order_indices.push_back(i);
-			std::stable_sort(task_order_indices.begin(), task_order_indices.end(),
+					_task_order_indices.push_back(i);
+			std::stable_sort(_task_order_indices.begin(), _task_order_indices.end(),
 				[this](uint16_t a, uint16_t b) { return task_list[a].priority < task_list[b].priority; });
-			tasks_dirty = false;
+			_tasks_dirty = false;
 		}
 
-		for (uint16_t oi = 0; oi < (uint16_t)task_order_indices.size(); ++oi)
+		for (uint16_t oi = 0; oi < (uint16_t)_task_order_indices.size(); ++oi)
 		{
-			uint16_t ti = task_order_indices[oi];
+			uint16_t ti = _task_order_indices[oi];
 			// Access task_list[ti] by index throughout — never hold a reference
-			// across a task call, because schedule()/push_back may reallocate.
+			// across a task call, because task_add()/push_back may reallocate.
 			if (!task_list[ti].active || !task_list[ti].fn)
 				continue;
-			if (task_list[ti].pauseable && paused && !stepping_active)
+			if (task_list[ti].pauseable && paused && !_stepping_active)
 				continue;
 
 			auto exec_t = [&, ti]()
@@ -678,30 +658,30 @@ public:
 				catch (const TaskFault &e)
 				{
 					task_list[ti].active = false;
-					fault_list.push_back(std::string(name_str(task_list[ti].name)) + ": " + e.what());
-					tasks_dirty = true;
+					_fault_list.push_back(std::string(name_get(task_list[ti].name)) + ": " + e.what());
+					_tasks_dirty = true;
 				}
 				task_list[ti].record(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
 			};
 
-			active_task = task_list[ti].name;
+			_active_task = task_list[ti].name;
 			exec_t();
-			active_task = NULL_NAME;
+			_active_task = NULL_NAME;
 		}
 
-		flush_removes();
-		stepping_active = false;
+		id_process_removes();
+		_stepping_active = false;
 	}
 
 	// ====== IDS ======
-	Id spawn()
+	Id id_add()
 	{
 		uint32_t idx = UINT32_MAX;
-		while (!free_ids.empty())
+		while (!_free_ids.empty())
 		{
-			uint32_t candidate = free_ids.back();
-			free_ids.pop_back();
-			if (id_is_free(m_slots[candidate]))
+			uint32_t candidate = _free_ids.back();
+			_free_ids.pop_back();
+			if (id_is_free(_slots[candidate]))
 			{
 				idx = candidate;
 				break;
@@ -709,50 +689,50 @@ public:
 		}
 		if (idx == UINT32_MAX)
 		{
-			idx = static_cast<uint32_t>(m_slots.size());
-			m_slots.push_back(make_id(idx, 1, ID_FLAG_FREE));
+			idx = static_cast<uint32_t>(_slots.size());
+			_slots.push_back(make_id(idx, 1, ID_FLAG_FREE));
 		}
-		uint32_t gen = id_generation(m_slots[idx]);
-		m_slots[idx] = make_id(idx, gen); // clear free flag
-		spawns_this_frame++;
-		alive_count++;
+		uint32_t gen = id_generation(_slots[idx]);
+		_slots[idx] = make_id(idx, gen); // clear free flag
+		_spawns_this_frame++;
+		_alive_count++;
 		return make_id(idx, gen);
 	}
 
-	void remove_entity(Id id)
+	void id_remove(Id id)
 	{
-		std::lock_guard<std::mutex> lk(remove_mtx);
-		pending_removes.push_back(id);
+		std::lock_guard<std::mutex> lk(_remove_mtx);
+		_pending_removes.push_back(id);
 	}
 
-	uint32_t remove_pending() const { return static_cast<uint32_t>(pending_removes.size()); }
+	uint32_t id_pending_removes() const { return static_cast<uint32_t>(_pending_removes.size()); }
 
-	void flush_removes()
+	void id_process_removes()
 	{
-		for (Id id : pending_removes)
+		for (Id id : _pending_removes)
 		{
 			uint32_t idx = id_index(id);
-			if (idx >= m_slots.size()) continue;
-			if (id_generation(m_slots[idx]) != id_generation(id)) continue;
-			if (id_is_free(m_slots[idx])) continue;
+			if (idx >= _slots.size()) continue;
+			if (id_generation(_slots[idx]) != id_generation(id)) continue;
+			if (id_is_free(_slots[idx])) continue;
 
 			uint32_t new_gen = (id_generation(id) + 1) & 0xFFFFFF;
 			if (new_gen == 0) new_gen = 1;
-			m_slots[idx] = make_id(idx, new_gen, ID_FLAG_FREE);
+			_slots[idx] = make_id(idx, new_gen, ID_FLAG_FREE);
 
-			for (PoolBase *p : pool_by_id)
+			for (PoolBase *p : _pool_by_id)
 			{
 				if (p) p->remove(id);
 			}
 
-			free_ids.push_back(idx);
-			removes_this_frame++;
-			alive_count--;
+			_free_ids.push_back(idx);
+			_removes_this_frame++;
+			_alive_count--;
 		}
-		pending_removes.clear();
+		_pending_removes.clear();
 	}
 
-	bool sync_id(Id id)
+	bool id_sync(Id id)
 	{
 		uint32_t idx = id_index(id);
 		uint32_t gen = id_generation(id);
@@ -760,41 +740,29 @@ public:
 		if (idx > MAX_SYNC_INDEX)
 			return false;
 
-		if (idx >= m_slots.size())
+		if (idx >= _slots.size())
 		{
-			uint32_t old_size = static_cast<uint32_t>(m_slots.size());
-			m_slots.resize(idx + 1, make_id(0, 0, ID_FLAG_FREE));
+			uint32_t old_size = static_cast<uint32_t>(_slots.size());
+			_slots.resize(idx + 1, make_id(0, 0, ID_FLAG_FREE));
 			for (uint32_t i = old_size; i <= idx; ++i)
 			{
-				m_slots[i] = make_id(i, 0, ID_FLAG_FREE);
-				if (i < idx) free_ids.push_back(i);
+				_slots[i] = make_id(i, 0, ID_FLAG_FREE);
+				if (i < idx) _free_ids.push_back(i);
 			}
 		}
 
-		uint32_t current_gen = id_generation(m_slots[idx]);
+		uint32_t current_gen = id_generation(_slots[idx]);
 		if (current_gen > gen)
 			return false;
 
-		if (id_is_free(m_slots[idx])) alive_count++;
-		m_slots[idx] = make_id(idx, gen); // clear free flag
+		if (id_is_free(_slots[idx])) _alive_count++;
+		_slots[idx] = make_id(idx, gen); // clear free flag
 		return true;
-	}
-
-	template <typename T>
-	Handle<T> handle(NameId pool_name, Id id)
-	{
-		return {id, pool<T>(pool_name)};
-	}
-
-	template <typename T>
-	Handle<T> handle(const char *pool_name, Id id)
-	{
-		return handle<T>(intern(pool_name), id);
 	}
 
 	// ====== SCHEDULING ======
 	template <typename F>
-	void schedule(NameId name, float priority, F &&fn, bool pauseable = false)
+	void task_add(NameId name, float priority, F &&fn, bool pauseable = false)
 	{
 		Task t;
 		t.name = name;
@@ -803,28 +771,27 @@ public:
 
 		t.fn = [f = std::forward<F>(fn)](Pm &pm) { f(pm); };
 		task_list.push_back(std::move(t));
-		tasks_dirty = true;
+		_tasks_dirty = true;
 	}
 
 	template <typename F>
-	void schedule(const char *name, float priority, F &&fn, bool pauseable = false)
+	void task_add(const char *name, float priority, F &&fn, bool pauseable = false)
 	{
-		schedule(intern(name), priority, std::forward<F>(fn), pauseable);
+		task_add(name_new(name), priority, std::forward<F>(fn), pauseable);
 	}
 
-	const std::vector<Task> &tasks() const { return task_list; }
-	const std::vector<uint16_t> &task_order() const { return task_order_indices; }
+	const std::vector<uint16_t> &task_order() const { return _task_order_indices; }
 
-	Task *task(NameId name)
+	Task *task_get(NameId name)
 	{
 		for (auto &t : task_list)
 			if (t.name == name)
 				return &t;
 		return nullptr;
 	}
-	Task *task(const char *name) { return task(intern(name)); }
+	Task *task_get(const char *name) { return task_get(name_new(name)); }
 
-	void reset_task_stats()
+	void task_reset_stats()
 	{
 		for (auto &t : task_list)
 		{
@@ -833,47 +800,36 @@ public:
 		}
 	}
 
-	void stop_task(NameId name)
-	{
-		for (auto &t : task_list)
-			if (t.name == name)
-			{
-				t.active = false;
-				tasks_dirty = true;
-			}
-	}
-	void stop_task(const char *name) { stop_task(intern(name)); }
-
-	void unschedule(NameId name)
+	void task_stop(NameId name)
 	{
 		for (auto &t : task_list)
 			if (t.name == name)
 			{
 				t.fn = {};
 				t.active = false;
-				tasks_dirty = true;
+				_tasks_dirty = true;
 			}
 	}
-	void unschedule(const char *name) { unschedule(intern(name)); }
+	void task_stop(const char *name) { task_stop(name_new(name)); }
 
 	// ====== POOLS ======
 	template <typename T>
-	Pool<T> *pool(NameId name)
+	Pool<T> *pool_get(NameId name)
 	{
 		if (name == NULL_NAME) return nullptr;
-		if (name >= pool_entries.size()) pool_entries.resize(name + 1);
-		auto &r = pool_entries[name];
+		if (name >= _pool_entries.size()) _pool_entries.resize(name + 1);
+		auto &r = _pool_entries[name];
 		if (!r.pool)
 		{
 			auto p = std::make_unique<Pool<T>>();
-			p->pool_id = next_pool_id++;
-			p->kernel_slots = &m_slots;
+			p->pool_id = _next_pool_id++;
+			p->kernel_slots = &_slots;
 			p->kernel = this;
 			r.type_id = get_type_id<T>();
 
-			if (p->pool_id >= pool_by_id.size())
-				pool_by_id.resize(p->pool_id + 1, nullptr);
-			pool_by_id[p->pool_id] = p.get();
+			if (p->pool_id >= _pool_by_id.size())
+				_pool_by_id.resize(p->pool_id + 1, nullptr);
+			_pool_by_id[p->pool_id] = p.get();
 			r.pool = std::move(p);
 		}
 		assert(r.type_id == get_type_id<T>() && "Pool type mismatch! Same name used with different types");
@@ -881,15 +837,15 @@ public:
 	}
 
 	template <typename T>
-	Pool<T> *pool(const char *name) { return pool<T>(intern(name)); }
+	Pool<T> *pool_get(const char *name) { return pool_get<T>(name_new(name)); }
 
 	// ====== STATES — Named singletons ======
 	template <typename T>
-	T *state(NameId name)
+	T *state_get(NameId name)
 	{
 		if (name == NULL_NAME) return nullptr;
-		if (name >= state_entries.size()) state_entries.resize(name + 1);
-		auto &r = state_entries[name];
+		if (name >= _state_entries.size()) _state_entries.resize(name + 1);
+		auto &r = _state_entries[name];
 		if (!r.state)
 		{
 			r.state = std::make_unique<StateHolder<T>>();
@@ -900,7 +856,7 @@ public:
 	}
 
 	template <typename T>
-	T *state(const char *name) { return state<T>(intern(name)); }
+	T *state_get(const char *name) { return state_get<T>(name_new(name)); }
 
 };
 

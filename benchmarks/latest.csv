@@ -1,91 +1,91 @@
-benchmark,total_ms,ops,ns_per_op
-"pool add 10k",0.2199,10000,21.99
-"pool add 100k",1.8806,100000,18.81
-"pool add overwrite 10k",0.1209,10000,12.09
-"pool add 10k (256B component)",1.4608,10000,146.08
-"pool get 10k (sequential)",0.0115,10000,1.15
-"pool get 10k (stale ids — all miss)",0.0047,10000,0.47
-"pool has 10k",0.0115,10000,1.15
-"pool remove 10k (swap-and-pop)",0.1079,10000,10.79
-"pool remove 10k via flush_removes (20 pools)",3.9651,10000,396.51
-"each 100k trivial (seq)",0.0469,100000,0.47
-"each 100k trivial (parallel)",0.2737,100000,2.74
-"each 100k trig (seq)",1.6554,100000,16.55
-"each 100k trig (parallel)",0.5127,100000,5.13
-"each 100k 256B read-all (seq)",22.2408,100000,222.41
-"each 100k 256B read-all (parallel)",4.8174,100000,48.17
-"each 100k join 2 pools + branch (seq)",0.2822,100000,2.82
-"each 100k join 2 pools + branch (parallel)",0.3465,100000,3.47
-"each 500k trig (seq)",3.4984,500000,7.00
-"each 500k trig (parallel)",0.7033,500000,1.41
-"each_mut 100k trivial (seq)",0.0733,100000,0.73
-"each_mut 100k trivial (parallel)",0.2520,100000,2.52
-"each_mut 100k physics sim (seq)",1.2784,100000,12.78
-"each_mut 100k physics sim (parallel)",0.3227,100000,3.23
-"each_mut 100k 256B transform (seq)",12.3218,100000,123.22
-"each_mut 100k 256B transform (parallel)",2.1483,100000,21.48
-"each_mut 100k join + physics (seq)",1.3190,100000,13.19
-"each_mut 100k join + physics (parallel)",0.3805,100000,3.81
-"each_mut 100k with change hook",0.1138,100000,1.14
-"each_mut 500k physics sim (seq)",6.5734,500000,13.15
-"each_mut 500k physics sim (parallel)",2.1551,500000,4.31
-"pool clear_all 100k",0.8168,100000,8.17
-"pool mixed ops 10k (add, get, remove interleaved)",0.2768,30000,9.23
-"state fetch 10k (same state, repeated)",0.1217,10000,12.17
-"state create 100 distinct states",0.0175,100,175.01
-"spawn 10k",0.0166,10000,1.66
-"spawn 100k",0.3165,100000,3.17
-"spawn 10k after remove (free-list reuse)",0.2248,10000,22.48
-"flush 10k removes (1 pool)",0.2538,10000,25.38
-"flush 10k removes (8 pools)",1.6400,10000,164.00
-"flush 1k removes (20 pools, 3 populated)",0.0730,1000,73.02
-"entity churn 10k (spawn, add 3 components, remove, repeat)",0.3243,10000,32.43
-"game tick: 5k physics + 500 health checks",0.0952,5500,17.31
-"multi-archetype: 3100 entities, 8 pools, tick sim",0.1309,3100,42.22
-"iterate 50k pos, lookup vel (join pattern, seq)",0.1261,50000,2.52
-"iterate 50k pos, lookup vel (join pattern, parallel)",0.2559,50000,5.12
-"iterate 10k health, lookup pos (smaller iterates larger)",0.0000,10000,0.00
-"30 frames: 1k spawn + 1k remove + iterate 5k",1.4034,30,46778.67
-"each 200k trig — 1 thread",3.2925,200000,16.46
-"each 200k trig — 2 threads",2.0847,200000,10.42
-"each 200k trig — 4 threads",1.1480,200000,5.74
-"each 200k trig — 8 threads",1.7023,200000,8.51
-"each 200k trig — 16 threads",0.7150,200000,3.57
-"each 200k trig — 20 threads",0.9247,200000,4.62
-"each_mut 200k physics — 1 thread",2.4039,200000,12.02
-"each_mut 200k physics — 2 threads",1.5417,200000,7.71
-"each_mut 200k physics — 4 threads",0.8119,200000,4.06
-"each_mut 200k physics — 8 threads",0.8002,200000,4.00
-"each_mut 200k physics — 16 threads",0.6924,200000,3.46
-"each_mut 200k physics — 20 threads",0.7466,200000,3.73
-"each_mut 100k 256B — 1 thread",13.1720,100000,131.72
-"each_mut 100k 256B — 2 threads",5.3613,100000,53.61
-"each_mut 100k 256B — 4 threads",2.9428,100000,29.43
-"each_mut 100k 256B — 8 threads",2.6982,100000,26.98
-"each_mut 100k 256B — 16 threads",1.9490,100000,19.49
-"each_mut 100k 256B — 20 threads",1.6163,100000,16.16
-"spatial insert 400 (hellfire peak)",0.0215,400,53.80
-"spatial insert 4k (10x stress)",0.0764,4000,19.09
-"spatial clear + insert 400 (per-frame rebuild)",0.0027,400,6.63
-"spatial query small radius (r=20, 1k queries)",0.0315,1000,31.47
-"spatial query large radius (r=100, 1k queries)",0.0839,1000,83.92
-"spatial full frame (400 insert + 600 queries)",0.0317,1000,31.74
-"bullet churn: 30f, 50 spawn + 40 expire/f",0.0438,2700,16.23
-"bullet churn: 30f, 200 spawn + 180 expire/f",0.2284,11400,20.03
-"bullet physics: each_mut 600 (pos += vel*dt)",0.0105,600,17.42
-"monster AI 400 (closest of 4 + steer, seq)",0.0040,400,10.12
-"monster AI 400 (closest of 4 + steer, parallel)",0.2538,400,634.56
-"monster AI 2000 (5x stress, sequential)",0.0378,2000,18.92
-"collision frame: 400 mon, 300 bul, 4 players",0.0419,1300,32.24
-"collision frame: 400 mon, 600 bul, 4 players",0.0493,1600,30.82
-"collision brute force: 400x600 (no grid)",0.0675,240000,0.28
-"server tick: level 1 (60 mon, 50 bul)",0.0080,200,40.09
-"server tick: level 5 (400 mon, 600 bul)",0.0655,1600,40.94
-"30 server ticks: level 5 sustained",0.7881,48000,16.42
-"Cooldown::ready 100k",0.0473,100000,0.47
-"Hysteresis update+set 100k",0.0881,100000,0.88
-"RisingEdge update 100k",0.0304,100000,0.30
-"DelayTimer update 100k",0.1156,100000,1.16
-"Counter increment 100k",0.0659,100000,0.66
-"multi-pool tick: 4p + 400m + 600b, iterate all",0.0246,1004,24.52
-"multi-pool tick + spatial grid collision",0.0617,1004,61.48
+benchmark,median_ms,max_ms,ops,ns_per_op
+"pool add 10k",0.2183,0.2239,10000,21.83
+"pool add 100k",2.6945,3.1245,100000,26.95
+"pool add overwrite 10k",0.0250,0.0252,10000,2.50
+"pool add 10k (256B component)",3.4201,4.8951,10000,342.01
+"pool get 10k (sequential)",0.0275,0.0280,10000,2.75
+"pool get 10k (stale ids — all miss)",0.0106,0.0249,10000,1.06
+"pool has 10k",0.0259,0.0260,10000,2.59
+"pool remove 10k (swap-and-pop)",0.0646,0.0648,10000,6.46
+"pool remove 10k via id_process_removes (20 pools)",0.5657,0.9066,10000,56.57
+"each 100k trivial (seq)",0.0762,0.0770,100000,0.76
+"each 100k trivial (parallel)",0.2572,0.2978,100000,2.57
+"each 100k trig (seq)",1.7285,2.2703,100000,17.28
+"each 100k trig (parallel)",0.3925,0.5092,100000,3.92
+"each 100k 256B read-all (seq)",37.6451,43.0843,100000,376.45
+"each 100k 256B read-all (parallel)",3.4917,4.2845,100000,34.92
+"each 100k join 2 pools + branch (seq)",0.2702,0.2710,100000,2.70
+"each 100k join 2 pools + branch (parallel)",0.2514,0.3576,100000,2.51
+"each 500k trig (seq)",4.7044,4.9019,500000,9.41
+"each 500k trig (parallel)",0.7402,0.7986,500000,1.48
+"each_mut 100k trivial (seq)",0.0610,0.0770,100000,0.61
+"each_mut 100k trivial (parallel)",0.1683,0.1716,100000,1.68
+"each_mut 100k physics sim (seq)",1.2949,1.4981,100000,12.95
+"each_mut 100k physics sim (parallel)",0.6072,2.2029,100000,6.07
+"each_mut 100k 256B transform (seq)",9.1934,14.0611,100000,91.93
+"each_mut 100k 256B transform (parallel)",1.8078,3.1407,100000,18.08
+"each_mut 100k join + physics (seq)",1.3036,1.3995,100000,13.04
+"each_mut 100k join + physics (parallel)",0.3683,0.4290,100000,3.68
+"each_mut 100k with change hook",0.1169,0.1223,100000,1.17
+"each_mut 500k physics sim (seq)",9.5923,10.5549,500000,19.18
+"each_mut 500k physics sim (parallel)",1.4911,1.8207,500000,2.98
+"pool clear_all 100k",0.0302,0.0334,100000,0.30
+"pool mixed ops 10k (add, get, remove interleaved)",0.3115,0.3847,30000,10.38
+"state fetch 10k (same state, repeated)",0.1035,0.1035,10000,10.35
+"state create 100 distinct states",0.0138,0.0157,100,138.40
+"id_add10k",0.0203,0.0204,10000,2.03
+"id_add100k",0.1458,0.1736,100000,1.46
+"id_add10k after remove (free-list reuse)",0.0179,0.0181,10000,1.79
+"flush 10k removes (1 pool)",0.0564,0.0700,10000,5.64
+"flush 10k removes (8 pools)",0.3442,0.4601,10000,34.42
+"flush 1k removes (20 pools, 3 populated)",0.0506,0.0699,1000,50.65
+"entity churn 10k (spawn, add 3 components, remove, repeat)",0.6328,0.6793,10000,63.28
+"game tick: 5k physics + 500 health checks",0.0277,0.0671,5500,5.04
+"multi-archetype: 3100 entities, 8 pools, tick sim",0.0187,0.0189,3100,6.04
+"iterate 50k pos, lookup vel (join pattern, seq)",0.0972,0.0980,50000,1.94
+"iterate 50k pos, lookup vel (join pattern, parallel)",0.3074,0.4271,50000,6.15
+"iterate 10k health, lookup pos (smaller iterates larger)",0.0000,0.0000,10000,0.00
+"30 frames: 1k spawn + 1k remove + iterate 5k",1.8686,2.1094,30,62285.90
+"each 200k trig — 1 thread",8.2439,11.1714,200000,41.22
+"each 200k trig — 2 threads",4.7021,8.0608,200000,23.51
+"each 200k trig — 4 threads",3.1195,4.5286,200000,15.60
+"each 200k trig — 8 threads",2.4169,2.7048,200000,12.08
+"each 200k trig — 16 threads",1.2733,1.3716,200000,6.37
+"each 200k trig — 20 threads",1.0427,1.1202,200000,5.21
+"each_mut 200k physics — 1 thread",2.4686,3.1698,200000,12.34
+"each_mut 200k physics — 2 threads",1.5755,1.8752,200000,7.88
+"each_mut 200k physics — 4 threads",0.9931,1.2244,200000,4.97
+"each_mut 200k physics — 8 threads",0.8006,0.9267,200000,4.00
+"each_mut 200k physics — 16 threads",0.6822,0.7880,200000,3.41
+"each_mut 200k physics — 20 threads",0.6387,0.7052,200000,3.19
+"each_mut 100k 256B — 1 thread",12.2947,13.9693,100000,122.95
+"each_mut 100k 256B — 2 threads",5.2448,5.7097,100000,52.45
+"each_mut 100k 256B — 4 threads",2.7072,2.8635,100000,27.07
+"each_mut 100k 256B — 8 threads",2.3370,2.9794,100000,23.37
+"each_mut 100k 256B — 16 threads",1.7414,2.0877,100000,17.41
+"each_mut 100k 256B — 20 threads",1.6880,2.0549,100000,16.88
+"spatial insert 400 (hellfire peak)",0.0180,0.0259,400,44.95
+"spatial insert 4k (10x stress)",0.0840,0.1578,4000,21.00
+"spatial clear + insert 400 (per-frame rebuild)",0.0025,0.0027,400,6.17
+"spatial query small radius (r=20, 1k queries)",0.0243,0.0847,1000,24.25
+"spatial query large radius (r=100, 1k queries)",0.0800,0.0857,1000,79.95
+"spatial full frame (400 insert + 600 queries)",0.0283,0.0369,1000,28.32
+"bullet churn: 30f, 50 spawn + 40 expire/f",0.0466,0.0474,2700,17.25
+"bullet churn: 30f, 200 spawn + 180 expire/f",0.1792,0.1829,11400,15.72
+"bullet physics: each_mut 600 (pos += vel*dt)",0.0107,0.0110,600,17.79
+"monster AI 400 (closest of 4 + steer, seq)",0.0027,0.0042,400,6.65
+"monster AI 400 (closest of 4 + steer, parallel)",0.1727,0.3266,400,431.74
+"monster AI 2000 (5x stress, sequential)",0.0206,0.0279,2000,10.30
+"collision frame: 400 mon, 300 bul, 4 players",0.0308,0.0453,1300,23.71
+"collision frame: 400 mon, 600 bul, 4 players",0.0410,0.0493,1600,25.61
+"collision brute force: 400x600 (no grid)",0.0662,0.0731,240000,0.28
+"server tick: level 1 (60 mon, 50 bul)",0.0062,0.0082,200,31.18
+"server tick: level 5 (400 mon, 600 bul)",0.0610,0.0828,1600,38.12
+"30 server ticks: level 5 sustained",0.7778,0.8809,48000,16.20
+"Cooldown::ready 100k",0.0448,0.0450,100000,0.45
+"Hysteresis update+set 100k",0.0860,0.2373,100000,0.86
+"RisingEdge update 100k",0.0926,0.0929,100000,0.93
+"DelayTimer update 100k",0.1579,0.1781,100000,1.58
+"Counter increment 100k",0.0871,0.0900,100000,0.87
+"multi-pool tick: 4p + 400m + 600b, iterate all",0.0333,0.0399,1004,33.17
+"multi-pool tick + spatial grid collision",0.0721,0.0806,1004,71.81
