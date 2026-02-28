@@ -135,6 +135,7 @@ struct ThreadPool
 	std::function<void(size_t, size_t)> work_fn;
 	size_t work_total = 0;
 	uint32_t work_gen = 0;
+	uint32_t work_active = 0; // how many workers should do actual work this dispatch
 
 	std::atomic<uint32_t> remaining{0};
 	std::exception_ptr captured_exception;
@@ -145,7 +146,7 @@ struct ThreadPool
 	{
 		num_threads = n;
 		for (uint32_t i = 0; i < n; i++)
-			workers.emplace_back([this, i, n]() { run(i, n); });
+			workers.emplace_back([this, i]() { run(i); });
 	}
 
 	~ThreadPool()
@@ -155,13 +156,17 @@ struct ThreadPool
 		for (auto &w : workers) w.join();
 	}
 
-	void dispatch(size_t count, std::function<void(size_t, size_t)> fn)
+	// use_threads: how many workers to use. 0 = all.
+	void dispatch(size_t count, std::function<void(size_t, size_t)> fn, uint32_t use_threads = 0)
 	{
+		uint32_t active = (use_threads == 0 || use_threads >= num_threads)
+			? num_threads : use_threads;
 		captured_exception = nullptr;
 		{
 			std::lock_guard<std::mutex> lk(mtx);
 			work_fn = std::move(fn);
 			work_total = count;
+			work_active = active;
 			remaining.store(num_threads, std::memory_order_relaxed);
 			work_gen++;
 		}
@@ -179,7 +184,7 @@ struct ThreadPool
 	}
 
 private:
-	void run(uint32_t id, uint32_t n)
+	void run(uint32_t id)
 	{
 		uint32_t local_gen = 0;
 		while (true)
@@ -190,21 +195,25 @@ private:
 			local_gen = work_gen;
 
 			size_t total = work_total;
+			uint32_t active = work_active;
 			auto fn = work_fn;
 			lk.unlock();
 
-			size_t chunk = (total + n - 1) / n;
-			size_t begin = std::min(static_cast<size_t>(id) * chunk, total);
-			size_t end = std::min(begin + chunk, total);
+			if (id < active)
+			{
+				size_t chunk = (total + active - 1) / active;
+				size_t begin = std::min(static_cast<size_t>(id) * chunk, total);
+				size_t end = std::min(begin + chunk, total);
 
-			try
-			{
-				if (begin < end) fn(begin, end);
-			}
-			catch (...)
-			{
-				std::lock_guard<std::mutex> elk(mtx);
-				if (!captured_exception) captured_exception = std::current_exception();
+				try
+				{
+					if (begin < end) fn(begin, end);
+				}
+				catch (...)
+				{
+					std::lock_guard<std::mutex> elk(mtx);
+					if (!captured_exception) captured_exception = std::current_exception();
+				}
 			}
 
 			if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
@@ -444,11 +453,12 @@ public:
 
 	static constexpr size_t PARALLEL_THRESHOLD = 1024;
 
+	// threads: 0 = use all workers, N = use at most N workers for this call.
 	template <typename F>
-	void each(F &&fn, Parallel p = Parallel::Auto);
+	void each(F &&fn, Parallel p = Parallel::Auto, uint32_t threads = 0);
 
 	template <typename F>
-	void each_mut(F &&fn, Parallel p = Parallel::Auto);
+	void each_mut(F &&fn, Parallel p = Parallel::Auto, uint32_t threads = 0);
 };
 
 // =============================================================================
@@ -540,6 +550,7 @@ class Pm
 	std::vector<Id> pending_removes;
 	std::mutex remove_mtx;
 	std::unique_ptr<ThreadPool> m_thread_pool;
+	uint32_t m_thread_count = 0; // 0 = auto (hardware_concurrency, capped at 32)
 
 	std::vector<Task> task_list;
 	std::vector<uint16_t> task_order_indices;
@@ -584,13 +595,27 @@ public:
 	~Pm() = default;
 
 	// ====== THREAD POOL (lazy-init) ======
+
+	// Set worker thread count. Must be called before any parallel each/each_mut.
+	// 0 = auto (hardware_concurrency, capped at processor count).
+	// Clamped to [1, hardware_concurrency] — never exceeds actual cores.
+	void set_thread_count(uint32_t n)
+	{
+		uint32_t hw = std::thread::hardware_concurrency();
+		if (hw == 0) hw = 4;
+		m_thread_count = (n == 0) ? 0 : std::min(n, hw);
+	}
+
 	ThreadPool *thread_pool()
 	{
 		if (!m_thread_pool)
 		{
-			uint32_t n = std::thread::hardware_concurrency();
-			if (n == 0) n = 4;
-			if (n > 32) n = 32;
+			uint32_t n = m_thread_count;
+			if (n == 0)
+			{
+				n = std::thread::hardware_concurrency();
+				if (n == 0) n = 4;
+			}
 			m_thread_pool = std::make_unique<ThreadPool>();
 			m_thread_pool->start(n);
 		}
@@ -921,7 +946,7 @@ public:
 // =============================================================================
 template <typename T>
 template <typename F>
-void Pool<T>::each(F &&fn, Parallel p)
+void Pool<T>::each(F &&fn, Parallel p, uint32_t threads)
 {
 	size_t n = items.size();
 	if (n == 0) return;
@@ -941,7 +966,7 @@ void Pool<T>::each(F &&fn, Parallel p)
 				else
 					fn(static_cast<const T &>(items[i]));
 			}
-		});
+		}, threads);
 	}
 	else
 	{
@@ -962,7 +987,7 @@ void Pool<T>::each(F &&fn, Parallel p)
 // =============================================================================
 template <typename T>
 template <typename F>
-void Pool<T>::each_mut(F &&fn, Parallel p)
+void Pool<T>::each_mut(F &&fn, Parallel p, uint32_t threads)
 {
 	size_t n = items.size();
 	if (n == 0) return;
@@ -983,7 +1008,7 @@ void Pool<T>::each_mut(F &&fn, Parallel p)
 				else
 					fn(items[i]);
 			}
-		});
+		}, threads);
 	}
 	else
 	{
