@@ -19,8 +19,7 @@ This project builds inside WSL (Ubuntu-24.04). All commands assume you're runnin
 the project root.
 
 ```bash
-cmake --preset debug        # configure (once), build dir: build/
-cmake --preset release      # release build with LTO, build dir: build-release/
+cmake --preset dev          # configure (once), build dir: build/
 cmake --build build         # build all targets
 ctest --test-dir build -V   # run tests
 ./build/pm_bench            # run benchmarks
@@ -32,13 +31,21 @@ Individual targets:
 cmake --build build --target hellfire_client
 cmake --build build --target hellfire_server
 cmake --build build --target pm_tests
-cmake --build build --target pm_bench       # benchmarks (built with -O2)
+cmake --build build --target pm_bench
 cmake --build build --target example_mod    # rebuild mod .so for hot-reload
+```
+
+Sanitizer builds (reconfigure to switch):
+
+```bash
+cmake --preset asan         # ASan + UBSan
+cmake --preset tsan         # thread sanitizer (can't combine with ASan)
+cmake --build build
 ```
 
 SDL3 and SDL3_image are built from source via FetchContent — first build takes a while.
 **Do NOT `rm -rf build`** — rebuilding SDL3 from source is slow. To reconfigure, just
-re-run `cmake --preset debug`.
+re-run `cmake --preset dev`.
 
 ## Framework headers (`src/pm/`)
 
@@ -84,6 +91,26 @@ pm.set_loop_rate(60);
 pm.run();
 ```
 
+### Init-time capture
+
+Fetch pools, states, and other pointers **during init** and capture them in the lambda
+closure. Don't call `pool<T>()` or `state<T>()` inside a task — those are init-time
+operations. `TaskContext` exists only to carry per-frame info (`dt()`, `spawn()`,
+`remove_entity()`). If you need the `Pm` directly (level loading, mod init), use `ctx.pm`.
+
+```cpp
+void physics_init(Pm& pm) {
+    auto* pos = pm.pool<Pos>("pos");   // capture at init
+    auto* vel = pm.pool<Vel>("vel");
+
+    pm.schedule("physics", 30.f, [pos, vel](TaskContext& ctx) {
+        // Good: pos/vel already captured, no lookup per frame
+        float dt = ctx.dt();
+        pos->each_mut([dt](Pos& p) { p.x += p.vx * dt; });
+    });
+}
+```
+
 Quick reference:
 
 - `pm.state<T>("name")` — singleton state, returns same pointer on re-fetch
@@ -94,7 +121,7 @@ Quick reference:
 - `pm.remove_entity(id)` — deferred removal (flushed at end of `tick_once()`)
 - `pool->each([](const T&) { ... })` — read-only iteration, no change hooks
 - `pool->each_mut([](T&) { ... })` — mutable iteration, fires change hooks
-- Tasks receive `TaskContext& ctx` with `ctx.dt()`, `ctx.pm()`, `ctx.quit()`
+- Tasks receive `TaskContext& ctx` with `ctx.dt()`, `ctx.pm`, `ctx.quit()`
 - Networking: `net->on_recv(type, handler)`, `net->send_to(peer, data, size)`
 - All time is `float` seconds (matches `ctx.dt()`)
 - Mods: `.so` files exporting `extern "C" pm_mod_load(Pm&)` / `pm_mod_unload(Pm&)`
@@ -190,20 +217,9 @@ pool size at start so newly spawned entities are not visited.
 
 ## Example game: Hellfire
 
-A networked multiplayer top-down shooter in `src/examples/hellfire/`.
-
-- `hellfire_common.hpp` — shared types (Player, Monster, Bullet, packets, Phase constants)
-- `hellfire_server.cpp` — authoritative server (headless, no SDL)
-- `hellfire_client.cpp` — rendering client with lobby, sprites, debug overlay
-- `mods/example_mod.cpp` — example hot-reload mod (.so)
-- `resources/` — PNG sprites (player, monsters, bullets, background)
-
-Run the server and connect clients:
-
-```bash
-./build/hellfire_server 9998
-./build/hellfire_client   # connects to localhost:9998
-```
+A networked multiplayer top-down shooter. See
+[src/examples/hellfire/README.md](src/examples/hellfire/README.md) for game docs, architecture,
+and game-specific roadmap.
 
 ## Benchmarks
 
@@ -286,9 +302,9 @@ ctest --test-dir build -V
   - **Devirtualize PoolBase:** replace virtual `remove`/`clear_all`/`shrink_to_fit` with
     function pointers or type-erased callables. C++20 not strictly required but concepts
     can constrain the erased interface.
-- **Compiler warnings (always on):** `-Wall -Wextra -Wpedantic -Werror -Wconversion -Wshadow`
-- **Debug builds:** `-fsanitize=address`, `-fsanitize=undefined`, `-fstack-protector-strong`
-- **Release builds:** `-D_FORTIFY_SOURCE=2`, `-fsanitize=undefined -fno-sanitize-recover`
+- ~~**Compiler warnings (always on):** `-Wall -Wextra -Wpedantic -Werror -Wshadow`~~
+- ~~**Single build config:** `RelWithDebInfo` (`-O2 -g`), sanitizer presets (`asan`, `tsan`)~~
+- **`-Wconversion`:** deferred — extremely noisy in game code, needs dedicated cleanup pass
 - **CI (4 jobs):** ASan build, UBSan build, TSan build (separate — can't combine with ASan),
   clean release build
 - **Test splitting:** `test_pool.cpp`, `test_kernel.cpp`, `test_net.cpp`, etc. — each compiles
@@ -340,10 +356,6 @@ ctest --test-dir build -V
   inter-task data flow. Frame-scoped (drain clears every frame) vs persistent (consumed
   explicitly). Critical for hot reload: mods push to queues core tasks drain.
 - **Query caching:** generation counter invalidation for joins — O(1) setup for stable pools
-- **Debug entity inspector:** click entity, see all components across all pools
-- **Per-pool staleness timeout:** framework-managed parallel array, reset on `add()`,
-  incremented per frame, entity removed when exceeded. Configured on `bind_recv`:
-  `net->bind_recv(bullets, read_bullets, {.stale_timeout = 1.5f})`
 
 ### Phase 4 — Relationship system
 General-purpose entity-to-entity relationship module. Built on top of the framework —
@@ -364,14 +376,10 @@ rels->to(entity_b, "held_by");      // reverse lookup
 
 ## Planned work
 
-**Next up:** SDL3_ttf text rendering — replace pixel font (`push_str`/`tiny_font`) with
-SDL3_ttf. Debug overlay currently causes ~30% CPU from 10k-15k tiny DrawRect quads per
-character pixel. TTF renders each string as 1 texture instead.
+**Next up:** CI pipeline, doctest migration, test splitting, `-Wconversion` cleanup.
 
-**Non-v3:**
-- Spatial quad-tree (pm_spatial_quad_tree.hpp)
-- Monster AI refactor (idle monsters shouldn't move every frame)
-- Mod enhancements: directory scanning, copy-before-load, DebugOverlay cleanup API
+See [src/examples/hellfire/README.md](src/examples/hellfire/README.md) for game-specific
+roadmap (SDL3_ttf, monster AI, spatial quad-tree, mod enhancements).
 
 ## Environment
 

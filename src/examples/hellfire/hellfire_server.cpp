@@ -52,16 +52,14 @@ struct ServerState {
     void set_roster_name(uint8_t peer, const char* name) {
         for (int i = 0; i < roster_count; i++) {
             if (roster[i].peer_id == peer) {
-                strncpy(roster[i].name, name, MAX_NAME);
-                roster[i].name[MAX_NAME] = 0;
+                snprintf(roster[i].name, MAX_NAME + 1, "%s", name);
                 return;
             }
         }
         if (roster_count < 4) {
             roster[roster_count].peer_id = peer;
             roster[roster_count].connected = true;
-            strncpy(roster[roster_count].name, name, MAX_NAME);
-            roster[roster_count].name[MAX_NAME] = 0;
+            snprintf(roster[roster_count].name, MAX_NAME + 1, "%s", name);
             roster_count++;
         }
     }
@@ -163,13 +161,12 @@ void server_init(Pm& pm) {
         if (p.peer < 4) gs->axes[p.peer] = {p.dx, p.dy, p.ax, p.ay, p.shooting != 0};
     });
 
-    net->on_recv(PKT_START, [gs, net](TaskContext& ctx, const uint8_t* buf, int, struct sockaddr_in&) {
+    net->on_recv(PKT_START, [gs, net](TaskContext& ctx, const uint8_t* /*buf*/, int, struct sockaddr_in&) {
         if (gs->started) return;
         gs->started = true;
-        Pm& pm = ctx.pm();
         for (int i = 0; i < gs->roster_count; i++) {
             uint8_t p = gs->roster[i].peer_id;
-            if (p < 4) gs->add_player(pm, p);
+            if (p < 4) gs->add_player(ctx.pm, p);
         }
         PktStart start{PKT_START};
         net->broadcast(net->remote_peers(), &start, sizeof(start));
@@ -222,7 +219,6 @@ void server_init(Pm& pm) {
         if (gs->level_hold > 0.f) { gs->level_hold -= dt; return; }
         int next = gs->current_level + 1;
         if (next < NUM_LEVELS && gs->score >= LEVELS[next].score_threshold) {
-            Pm& pm = ctx.pm();
             gs->current_level = next;
             gs->round++;
             gs->spawn_accum = 0.f; gs->level_flash = 3.0f; gs->level_hold = 3.0f;
@@ -249,10 +245,9 @@ void server_init(Pm& pm) {
                         + (sinf(gs->time * 0.08f) * 0.5f + 0.5f) * 0.4f;
         if ((int)mp->items.size() >= lvl.max_monsters) return;
         gs->spawn_accum += (1.f + 8.f * intensity) * lvl.spawn_mult * dt;
-        Pm& pm = ctx.pm();
         while (gs->spawn_accum >= 1.f && (int)mp->items.size() < lvl.max_monsters) {
             gs->spawn_accum -= 1.f;
-            spawn_monster(pm, mp, gs);
+            spawn_monster(ctx.pm, mp, gs);
         }
     }, true);
 
@@ -360,7 +355,7 @@ void server_init(Pm& pm) {
     // --- Broadcast game state via state sync ---
     net->bind_state_send(pm, STATE_ID_GAME, "state_send", Phase::NET_SEND, [gs, net](TaskContext& ctx, uint8_t* buf) -> uint16_t {
         if (!gs->started) return 0;
-        PktState pkt{PKT_STATE, net->net_frame, gs->time, gs->score, gs->kills, (uint8_t)ctx.is_paused(), gs->game_over, 0, gs->round};
+        PktState pkt{PKT_STATE, net->net_frame, gs->time, gs->score, gs->kills, (uint8_t)ctx.is_paused(), gs->game_over, 0, gs->round, {}};
         for (int i = 0; i < 4; i++) {
             auto* p = gs->players->get(gs->peer_ids[i]);
             if (p) { pkt.p[pkt.pcnt++] = {p->pos.x, p->pos.y, p->hp, (uint8_t)p->alive}; }

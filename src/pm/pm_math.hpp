@@ -20,7 +20,7 @@ struct Vec2 {
 	float x = 0, y = 0;
 
 	Vec2() = default;
-	Vec2(float x, float y) : x(x), y(y) {}
+	Vec2(float x_, float y_) : x(x_), y(y_) {}
 
 	Vec2 operator+(Vec2 o)  const { return {x + o.x, y + o.y}; }
 	Vec2 operator-(Vec2 o)  const { return {x - o.x, y - o.y}; }

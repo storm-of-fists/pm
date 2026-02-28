@@ -480,20 +480,17 @@ public:
 // =============================================================================
 // TaskContext — Task execution context
 //
-// Exposes the runtime API tasks need each frame. Intentionally omits
-// init-time operations (pool<T>, state<T>, schedule) to guide
-// users toward capturing pointers during init functions.
-//
-// For admin tasks (level loading, mod init), use ctx.pm() to escape.
+// Thin wrapper carrying per-frame state (dt, spawn, remove_entity, pause).
+// Pools and states should be captured at init time, not fetched per frame.
+// ctx.pm is public for admin tasks (level loading, mod init) that need
+// the full Pm API.
 // =============================================================================
 class Pm;
 class TaskContext
 {
-	Pm *owner;
 public:
-	explicit TaskContext(Pm &pm) : owner(&pm) {}
-
-	Pm &pm();
+	Pm &pm;
+	explicit TaskContext(Pm &pm_) : pm(pm_) {}
 
 	float dt() const;
 	uint64_t tick_count() const;
@@ -1027,20 +1024,19 @@ void Pool<T>::each_mut(F &&fn, Parallel p, uint32_t threads)
 // =============================================================================
 // TaskContext inline implementations
 // =============================================================================
-inline Pm &TaskContext::pm() { return *owner; }
-inline float TaskContext::dt() const { return owner->dt(); }
-inline uint64_t TaskContext::tick_count() const { return owner->tick_count(); }
-inline Id TaskContext::spawn() { return owner->spawn(); }
-inline void TaskContext::remove_entity(Id id) { owner->remove_entity(id); }
+inline float TaskContext::dt() const { return pm.dt(); }
+inline uint64_t TaskContext::tick_count() const { return pm.tick_count(); }
+inline Id TaskContext::spawn() { return pm.spawn(); }
+inline void TaskContext::remove_entity(Id id) { pm.remove_entity(id); }
 
-inline bool TaskContext::sync_id(Id id) { return owner->sync_id(id); }
-inline void TaskContext::quit() { owner->quit(); }
-inline bool TaskContext::is_running() const { return owner->is_running(); }
-inline bool TaskContext::is_paused() const { return owner->is_paused(); }
-inline void TaskContext::pause() { owner->pause(); }
-inline void TaskContext::resume() { owner->resume(); }
-inline void TaskContext::toggle_pause() { owner->toggle_pause(); }
-inline const std::vector<std::string> &TaskContext::faults() const { return owner->faults(); }
-inline bool TaskContext::stepping() const { return owner->stepping(); }
+inline bool TaskContext::sync_id(Id id) { return pm.sync_id(id); }
+inline void TaskContext::quit() { pm.quit(); }
+inline bool TaskContext::is_running() const { return pm.is_running(); }
+inline bool TaskContext::is_paused() const { return pm.is_paused(); }
+inline void TaskContext::pause() { pm.pause(); }
+inline void TaskContext::resume() { pm.resume(); }
+inline void TaskContext::toggle_pause() { pm.toggle_pause(); }
+inline const std::vector<std::string> &TaskContext::faults() const { return pm.faults(); }
+inline bool TaskContext::stepping() const { return pm.stepping(); }
 
 } // namespace pm

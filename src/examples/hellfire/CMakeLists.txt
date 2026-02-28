@@ -3,7 +3,6 @@ set(PM_INCLUDES
     ${CMAKE_SOURCE_DIR}/src/pm
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-set(PM_WARNINGS -Wall -Wextra -Wpedantic)
 
 # ── Server (no SDL) ──────────────────────────────────────────────────────────
 add_executable(hellfire_server hellfire_server.cpp)

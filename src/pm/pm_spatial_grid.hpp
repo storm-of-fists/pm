@@ -39,10 +39,10 @@ struct SpatialGrid {
 	// world_w / world_h — extent of the simulation space (pixels, units, etc.)
 	// cell_sz           — side length of one grid cell in the same units.
 	//                     Tune so that a typical query touches 1–4 cells.
-	SpatialGrid(float world_w, float world_h, int cell_sz = 64)
-		: cell_sz(cell_sz)
-		, cols(std::max(1, (int)std::ceil(world_w / (float)cell_sz)))
-		, rows(std::max(1, (int)std::ceil(world_h / (float)cell_sz)))
+	SpatialGrid(float world_w, float world_h, int csz = 64)
+		: cell_sz(csz)
+		, cols(std::max(1, (int)std::ceil(world_w / (float)csz)))
+		, rows(std::max(1, (int)std::ceil(world_h / (float)csz)))
 		, cells(cols * rows)
 	{}
 

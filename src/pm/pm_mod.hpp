@@ -15,7 +15,7 @@
 //   mods.watch(exe_dir() + "mods/my_mod.so");
 //   mods.load_all(pm);
 //   pm.schedule("mods/poll", Phase::INPUT - 5.f, [&mods](TaskContext& ctx) {
-//       mods.poll(ctx.pm());
+//       mods.poll(ctx.pm);
 //   });
 //   pm.run();
 //   mods.unload_all(pm);

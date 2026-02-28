@@ -2,31 +2,41 @@
   "version": 3,
   "configurePresets": [
     {
-      "name": "debug",
-      "displayName": "Debug",
+      "name": "dev",
+      "displayName": "Dev",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
     },
     {
-      "name": "release",
-      "displayName": "Release",
-      "binaryDir": "${sourceDir}/build-release",
+      "name": "asan",
+      "displayName": "ASan + UBSan",
+      "inherits": "dev",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON"
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "TSan",
+      "inherits": "dev",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-fsanitize=thread",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread"
       }
     }
   ],
   "buildPresets": [
-    { "name": "debug",   "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" }
+    { "name": "dev",  "configurePreset": "dev" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" }
   ],
   "testPresets": [
     {
-      "name": "debug",
-      "configurePreset": "debug",
+      "name": "dev",
+      "configurePreset": "dev",
       "output": { "verbosity": "verbose" }
     }
   ]
