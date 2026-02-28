@@ -1,12 +1,14 @@
-// bench.cpp — pm_core stress tests & benchmarks
+// bench.cpp — pm_core benchmarks as doctest TEST_CASEs with threshold checks.
 //
-// Measures ns/op for Pool, State, Entity, and integrated workloads.
-// No external dependencies — raw chrono timing + printf results.
-// Compiled into pm_tests — benchmarks run after all tests pass.
+// Each benchmark runs median-of-5 timing and CHECKs that ns/op stays
+// below 2x the historical max. Thresholds calibrated from latest.csv
+// on 20-core WSL (Ubuntu 24.04).
 //
-// Build: cmake --build build --target pm_tests
-// Run:   ./build/pm_tests
+// Run:   ./build/pm_tests -ts=bench
+// Skip:  ./build/pm_tests -tse=bench
 
+#include "doctest/doctest.h"
+#include "test_types.hpp"
 #include "pm_core.hpp"
 #include "pm_spatial_grid.hpp"
 #include "pm_math.hpp"
@@ -27,17 +29,15 @@ static constexpr int BENCH_ITERATIONS = 5;
 
 struct BenchResult
 {
-    std::string name;
+    const char* name;
     double median_ms;
     double max_ms;
     uint64_t ops;
     double ns_per_op;
 };
 
-static std::vector<BenchResult> g_results;
-
 template <typename F>
-void bench(const char *name, uint64_t ops, F &&fn)
+BenchResult bench(const char *name, uint64_t ops, F &&fn)
 {
     // Warmup
     fn();
@@ -58,12 +58,12 @@ void bench(const char *name, uint64_t ops, F &&fn)
 
     printf("  %-50s %8.2f ms  %10.1f ns/op  (max %.2f)\n",
            name, median, ns_op, max_ms);
-    g_results.push_back({name, median, max_ms, ops, ns_op});
+    return {name, median, max_ms, ops, ns_op};
 }
 
 // Overload for destructive operations: setup runs un-timed before each timed run.
 template <typename S, typename F>
-void bench(const char *name, uint64_t ops, S &&setup, F &&fn)
+BenchResult bench(const char *name, uint64_t ops, S &&setup, F &&fn)
 {
     // Warmup
     setup();
@@ -86,16 +86,109 @@ void bench(const char *name, uint64_t ops, S &&setup, F &&fn)
 
     printf("  %-50s %8.2f ms  %10.1f ns/op  (max %.2f)\n",
            name, median, ns_op, max_ms);
-    g_results.push_back({name, median, max_ms, ops, ns_op});
+    return {name, median, max_ms, ops, ns_op};
+}
+
+// =============================================================================
+// Thresholds — 2x historical max ns/op (from benchmarks/latest.csv)
+// =============================================================================
+
+namespace threshold {
+    // Pool: add
+    constexpr double POOL_ADD_10K           = 220.0;
+    constexpr double POOL_ADD_100K          = 136.0;
+    constexpr double POOL_ADD_OVERWRITE     = 18.0;
+    constexpr double POOL_ADD_BIG           = 1118.0;
+    // Pool: get
+    constexpr double POOL_GET_SEQ           = 5.2;
+    constexpr double POOL_GET_STALE         = 2.1;
+    constexpr double POOL_HAS               = 5.1;
+    // Pool: remove
+    constexpr double POOL_REMOVE_SWAP       = 10.0;
+    constexpr double POOL_REMOVE_20POOLS    = 147.0;
+    // Pool: each (read-only)
+    constexpr double EACH_TRIVIAL_SEQ       = 4.0;
+    constexpr double EACH_TRIVIAL_PAR       = 10.0;
+    constexpr double EACH_TRIG_SEQ          = 110.0;
+    constexpr double EACH_TRIG_PAR          = 22.0;
+    constexpr double EACH_256B_SEQ          = 1096.0;
+    constexpr double EACH_256B_PAR          = 89.0;
+    constexpr double EACH_JOIN_SEQ          = 9.5;
+    constexpr double EACH_JOIN_PAR          = 6.2;
+    constexpr double EACH_500K_TRIG_SEQ     = 14.0;
+    constexpr double EACH_500K_TRIG_PAR     = 3.0;
+    // Pool: each_mut (mutable)
+    constexpr double EACH_MUT_TRIV_SEQ      = 1.4;
+    constexpr double EACH_MUT_TRIV_PAR      = 11.1;
+    constexpr double EACH_MUT_PHYS_SEQ      = 24.2;
+    constexpr double EACH_MUT_PHYS_PAR      = 9.5;
+    constexpr double EACH_MUT_256B_SEQ      = 319.0;
+    constexpr double EACH_MUT_256B_PAR      = 156.0;
+    constexpr double EACH_MUT_JOIN_SEQ      = 36.0;
+    constexpr double EACH_MUT_JOIN_PAR      = 10.2;
+    constexpr double EACH_MUT_HOOK          = 2.4;
+    constexpr double EACH_MUT_500K_SEQ      = 24.0;
+    constexpr double EACH_MUT_500K_PAR      = 4.8;
+    // Pool: clear
+    constexpr double POOL_CLEAR             = 0.6;
+    // Pool: mixed
+    constexpr double POOL_MIXED             = 20.4;
+    // State
+    constexpr double STATE_FETCH            = 21.4;
+    constexpr double STATE_CREATE           = 312.0;
+    // Entity / kernel
+    constexpr double ID_ADD_10K             = 3.4;
+    constexpr double ID_ADD_100K            = 3.2;
+    constexpr double ID_ADD_REUSE           = 14.0;
+    constexpr double FLUSH_1POOL            = 8.9;
+    constexpr double FLUSH_8POOLS           = 76.3;
+    constexpr double FLUSH_20POOLS_SPARSE   = 54.8;
+    constexpr double ENTITY_CHURN           = 71.1;
+    // Integrated
+    constexpr double GAME_TICK              = 3.4;
+    constexpr double MULTI_ARCH             = 6.0;
+    constexpr double JOIN_50K_SEQ           = 4.2;
+    constexpr double JOIN_50K_PAR           = 22.5;
+    constexpr double JOIN_10K_SMALL         = 1.0;
+    constexpr double SUSTAINED_CHURN        = 103754.0;
+    // Spatial grid
+    constexpr double SPATIAL_INSERT_400     = 90.5;
+    constexpr double SPATIAL_INSERT_4K      = 40.0;
+    constexpr double SPATIAL_REBUILD_400    = 11.5;
+    constexpr double SPATIAL_QUERY_SMALL    = 62.2;
+    constexpr double SPATIAL_QUERY_LARGE    = 159.0;
+    constexpr double SPATIAL_FULL_FRAME     = 74.2;
+    // Bullet churn
+    constexpr double BULLET_CHURN_50        = 35.0;
+    constexpr double BULLET_CHURN_200       = 52.0;
+    constexpr double BULLET_PHYSICS         = 37.4;
+    // Monster AI
+    constexpr double MONSTER_AI_400_SEQ     = 21.5;
+    constexpr double MONSTER_AI_400_PAR     = 1288.0;
+    constexpr double MONSTER_AI_2000        = 27.5;
+    // Collision
+    constexpr double COLLISION_MID          = 60.0;
+    constexpr double COLLISION_PEAK         = 74.2;
+    constexpr double COLLISION_BRUTE        = 0.8;
+    // Server tick
+    constexpr double SERVER_TICK_L1         = 92.0;
+    constexpr double SERVER_TICK_L5         = 137.0;
+    constexpr double SERVER_TICK_30         = 39.0;
+    // PLC utils
+    constexpr double COOLDOWN               = 0.94;
+    constexpr double HYSTERESIS             = 1.82;
+    constexpr double RISING_EDGE            = 0.62;
+    constexpr double DELAY_TIMER            = 2.4;
+    constexpr double COUNTER                = 2.0;
+    // Multi-pool tick
+    constexpr double MULTI_POOL_TICK        = 53.6;
+    constexpr double MULTI_POOL_TICK_GRID   = 125.5;
 }
 
 // =============================================================================
 // Component types for benchmarks
 // =============================================================================
 
-struct Pos       { float x = 0, y = 0; };
-struct Vel       { float dx = 0, dy = 0; };
-struct Health    { int hp = 100; };
 struct Damage    { int dmg = 10; };
 struct Sprite    { uint32_t tex_id = 0; float u = 0, v = 0, w = 16, h = 16; };
 struct Cooldown  { float remaining = 0; };
@@ -107,16 +200,26 @@ struct BMonster  { pm::Vec2 pos, vel; float shoot_timer = 0, size = 12; };
 struct BBullet   { pm::Vec2 pos, vel; float lifetime = 1.5f, size = 4; bool player_owned = true; };
 struct BPlayer   { pm::Vec2 pos; float hp = 100, cooldown = 0, invuln = 0; bool alive = true; };
 
-// =============================================================================
-// POOL BENCHMARKS
-// =============================================================================
-
-void bench_pool_add()
+// Helper to prevent compiler from optimizing away a value
+template <typename T>
+static void do_not_optimize(T const &val)
 {
-    printf("\n--- Pool: add ---\n");
+    asm volatile("" : : "r,m"(val) : "memory");
+}
 
-    // 10k adds to empty pool
-    bench("pool add 10k", 10000, []() {
+// State types for state benchmarks
+struct GameConfig  { int width = 800, height = 600; float fov = 90; };
+
+// =============================================================================
+// BENCHMARKS
+// =============================================================================
+
+TEST_SUITE("bench") {
+
+// --- Pool: add ---
+
+TEST_CASE("pool add") {
+    auto r1 = bench("pool add 10k", 10000, []() {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
         for (int i = 0; i < 10000; i++)
@@ -125,9 +228,9 @@ void bench_pool_add()
             pool->add(id, {static_cast<float>(i), static_cast<float>(i)});
         }
     });
+    CHECK(r1.ns_per_op < threshold::POOL_ADD_10K);
 
-    // 100k adds
-    bench("pool add 100k", 100000, []() {
+    auto r2 = bench("pool add 100k", 100000, []() {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
         for (int i = 0; i < 100000; i++)
@@ -136,6 +239,7 @@ void bench_pool_add()
             pool->add(id, {static_cast<float>(i), static_cast<float>(i)});
         }
     });
+    CHECK(r2.ns_per_op < threshold::POOL_ADD_100K);
 
     // add overwrite (entity already in pool)
     {
@@ -149,14 +253,14 @@ void bench_pool_add()
             pool->add(id, {0, 0});
             ids.push_back(id);
         }
-        bench("pool add overwrite 10k", 10000, [&]() {
+        auto r3 = bench("pool add overwrite 10k", 10000, [&]() {
             for (int i = 0; i < 10000; i++)
                 pool->add(ids[static_cast<size_t>(i)], {static_cast<float>(i), static_cast<float>(i)});
         });
+        CHECK(r3.ns_per_op < threshold::POOL_ADD_OVERWRITE);
     }
 
-    // add with big component (cache pressure)
-    bench("pool add 10k (256B component)", 10000, []() {
+    auto r4 = bench("pool add 10k (256B component)", 10000, []() {
         pm::Pm pm;
         auto *pool = pm.pool_get<BigComp>("big");
         for (int i = 0; i < 10000; i++)
@@ -167,13 +271,12 @@ void bench_pool_add()
             pool->add(id, c);
         }
     });
+    CHECK(r4.ns_per_op < threshold::POOL_ADD_BIG);
 }
 
-void bench_pool_get()
-{
-    printf("\n--- Pool: get ---\n");
+// --- Pool: get ---
 
-    // Setup: 10k entities in pool, then benchmark random access
+TEST_CASE("pool get") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
     std::vector<pm::Id> ids;
@@ -185,7 +288,7 @@ void bench_pool_get()
         ids.push_back(id);
     }
 
-    bench("pool get 10k (sequential)", 10000, [&]() {
+    auto r1 = bench("pool get 10k (sequential)", 10000, [&]() {
         float sum = 0;
         for (auto id : ids)
         {
@@ -194,6 +297,7 @@ void bench_pool_get()
         }
         assert(sum > 0);
     });
+    CHECK(r1.ns_per_op < threshold::POOL_GET_SEQ);
 
     // get with stale ids (should return nullptr)
     pm::Pm pm2;
@@ -206,12 +310,11 @@ void bench_pool_get()
         pool2->add(id, {static_cast<float>(i), 0});
         stale_ids.push_back(id);
     }
-    // Remove all, making ids stale
     for (auto id : stale_ids)
         pm2.id_remove(id);
     pm2.id_process_removes();
 
-    bench("pool get 10k (stale ids — all miss)", 10000, [&]() {
+    auto r2 = bench("pool get 10k (stale ids — all miss)", 10000, [&]() {
         int misses = 0;
         for (auto id : stale_ids)
         {
@@ -219,8 +322,9 @@ void bench_pool_get()
         }
         assert(misses == 10000);
     });
+    CHECK(r2.ns_per_op < threshold::POOL_GET_STALE);
 
-    bench("pool has 10k", 10000, [&]() {
+    auto r3 = bench("pool has 10k", 10000, [&]() {
         int hits = 0;
         for (auto id : ids)
         {
@@ -228,12 +332,12 @@ void bench_pool_get()
         }
         assert(hits == 10000);
     });
+    CHECK(r3.ns_per_op < threshold::POOL_HAS);
 }
 
-void bench_pool_remove()
-{
-    printf("\n--- Pool: remove ---\n");
+// --- Pool: remove ---
 
+TEST_CASE("pool remove") {
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
@@ -245,9 +349,8 @@ void bench_pool_remove()
             pool->add(id, {static_cast<float>(i), 0});
             ids.push_back(id);
         }
-        bench("pool remove 10k (swap-and-pop)", 10000,
+        auto r1 = bench("pool remove 10k (swap-and-pop)", 10000,
             [&]() {
-                // Re-add all entities to pool
                 for (auto id : ids)
                     pool->add(id, {0, 0});
             },
@@ -255,6 +358,7 @@ void bench_pool_remove()
                 for (auto id : ids)
                     pool->remove(id);
             });
+        CHECK(r1.ns_per_op < threshold::POOL_REMOVE_SWAP);
     }
 
     {
@@ -267,6 +371,7 @@ void bench_pool_remove()
         auto *cd      = pm.pool_get<Cooldown>("cd");
         auto *team    = pm.pool_get<Team>("team");
         auto *big     = pm.pool_get<BigComp>("big");
+
         // Create 12 more pools (empty, but present in pool_by_id for broadcast)
         pm.pool_get<Pos>("pos2");  pm.pool_get<Pos>("pos3");  pm.pool_get<Pos>("pos4");
         pm.pool_get<Pos>("pos5");  pm.pool_get<Pos>("pos6");  pm.pool_get<Pos>("pos7");
@@ -276,9 +381,8 @@ void bench_pool_remove()
         std::vector<pm::Id> ids;
         ids.reserve(10000);
 
-        bench("pool remove 10k via id_process_removes (20 pools)", 10000,
+        auto r2 = bench("pool remove 10k via id_process_removes (20 pools)", 10000,
             [&]() {
-                // Re-spawn + populate (flush bumps generation, so need fresh ids)
                 ids.clear();
                 for (int i = 0; i < 10000; i++)
                 {
@@ -299,21 +403,14 @@ void bench_pool_remove()
             [&]() {
                 pm.id_process_removes();
             });
+        CHECK(r2.ns_per_op < threshold::POOL_REMOVE_20POOLS);
     }
 }
 
-// Helper to prevent compiler from optimizing away a value
-template <typename T>
-static void do_not_optimize(T const &val)
-{
-    asm volatile("" : : "r,m"(val) : "memory");
-}
+// --- Pool: each (read-only) ---
 
-void bench_pool_each()
-{
-    printf("\n--- Pool: each (read-only) ---\n");
-
-    // --- Trivial work (baseline) ---
+TEST_CASE("pool each") {
+    // Trivial work (baseline)
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
@@ -323,18 +420,20 @@ void bench_pool_each()
             pool->add(id, {static_cast<float>(i), static_cast<float>(i)});
         }
 
-        bench("each 100k trivial (seq)", 100000, [&]() {
+        auto r1 = bench("each 100k trivial (seq)", 100000, [&]() {
             float sum = 0;
             pool->each([&](const Pos &p) { sum += p.x; }, pm::Parallel::Off);
             do_not_optimize(sum);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_TRIVIAL_SEQ);
 
-        bench("each 100k trivial (parallel)", 100000, [&]() {
+        auto r2 = bench("each 100k trivial (parallel)", 100000, [&]() {
             pool->each([](const Pos &p) { do_not_optimize(p.x); }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_TRIVIAL_PAR);
     }
 
-    // --- Medium work: trig per element (sqrtf + sinf + cosf) ---
+    // Medium work: trig per element
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
@@ -344,7 +443,7 @@ void bench_pool_each()
             pool->add(id, {static_cast<float>(i) * 0.01f, static_cast<float>(i) * 0.02f});
         }
 
-        bench("each 100k trig (seq)", 100000, [&]() {
+        auto r1 = bench("each 100k trig (seq)", 100000, [&]() {
             pool->each([](const Pos &p) {
                 float d = sqrtf(p.x * p.x + p.y * p.y);
                 float a = atan2f(p.y, p.x);
@@ -352,8 +451,9 @@ void bench_pool_each()
                 do_not_optimize(r);
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_TRIG_SEQ);
 
-        bench("each 100k trig (parallel)", 100000, [&]() {
+        auto r2 = bench("each 100k trig (parallel)", 100000, [&]() {
             pool->each([](const Pos &p) {
                 float d = sqrtf(p.x * p.x + p.y * p.y);
                 float a = atan2f(p.y, p.x);
@@ -361,9 +461,10 @@ void bench_pool_each()
                 do_not_optimize(r);
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_TRIG_PAR);
     }
 
-    // --- Heavy work: 256B component, read all 64 floats per element ---
+    // Heavy work: 256B component
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<BigComp>("big");
@@ -376,7 +477,7 @@ void bench_pool_each()
             pool->add(id, c);
         }
 
-        bench("each 100k 256B read-all (seq)", 100000, [&]() {
+        auto r1 = bench("each 100k 256B read-all (seq)", 100000, [&]() {
             pool->each([](const BigComp &c) {
                 float sum = 0;
                 for (int j = 0; j < 64; j++)
@@ -384,8 +485,9 @@ void bench_pool_each()
                 do_not_optimize(sum);
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_256B_SEQ);
 
-        bench("each 100k 256B read-all (parallel)", 100000, [&]() {
+        auto r2 = bench("each 100k 256B read-all (parallel)", 100000, [&]() {
             pool->each([](const BigComp &c) {
                 float sum = 0;
                 for (int j = 0; j < 64; j++)
@@ -393,9 +495,10 @@ void bench_pool_each()
                 do_not_optimize(sum);
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_256B_PAR);
     }
 
-    // --- Cross-pool join: iterate pos, lookup vel + health ---
+    // Cross-pool join
     {
         pm::Pm pm;
         auto *pos = pm.pool_get<Pos>("pos");
@@ -409,7 +512,7 @@ void bench_pool_each()
             if (i % 3 == 0) hp->add(id, {100 + i % 50});
         }
 
-        bench("each 100k join 2 pools + branch (seq)", 100000, [&]() {
+        auto r1 = bench("each 100k join 2 pools + branch (seq)", 100000, [&]() {
             pos->each([&](pm::Id id, const Pos &p) {
                 auto *v = vel->get(id);
                 auto *h = hp->get(id);
@@ -419,8 +522,9 @@ void bench_pool_each()
                 do_not_optimize(r);
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_JOIN_SEQ);
 
-        bench("each 100k join 2 pools + branch (parallel)", 100000, [&]() {
+        auto r2 = bench("each 100k join 2 pools + branch (parallel)", 100000, [&]() {
             pos->each([&](pm::Id id, const Pos &p) {
                 auto *v = vel->get(id);
                 auto *h = hp->get(id);
@@ -430,9 +534,10 @@ void bench_pool_each()
                 do_not_optimize(r);
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_JOIN_PAR);
     }
 
-    // --- Scale test: 500k with medium work ---
+    // Scale: 500k
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
@@ -442,29 +547,30 @@ void bench_pool_each()
             pool->add(id, {static_cast<float>(i) * 0.01f, static_cast<float>(i) * 0.02f});
         }
 
-        bench("each 500k trig (seq)", 500000, [&]() {
+        auto r1 = bench("each 500k trig (seq)", 500000, [&]() {
             pool->each([](const Pos &p) {
                 float d = sqrtf(p.x * p.x + p.y * p.y);
                 float r = sinf(d) * cosf(d);
                 do_not_optimize(r);
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_500K_TRIG_SEQ);
 
-        bench("each 500k trig (parallel)", 500000, [&]() {
+        auto r2 = bench("each 500k trig (parallel)", 500000, [&]() {
             pool->each([](const Pos &p) {
                 float d = sqrtf(p.x * p.x + p.y * p.y);
                 float r = sinf(d) * cosf(d);
                 do_not_optimize(r);
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_500K_TRIG_PAR);
     }
 }
 
-void bench_pool_each_mut()
-{
-    printf("\n--- Pool: each_mut (mutable) ---\n");
+// --- Pool: each_mut (mutable) ---
 
-    // --- Trivial work (baseline) ---
+TEST_CASE("pool each_mut") {
+    // Trivial work
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
@@ -474,16 +580,18 @@ void bench_pool_each_mut()
             pool->add(id, {static_cast<float>(i), static_cast<float>(i)});
         }
 
-        bench("each_mut 100k trivial (seq)", 100000, [&]() {
+        auto r1 = bench("each_mut 100k trivial (seq)", 100000, [&]() {
             pool->each_mut([](Pos &p) { p.x += 1.0f; }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_MUT_TRIV_SEQ);
 
-        bench("each_mut 100k trivial (parallel)", 100000, [&]() {
+        auto r2 = bench("each_mut 100k trivial (parallel)", 100000, [&]() {
             pool->each_mut([](Pos &p) { p.x += 1.0f; }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_MUT_TRIV_PAR);
     }
 
-    // --- Medium work: physics-style update with trig ---
+    // Physics sim
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
@@ -493,18 +601,18 @@ void bench_pool_each_mut()
             pool->add(id, {static_cast<float>(i) * 0.1f, static_cast<float>(i) * 0.05f});
         }
 
-        bench("each_mut 100k physics sim (seq)", 100000, [&]() {
+        auto r1 = bench("each_mut 100k physics sim (seq)", 100000, [&]() {
             pool->each_mut([](Pos &p) {
                 float angle = atan2f(p.y, p.x);
                 float dist = sqrtf(p.x * p.x + p.y * p.y);
-                // Orbit: rotate position around origin
                 angle += 0.01f;
                 p.x = cosf(angle) * dist;
                 p.y = sinf(angle) * dist;
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_MUT_PHYS_SEQ);
 
-        bench("each_mut 100k physics sim (parallel)", 100000, [&]() {
+        auto r2 = bench("each_mut 100k physics sim (parallel)", 100000, [&]() {
             pool->each_mut([](Pos &p) {
                 float angle = atan2f(p.y, p.x);
                 float dist = sqrtf(p.x * p.x + p.y * p.y);
@@ -513,9 +621,10 @@ void bench_pool_each_mut()
                 p.y = sinf(angle) * dist;
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_MUT_PHYS_PAR);
     }
 
-    // --- Heavy work: 256B component, transform all 64 floats ---
+    // 256B transform
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<BigComp>("big");
@@ -528,22 +637,24 @@ void bench_pool_each_mut()
             pool->add(id, c);
         }
 
-        bench("each_mut 100k 256B transform (seq)", 100000, [&]() {
+        auto r1 = bench("each_mut 100k 256B transform (seq)", 100000, [&]() {
             pool->each_mut([](BigComp &c) {
                 for (int j = 0; j < 64; j++)
                     c.data[j] = sinf(c.data[j]) * 0.99f + 0.01f;
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_MUT_256B_SEQ);
 
-        bench("each_mut 100k 256B transform (parallel)", 100000, [&]() {
+        auto r2 = bench("each_mut 100k 256B transform (parallel)", 100000, [&]() {
             pool->each_mut([](BigComp &c) {
                 for (int j = 0; j < 64; j++)
                     c.data[j] = sinf(c.data[j]) * 0.99f + 0.01f;
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_MUT_256B_PAR);
     }
 
-    // --- Cross-pool mutable join: iterate pos, write with vel lookup ---
+    // Cross-pool join
     {
         pm::Pm pm;
         auto *pos = pm.pool_get<Pos>("pos");
@@ -555,7 +666,7 @@ void bench_pool_each_mut()
             vel->add(id, {sinf(static_cast<float>(i)), cosf(static_cast<float>(i))});
         }
 
-        bench("each_mut 100k join + physics (seq)", 100000, [&]() {
+        auto r1 = bench("each_mut 100k join + physics (seq)", 100000, [&]() {
             pos->each_mut([&](pm::Id id, Pos &p) {
                 auto *v = vel->get(id);
                 if (v)
@@ -567,8 +678,9 @@ void bench_pool_each_mut()
                 }
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_MUT_JOIN_SEQ);
 
-        bench("each_mut 100k join + physics (parallel)", 100000, [&]() {
+        auto r2 = bench("each_mut 100k join + physics (parallel)", 100000, [&]() {
             pos->each_mut([&](pm::Id id, Pos &p) {
                 auto *v = vel->get(id);
                 if (v)
@@ -580,9 +692,10 @@ void bench_pool_each_mut()
                 }
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_MUT_JOIN_PAR);
     }
 
-    // --- Change hook overhead ---
+    // Change hook overhead
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
@@ -597,16 +710,17 @@ void bench_pool_each_mut()
             (*static_cast<int *>(ctx))++;
         }, &hook_count);
 
-        bench("each_mut 100k with change hook", 100000, [&]() {
+        auto r = bench("each_mut 100k with change hook", 100000, [&]() {
             hook_count = 0;
             pool->each_mut([](Pos &p) { p.x += 1.0f; });
             assert(hook_count == 100000);
         });
+        CHECK(r.ns_per_op < threshold::EACH_MUT_HOOK);
 
         pool->set_change_hook(nullptr, nullptr);
     }
 
-    // --- Scale: 500k with physics ---
+    // Scale: 500k
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
@@ -616,7 +730,7 @@ void bench_pool_each_mut()
             pool->add(id, {static_cast<float>(i) * 0.1f, static_cast<float>(i) * 0.05f});
         }
 
-        bench("each_mut 500k physics sim (seq)", 500000, [&]() {
+        auto r1 = bench("each_mut 500k physics sim (seq)", 500000, [&]() {
             pool->each_mut([](Pos &p) {
                 float angle = atan2f(p.y, p.x);
                 float dist = sqrtf(p.x * p.x + p.y * p.y);
@@ -625,8 +739,9 @@ void bench_pool_each_mut()
                 p.y = sinf(angle) * dist;
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::EACH_MUT_500K_SEQ);
 
-        bench("each_mut 500k physics sim (parallel)", 500000, [&]() {
+        auto r2 = bench("each_mut 500k physics sim (parallel)", 500000, [&]() {
             pool->each_mut([](Pos &p) {
                 float angle = atan2f(p.y, p.x);
                 float dist = sqrtf(p.x * p.x + p.y * p.y);
@@ -635,43 +750,40 @@ void bench_pool_each_mut()
                 p.y = sinf(angle) * dist;
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::EACH_MUT_500K_PAR);
     }
 }
 
-void bench_pool_clear()
-{
-    printf("\n--- Pool: clear_all ---\n");
+// --- Pool: clear ---
 
-    {
-        pm::Pm pm;
-        auto *pool = pm.pool_get<Pos>("pos");
-        std::vector<pm::Id> ids;
-        ids.reserve(100000);
-        for (int i = 0; i < 100000; i++)
-            ids.push_back(pm.id_add());
+TEST_CASE("pool clear") {
+    pm::Pm pm;
+    auto *pool = pm.pool_get<Pos>("pos");
+    std::vector<pm::Id> ids;
+    ids.reserve(100000);
+    for (int i = 0; i < 100000; i++)
+        ids.push_back(pm.id_add());
 
-        bench("pool clear_all 100k", 100000,
-            [&]() {
-                for (int i = 0; i < 100000; i++)
-                    pool->add(ids[static_cast<size_t>(i)], {static_cast<float>(i), 0});
-            },
-            [&]() {
-                pool->clear_all();
-            });
-    }
+    auto r = bench("pool clear_all 100k", 100000,
+        [&]() {
+            for (int i = 0; i < 100000; i++)
+                pool->add(ids[static_cast<size_t>(i)], {static_cast<float>(i), 0});
+        },
+        [&]() {
+            pool->clear_all();
+        });
+    CHECK(r.ns_per_op < threshold::POOL_CLEAR);
 }
 
-void bench_pool_mixed()
-{
-    printf("\n--- Pool: mixed add/get/remove ---\n");
+// --- Pool: mixed ---
 
-    bench("pool mixed ops 10k (add, get, remove interleaved)", 30000, []() {
+TEST_CASE("pool mixed ops") {
+    auto r = bench("pool mixed ops 10k (add, get, remove interleaved)", 30000, []() {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
         std::vector<pm::Id> ids;
         ids.reserve(10000);
 
-        // Phase 1: add 10k
         for (int i = 0; i < 10000; i++)
         {
             pm::Id id = pm.id_add();
@@ -679,7 +791,6 @@ void bench_pool_mixed()
             ids.push_back(id);
         }
 
-        // Phase 2: get all 10k
         float sum = 0;
         for (auto id : ids)
         {
@@ -688,27 +799,18 @@ void bench_pool_mixed()
         }
         assert(sum > 0);
 
-        // Phase 3: remove all 10k via deferred
         for (auto id : ids)
             pm.id_remove(id);
         pm.id_process_removes();
         assert(pool->size() == 0);
     });
+    CHECK(r.ns_per_op < threshold::POOL_MIXED);
 }
 
-// =============================================================================
-// STATE BENCHMARKS
-// =============================================================================
+// --- State ---
 
-struct GameConfig  { int width = 800, height = 600; float fov = 90; };
-struct PhysicsCfg  { float gravity = -9.8f; float friction = 0.3f; };
-struct NetConfig   { uint16_t port = 9999; int max_peers = 32; };
-
-void bench_state()
-{
-    printf("\n--- State ---\n");
-
-    bench("state fetch 10k (same state, repeated)", 10000, []() {
+TEST_CASE("state") {
+    auto r1 = bench("state fetch 10k (same state, repeated)", 10000, []() {
         pm::Pm pm;
         auto *cfg = pm.state_get<GameConfig>("config");
         cfg->width = 1920;
@@ -718,8 +820,9 @@ void bench_state()
             assert(c->width == 1920);
         }
     });
+    CHECK(r1.ns_per_op < threshold::STATE_FETCH);
 
-    bench("state create 100 distinct states", 100, []() {
+    auto r2 = bench("state create 100 distinct states", 100, []() {
         pm::Pm pm;
         char buf[32];
         for (int i = 0; i < 100; i++)
@@ -729,27 +832,25 @@ void bench_state()
             s->width = i;
         }
     });
+    CHECK(r2.ns_per_op < threshold::STATE_CREATE);
 }
 
-// =============================================================================
-// ENTITY / KERNEL BENCHMARKS
-// =============================================================================
+// --- Entity: id_add ---
 
-void bench_id_add()
-{
-    printf("\n--- Entity: id_add ---\n");
-
-    bench("id_add10k", 10000, []() {
+TEST_CASE("id_add") {
+    auto r1 = bench("id_add10k", 10000, []() {
         pm::Pm pm;
         for (int i = 0; i < 10000; i++)
             pm.id_add();
     });
+    CHECK(r1.ns_per_op < threshold::ID_ADD_10K);
 
-    bench("id_add100k", 100000, []() {
+    auto r2 = bench("id_add100k", 100000, []() {
         pm::Pm pm;
         for (int i = 0; i < 100000; i++)
             pm.id_add();
     });
+    CHECK(r2.ns_per_op < threshold::ID_ADD_100K);
 
     // Spawn with free-list reuse
     {
@@ -759,33 +860,32 @@ void bench_id_add()
         for (int i = 0; i < 10000; i++)
             ids.push_back(pm.id_add());
 
-        bench("id_add10k after remove (free-list reuse)", 10000,
+        auto r3 = bench("id_add10k after remove (free-list reuse)", 10000,
             [&]() {
                 for (auto id : ids)
                     pm.id_remove(id);
                 pm.id_process_removes();
             },
             [&]() {
-                // Spawn again — should reuse free slots
                 ids.clear();
                 for (int i = 0; i < 10000; i++)
                     ids.push_back(pm.id_add());
             });
+        CHECK(r3.ns_per_op < threshold::ID_ADD_REUSE);
     }
 }
 
-void bench_flush()
-{
-    printf("\n--- Entity: id_process_removes ---\n");
+// --- Entity: id_process_removes ---
 
-    // flush with 1 pool
+TEST_CASE("flush") {
+    // 1 pool
     {
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
         std::vector<pm::Id> ids;
         ids.reserve(10000);
 
-        bench("flush 10k removes (1 pool)", 10000,
+        auto r = bench("flush 10k removes (1 pool)", 10000,
             [&]() {
                 ids.clear();
                 for (int i = 0; i < 10000; i++)
@@ -800,9 +900,10 @@ void bench_flush()
             [&]() {
                 pm.id_process_removes();
             });
+        CHECK(r.ns_per_op < threshold::FLUSH_1POOL);
     }
 
-    // flush with 8 pools
+    // 8 pools
     {
         pm::Pm pm;
         auto *p1 = pm.pool_get<Pos>("pos");
@@ -817,7 +918,7 @@ void bench_flush()
         std::vector<pm::Id> ids;
         ids.reserve(10000);
 
-        bench("flush 10k removes (8 pools)", 10000,
+        auto r = bench("flush 10k removes (8 pools)", 10000,
             [&]() {
                 ids.clear();
                 for (int i = 0; i < 10000; i++)
@@ -839,15 +940,15 @@ void bench_flush()
             [&]() {
                 pm.id_process_removes();
             });
+        CHECK(r.ns_per_op < threshold::FLUSH_8POOLS);
     }
 
-    // flush with many pools but sparse membership
+    // 20 pools, sparse
     {
         pm::Pm pm;
         auto *pos  = pm.pool_get<Pos>("pos");
         auto *vel  = pm.pool_get<Vel>("vel");
         auto *hp   = pm.pool_get<Health>("hp");
-        // 17 empty pools that still get the broadcast
         pm.pool_get<Pos>("e1");  pm.pool_get<Pos>("e2");  pm.pool_get<Pos>("e3");
         pm.pool_get<Pos>("e4");  pm.pool_get<Pos>("e5");  pm.pool_get<Pos>("e6");
         pm.pool_get<Pos>("e7");  pm.pool_get<Pos>("e8");  pm.pool_get<Pos>("e9");
@@ -858,7 +959,7 @@ void bench_flush()
         std::vector<pm::Id> ids;
         ids.reserve(1000);
 
-        bench("flush 1k removes (20 pools, 3 populated)", 1000,
+        auto r = bench("flush 1k removes (20 pools, 3 populated)", 1000,
             [&]() {
                 ids.clear();
                 for (int i = 0; i < 1000; i++)
@@ -875,14 +976,14 @@ void bench_flush()
             [&]() {
                 pm.id_process_removes();
             });
+        CHECK(r.ns_per_op < threshold::FLUSH_20POOLS_SPARSE);
     }
 }
 
-void bench_entity_churn()
-{
-    printf("\n--- Entity: churn (spawn/remove cycles) ---\n");
+// --- Entity: churn ---
 
-    bench("entity churn 10k (spawn, add 3 components, remove, repeat)", 10000, []() {
+TEST_CASE("entity churn") {
+    auto r = bench("entity churn 10k (spawn, add 3 components, remove, repeat)", 10000, []() {
         pm::Pm pm;
         auto *pos = pm.pool_get<Pos>("pos");
         auto *vel = pm.pool_get<Vel>("vel");
@@ -895,174 +996,142 @@ void bench_entity_churn()
             vel->add(id, {1, 1});
             hp->add(id, {100});
             pm.id_remove(id);
-            // Flush every 100 to keep deferred queue bounded
             if (i % 100 == 99)
                 pm.id_process_removes();
         }
         pm.id_process_removes();
         assert(pos->size() == 0);
     });
+    CHECK(r.ns_per_op < threshold::ENTITY_CHURN);
 }
 
-// =============================================================================
-// INTEGRATED BENCHMARKS — simulated game workloads
-// =============================================================================
+// --- Integrated: game tick ---
 
-void bench_integrated_game_tick()
-{
-    printf("\n--- Integrated: simulated game tick ---\n");
-
-    // Simulate: 5000 entities with Pos+Vel, 500 with Health,
-    // iterate all for physics, check collisions via get()
-    {
-        pm::Pm pm;
-        auto *pos = pm.pool_get<Pos>("pos");
-        auto *vel = pm.pool_get<Vel>("vel");
-        auto *hp  = pm.pool_get<Health>("hp");
-
-        for (int i = 0; i < 5000; i++)
-        {
-            pm::Id id = pm.id_add();
-            pos->add(id, {static_cast<float>(i % 100), static_cast<float>(i / 100)});
-            vel->add(id, {1.0f, 0.5f});
-            if (i < 500) hp->add(id, {100});
-        }
-
-        float dt = 0.016f;
-
-        bench("game tick: 5k physics + 500 health checks", 5500, [&]() {
-            // Physics: iterate pos+vel
-            pos->each_mut([&](pm::Id id, Pos &p) {
-                auto *v = vel->get(id);
-                if (v)
-                {
-                    p.x += v->dx * dt;
-                    p.y += v->dy * dt;
-                }
-            }, pm::Parallel::Off);
-
-            // Health check: iterate health, get pos for range check
-            hp->each([&](pm::Id id, const Health &h) {
-                (void)h;
-                auto *p = pos->get(id);
-                if (p && p->x > 50.0f)
-                {
-                    // Would apply damage — just read for benchmark
-                }
-            }, pm::Parallel::Off);
-        });
-    }
-}
-
-void bench_integrated_multi_archetype()
-{
-    printf("\n--- Integrated: multi-archetype world ---\n");
-
-    // Simulate a world with different entity archetypes:
-    // - Players (Pos, Vel, Health, Team): 100
-    // - Bullets (Pos, Vel, Damage, Cooldown): 2000
-    // - Monsters (Pos, Health, Sprite, Team): 500
-    // - Pickups (Pos, Sprite): 200
-    // - Walls (Pos, BigComp): 300
-    {
-        pm::Pm pm;
-        auto *pos  = pm.pool_get<Pos>("pos");
-        auto *vel  = pm.pool_get<Vel>("vel");
-        auto *hp   = pm.pool_get<Health>("hp");
-        auto *dmg  = pm.pool_get<Damage>("dmg");
-        auto *spr  = pm.pool_get<Sprite>("spr");
-        auto *cd   = pm.pool_get<Cooldown>("cd");
-        auto *team = pm.pool_get<Team>("team");
-        auto *big  = pm.pool_get<BigComp>("big");
-
-        // Spawn players
-        for (int i = 0; i < 100; i++)
-        {
-            pm::Id id = pm.id_add();
-            pos->add(id, {static_cast<float>(i * 10), 0});
-            vel->add(id, {0, 0});
-            hp->add(id, {200});
-            team->add(id, {static_cast<uint8_t>(i % 2)});
-        }
-
-        // Spawn bullets
-        std::vector<pm::Id> bullet_ids;
-        bullet_ids.reserve(2000);
-        for (int i = 0; i < 2000; i++)
-        {
-            pm::Id id = pm.id_add();
-            pos->add(id, {static_cast<float>(i), static_cast<float>(i % 50)});
-            vel->add(id, {10.0f, 0});
-            dmg->add(id, {25});
-            cd->add(id, {1.0f});
-            bullet_ids.push_back(id);
-        }
-
-        // Spawn monsters
-        for (int i = 0; i < 500; i++)
-        {
-            pm::Id id = pm.id_add();
-            pos->add(id, {static_cast<float>(i * 5), static_cast<float>(i * 2)});
-            hp->add(id, {150});
-            spr->add(id, {1, 0, 0, 32, 32});
-            team->add(id, {2});
-        }
-
-        // Spawn pickups
-        for (int i = 0; i < 200; i++)
-        {
-            pm::Id id = pm.id_add();
-            pos->add(id, {static_cast<float>(i * 20), 100});
-            spr->add(id, {2, 0, 0, 16, 16});
-        }
-
-        // Spawn walls
-        for (int i = 0; i < 300; i++)
-        {
-            pm::Id id = pm.id_add();
-            pos->add(id, {static_cast<float>(i * 3), 0});
-            big->add(id);
-        }
-
-        float dt = 0.016f;
-
-        bench("multi-archetype: 3100 entities, 8 pools, tick sim", 3100, [&]() {
-            // Tick 1: Move all entities with velocity
-            pos->each_mut([&](pm::Id id, Pos &p) {
-                auto *v = vel->get(id);
-                if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
-            }, pm::Parallel::Off);
-
-            // Tick 2: Decay cooldowns
-            cd->each_mut([&](Cooldown &c) {
-                c.remaining -= dt;
-                if (c.remaining < 0) c.remaining = 0;
-            }, pm::Parallel::Off);
-
-            // Tick 3: Bullet lifetime check (no removes — cooldown >> dt)
-            for (auto bid : bullet_ids)
-            {
-                auto *c = cd->get(bid);
-                if (c && c->remaining <= 0)
-                    pm.id_remove(bid);
-            }
-
-            pm.id_process_removes();
-        });
-    }
-}
-
-void bench_integrated_heavy_iteration()
-{
-    printf("\n--- Integrated: heavy iteration (join pattern) ---\n");
-
-    // Common pattern: iterate pool A, lookup pool B for each entity
+TEST_CASE("integrated game tick") {
     pm::Pm pm;
     auto *pos = pm.pool_get<Pos>("pos");
     auto *vel = pm.pool_get<Vel>("vel");
     auto *hp  = pm.pool_get<Health>("hp");
 
-    // 50k entities with pos+vel, 10k also have health
+    for (int i = 0; i < 5000; i++)
+    {
+        pm::Id id = pm.id_add();
+        pos->add(id, {static_cast<float>(i % 100), static_cast<float>(i / 100)});
+        vel->add(id, {1.0f, 0.5f});
+        if (i < 500) hp->add(id, {100});
+    }
+
+    float dt = 0.016f;
+
+    auto r = bench("game tick: 5k physics + 500 health checks", 5500, [&]() {
+        pos->each_mut([&](pm::Id id, Pos &p) {
+            auto *v = vel->get(id);
+            if (v)
+            {
+                p.x += v->dx * dt;
+                p.y += v->dy * dt;
+            }
+        }, pm::Parallel::Off);
+
+        hp->each([&](pm::Id id, const Health &h) {
+            (void)h;
+            auto *p = pos->get(id);
+            if (p && p->x > 50.0f) {}
+        }, pm::Parallel::Off);
+    });
+    CHECK(r.ns_per_op < threshold::GAME_TICK);
+}
+
+// --- Integrated: multi-archetype ---
+
+TEST_CASE("integrated multi-archetype") {
+    pm::Pm pm;
+    auto *pos  = pm.pool_get<Pos>("pos");
+    auto *vel  = pm.pool_get<Vel>("vel");
+    auto *hp   = pm.pool_get<Health>("hp");
+    auto *dmg  = pm.pool_get<Damage>("dmg");
+    auto *spr  = pm.pool_get<Sprite>("spr");
+    auto *cd   = pm.pool_get<Cooldown>("cd");
+    auto *team = pm.pool_get<Team>("team");
+    auto *big  = pm.pool_get<BigComp>("big");
+
+    for (int i = 0; i < 100; i++)
+    {
+        pm::Id id = pm.id_add();
+        pos->add(id, {static_cast<float>(i * 10), 0});
+        vel->add(id, {0, 0});
+        hp->add(id, {200});
+        team->add(id, {static_cast<uint8_t>(i % 2)});
+    }
+
+    std::vector<pm::Id> bullet_ids;
+    bullet_ids.reserve(2000);
+    for (int i = 0; i < 2000; i++)
+    {
+        pm::Id id = pm.id_add();
+        pos->add(id, {static_cast<float>(i), static_cast<float>(i % 50)});
+        vel->add(id, {10.0f, 0});
+        dmg->add(id, {25});
+        cd->add(id, {1.0f});
+        bullet_ids.push_back(id);
+    }
+
+    for (int i = 0; i < 500; i++)
+    {
+        pm::Id id = pm.id_add();
+        pos->add(id, {static_cast<float>(i * 5), static_cast<float>(i * 2)});
+        hp->add(id, {150});
+        spr->add(id, {1, 0, 0, 32, 32});
+        team->add(id, {2});
+    }
+
+    for (int i = 0; i < 200; i++)
+    {
+        pm::Id id = pm.id_add();
+        pos->add(id, {static_cast<float>(i * 20), 100});
+        spr->add(id, {2, 0, 0, 16, 16});
+    }
+
+    for (int i = 0; i < 300; i++)
+    {
+        pm::Id id = pm.id_add();
+        pos->add(id, {static_cast<float>(i * 3), 0});
+        big->add(id);
+    }
+
+    float dt = 0.016f;
+
+    auto r = bench("multi-archetype: 3100 entities, 8 pools, tick sim", 3100, [&]() {
+        pos->each_mut([&](pm::Id id, Pos &p) {
+            auto *v = vel->get(id);
+            if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
+        }, pm::Parallel::Off);
+
+        cd->each_mut([&](Cooldown &c) {
+            c.remaining -= dt;
+            if (c.remaining < 0) c.remaining = 0;
+        }, pm::Parallel::Off);
+
+        for (auto bid : bullet_ids)
+        {
+            auto *c = cd->get(bid);
+            if (c && c->remaining <= 0)
+                pm.id_remove(bid);
+        }
+
+        pm.id_process_removes();
+    });
+    CHECK(r.ns_per_op < threshold::MULTI_ARCH);
+}
+
+// --- Integrated: heavy iteration ---
+
+TEST_CASE("integrated heavy iteration") {
+    pm::Pm pm;
+    auto *pos = pm.pool_get<Pos>("pos");
+    auto *vel = pm.pool_get<Vel>("vel");
+    auto *hp  = pm.pool_get<Health>("hp");
+
     for (int i = 0; i < 50000; i++)
     {
         pm::Id id = pm.id_add();
@@ -1071,43 +1140,43 @@ void bench_integrated_heavy_iteration()
         if (i < 10000) hp->add(id, {100});
     }
 
-    bench("iterate 50k pos, lookup vel (join pattern, seq)", 50000, [&]() {
+    auto r1 = bench("iterate 50k pos, lookup vel (join pattern, seq)", 50000, [&]() {
         float dt = 0.016f;
         pos->each_mut([&](pm::Id id, Pos &p) {
             auto *v = vel->get(id);
             if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
         }, pm::Parallel::Off);
     });
+    CHECK(r1.ns_per_op < threshold::JOIN_50K_SEQ);
 
-    bench("iterate 50k pos, lookup vel (join pattern, parallel)", 50000, [&]() {
+    auto r2 = bench("iterate 50k pos, lookup vel (join pattern, parallel)", 50000, [&]() {
         float dt = 0.016f;
         pos->each_mut([&](pm::Id id, Pos &p) {
             auto *v = vel->get(id);
             if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
         }, pm::Parallel::On);
     });
+    CHECK(r2.ns_per_op < threshold::JOIN_50K_PAR);
 
-    bench("iterate 10k health, lookup pos (smaller iterates larger)", 10000, [&]() {
+    auto r3 = bench("iterate 10k health, lookup pos (smaller iterates larger)", 10000, [&]() {
         hp->each([&](pm::Id id, const Health &h) {
             (void)h;
             auto *p = pos->get(id);
             if (p) { /* read position */ }
         }, pm::Parallel::Off);
     });
+    CHECK(r3.ns_per_op < threshold::JOIN_10K_SMALL);
 }
 
-void bench_integrated_sustained_churn()
-{
-    printf("\n--- Integrated: sustained churn (30 frames) ---\n");
+// --- Integrated: sustained churn ---
 
-    // Simulate 30 frames of spawning/removing entities while iterating
-    bench("30 frames: 1k spawn + 1k remove + iterate 5k", 30, []() {
+TEST_CASE("integrated sustained churn") {
+    auto r = bench("30 frames: 1k spawn + 1k remove + iterate 5k", 30, []() {
         pm::Pm pm;
         auto *pos = pm.pool_get<Pos>("pos");
         auto *vel = pm.pool_get<Vel>("vel");
         auto *hp  = pm.pool_get<Health>("hp");
 
-        // Seed with 5000 entities
         std::vector<pm::Id> live_ids;
         live_ids.reserve(10000);
         for (int i = 0; i < 5000; i++)
@@ -1123,23 +1192,17 @@ void bench_integrated_sustained_churn()
 
         for (int frame = 0; frame < 30; frame++)
         {
-            // Iterate: physics
             pos->each_mut([&](pm::Id id, Pos &p) {
                 auto *v = vel->get(id);
                 if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
             }, pm::Parallel::Off);
 
-            // Remove oldest 1000
             int to_remove = std::min(1000, static_cast<int>(live_ids.size()));
             for (int i = 0; i < to_remove; i++)
-            {
                 pm.id_remove(live_ids[static_cast<size_t>(i)]);
-            }
             live_ids.erase(live_ids.begin(), live_ids.begin() + to_remove);
-
             pm.id_process_removes();
 
-            // Spawn 1000 new
             for (int i = 0; i < 1000; i++)
             {
                 pm::Id id = pm.id_add();
@@ -1150,30 +1213,24 @@ void bench_integrated_sustained_churn()
             }
         }
     });
+    CHECK(r.ns_per_op < threshold::SUSTAINED_CHURN);
 }
 
-// =============================================================================
-// THREAD SCALING — same workload at 1, 2, 4, 8, and hardware_concurrency threads
-// =============================================================================
+// --- Thread scaling (informational — no thresholds) ---
 
-void bench_thread_scaling()
-{
+TEST_CASE("thread scaling") {
     uint32_t hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
 
-    // Build thread counts: 1, 2, 4, 8, ..., up to hw (deduplicated)
     std::vector<uint32_t> counts;
     for (uint32_t n = 1; n <= hw; n *= 2)
         counts.push_back(n);
     if (counts.back() != hw)
         counts.push_back(hw);
 
-    // Single Pm instance — all benchmarks share the same thread pool,
-    // using the per-call threads parameter to limit active workers.
     pm::Pm pm;
 
-    printf("\n--- Thread scaling: each 200k trig (sqrt+sin+cos per element) ---\n");
-    printf("  (hardware_concurrency = %u)\n", hw);
+    printf("\n  (hardware_concurrency = %u)\n", hw);
 
     {
         auto *pool = pm.pool_get<Pos>("pos_scale1");
@@ -1198,8 +1255,6 @@ void bench_thread_scaling()
         }
     }
 
-    printf("\n--- Thread scaling: each_mut 200k physics (atan2+sqrt+sin+cos per element) ---\n");
-
     {
         auto *pool = pm.pool_get<Pos>("pos_scale2");
         for (int i = 0; i < 200000; i++)
@@ -1223,8 +1278,6 @@ void bench_thread_scaling()
             });
         }
     }
-
-    printf("\n--- Thread scaling: each_mut 100k 256B transform (64 sinf per element) ---\n");
 
     {
         auto *pool = pm.pool_get<BigComp>("big_scale");
@@ -1251,16 +1304,10 @@ void bench_thread_scaling()
     }
 }
 
-// =============================================================================
-// HELLFIRE GAME WORKLOAD BENCHMARKS
-// =============================================================================
+// --- Spatial grid ---
 
-void bench_spatial_grid()
-{
-    printf("\n--- Spatial grid (hellfire collision) ---\n");
-
-    // Insert 400 monsters (hellfire peak)
-    bench("spatial insert 400 (hellfire peak)", 400, []() {
+TEST_CASE("spatial grid") {
+    auto r1 = bench("spatial insert 400 (hellfire peak)", 400, []() {
         pm::SpatialGrid grid(900, 700, 64);
         pm::Rng rng{42};
         for (int i = 0; i < 400; i++) {
@@ -1268,9 +1315,9 @@ void bench_spatial_grid()
             grid.insert(id, {rng.rfr(0, 900), rng.rfr(0, 700)});
         }
     });
+    CHECK(r1.ns_per_op < threshold::SPATIAL_INSERT_400);
 
-    // Insert 4k (10x stress)
-    bench("spatial insert 4k (10x stress)", 4000, []() {
+    auto r2 = bench("spatial insert 4k (10x stress)", 4000, []() {
         pm::SpatialGrid grid(900, 700, 64);
         pm::Rng rng{42};
         for (int i = 0; i < 4000; i++) {
@@ -1278,9 +1325,9 @@ void bench_spatial_grid()
             grid.insert(id, {rng.rfr(0, 900), rng.rfr(0, 700)});
         }
     });
+    CHECK(r2.ns_per_op < threshold::SPATIAL_INSERT_4K);
 
-    // Clear + insert (per-frame rebuild pattern — capacity retained)
-    bench("spatial clear + insert 400 (per-frame rebuild)", 400, []() {
+    auto r3 = bench("spatial clear + insert 400 (per-frame rebuild)", 400, []() {
         static pm::SpatialGrid grid(900, 700, 64);
         pm::Rng rng{42};
         grid.clear();
@@ -1289,8 +1336,9 @@ void bench_spatial_grid()
             grid.insert(id, {rng.rfr(0, 900), rng.rfr(0, 700)});
         }
     });
+    CHECK(r3.ns_per_op < threshold::SPATIAL_REBUILD_400);
 
-    // Query benchmarks — pre-fill grid, then measure queries
+    // Queries
     {
         pm::SpatialGrid grid(900, 700, 64);
         pm::Rng rng{42};
@@ -1299,7 +1347,7 @@ void bench_spatial_grid()
             grid.insert(id, {rng.rfr(0, 900), rng.rfr(0, 700)});
         }
 
-        bench("spatial query small radius (r=20, 1k queries)", 1000, [&]() {
+        auto r4 = bench("spatial query small radius (r=20, 1k queries)", 1000, [&]() {
             pm::Rng qrng{99};
             int hits = 0;
             for (int i = 0; i < 1000; i++) {
@@ -1308,8 +1356,9 @@ void bench_spatial_grid()
             }
             do_not_optimize(hits);
         });
+        CHECK(r4.ns_per_op < threshold::SPATIAL_QUERY_SMALL);
 
-        bench("spatial query large radius (r=100, 1k queries)", 1000, [&]() {
+        auto r5 = bench("spatial query large radius (r=100, 1k queries)", 1000, [&]() {
             pm::Rng qrng{99};
             int hits = 0;
             for (int i = 0; i < 1000; i++) {
@@ -1318,18 +1367,16 @@ void bench_spatial_grid()
             }
             do_not_optimize(hits);
         });
+        CHECK(r5.ns_per_op < threshold::SPATIAL_QUERY_LARGE);
     }
 
-    // Full collision frame: rebuild grid + query per bullet
-    bench("spatial full frame (400 insert + 600 queries)", 1000, []() {
+    auto r6 = bench("spatial full frame (400 insert + 600 queries)", 1000, []() {
         pm::SpatialGrid grid(900, 700, 64);
         pm::Rng rng{42};
-        // Insert 400 monsters
         for (int i = 0; i < 400; i++) {
             pm::Id id = pm::Id(static_cast<uint64_t>(i) << 16);
             grid.insert(id, {rng.rfr(0, 900), rng.rfr(0, 700)});
         }
-        // Query per bullet (600 bullets)
         int hits = 0;
         for (int i = 0; i < 600; i++) {
             pm::Vec2 c = {rng.rfr(0, 900), rng.rfr(0, 700)};
@@ -1337,21 +1384,19 @@ void bench_spatial_grid()
         }
         do_not_optimize(hits);
     });
+    CHECK(r6.ns_per_op < threshold::SPATIAL_FULL_FRAME);
 }
 
-void bench_bullet_churn()
-{
-    printf("\n--- Bullet churn (hellfire high-frequency spawn/expire) ---\n");
+// --- Bullet churn ---
 
-    // 30 frames, 50 spawn + 40 expire per frame (typical hellfire)
-    bench("bullet churn: 30f, 50 spawn + 40 expire/f", 30 * 90, []() {
+TEST_CASE("bullet churn") {
+    auto r1 = bench("bullet churn: 30f, 50 spawn + 40 expire/f", 30 * 90, []() {
         pm::Pm pm;
         auto* bp = pm.pool_get<BBullet>("bullets");
         pm::Rng rng{42};
         std::vector<pm::Id> live;
         live.reserve(600);
 
-        // Seed with 200 bullets
         for (int i = 0; i < 200; i++) {
             pm::Id id = pm.id_add();
             bp->add(id, BBullet{{rng.rfr(0, 900), rng.rfr(0, 700)},
@@ -1361,14 +1406,12 @@ void bench_bullet_churn()
         }
 
         for (int f = 0; f < 30; f++) {
-            // Expire oldest 40
             int to_remove = std::min(40, static_cast<int>(live.size()));
             for (int i = 0; i < to_remove; i++)
                 pm.id_remove(live[static_cast<size_t>(i)]);
             live.erase(live.begin(), live.begin() + to_remove);
             pm.id_process_removes();
 
-            // Spawn 50 new
             for (int i = 0; i < 50; i++) {
                 pm::Id id = pm.id_add();
                 bp->add(id, BBullet{{rng.rfr(0, 900), rng.rfr(0, 700)},
@@ -1378,9 +1421,9 @@ void bench_bullet_churn()
             }
         }
     });
+    CHECK(r1.ns_per_op < threshold::BULLET_CHURN_50);
 
-    // Stress: 4x hellfire rate
-    bench("bullet churn: 30f, 200 spawn + 180 expire/f", 30 * 380, []() {
+    auto r2 = bench("bullet churn: 30f, 200 spawn + 180 expire/f", 30 * 380, []() {
         pm::Pm pm;
         auto* bp = pm.pool_get<BBullet>("bullets");
         pm::Rng rng{42};
@@ -1411,9 +1454,9 @@ void bench_bullet_churn()
             }
         }
     });
+    CHECK(r2.ns_per_op < threshold::BULLET_CHURN_200);
 
-    // Bullet physics: each_mut 600 (pos += vel * dt)
-    bench("bullet physics: each_mut 600 (pos += vel*dt)", 600, []() {
+    auto r3 = bench("bullet physics: each_mut 600 (pos += vel*dt)", 600, []() {
         pm::Pm pm;
         auto* bp = pm.pool_get<BBullet>("bullets");
         pm::Rng rng{42};
@@ -1430,18 +1473,17 @@ void bench_bullet_churn()
             b.lifetime -= dt;
         }, pm::Parallel::Off);
     });
+    CHECK(r3.ns_per_op < threshold::BULLET_PHYSICS);
 }
 
-void bench_monster_ai()
-{
-    printf("\n--- Monster AI (hellfire steering + shooting) ---\n");
+// --- Monster AI ---
 
-    // Setup shared player data (4 players at fixed positions like hellfire)
+TEST_CASE("monster AI") {
     static const pm::Vec2 player_pos[4] = {
         {225, 280}, {675, 280}, {225, 420}, {675, 420}
     };
 
-    // 400 monsters, find closest of 4 players + steer (sequential)
+    // 400 seq
     {
         pm::Pm pm;
         auto* mp = pm.pool_get<BMonster>("monsters");
@@ -1456,7 +1498,7 @@ void bench_monster_ai()
             mp->add(id, m);
         }
 
-        bench("monster AI 400 (closest of 4 + steer, seq)", 400, [&]() {
+        auto r1 = bench("monster AI 400 (closest of 4 + steer, seq)", 400, [&]() {
             float dt = 0.016f;
             mp->each_mut([dt](BMonster& m) {
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
@@ -1472,8 +1514,9 @@ void bench_monster_ai()
                 m.pos.y += m.vel.y * dt;
             }, pm::Parallel::Off);
         });
+        CHECK(r1.ns_per_op < threshold::MONSTER_AI_400_SEQ);
 
-        bench("monster AI 400 (closest of 4 + steer, parallel)", 400, [&]() {
+        auto r2 = bench("monster AI 400 (closest of 4 + steer, parallel)", 400, [&]() {
             float dt = 0.016f;
             mp->each_mut([dt](BMonster& m) {
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
@@ -1489,9 +1532,10 @@ void bench_monster_ai()
                 m.pos.y += m.vel.y * dt;
             }, pm::Parallel::On);
         });
+        CHECK(r2.ns_per_op < threshold::MONSTER_AI_400_PAR);
     }
 
-    // 2000 monsters (5x stress) — sequential only
+    // 2000 stress
     {
         pm::Pm pm;
         auto* mp = pm.pool_get<BMonster>("monsters");
@@ -1506,7 +1550,7 @@ void bench_monster_ai()
             mp->add(id, m);
         }
 
-        bench("monster AI 2000 (5x stress, sequential)", 2000, [&]() {
+        auto r = bench("monster AI 2000 (5x stress, sequential)", 2000, [&]() {
             float dt = 0.016f;
             mp->each_mut([dt](BMonster& m) {
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
@@ -1522,28 +1566,26 @@ void bench_monster_ai()
                 m.pos.y += m.vel.y * dt;
             }, pm::Parallel::Off);
         });
+        CHECK(r.ns_per_op < threshold::MONSTER_AI_2000);
     }
 }
 
-void bench_collision_frame()
-{
-    printf("\n--- Collision frame (hellfire full collision pass) ---\n");
+// --- Collision frame ---
 
+TEST_CASE("collision frame") {
     static const pm::Vec2 player_pos[4] = {
         {225, 280}, {675, 280}, {225, 420}, {675, 420}
     };
     static constexpr float PLAYER_R = 32.f;
-    static constexpr float QUERY_R  = 20.f; // PBULLET_SIZE + MONSTER_MAX_SZ * 0.65
+    static constexpr float QUERY_R  = 20.f;
 
-    // Mid-game: 400 monsters, 300 bullets
-    bench("collision frame: 400 mon, 300 bul, 4 players", 1300, []() {
+    auto r1 = bench("collision frame: 400 mon, 300 bul, 4 players", 1300, []() {
         pm::Pm pm;
         auto* mp = pm.pool_get<BMonster>("monsters");
         auto* bp = pm.pool_get<BBullet>("bullets");
         pm::Rng rng{42};
         pm::SpatialGrid grid(900, 700, 64);
 
-        // Fill monsters
         for (int i = 0; i < 400; i++) {
             pm::Id id = pm.id_add();
             BMonster m;
@@ -1552,7 +1594,6 @@ void bench_collision_frame()
             m.size = rng.rfr(8, 16);
             mp->add(id, m);
         }
-        // Fill bullets (200 player-owned, 100 enemy)
         for (int i = 0; i < 300; i++) {
             pm::Id id = pm.id_add();
             BBullet b;
@@ -1564,14 +1605,11 @@ void bench_collision_frame()
             bp->add(id, b);
         }
 
-        // --- Collision pass (mirrors hellfire_server.cpp) ---
-        // 1. Build monster grid
         grid.clear();
         mp->each([&](pm::Id mid, const BMonster& m) {
             grid.insert(mid, m.pos);
         }, pm::Parallel::Off);
 
-        // 2. Player bullets vs monsters via grid
         int kills = 0;
         bp->each([&](pm::Id, const BBullet& b) {
             if (!b.player_owned) return;
@@ -1582,7 +1620,6 @@ void bench_collision_frame()
             });
         }, pm::Parallel::Off);
 
-        // 3. Players vs enemy bullets
         int player_hits = 0;
         for (int pi = 0; pi < 4; pi++) {
             bp->each([&](const BBullet& b) {
@@ -1594,9 +1631,9 @@ void bench_collision_frame()
         do_not_optimize(kills);
         do_not_optimize(player_hits);
     });
+    CHECK(r1.ns_per_op < threshold::COLLISION_MID);
 
-    // Peak: 400 monsters, 600 bullets
-    bench("collision frame: 400 mon, 600 bul, 4 players", 1600, []() {
+    auto r2 = bench("collision frame: 400 mon, 600 bul, 4 players", 1600, []() {
         pm::Pm pm;
         auto* mp = pm.pool_get<BMonster>("monsters");
         auto* bp = pm.pool_get<BBullet>("bullets");
@@ -1648,9 +1685,9 @@ void bench_collision_frame()
         do_not_optimize(kills);
         do_not_optimize(player_hits);
     });
+    CHECK(r2.ns_per_op < threshold::COLLISION_PEAK);
 
-    // Brute force comparison: O(bullets * monsters) without grid
-    bench("collision brute force: 400x600 (no grid)", 240000, []() {
+    auto r3 = bench("collision brute force: 400x600 (no grid)", 240000, []() {
         pm::Rng rng{42};
         std::vector<pm::Vec2> monsters(400), bullets(600);
         std::vector<float> mon_sz(400);
@@ -1671,25 +1708,24 @@ void bench_collision_frame()
         }
         do_not_optimize(kills);
     });
+    CHECK(r3.ns_per_op < threshold::COLLISION_BRUTE);
 }
 
-void bench_server_tick()
-{
-    printf("\n--- Server tick (hellfire full frame simulation) ---\n");
+// --- Server tick ---
 
+TEST_CASE("server tick") {
     static const pm::Vec2 player_pos[4] = {
         {225, 280}, {675, 280}, {225, 420}, {675, 420}
     };
 
     auto run_tick = [](int n_monsters, int n_bullets, const char* label, uint64_t ops) {
-        bench(label, ops, [n_monsters, n_bullets]() {
+        return bench(label, ops, [n_monsters, n_bullets]() {
             pm::Pm pm;
             auto* mp = pm.pool_get<BMonster>("monsters");
             auto* bp = pm.pool_get<BBullet>("bullets");
             pm::Rng rng{42};
             pm::SpatialGrid grid(900, 700, 64);
 
-            // Setup monsters
             for (int i = 0; i < n_monsters; i++) {
                 pm::Id id = pm.id_add();
                 BMonster m;
@@ -1699,7 +1735,6 @@ void bench_server_tick()
                 m.shoot_timer = rng.rfr(1.5f, 4.f);
                 mp->add(id, m);
             }
-            // Setup bullets
             for (int i = 0; i < n_bullets; i++) {
                 pm::Id id = pm.id_add();
                 BBullet b;
@@ -1713,7 +1748,6 @@ void bench_server_tick()
 
             float dt = 0.016f;
 
-            // Phase 1: Monster AI
             mp->each_mut([dt](BMonster& m) {
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
                 for (int i = 0; i < 4; i++) {
@@ -1728,7 +1762,6 @@ void bench_server_tick()
                 m.pos.y += m.vel.y * dt;
             }, pm::Parallel::Off);
 
-            // Phase 2: Bullet physics
             bp->each_mut([&](pm::Id id, BBullet& b) {
                 b.pos.x += b.vel.x * dt;
                 b.pos.y += b.vel.y * dt;
@@ -1736,7 +1769,6 @@ void bench_server_tick()
                 if (b.lifetime <= 0) pm.id_remove(id);
             }, pm::Parallel::Off);
 
-            // Phase 3: Collision
             grid.clear();
             mp->each([&](pm::Id mid, const BMonster& m) {
                 grid.insert(mid, m.pos);
@@ -1756,7 +1788,6 @@ void bench_server_tick()
                 });
             }, pm::Parallel::Off);
 
-            // Phase 4: Cleanup OOB
             mp->each([&](pm::Id id, const BMonster& m) {
                 if (m.pos.x < -100 || m.pos.x > 1000 || m.pos.y < -100 || m.pos.y > 800)
                     pm.id_remove(id);
@@ -1766,23 +1797,23 @@ void bench_server_tick()
                     pm.id_remove(id);
             }, pm::Parallel::Off);
 
-            // Phase 5: Flush
             pm.id_process_removes();
         });
     };
 
-    run_tick(60, 50, "server tick: level 1 (60 mon, 50 bul)", 200);
-    run_tick(400, 600, "server tick: level 5 (400 mon, 600 bul)", 1600);
+    auto r1 = run_tick(60, 50, "server tick: level 1 (60 mon, 50 bul)", 200);
+    CHECK(r1.ns_per_op < threshold::SERVER_TICK_L1);
 
-    // Sustained: 30 ticks at level 5
-    bench("30 server ticks: level 5 sustained", 30 * 1600, []() {
+    auto r2 = run_tick(400, 600, "server tick: level 5 (400 mon, 600 bul)", 1600);
+    CHECK(r2.ns_per_op < threshold::SERVER_TICK_L5);
+
+    auto r3 = bench("30 server ticks: level 5 sustained", 30 * 1600, []() {
         pm::Pm pm;
         auto* mp = pm.pool_get<BMonster>("monsters");
         auto* bp = pm.pool_get<BBullet>("bullets");
         pm::Rng rng{42};
         pm::SpatialGrid grid(900, 700, 64);
 
-        // Initial population
         for (int i = 0; i < 400; i++) {
             pm::Id id = pm.id_add();
             BMonster m;
@@ -1806,7 +1837,6 @@ void bench_server_tick()
         float dt = 0.016f;
 
         for (int tick = 0; tick < 30; tick++) {
-            // Monster AI
             mp->each_mut([dt](BMonster& m) {
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
                 for (int i = 0; i < 4; i++) {
@@ -1821,7 +1851,6 @@ void bench_server_tick()
                 m.pos.y += m.vel.y * dt;
             }, pm::Parallel::Off);
 
-            // Bullet physics
             bp->each_mut([&](pm::Id id, BBullet& b) {
                 b.pos.x += b.vel.x * dt;
                 b.pos.y += b.vel.y * dt;
@@ -1829,7 +1858,6 @@ void bench_server_tick()
                 if (b.lifetime <= 0) pm.id_remove(id);
             }, pm::Parallel::Off);
 
-            // Collision
             grid.clear();
             mp->each([&](pm::Id mid, const BMonster& m) {
                 grid.insert(mid, m.pos);
@@ -1849,7 +1877,6 @@ void bench_server_tick()
                 });
             }, pm::Parallel::Off);
 
-            // Cleanup OOB
             mp->each([&](pm::Id id, const BMonster& m) {
                 if (m.pos.x < -100 || m.pos.x > 1000 || m.pos.y < -100 || m.pos.y > 800)
                     pm.id_remove(id);
@@ -1861,7 +1888,6 @@ void bench_server_tick()
 
             pm.id_process_removes();
 
-            // Respawn lost monsters/bullets to maintain population
             while (static_cast<int>(mp->items.size()) < 400) {
                 pm::Id id = pm.id_add();
                 BMonster m;
@@ -1883,13 +1909,13 @@ void bench_server_tick()
             }
         }
     });
+    CHECK(r3.ns_per_op < threshold::SERVER_TICK_30);
 }
 
-void bench_plc_utils()
-{
-    printf("\n--- PLC utilities (per-entity-per-frame overhead) ---\n");
+// --- PLC utils ---
 
-    bench("Cooldown::ready 100k", 100000, []() {
+TEST_CASE("plc utils") {
+    auto r1 = bench("Cooldown::ready 100k", 100000, []() {
         std::vector<pm::Cooldown> cds(100000, pm::Cooldown(0.5f));
         float dt = 0.016f;
         int fires = 0;
@@ -1898,8 +1924,9 @@ void bench_plc_utils()
         }
         do_not_optimize(fires);
     });
+    CHECK(r1.ns_per_op < threshold::COOLDOWN);
 
-    bench("Hysteresis update+set 100k", 100000, []() {
+    auto r2 = bench("Hysteresis update+set 100k", 100000, []() {
         std::vector<pm::Hysteresis<bool>> hs(100000, pm::Hysteresis<bool>(false, 0.1f));
         float dt = 0.016f;
         for (size_t i = 0; i < hs.size(); i++) {
@@ -1908,8 +1935,9 @@ void bench_plc_utils()
         }
         do_not_optimize(hs[0].get());
     });
+    CHECK(r2.ns_per_op < threshold::HYSTERESIS);
 
-    bench("RisingEdge update 100k", 100000, []() {
+    auto r3 = bench("RisingEdge update 100k", 100000, []() {
         std::vector<pm::RisingEdge> edges(100000);
         int fires = 0;
         for (size_t i = 0; i < edges.size(); i++) {
@@ -1917,8 +1945,9 @@ void bench_plc_utils()
         }
         do_not_optimize(fires);
     });
+    CHECK(r3.ns_per_op < threshold::RISING_EDGE);
 
-    bench("DelayTimer update 100k", 100000, []() {
+    auto r4 = bench("DelayTimer update 100k", 100000, []() {
         std::vector<pm::DelayTimer> timers(100000, pm::DelayTimer(0.5f, 0.2f));
         float dt = 0.016f;
         int active = 0;
@@ -1928,8 +1957,9 @@ void bench_plc_utils()
         }
         do_not_optimize(active);
     });
+    CHECK(r4.ns_per_op < threshold::DELAY_TIMER);
 
-    bench("Counter increment 100k", 100000, []() {
+    auto r5 = bench("Counter increment 100k", 100000, []() {
         std::vector<pm::Counter> ctrs(100000, pm::Counter(10));
         int done = 0;
         for (auto& c : ctrs) {
@@ -1938,30 +1968,27 @@ void bench_plc_utils()
         }
         do_not_optimize(done);
     });
+    CHECK(r5.ns_per_op < threshold::COUNTER);
 }
 
-void bench_multi_pool_tick()
-{
-    printf("\n--- Multi-pool tick (hellfire pool structure) ---\n");
+// --- Multi-pool tick ---
 
+TEST_CASE("multi-pool tick") {
     static const pm::Vec2 player_pos[4] = {
         {225, 280}, {675, 280}, {225, 420}, {675, 420}
     };
 
-    // 3 pools, hellfire sizes: iterate all + cross-lookups
-    bench("multi-pool tick: 4p + 400m + 600b, iterate all", 1004, []() {
+    auto r1 = bench("multi-pool tick: 4p + 400m + 600b, iterate all", 1004, []() {
         pm::Pm pm;
         auto* pp = pm.pool_get<BPlayer>("players");
         auto* mp = pm.pool_get<BMonster>("monsters");
         auto* bp = pm.pool_get<BBullet>("bullets");
         pm::Rng rng{42};
 
-        // 4 players
         for (int i = 0; i < 4; i++) {
             pm::Id id = pm.id_add();
             pp->add(id, BPlayer{player_pos[i], 100, 0, 0, true});
         }
-        // 400 monsters
         for (int i = 0; i < 400; i++) {
             pm::Id id = pm.id_add();
             BMonster m;
@@ -1970,7 +1997,6 @@ void bench_multi_pool_tick()
             m.size = rng.rfr(8, 16);
             mp->add(id, m);
         }
-        // 600 bullets
         for (int i = 0; i < 600; i++) {
             pm::Id id = pm.id_add();
             BBullet b;
@@ -1984,13 +2010,11 @@ void bench_multi_pool_tick()
 
         float dt = 0.016f;
 
-        // Player update
         pp->each_mut([dt](BPlayer& p) {
             if (p.cooldown > 0) p.cooldown -= dt;
             if (p.invuln > 0) p.invuln -= dt;
         }, pm::Parallel::Off);
 
-        // Monster AI (reads player pool)
         mp->each_mut([&, dt](BMonster& m) {
             pm::Vec2 tgt = m.pos; float best = 1e9f;
             pp->each([&](const BPlayer& p) {
@@ -2005,16 +2029,15 @@ void bench_multi_pool_tick()
             m.pos.y += m.vel.y * dt;
         }, pm::Parallel::Off);
 
-        // Bullet physics
         bp->each_mut([dt](BBullet& b) {
             b.pos.x += b.vel.x * dt;
             b.pos.y += b.vel.y * dt;
             b.lifetime -= dt;
         }, pm::Parallel::Off);
     });
+    CHECK(r1.ns_per_op < threshold::MULTI_POOL_TICK);
 
-    // Same + spatial grid collision
-    bench("multi-pool tick + spatial grid collision", 1004, []() {
+    auto r2 = bench("multi-pool tick + spatial grid collision", 1004, []() {
         pm::Pm pm;
         auto* pp = pm.pool_get<BPlayer>("players");
         auto* mp = pm.pool_get<BMonster>("monsters");
@@ -2047,13 +2070,11 @@ void bench_multi_pool_tick()
 
         float dt = 0.016f;
 
-        // Player update
         pp->each_mut([dt](BPlayer& p) {
             if (p.cooldown > 0) p.cooldown -= dt;
             if (p.invuln > 0) p.invuln -= dt;
         }, pm::Parallel::Off);
 
-        // Monster AI
         mp->each_mut([&, dt](BMonster& m) {
             pm::Vec2 tgt = m.pos; float best = 1e9f;
             pp->each([&](const BPlayer& p) {
@@ -2068,14 +2089,12 @@ void bench_multi_pool_tick()
             m.pos.y += m.vel.y * dt;
         }, pm::Parallel::Off);
 
-        // Bullet physics
         bp->each_mut([dt](BBullet& b) {
             b.pos.x += b.vel.x * dt;
             b.pos.y += b.vel.y * dt;
             b.lifetime -= dt;
         }, pm::Parallel::Off);
 
-        // Collision via grid
         grid.clear();
         mp->each([&](pm::Id mid, const BMonster& m) {
             grid.insert(mid, m.pos);
@@ -2093,80 +2112,7 @@ void bench_multi_pool_tick()
 
         do_not_optimize(kills);
     });
+    CHECK(r2.ns_per_op < threshold::MULTI_POOL_TICK_GRID);
 }
 
-// =============================================================================
-// MAIN
-// =============================================================================
-
-// Write CSV to benchmarks/latest.csv (git-tracked for regression comparison).
-static void write_csv()
-{
-    const char* path = PM_BENCH_CSV_PATH;
-    FILE* f = fopen(path, "w");
-    if (!f) {
-        fprintf(stderr, "warning: could not write %s (run from repo root?)\n", path);
-        return;
-    }
-    fprintf(f, "benchmark,median_ms,max_ms,ops,ns_per_op\n");
-    for (auto& r : g_results)
-        fprintf(f, "\"%s\",%.4f,%.4f,%llu,%.2f\n",
-                r.name.c_str(), r.median_ms, r.max_ms,
-                (unsigned long long)r.ops, r.ns_per_op);
-    fclose(f);
-    printf("\nCSV written to %s\n", path);
-}
-
-void run_benchmarks()
-{
-    printf("=== pm_core benchmarks ===\n");
-    printf("(warmup + %d timed runs per bench, reporting median)\n", BENCH_ITERATIONS);
-
-    // Pool benchmarks
-    bench_pool_add();
-    bench_pool_get();
-    bench_pool_remove();
-    bench_pool_each();
-    bench_pool_each_mut();
-    bench_pool_clear();
-    bench_pool_mixed();
-
-    // State benchmarks
-    bench_state();
-
-    // Entity / kernel benchmarks
-    bench_id_add();
-    bench_flush();
-    bench_entity_churn();
-
-    // Integrated benchmarks
-    bench_integrated_game_tick();
-    bench_integrated_multi_archetype();
-    bench_integrated_heavy_iteration();
-    bench_integrated_sustained_churn();
-
-    // Thread scaling
-    bench_thread_scaling();
-
-    // Hellfire game workload benchmarks
-    bench_spatial_grid();
-    bench_bullet_churn();
-    bench_monster_ai();
-    bench_collision_frame();
-    bench_server_tick();
-    bench_plc_utils();
-    bench_multi_pool_tick();
-
-    // Summary
-    printf("\n=== Summary ===\n");
-    printf("  %-50s %10s %12s\n", "Benchmark", "Median ms", "ns/op");
-    printf("  %-50s %10s %12s\n",
-           "--------------------------------------------------",
-           "--------", "----------");
-    for (auto &r : g_results)
-        printf("  %-50s %8.2f ms %10.1f\n", r.name.c_str(), r.median_ms, r.ns_per_op);
-    printf("\n=== All benchmarks complete ===\n");
-
-    // Write CSV for regression tracking
-    write_csv();
-}
+} // TEST_SUITE("bench")

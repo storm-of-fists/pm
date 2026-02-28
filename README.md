@@ -224,7 +224,15 @@ and game-specific roadmap.
 ~90 benchmarks covering kernel operations and real game workloads. Built with `-O2`.
 Benchmarks run automatically after tests pass via `ctest --test-dir build -V`.
 
-Results are written to `benchmarks/latest.csv` (git-tracked) for regression comparison.
+Each benchmark is a doctest `TEST_CASE` with a threshold check — if ns/op exceeds
+the threshold, the test fails. Thresholds are set at ~2x measured maximums to catch
+real regressions while tolerating normal variance.
+
+```bash
+./build/pm_tests -ts=bench             # benchmarks only
+./build/pm_tests -tse=bench            # tests only, skip benchmarks
+./build/pm_tests -tc="pool add"        # single benchmark
+```
 
 ### Benchmark groups
 
@@ -260,11 +268,13 @@ Results are written to `benchmarks/latest.csv` (git-tracked) for regression comp
 
 ## Tests
 
-94 tests + ~90 benchmarks in a single binary. Tests run first; benchmarks run after all tests pass.
+97 tests + 23 benchmark cases in a single binary (`pm_tests`), powered by doctest.
 
 ```bash
-cmake --build build --target pm_tests
-ctest --test-dir build -V
+cmake --build build --target pm_tests   # build
+ctest --test-dir build                  # run all (tests + benchmarks)
+./build/pm_tests -ts=core              # just core ECS tests
+./build/pm_tests -ltc                  # list all test cases
 ```
 
 ## v3 Roadmap
@@ -306,15 +316,11 @@ ctest --test-dir build -V
   clean release build
 - **Test splitting:** `test_pool.cpp`, `test_kernel.cpp`, `test_net.cpp`, etc. — each compiles
   and runs independently. Failing network tests don't block pool results.
-- **doctest:** replace raw asserts. Test names, actual vs expected on failure, CLI filtering
-  (`./test --test-case="*orphan*"`).
+- ~~**doctest:** replace raw asserts. Test names, actual vs expected on failure, CLI filtering.~~
 - **Fuzz testing:** network recv path + mod loading via libFuzzer/AFL. Finds buffer overreads,
   malformed packets, truncated crashes.
-- **Benchmark suite:** median-of-5 timing harness (no external deps), ns/op, CSV output to
-  `benchmarks/latest.csv` (git-tracked) for regression tracking. ~90 benchmarks across
-  kernel ops, thread scaling, and hellfire game workloads (spatial grid, collision, AI,
-  bullet churn, PLC utils, full server tick simulation). Destructive benchmarks (remove,
-  flush, clear) use a setup/work split pattern — setup runs un-timed before each timed run.
+- ~~**Benchmark suite:** median-of-5 timing harness, ns/op, threshold-based pass/fail via
+  doctest. ~90 benchmarks across kernel ops, thread scaling, and hellfire game workloads.~~
 - **Deterministic replay:** record inputs (packets, player inputs, RNG seeds). Replay = bug
   report. RNG already seeded (`Rng{42}`), just need input stream capture.
 - **Compile time tracking:** `-ftime-trace` (Clang), visualize in Chrome tracing, track in CI.
