@@ -131,7 +131,7 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 	auto* keys_q = pm.state<KeyQueue>("keys");
 	auto* draw_q = pm.state<DrawQueue>("draw");
 
-	pm.schedule("debug/input", input_phase + 3.f, [debug, keys_q](TaskContext& ctx) {
+	pm.schedule("debug/input", input_phase + 3.f, [debug, keys_q](Pm& pm) {
 		for (auto key : *keys_q) {
 			if (key <= 0) continue;
 
@@ -139,7 +139,7 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 				debug->visible = !debug->visible;
 				if (debug->visible) {
 					debug->rings.clear();
-					ctx.pm.reset_task_stats();
+					pm.reset_task_stats();
 					debug->fps = 0; debug->frame_ms = 0;
 					debug->fps_accum = 0; debug->fps_frames = 0;
 				}
@@ -149,35 +149,35 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 
 			if (key == SDLK_R && (SDL_GetModState() & SDL_KMOD_CTRL)) {
 				debug->rings.clear();
-				ctx.pm.reset_task_stats();
+				pm.reset_task_stats();
 				debug->fps = 0; debug->frame_ms = 0;
 				debug->fps_accum = 0; debug->fps_frames = 0;
 			}
 
 			if (key == SDLK_F10)
-				ctx.pm.request_step();
+				pm.request_step();
 		}
 	});
 
-	pm.schedule("debug/sample", hud_phase + 4.f, [debug](TaskContext& ctx) {
+	pm.schedule("debug/sample", hud_phase + 4.f, [debug](Pm& pm) {
 		if (!debug->visible) return;
 
 		debug->fps_frames++;
-		debug->fps_accum += ctx.dt();
+		debug->fps_accum += pm.dt();
 		if (debug->fps_accum >= 0.5f) {
 			debug->fps = (float)debug->fps_frames / debug->fps_accum;
 			debug->fps_frames = 0;
 			debug->fps_accum = 0;
 		}
-		debug->frame_ms = ctx.dt() * 1000.f;
+		debug->frame_ms = pm.dt() * 1000.f;
 
-		for (auto& t : ctx.pm.tasks()) {
+		for (auto& t : pm.tasks()) {
 			if (!t.active) continue;
 			debug->rings[t.name].push(t.last_us);
 		}
 	});
 
-	pm.schedule("debug/draw", hud_phase + 5.f, [debug, draw_q](TaskContext& ctx) {
+	pm.schedule("debug/draw", hud_phase + 5.f, [debug, draw_q](Pm& pm) {
 		if (!debug->visible) return;
 		int sc = 2;
 		int cw = 4 * sc;
@@ -196,9 +196,9 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		int col_max    = col_med  + 9 * cw;
 		int panel_w    = col_max  + 9 * cw + pad;
 
-		auto& all_tasks = ctx.pm.tasks();
+		auto& all_tasks = pm.tasks();
 		int task_rows  = (int)all_tasks.size();
-		int fault_rows = ctx.pm.faults().empty() ? 0 : 1 + (int)ctx.pm.faults().size();
+		int fault_rows = pm.faults().empty() ? 0 : 1 + (int)pm.faults().size();
 
 		// All tasks sorted by priority (active and inactive)
 		std::vector<size_t> sorted_idx;
@@ -224,10 +224,10 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		{
 			char buf[96];
 			const char* state = "";
-			if (ctx.is_paused() && ctx.stepping()) state = "  |step|";
-			else if (ctx.is_paused())              state = "  |paused|";
+			if (pm.is_paused() && pm.stepping()) state = "  |step|";
+			else if (pm.is_paused())             state = "  |paused|";
 			snprintf(buf, sizeof(buf), "fps:%.0f  dt:%.1f ms  tick:%llu%s",
-				debug->fps, debug->frame_ms, (unsigned long long)ctx.pm.tick_count(), state);
+				debug->fps, debug->frame_ms, (unsigned long long)pm.tick_count(), state);
 			push_str(draw_q, buf, x0, y, sc, 140, 220, 140);
 			y += rh;
 		}
@@ -253,13 +253,13 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		uint64_t total_step = 0, total_med = 0;
 		for (size_t idx : sorted_idx) {
 			auto& t = all_tasks[idx];
-			const char* name = ctx.pm.name_str(t.name);
-			bool running = t.active && !(t.pauseable && ctx.is_paused());
+			const char* name = pm.name_str(t.name);
+			bool running = t.active && !(t.pauseable && pm.is_paused());
 
 			// Status
 			const char* sts; uint8_t sr, sg, sb;
 			if      (!t.active)                          { sts = "er"; sr=255; sg=80;  sb=80;  }
-			else if (t.pauseable && ctx.is_paused())     { sts = "ps"; sr=220; sg=160; sb=60;  }
+			else if (t.pauseable && pm.is_paused())      { sts = "ps"; sr=220; sg=160; sb=60;  }
 			else                                         { sts = "ok"; sr=120; sg=200; sb=120; }
 			push_str(draw_q, sts, col_status, y, sc, sr, sg, sb);
 
@@ -320,7 +320,7 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		{
 			char buf[128];
 			snprintf(buf, sizeof(buf), "entities:%u  +%u/-%u  draws:%zu",
-				ctx.pm.entity_count(), ctx.pm.frame_spawns(), ctx.pm.frame_removes(),
+				pm.entity_count(), pm.frame_spawns(), pm.frame_removes(),
 				draw_q->size());
 			push_str(draw_q, buf, x0, y, sc, 180, 200, 255);
 			y += rh;
@@ -344,10 +344,10 @@ inline void debug_init(Pm& pm, DebugOverlay* debug, float input_phase, float hud
 		}
 
 		// Fault list
-		if (!ctx.pm.faults().empty()) {
+		if (!pm.faults().empty()) {
 			push_str(draw_q, "faults:", x0, y, sc, 255, 80, 80);
 			y += rh;
-			for (auto& f : ctx.pm.faults()) {
+			for (auto& f : pm.faults()) {
 				push_str(draw_q, f.c_str(), x0 + cw, y, sc, 255, 130, 110, 38);
 				y += rh;
 			}

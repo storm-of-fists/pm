@@ -201,12 +201,12 @@ inline void sdl_init(Pm &pm, SdlSystem *sdl, float input_phase, float render_pha
 	auto *keys_q = pm.state<KeyQueue>("keys");
 	auto *wheel  = pm.state<float>("wheel");
 
-	pm.schedule("sdl/input", input_phase, [keys_q, wheel](TaskContext &ctx) {
+	pm.schedule("sdl/input", input_phase, [keys_q, wheel](Pm& pm) {
 		keys_q->clear();
 		*wheel = 0.f;
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			if (ev.type == SDL_EVENT_QUIT) ctx.quit();
+			if (ev.type == SDL_EVENT_QUIT) pm.quit();
 			if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat)
 				keys_q->push_back((int)ev.key.key);
 			if (ev.type == SDL_EVENT_KEY_UP)
@@ -219,13 +219,13 @@ inline void sdl_init(Pm &pm, SdlSystem *sdl, float input_phase, float render_pha
 	// render_phase     — clear background + flush DrawQueue (solid rects, text)
 	// render_phase+0.5 — open slot for sprite/texture draws (game code)
 	// render_phase+1   — present
-	pm.schedule("sdl/render", render_phase, [sdl, draw_q](TaskContext &) {
+	pm.schedule("sdl/render", render_phase, [sdl, draw_q](Pm&) {
 		SDL_SetRenderDrawColor(sdl->renderer, sdl->clear_color.r, sdl->clear_color.g, sdl->clear_color.b, 255);
 		SDL_RenderClear(sdl->renderer);
 		render_draw_queue(sdl->renderer, draw_q);
 		draw_q->clear();
 	});
-	pm.schedule("sdl/present", render_phase + 1.f, [sdl](TaskContext &) {
+	pm.schedule("sdl/present", render_phase + 1.f, [sdl](Pm&) {
 		SDL_RenderPresent(sdl->renderer);
 	});
 }

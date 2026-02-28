@@ -478,41 +478,9 @@ public:
 };
 
 // =============================================================================
-// TaskContext — Task execution context
-//
-// Thin wrapper carrying per-frame state (dt, spawn, remove_entity, pause).
-// Pools and states should be captured at init time, not fetched per frame.
-// ctx.pm is public for admin tasks (level loading, mod init) that need
-// the full Pm API.
-// =============================================================================
-class Pm;
-class TaskContext
-{
-public:
-	Pm &pm;
-	explicit TaskContext(Pm &pm_) : pm(pm_) {}
-
-	float dt() const;
-	uint64_t tick_count() const;
-
-	Id spawn();
-	void remove_entity(Id id);
-	bool sync_id(Id id);
-
-	void quit();
-	bool is_running() const;
-	bool is_paused() const;
-	void pause();
-	void resume();
-	void toggle_pause();
-
-	const std::vector<std::string> &faults() const;
-	bool stepping() const;
-};
-
-// =============================================================================
 // Task
 // =============================================================================
+class Pm;
 struct Task
 {
 	NameId name = NULL_NAME;
@@ -520,7 +488,7 @@ struct Task
 	bool active = true;
 	bool pauseable = false;
 
-	std::function<void(TaskContext &)> fn;
+	std::function<void(Pm &)> fn;
 
 	uint64_t runs = 0, last_us = 0, max_us = 0;
 
@@ -703,10 +671,9 @@ public:
 			auto exec_t = [&, ti]()
 			{
 				auto t0 = std::chrono::steady_clock::now();
-				TaskContext ctx(*this);
 				try
 				{
-					task_list[ti].fn(ctx);
+					task_list[ti].fn(*this);
 				}
 				catch (const TaskFault &e)
 				{
@@ -834,7 +801,7 @@ public:
 		t.priority = priority;
 		t.pauseable = pauseable;
 
-		t.fn = [f = std::forward<F>(fn)](TaskContext &ctx) { f(ctx); };
+		t.fn = [f = std::forward<F>(fn)](Pm &pm) { f(pm); };
 		task_list.push_back(std::move(t));
 		tasks_dirty = true;
 	}
@@ -1020,23 +987,5 @@ void Pool<T>::each_mut(F &&fn, Parallel p, uint32_t threads)
 		}
 	}
 }
-
-// =============================================================================
-// TaskContext inline implementations
-// =============================================================================
-inline float TaskContext::dt() const { return pm.dt(); }
-inline uint64_t TaskContext::tick_count() const { return pm.tick_count(); }
-inline Id TaskContext::spawn() { return pm.spawn(); }
-inline void TaskContext::remove_entity(Id id) { pm.remove_entity(id); }
-
-inline bool TaskContext::sync_id(Id id) { return pm.sync_id(id); }
-inline void TaskContext::quit() { pm.quit(); }
-inline bool TaskContext::is_running() const { return pm.is_running(); }
-inline bool TaskContext::is_paused() const { return pm.is_paused(); }
-inline void TaskContext::pause() { pm.pause(); }
-inline void TaskContext::resume() { pm.resume(); }
-inline void TaskContext::toggle_pause() { pm.toggle_pause(); }
-inline const std::vector<std::string> &TaskContext::faults() const { return pm.faults(); }
-inline bool TaskContext::stepping() const { return pm.stepping(); }
 
 } // namespace pm

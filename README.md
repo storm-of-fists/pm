@@ -51,7 +51,7 @@ re-run `cmake --preset dev`.
 
 | Header | Purpose |
 |--------|---------|
-| `pm_core.hpp` | Kernel: Pm scheduler, Pool\<T\>, State\<T\>, TaskContext, ECS, ThreadPool |
+| `pm_core.hpp` | Kernel: Pm scheduler, Pool\<T\>, State\<T\>, ECS, ThreadPool |
 | `pm_math.hpp` | Vec2, distance, normalize, Rng (xorshift32) |
 | `pm_udp.hpp` | Networked sync: NetSys, peer management, reliable messaging, pool sync |
 | `pm_sdl.hpp` | SDL3 window/renderer, DrawQueue, KeyQueue, pixel font, exe_dir() |
@@ -73,8 +73,8 @@ auto* cfg = pm.state<Config>("config");
 auto* pos = pm.pool<Pos>("pos");
 
 // Task scheduling (runs lowest priority first)
-pm.schedule("physics", 30.f, [pos](TaskContext& ctx) {
-    float dt = ctx.dt();
+pm.schedule("physics", 30.f, [pos](Pm& pm) {
+    float dt = pm.dt();
     pos->each_mut([dt](Pos& p) {
         p.x += p.vx * dt;
         p.y += p.vy * dt;
@@ -95,17 +95,17 @@ pm.run();
 
 Fetch pools, states, and other pointers **during init** and capture them in the lambda
 closure. Don't call `pool<T>()` or `state<T>()` inside a task — those are init-time
-operations. `TaskContext` exists only to carry per-frame info (`dt()`, `spawn()`,
-`remove_entity()`). If you need the `Pm` directly (level loading, mod init), use `ctx.pm`.
+operations. Tasks receive `Pm&` directly, giving access to per-frame info (`dt()`, `spawn()`,
+`remove_entity()`) and everything else.
 
 ```cpp
 void physics_init(Pm& pm) {
     auto* pos = pm.pool<Pos>("pos");   // capture at init
     auto* vel = pm.pool<Vel>("vel");
 
-    pm.schedule("physics", 30.f, [pos, vel](TaskContext& ctx) {
+    pm.schedule("physics", 30.f, [pos, vel](Pm& pm) {
         // Good: pos/vel already captured, no lookup per frame
-        float dt = ctx.dt();
+        float dt = pm.dt();
         pos->each_mut([dt](Pos& p) { p.x += p.vx * dt; });
     });
 }
@@ -121,9 +121,9 @@ Quick reference:
 - `pm.remove_entity(id)` — deferred removal (flushed at end of `tick_once()`)
 - `pool->each([](const T&) { ... })` — read-only iteration, no change hooks
 - `pool->each_mut([](T&) { ... })` — mutable iteration, fires change hooks
-- Tasks receive `TaskContext& ctx` with `ctx.dt()`, `ctx.pm`, `ctx.quit()`
+- Tasks receive `Pm& pm` with `pm.dt()`, `pm.quit()`, `pm.spawn()`, etc.
 - Networking: `net->on_recv(type, handler)`, `net->send_to(peer, data, size)`
-- All time is `float` seconds (matches `ctx.dt()`)
+- All time is `float` seconds (matches `pm.dt()`)
 - Mods: `.so` files exporting `extern "C" pm_mod_load(Pm&)` / `pm_mod_unload(Pm&)`
 - `pm.unschedule("name")` — remove a task (nulls fn + deactivates, safe for dlclose)
 
@@ -171,7 +171,7 @@ net->port = 9998;
 net->start();
 net_init(pm, net, Phase::NET_RECV, Phase::NET_SEND);
 
-net->on_recv(PKT_INPUT, [](TaskContext&, const uint8_t* buf, int n, sockaddr_in&) {
+net->on_recv(PKT_INPUT, [](Pm&, const uint8_t* buf, int n, sockaddr_in&) {
     // handle packet
 });
 
@@ -183,7 +183,7 @@ net->bind_send(pm, pool, "sync_name", Phase::NET_SEND, write_fn);
 ```cpp
 // In your .so mod:
 extern "C" void pm_mod_load(Pm& pm) {
-    pm.schedule("mod_task", 50.f, [](TaskContext& ctx) { /* ... */ });
+    pm.schedule("mod_task", 50.f, [](Pm& pm) { /* ... */ });
 }
 extern "C" void pm_mod_unload(Pm& pm) {
     pm.unschedule("mod_task");
@@ -302,7 +302,7 @@ ctest --test-dir build -V
   - **Devirtualize PoolBase:** replace virtual `remove`/`clear_all`/`shrink_to_fit` with
     function pointers or type-erased callables. C++20 not strictly required but concepts
     can constrain the erased interface.
-- ~~**Compiler warnings (always on):** `-Wall -Wextra -Wpedantic -Werror -Wshadow`~~
+- ~~**Compiler warnings (always on):** `-Wall -Wextra -Wpedantic -Werror`~~
 - ~~**Single build config:** `RelWithDebInfo` (`-O2 -g`), sanitizer presets (`asan`, `tsan`)~~
 - **`-Wconversion`:** deferred — extremely noisy in game code, needs dedicated cleanup pass
 - **CI (4 jobs):** ASan build, UBSan build, TSan build (separate — can't combine with ASan),

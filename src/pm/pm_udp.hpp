@@ -585,7 +585,7 @@ struct NetSys {
 	float send_timer = 0;
 
 	// --- Custom packet dispatch ---
-	using PacketHandler = std::function<void(TaskContext&, const uint8_t*, int, struct sockaddr_in&)>;
+	using PacketHandler = std::function<void(Pm&, const uint8_t*, int, struct sockaddr_in&)>;
 	PacketHandler packet_handlers[256]{};
 
 	void on_recv(uint8_t type, PacketHandler fn) {
@@ -593,7 +593,7 @@ struct NetSys {
 	}
 
 	// --- Pool registration ---
-	using RecvHandler = std::function<void(TaskContext&, const uint8_t*, uint16_t)>;
+	using RecvHandler = std::function<void(Pm&, const uint8_t*, uint16_t)>;
 	struct PoolHandler {
 		RecvHandler on_sync;
 		RecvHandler on_removal;
@@ -698,16 +698,16 @@ struct NetSys {
 			peer_net[p].pending_removals.push_back({pool_id, id});
 	}
 
-	void tracked_remove(TaskContext& ctx, PoolBase* pool, Id id) {
+	void tracked_remove(Pm& pm, PoolBase* pool, Id id) {
 		track_removal(pool->pool_id, id);
-		ctx.remove_entity(id);
+		pm.remove_entity(id);
 	}
 
 	template<typename T>
-	void clear_pool(TaskContext& ctx, Pool<T>* pool) {
+	void clear_pool(Pm& pm, Pool<T>* pool) {
 		pool->each([&](Id id, const T&) {
 			track_removal(pool->pool_id, id);
-			ctx.remove_entity(id);
+			pm.remove_entity(id);
 		}, Parallel::Off);
 	}
 
@@ -779,7 +779,7 @@ struct NetSys {
 	}
 
 	// --- State sync registration ---
-	using StateRecvHandler = std::function<void(TaskContext&, const uint8_t*, uint16_t)>;
+	using StateRecvHandler = std::function<void(Pm&, const uint8_t*, uint16_t)>;
 	std::unordered_map<uint32_t, StateRecvHandler> state_recv_handlers;
 
 	void on_state_recv(uint32_t state_id, StateRecvHandler fn) {
@@ -787,13 +787,13 @@ struct NetSys {
 	}
 
 	// bind_state_send: register a task that serializes state and pushes to all peers every tick.
-	// WriteFn signature: uint16_t(TaskContext& ctx, uint8_t* out_buf) — returns bytes written (0 = skip).
+	// WriteFn signature: uint16_t(Pm& pm, uint8_t* out_buf) — returns bytes written (0 = skip).
 	template<typename WriteFn>
 	void bind_state_send(Pm& pm, uint32_t state_id, const char* task_name, float priority, WriteFn write_fn) {
-		pm.schedule(task_name, priority, [this, state_id, write_fn](TaskContext& ctx) {
+		pm.schedule(task_name, priority, [this, state_id, write_fn](Pm& pm) {
 			if (!should_send) return;
 			uint8_t buf[MAX_STATE_SIZE];
-			uint16_t sz = write_fn(ctx, buf);
+			uint16_t sz = write_fn(pm, buf);
 			if (sz > 0) push_state_all(state_id, buf, sz);
 		});
 	}
@@ -873,14 +873,14 @@ struct NetSys {
 	template <typename T, typename ReadFn>
 	void bind_recv(Pool<T>* pool, ReadFn read_fn) {
 		register_pool(pool->pool_id,
-			[pool, read_fn](TaskContext& ctx, const uint8_t* data, uint16_t count) {
-				read_fn(ctx, pool, data, count);
+			[pool, read_fn](Pm& pm, const uint8_t* data, uint16_t count) {
+				read_fn(pm, pool, data, count);
 			},
-			[](TaskContext& ctx, const uint8_t* data, uint16_t count) {
+			[](Pm& pm, const uint8_t* data, uint16_t count) {
 				for (uint16_t i = 0; i < count; i++) {
 					Id id; memcpy(&id, data + i * sizeof(Id), sizeof(Id));
-					ctx.sync_id(id);
-					ctx.remove_entity(id);
+					pm.sync_id(id);
+					pm.remove_entity(id);
 				}
 			});
 	}
@@ -906,7 +906,8 @@ struct NetSys {
 
 		ss->repend_all(pool);
 
-		pm.schedule(task_name, priority, [this, pool, ss, write_fn, interest_fn, hysteresis](TaskContext& ctx) {
+		pm.schedule(task_name, priority, [this, pool, ss, write_fn, interest_fn, hysteresis](Pm& pm) {
+			(void)pm;
 			if (!should_send) return;
 			constexpr bool has_interest = !std::is_same_v<InterestFn, std::nullptr_t>;
 
@@ -917,7 +918,7 @@ struct NetSys {
 					for (size_t di = 0; di < pool->items.size(); di++) {
 						Id id = pool->id_at(di);
 						if (!ss->is_synced_to(p, id)) continue;
-						if (!interest_fn(ctx, p, id, pool->items[di], hysteresis)) {
+						if (!interest_fn(pm, p, id, pool->items[di], hysteresis)) {
 							ss->mark_unsynced_for(p, id);
 							peer_net[p].pending_removals.push_back({pool->pool_id, id});
 						}
@@ -926,7 +927,7 @@ struct NetSys {
 
 				ss->each_unsynced(pool, p, remote_mask, [&](Id id, T& val, size_t) {
 					if constexpr (has_interest) {
-						if (!interest_fn(ctx, p, id, val, 0.f)) return;
+						if (!interest_fn(pm, p, id, val, 0.f)) return;
 					}
 					uint8_t buf[MAX_ENTRY_SIZE];
 					uint16_t sz = write_fn(id, val, buf);
@@ -1050,7 +1051,7 @@ private:
 // =============================================================================
 inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 {
-	pm.schedule("net/recv", recv_phase, [net](TaskContext& ctx) {
+	pm.schedule("net/recv", recv_phase, [net](Pm& pm) {
 		if (net->sock.sock == INVALID_SOCKET) return;
 		struct sockaddr_in src{}; int n; uint8_t buf[16384];
 
@@ -1089,7 +1090,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 
 					auto it = net->handlers.find(sh.pool_id);
 					if (it != net->handlers.end() && sh.sync_count > 0 && it->second.on_sync)
-						it->second.on_sync(ctx, ptr, sh.sync_count);
+						it->second.on_sync(pm, ptr, sh.sync_count);
 					ptr += sync_bytes;
 				}
 			}
@@ -1099,7 +1100,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 				if ((int)sizeof(PktStateSync) + hdr.size <= n) {
 					auto it = net->state_recv_handlers.find(hdr.state_id);
 					if (it != net->state_recv_handlers.end())
-						it->second(ctx, buf + sizeof(PktStateSync), hdr.size);
+						it->second(pm, buf + sizeof(PktStateSync), hdr.size);
 				}
 			}
 			// --- Reliable message: dedup, ack, dispatch inner type ---
@@ -1128,7 +1129,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 						if (payload_size >= (int)(6 + count * sizeof(Id))) {
 							auto it = net->handlers.find(pool_id);
 							if (it != net->handlers.end() && it->second.on_removal)
-								it->second.on_removal(ctx, payload + 6, count);
+								it->second.on_removal(pm, payload + 6, count);
 						}
 					}
 				}
@@ -1139,7 +1140,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 					if (inner_size > 0) {
 						inner_buf[0] = hdr.inner_type;
 						memcpy(inner_buf + 1, buf + sizeof(PktReliable), inner_size);
-						net->packet_handlers[hdr.inner_type](ctx, inner_buf, inner_size + 1, src);
+						net->packet_handlers[hdr.inner_type](pm, inner_buf, inner_size + 1, src);
 					}
 				}
 			}
@@ -1235,24 +1236,24 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 			}
 			// --- Custom packet handlers ---
 			else if (net->packet_handlers[type]) {
-				net->packet_handlers[type](ctx, buf, n, src);
+				net->packet_handlers[type](pm, buf, n, src);
 			}
 		}
 	});
 
-	pm.schedule("net/tick", send_phase - 10.f, [net](TaskContext& ctx) {
-		net->local_time += ctx.dt();
+	pm.schedule("net/tick", send_phase - 10.f, [net](Pm& pm) {
+		net->local_time += pm.dt();
 		net->should_send = false;
 
 		// --- Client connect retry/timeout ---
 		if (net->conn_state == NetSys::ConnState::CONNECTING) {
-			net->connect_elapsed += ctx.dt();
+			net->connect_elapsed += pm.dt();
 			if (net->connect_elapsed >= net->connect_timeout) {
 				net->conn_state = NetSys::ConnState::DISCONNECTED;
 				if (net->connect_denied_callback)
 					net->connect_denied_callback(*net, 0); // reason 0 = timeout
 			} else {
-				net->connect_timer += ctx.dt();
+				net->connect_timer += pm.dt();
 				if (net->connect_timer >= net->connect_retry_interval) {
 					net->connect_timer = 0.f;
 					net->send_connect_req();
@@ -1261,7 +1262,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 		}
 
 		for (uint8_t p : net->remote_peers()) {
-			net->peer_net[p].snapshot_age = std::min(net->peer_net[p].snapshot_age + ctx.dt(), 0.2f);
+			net->peer_net[p].snapshot_age = std::min(net->peer_net[p].snapshot_age + pm.dt(), 0.2f);
 
 			// Timeout: disconnect peers we haven't heard from
 			if (net->peer_net[p].last_recv_time > 0.f &&
@@ -1271,7 +1272,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 		}
 
 		if (net->sock.sock != INVALID_SOCKET) {
-			net->send_timer += ctx.dt();
+			net->send_timer += pm.dt();
 			if (net->send_timer >= net->send_rate) {
 				net->send_timer -= net->send_rate;
 				net->should_send = true;
@@ -1290,7 +1291,7 @@ inline void net_init(Pm& pm, NetSys* net, float recv_phase, float send_phase)
 		}
 	});
 
-	pm.schedule("net/flush", send_phase + 5.f, [net](TaskContext&) {
+	pm.schedule("net/flush", send_phase + 5.f, [net](Pm&) {
 		if (!net->should_send) {
 			for (uint8_t p : net->remote_peers()) net->peer_net[p].clear_frame();
 			return;

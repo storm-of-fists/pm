@@ -17,14 +17,14 @@ void physics_init(pm::Pm& pm)
     auto* ps = pm.state<PhysicsState>("physics");
     auto* pos_pool = pm.pool<Pos>("pos");
     auto* vel_pool = pm.pool<Vel>("vel");
-    pm.schedule("physics/tick", 30.f, [ps, pos_pool, vel_pool](pm::TaskContext& ctx) {
+    pm.schedule("physics/tick", 30.f, [ps, pos_pool, vel_pool](pm::Pm& pm) {
         (void)ps;
         pos_pool->each_mut([&](pm::Id id, Pos& pos) {
             auto* vel = vel_pool->get(id);
             if (vel)
             {
-                pos.x += vel->dx * ctx.dt();
-                pos.y += vel->dy * ctx.dt();
+                pos.x += vel->dx * pm.dt();
+                pos.y += vel->dy * pm.dt();
             }
         }, pm::Parallel::Off);
     });
@@ -204,7 +204,7 @@ int main()
     {
         pm::Pm pm;
         int counter = 0;
-        pm.schedule("test/count", 50.f, [&counter](pm::TaskContext &) { counter++; });
+        pm.schedule("test/count", 50.f, [&counter](pm::Pm &) { counter++; });
         pm.tick_once();
         assert(counter == 1);
         pm.tick_once();
@@ -392,7 +392,7 @@ int main()
         auto *s = pm.state<PhysicsState>("mystate");
         assert(s != nullptr);
 
-        pm.schedule("mytask", 50.f, [](pm::TaskContext &) {});
+        pm.schedule("mytask", 50.f, [](pm::Pm &) {});
         assert(pm.task("mytask") != nullptr);
         printf("  [OK] const char* overloads\n");
     }
@@ -415,8 +415,8 @@ int main()
     {
         pm::Pm pm;
         int counter_a = 0, counter_b = 0;
-        pm.schedule("task_a", 50.f, [&counter_a](pm::TaskContext &) { counter_a++; });
-        pm.schedule("task_b", 60.f, [&counter_b](pm::TaskContext &) { counter_b++; });
+        pm.schedule("task_a", 50.f, [&counter_a](pm::Pm &) { counter_a++; });
+        pm.schedule("task_b", 60.f, [&counter_b](pm::Pm &) { counter_b++; });
 
         pm.tick_once();
         assert(counter_a == 1 && counter_b == 1);
@@ -431,7 +431,7 @@ int main()
     {
         pm::Pm pm;
         int counter = 0;
-        pm.schedule("mysys", 50.f, [&counter](pm::TaskContext &) { counter++; });
+        pm.schedule("mysys", 50.f, [&counter](pm::Pm &) { counter++; });
 
         pm.tick_once();
         assert(counter == 1);
@@ -536,9 +536,9 @@ int main()
         pool->add(e2, {2, 0});
         pool->add(e3, {3, 0});
 
-        pm.schedule("test", 1.f, [pool](pm::TaskContext& ctx) {
+        pm.schedule("test", 1.f, [pool](pm::Pm& pm) {
             pool->each([&](pm::Id id, const Pos& p) {
-                if (p.x == 2.f) ctx.remove_entity(id);
+                if (p.x == 2.f) pm.remove_entity(id);
             }, pm::Parallel::Off);
         });
         pm.tick_once();
@@ -677,7 +677,7 @@ int main()
     {
         pm::Pm pm;
         int counter = 0;
-        pm.schedule("faulty", 50.f, [&counter](pm::TaskContext &) {
+        pm.schedule("faulty", 50.f, [&counter](pm::Pm &) {
             counter++;
             if (counter >= 2) throw pm::TaskFault("boom");
         });
@@ -697,8 +697,8 @@ int main()
         pm::Pm pm;
         int always_count = 0, game_count = 0;
 
-        pm.schedule("input", 10.f, [&](pm::TaskContext&) { always_count++; });
-        pm.schedule("physics", 30.f, [&](pm::TaskContext&) { game_count++; },
+        pm.schedule("input", 10.f, [&](pm::Pm&) { always_count++; });
+        pm.schedule("physics", 30.f, [&](pm::Pm&) { game_count++; },
                     true);
 
         pm.tick_once();
@@ -1539,7 +1539,7 @@ int main()
         auto* net = pm.state<pm::NetSys>("net");
 
         bool called = false;
-        net->on_state_recv(42, [&](pm::TaskContext&, const uint8_t*, uint16_t) {
+        net->on_state_recv(42, [&](pm::Pm&, const uint8_t*, uint16_t) {
             called = true;
         });
 

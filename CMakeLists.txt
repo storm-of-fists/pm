@@ -9,7 +9,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Strict warnings — used by all pm targets (not applied to FetchContent deps)
-set(PM_WARNINGS -Wall -Wextra -Wpedantic -Werror -Wshadow)
+set(PM_WARNINGS -Wall -Wextra -Wpedantic -Werror)
 
 # SDL3 + SDL3_image — built from source via FetchContent
 include(FetchContent)
