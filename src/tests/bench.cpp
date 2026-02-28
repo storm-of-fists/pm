@@ -2,10 +2,10 @@
 //
 // Measures ns/op for Pool, State, Entity, and integrated workloads.
 // No external dependencies — raw chrono timing + printf results.
-// Always writes bench_results.csv next to the binary for regression tracking.
+// Compiled into pm_tests — benchmarks run after all tests pass.
 //
-// Build: cmake --build build --target pm_bench
-// Run:   ./build/pm_bench
+// Build: cmake --build build --target pm_tests
+// Run:   ./build/pm_tests
 
 #include "pm_core.hpp"
 #include "pm_spatial_grid.hpp"

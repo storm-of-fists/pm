@@ -235,23 +235,34 @@ inline size_t get_type_id()
 // =============================================================================
 // Ids & Handles
 // =============================================================================
-using Id = uint64_t;
-constexpr Id NULL_ID = 0xFFFFFFFFFFFFFFFFULL;
 constexpr uint32_t NULL_INDEX = 0x00FFFFFF;
+constexpr uint16_t ID_FLAG_FREE = 0x0001;
 
 // Id layout: [63..40] 24-bit index, [39..16] 24-bit generation, [15..0] 16-bit flags
-inline uint32_t id_index(Id id) { return static_cast<uint32_t>((id >> 40) & 0xFFFFFF); }
-inline uint32_t id_generation(Id id) { return static_cast<uint32_t>((id >> 16) & 0xFFFFFF); }
-inline uint16_t id_flags(Id id) { return static_cast<uint16_t>(id & 0xFFFF); }
-inline Id make_id(uint32_t idx, uint32_t gen, uint16_t flags = 0)
+struct Id
 {
-	return (static_cast<uint64_t>(idx & 0xFFFFFF) << 40)
-		 | (static_cast<uint64_t>(gen & 0xFFFFFF) << 16)
-		 | flags;
-}
+	uint64_t raw = 0xFFFFFFFFFFFFFFFFULL;
 
-constexpr uint16_t ID_FLAG_FREE = 0x0001;
-inline bool id_is_free(Id slot) { return (slot & ID_FLAG_FREE) != 0; }
+	Id() = default;
+	constexpr explicit Id(uint64_t v) : raw(v) {}
+
+	static Id make(uint32_t idx, uint32_t gen, uint16_t flags = 0)
+	{
+		return Id{(static_cast<uint64_t>(idx & 0xFFFFFF) << 40)
+				| (static_cast<uint64_t>(gen & 0xFFFFFF) << 16)
+				| flags};
+	}
+
+	uint32_t index()      const { return static_cast<uint32_t>((raw >> 40) & 0xFFFFFF); }
+	uint32_t generation() const { return static_cast<uint32_t>((raw >> 16) & 0xFFFFFF); }
+	uint16_t flags()      const { return static_cast<uint16_t>(raw & 0xFFFF); }
+	bool     is_free()    const { return (raw & ID_FLAG_FREE) != 0; }
+
+	bool operator==(Id o) const { return raw == o.raw; }
+	bool operator!=(Id o) const { return raw != o.raw; }
+};
+
+constexpr Id NULL_ID{};
 
 template <typename T>
 class Pool;
@@ -334,7 +345,7 @@ public:
 
 	T *add(Id id, T val = T{})
 	{
-		uint32_t idx = id_index(id);
+		uint32_t idx = id.index();
 		if (idx >= sparse_indices.size())
 			sparse_indices.resize(idx + 1, NULL_INDEX);
 
@@ -360,7 +371,7 @@ public:
 
 	void remove(Id id) override
 	{
-		uint32_t idx = id_index(id);
+		uint32_t idx = id.index();
 		if (idx >= sparse_indices.size() || sparse_indices[idx] == NULL_INDEX)
 			return;
 
@@ -413,7 +424,7 @@ public:
 
 	T *get(Id id)
 	{
-		uint32_t idx = id_index(id);
+		uint32_t idx = id.index();
 		if (idx >= sparse_indices.size() || sparse_indices[idx] == NULL_INDEX)
 			return nullptr;
 		uint32_t dense_idx = sparse_indices[idx];
@@ -421,7 +432,7 @@ public:
 		if (kernel_slots)
 		{
 			Id slot = (*kernel_slots)[idx];
-			if (id_generation(slot) != id_generation(id) || id_is_free(slot))
+			if (slot.generation() != id.generation() || slot.is_free())
 				return nullptr;
 		}
 		return &items[dense_idx];
@@ -681,7 +692,7 @@ public:
 		{
 			uint32_t candidate = _free_ids.back();
 			_free_ids.pop_back();
-			if (id_is_free(_slots[candidate]))
+			if (_slots[candidate].is_free())
 			{
 				idx = candidate;
 				break;
@@ -690,13 +701,13 @@ public:
 		if (idx == UINT32_MAX)
 		{
 			idx = static_cast<uint32_t>(_slots.size());
-			_slots.push_back(make_id(idx, 1, ID_FLAG_FREE));
+			_slots.push_back(Id::make(idx, 1, ID_FLAG_FREE));
 		}
-		uint32_t gen = id_generation(_slots[idx]);
-		_slots[idx] = make_id(idx, gen); // clear free flag
+		uint32_t gen = _slots[idx].generation();
+		_slots[idx] = Id::make(idx, gen); // clear free flag
 		_spawns_this_frame++;
 		_alive_count++;
-		return make_id(idx, gen);
+		return Id::make(idx, gen);
 	}
 
 	void id_remove(Id id)
@@ -711,14 +722,14 @@ public:
 	{
 		for (Id id : _pending_removes)
 		{
-			uint32_t idx = id_index(id);
+			uint32_t idx = id.index();
 			if (idx >= _slots.size()) continue;
-			if (id_generation(_slots[idx]) != id_generation(id)) continue;
-			if (id_is_free(_slots[idx])) continue;
+			if (_slots[idx].generation() != id.generation()) continue;
+			if (_slots[idx].is_free()) continue;
 
-			uint32_t new_gen = (id_generation(id) + 1) & 0xFFFFFF;
+			uint32_t new_gen = (id.generation() + 1) & 0xFFFFFF;
 			if (new_gen == 0) new_gen = 1;
-			_slots[idx] = make_id(idx, new_gen, ID_FLAG_FREE);
+			_slots[idx] = Id::make(idx, new_gen, ID_FLAG_FREE);
 
 			for (PoolBase *p : _pool_by_id)
 			{
@@ -734,8 +745,8 @@ public:
 
 	bool id_sync(Id id)
 	{
-		uint32_t idx = id_index(id);
-		uint32_t gen = id_generation(id);
+		uint32_t idx = id.index();
+		uint32_t gen = id.generation();
 
 		if (idx > MAX_SYNC_INDEX)
 			return false;
@@ -743,20 +754,20 @@ public:
 		if (idx >= _slots.size())
 		{
 			uint32_t old_size = static_cast<uint32_t>(_slots.size());
-			_slots.resize(idx + 1, make_id(0, 0, ID_FLAG_FREE));
+			_slots.resize(idx + 1, Id::make(0, 0, ID_FLAG_FREE));
 			for (uint32_t i = old_size; i <= idx; ++i)
 			{
-				_slots[i] = make_id(i, 0, ID_FLAG_FREE);
+				_slots[i] = Id::make(i, 0, ID_FLAG_FREE);
 				if (i < idx) _free_ids.push_back(i);
 			}
 		}
 
-		uint32_t current_gen = id_generation(_slots[idx]);
+		uint32_t current_gen = _slots[idx].generation();
 		if (current_gen > gen)
 			return false;
 
-		if (id_is_free(_slots[idx])) _alive_count++;
-		_slots[idx] = make_id(idx, gen); // clear free flag
+		if (_slots[idx].is_free()) _alive_count++;
+		_slots[idx] = Id::make(idx, gen); // clear free flag
 		return true;
 	}
 

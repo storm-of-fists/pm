@@ -202,7 +202,7 @@ int main()
     // --- id_sync ---
     {
         pm::Pm pm;
-        pm::Id remote_id = pm::make_id(42, 7);
+        pm::Id remote_id = pm::Id::make(42, 7);
         pm.id_sync(remote_id);
 
         auto *pos = pm.pool_get<Pos>("pos");
@@ -217,7 +217,7 @@ int main()
         auto *pool = pm.pool_get<Pos>("pos");
 
         for (uint32_t gen = 1; gen <= 100; gen++) {
-            pm::Id id = pm::make_id(5, gen);
+            pm::Id id = pm::Id::make(5, gen);
             pm.id_sync(id);
             pool->add(id, {(float)gen, 0});
             assert(pm.id_count() < 1000000);
@@ -233,7 +233,7 @@ int main()
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
 
-        pm::Id id_v1 = pm::make_id(5, 1);
+        pm::Id id_v1 = pm::Id::make(5, 1);
         assert(pm.id_sync(id_v1) == true);
         pool->add(id_v1, {1, 2});
 
@@ -242,7 +242,7 @@ int main()
 
         assert(pm.id_sync(id_v1) == false);
 
-        pm::Id id_v2 = pm::make_id(5, 2);
+        pm::Id id_v2 = pm::Id::make(5, 2);
         assert(pm.id_sync(id_v2) == true);
         pool->add(id_v2, {3, 4});
         assert(pool->has(id_v2));
@@ -255,11 +255,11 @@ int main()
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
 
-        pm::Id v1 = pm::make_id(5, 1);
+        pm::Id v1 = pm::Id::make(5, 1);
         pm.id_sync(v1);
         pool->add(v1, {10, 20});
 
-        pm::Id v2 = pm::make_id(5, 2);
+        pm::Id v2 = pm::Id::make(5, 2);
         pm.id_sync(v2);
         pool->add(v2, {30, 40});
 
@@ -275,19 +275,19 @@ int main()
         auto *pool = pm.pool_get<Pos>("pos");
 
         for (uint32_t i = 0; i < 10; i++) {
-            pm::Id id = pm::make_id(i * 3, 1);
+            pm::Id id = pm::Id::make(i * 3, 1);
             pm.id_sync(id);
             pool->add(id, {(float)i, 0});
         }
         assert(pm.id_count() == 10);
 
         for (uint32_t i = 0; i < 5; i++)
-            pm.id_remove(pm::make_id(i * 3, 1));
+            pm.id_remove(pm::Id::make(i * 3, 1));
         pm.loop_once();
         assert(pm.id_count() == 5);
 
         for (uint32_t i = 0; i < 5; i++) {
-            pm::Id id = pm::make_id(i * 3, 2);
+            pm::Id id = pm::Id::make(i * 3, 2);
             pm.id_sync(id);
             pool->add(id, {(float)i + 100, 0});
         }
@@ -300,14 +300,14 @@ int main()
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
 
-        pm::Id v1 = pm::make_id(5, 1);
+        pm::Id v1 = pm::Id::make(5, 1);
         pm.id_sync(v1);
         pool->add(v1, {1, 1});
         pm.id_remove(v1);
         pm.id_process_removes();
         assert(!pool->has(v1));
 
-        pm::Id v2 = pm::make_id(5, 2);
+        pm::Id v2 = pm::Id::make(5, 2);
         assert(pm.id_sync(v2));
         pool->add(v2, {99, 99});
 
@@ -321,7 +321,7 @@ int main()
         pm::Pm pm;
         auto *pool = pm.pool_get<Pos>("pos");
 
-        pm::Id v1 = pm::make_id(5, 1);
+        pm::Id v1 = pm::Id::make(5, 1);
         pm.id_sync(v1);
         pool->add(v1, {10, 20});
         assert(pool->has(v1));
@@ -480,7 +480,7 @@ int main()
             pool->add(e, {(float)i, 0.f});
         }
         pool->each_mut([](pm::Id id, Pos& p) {
-            p.y = (float)pm::id_index(id);
+            p.y = (float)id.index();
         });
         for (size_t i = 0; i < pool->items.size(); i++) {
             uint32_t slot = pool->dense_indices[i];

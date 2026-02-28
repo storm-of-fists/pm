@@ -257,7 +257,7 @@ struct PoolSyncState
 
 	void mark_changed(Id id)
 	{
-		uint32_t idx = id_index(id);
+		uint32_t idx = id.index();
 		ensure_size(idx);
 		synced[idx] = 0;
 		pending_add(idx, id);
@@ -265,14 +265,14 @@ struct PoolSyncState
 
 	void mark_synced(uint8_t peer, Id id)
 	{
-		uint32_t idx = id_index(id);
+		uint32_t idx = id.index();
 		ensure_size(idx);
 		synced[idx] |= (1ULL << peer);
 	}
 
 	void mark_unsynced_for(uint8_t peer, Id id)
 	{
-		uint32_t idx = id_index(id);
+		uint32_t idx = id.index();
 		ensure_size(idx);
 		synced[idx] &= ~(1ULL << peer);
 		pending_add(idx, id);
@@ -280,7 +280,7 @@ struct PoolSyncState
 
 	bool is_synced_to(uint8_t peer, Id id) const
 	{
-		uint32_t idx = id_index(id);
+		uint32_t idx = id.index();
 		if (idx >= synced.size()) return false;
 		return (synced[idx] & (1ULL << peer)) != 0;
 	}
@@ -293,7 +293,7 @@ struct PoolSyncState
 		for (size_t r = 0; r < pending.size(); r++)
 		{
 			Id id = pending[r];
-			uint32_t idx = id_index(id);
+			uint32_t idx = id.index();
 
 			if (!pool->has(id))
 			{
@@ -329,7 +329,7 @@ struct PoolSyncState
 		for (size_t i = 0; i < pool->items.size(); i++)
 		{
 			Id id = pool->id_at(i);
-			uint32_t idx = id_index(id);
+			uint32_t idx = id.index();
 			pending_add(idx, id);
 		}
 	}

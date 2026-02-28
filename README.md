@@ -339,6 +339,10 @@ ctest --test-dir build -V
 - **Devirtualize Pool:** replace virtual `PoolBase` with function pointers or template-erased
   callables. Eliminates vtable dispatch on every remove. Linear scan of pools is fine —
   `Pool::remove` fast-fails in 2 comparisons (~1-2ns per pool).
+- **Multi-hook support for Pool:** `set_change_hook()` / `set_swap_hook()` currently allow only
+  one observer per pool (raw function pointer, second call silently clobbers the first). Need to
+  support multiple hooks so e.g. network sync and debug/dirty-tracking can both observe the same
+  pool. Options: small inline vector of hooks, or a single dispatcher that fans out.
 - **Chunk allocation:** 16KB pages, cache-line aligned. Stable pointers across growth — no
   realloc stalls. Tension with `sort_by` (cross-chunk moves). Consider sort within chunks only.
 
