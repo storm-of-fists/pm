@@ -125,42 +125,6 @@ Quick reference:
 - Mods: `.so` files exporting `extern "C" pm_mod_load(Pm&)` / `pm_mod_unload(Pm&)`
 - `pm.task_stop("name")` — stop a task (clears fn + deactivates, safe for dlclose)
 
-### Iteration: `each()` / `each_mut()`
-
-```cpp
-// Read-only (no change hooks fired):
-pool->each([](const T& val) { ... });               // value only
-pool->each([](Id id, const T& val) { ... });        // with entity id
-pool->each(fn, Parallel::Off);                      // force sequential
-pool->each(fn, Parallel::On);                       // force parallel
-pool->each(fn);                                     // auto: parallel above 1024 items
-pool->each(fn, Parallel::On, 4);                    // force parallel, limit to 4 threads
-
-// Mutable (fires change hooks after each call):
-pool->each_mut([](T& val) { ... });                 // value only
-pool->each_mut([](Id id, T& val) { ... });          // with entity id
-pool->each_mut(fn, Parallel::Off);                  // force sequential
-pool->each_mut(fn);                                 // auto: parallel above 1024 items
-pool->each_mut(fn, Parallel::On, 8);                // force parallel, limit to 8 threads
-```
-
-- Lambda is the only iteration API (range-based forms removed)
-- `each()` is read-only: passes `const T&`, does NOT fire change hooks. Safe for parallel.
-- `each_mut()` is mutable: passes `T&`, auto-fires change hooks after every lambda call.
-  If a change hook is installed and parallel is requested, `each_mut()` falls back to
-  sequential to prevent data races in the hook.
-- Auto-parallel dispatches chunks across a ThreadPool (lazy-init, `hardware_concurrency()`)
-- Third parameter `threads` (default 0 = all workers) limits how many threads are active
-  for that specific call. Workers beyond the limit wake but skip work. Useful for tuning
-  per-pool: heavy compute benefits from all cores, light work is better with fewer.
-- `pm.thread_count = n` controls how many worker threads are created (clamped to
-  `hardware_concurrency()`). 0 = auto. Must be set before first parallel each.
-- `continue` in old range-for becomes `return` in lambda
-- Writes to `T&`: safe (your chunk in `each_mut`). Reads via `get()`: safe.
-  `id_remove()`: safe (deferred).
-- `id_add()`/`add()` in parallel `each`/`each_mut`: NOT safe (vector reallocation race).
-  Future: deferred spawn queue (like `id_remove`) or mutex-protected spawn.
-
 ### Networking
 
 ```cpp
@@ -190,66 +154,24 @@ extern "C" void pm_mod_unload(Pm& pm) {
 
 ModLoader watches `.so` files for mtime changes and hot-reloads via dlopen/dlclose.
 
-## Architecture
-
-### Phase constants
-
-Phase constants are game-specific, not framework-level. Hellfire defines its own in
-`hellfire_common.hpp`. Framework init functions (`sdl_init`, `net_init`, `debug_init`)
-take `float` priority parameters — tasks run lowest to highest. Document conventions
-per-game, don't bake them into pm_core.
-
-### Id flags
-
-Id flags (bits 15..0) must be immutable for the entity's lifetime (except `is_free`
-which is kernel-internal). Changing flags would require rewriting every `dense_ids`
-cache entry across all pools that contain the entity.
-
-### Deferred removes
-
-`id_remove(id)` queues the Id (mutex-protected, thread-safe). Entities stay alive
-and iterable for the rest of the frame. All queued removes flush at the end of
-`loop_once()` after all tasks complete. Double-removes are harmless (second is stale,
-skipped). Spawns are immediate (append to end of dense arrays); `each()` snapshots
-pool size at start so newly spawned entities are not visited.
-
 ## Example game: Hellfire
 
 A networked multiplayer top-down shooter. See
 [src/examples/hellfire/README.md](src/examples/hellfire/README.md) for game docs, architecture,
 and game-specific roadmap.
 
-## Benchmarks
+## Tests & Benchmarks
 
-~90 benchmarks covering kernel operations and real game workloads. Built with `-O2`.
-Benchmarks run automatically after tests pass via `ctest --test-dir build -V`.
-
-Each benchmark is a doctest `TEST_CASE` with a threshold check — if ns/op exceeds
-the threshold, the test fails. Thresholds are set at ~2x measured maximums to catch
-real regressions while tolerating normal variance.
+97 tests + 23 benchmark cases in a single binary (`pm_tests`), powered by doctest.
+Benchmarks have threshold-based pass/fail (~2x measured max) to catch regressions.
 
 ```bash
+ctest --test-dir build                  # run all (tests + benchmarks)
 ./build/pm_tests -ts=bench             # benchmarks only
 ./build/pm_tests -tse=bench            # tests only, skip benchmarks
-./build/pm_tests -tc="pool add"        # single benchmark
+./build/pm_tests -tc="pool add"        # single test/benchmark
+./build/pm_tests -ltc                  # list all test cases
 ```
-
-### Benchmark groups
-
-| Group | Benchmarks | What it covers |
-|-------|-----------|----------------|
-| Pool ops | 26 | add, get, has, remove, each, each_mut, clear, mixed |
-| State ops | 2 | fetch, create |
-| Entity/kernel | 7 | id_add, id_process_removes, entity churn |
-| Integrated workloads | 6 | game tick, multi-archetype, join patterns, sustained churn |
-| Thread scaling | 3 workloads x N threads | scaling behavior across core counts |
-| Spatial grid | 6 | insert, query (small/large radius), full frame rebuild+query |
-| Bullet churn | 3 | sustained spawn/expire, bullet physics |
-| Monster AI | 3 | steering + shooting (seq vs parallel, scaling) |
-| Collision frame | 3 | full collision pass, grid vs brute force comparison |
-| Server tick | 3 | full hellfire frame simulation (level 1, level 5, sustained) |
-| PLC utilities | 5 | Cooldown, Hysteresis, RisingEdge, DelayTimer, Counter |
-| Multi-pool tick | 2 | hellfire pool structure with cross-pool iteration |
 
 ### Key numbers (20-core WSL, -O2)
 
@@ -266,125 +188,48 @@ real regressions while tolerating normal variance.
 | Server tick level 5 | 0.06ms total |
 | Cooldown::ready | ~0.5 |
 
-## Tests
-
-97 tests + 23 benchmark cases in a single binary (`pm_tests`), powered by doctest.
-
-```bash
-cmake --build build --target pm_tests   # build
-ctest --test-dir build                  # run all (tests + benchmarks)
-./build/pm_tests -ts=core              # just core ECS tests
-./build/pm_tests -ltc                  # list all test cases
-```
-
 ## v3 Roadmap
 
 ### Phase 1 — Kernel cleanup (DONE)
-- ~~Id slots: bitpacked `uint64_t`, `m_slots` vector~~
-- ~~Deferred removes: `id_remove()` queues, `id_process_removes()` after all tasks~~
-- ~~Lambda `each()` with auto-parallel, ThreadPool~~
-- ~~Single-owner generation: Pool stores indices only~~
-- ~~Permanent pools/states via `unique_ptr`~~
-- ~~Kill pool/state graveyard vectors~~
-- ~~Remove entity string names~~
-- ~~Replace `Result` with `TaskFault`~~
-- ~~Remove `Hz` sub-stepping~~
-- ~~Phase constants moved to game code~~
+
+Bitpacked Id slots, deferred removes, lambda `each()`/`each_mut()` with auto-parallel,
+single-owner generation, permanent pools/states, no entity names, TaskFault, no Hz sub-stepping.
 
 ### Phase 2 — Build system & Architecture
 
-**Build system:**
-- **C++20 (active):** `CMAKE_CXX_STANDARD 20` set. Incremental adoption of C++20 features:
-  - **Concept constraints on Pool iteration:** add `requires` clauses to `each()`/`each_mut()`
-    so passing a bad lambda produces a clean error instead of template noise. Internal dispatch
-    stays `if constexpr` (handles two valid signatures per method). ~4 lines.
-  - **Concept constraints on init functions:** `sdl_init`, `net_init`, `debug_init` and
-    `pm.task_add()` take callable parameters — constrain with `std::invocable`.
-  - **`std::span` in networking API:** replace `const void* data, int/uint16_t len` pairs in
-    `pm_udp.hpp` (~10 functions: `send_to`, `broadcast`, `push`, `send_reliable`, etc.) with
-    `std::span<const uint8_t>`. Touches all callsites in hellfire server/client — standalone
-    refactor task.
-  - **`std::span` for Pool snapshots:** reader runners get `std::span<const T>` over frozen
-    copy (planned in pool snapshot feature below).
-  - **Devirtualize PoolBase:** replace virtual `remove`/`clear_all`/`shrink_to_fit` with
-    function pointers or type-erased callables. C++20 not strictly required but concepts
-    can constrain the erased interface.
-- ~~**Compiler warnings (always on):** `-Wall -Wextra -Wpedantic -Werror`~~
-- ~~**Single build config:** `RelWithDebInfo` (`-O2 -g`), sanitizer presets (`asan`, `tsan`)~~
-- **`-Wconversion`:** deferred — extremely noisy in game code, needs dedicated cleanup pass
-- **CI (4 jobs):** ASan build, UBSan build, TSan build (separate — can't combine with ASan),
-  clean release build
-- **Test splitting:** `test_pool.cpp`, `test_kernel.cpp`, `test_net.cpp`, etc. — each compiles
-  and runs independently. Failing network tests don't block pool results.
-- ~~**doctest:** replace raw asserts. Test names, actual vs expected on failure, CLI filtering.~~
-- **Fuzz testing:** network recv path + mod loading via libFuzzer/AFL. Finds buffer overreads,
-  malformed packets, truncated crashes.
-- ~~**Benchmark suite:** median-of-5 timing harness, ns/op, threshold-based pass/fail via
-  doctest. ~90 benchmarks across kernel ops, thread scaling, and hellfire game workloads.~~
-- **Deterministic replay:** record inputs (packets, player inputs, RNG seeds). Replay = bug
-  report. RNG already seeded (`Rng{42}`), just need input stream capture.
-- **Compile time tracking:** `-ftime-trace` (Clang), visualize in Chrome tracing, track in CI.
-- **Coverage:** `--coverage`, lcov/gcovr. Not chasing 100% — identify untested critical paths.
-- **Crash dump collection:** core dumps or Google Breakpad for minidumps. Ship release with
-  `-g1` for function names in stack traces. Module tag identifies which mod crashed.
+**Done:**
+- Compiler warnings: `-Wall -Wextra -Wpedantic -Werror`
+- Single build config: `RelWithDebInfo` (`-O2 -g`), sanitizer presets (`asan`, `tsan`)
+- doctest: test names, actual vs expected on failure, CLI filtering
+- Benchmark suite: median-of-5, threshold-based pass/fail via doctest
 
-**Architecture:**
-- **Multi-runner model:** named threads with own tick loops. `pm.task_add("runner", "task",
-  priority, fn)`. Runners auto-vivify — first task on a name creates the thread.
-- **Module system:** named ownership groups. `pm.module("name")` tags all registered tasks,
-  pools, queue handlers. `pm.unload_module("name")` tears down everything tagged. No tiered
-  system/mod distinction. Hot reload: dlclose old → unload_module → dlopen new → re-register.
-- **Pool snapshots:** `pm.pool_get<T>("name", {.snapshot = true})`. Double-buffered dense arrays.
-  Writer mutates live array normally. `swap_snapshot()` at end of frame atomically swaps.
-  Reader runners get `span<const T>` over the frozen copy — no locks, one frame latency.
-  2x memory cost, only enable for cross-runner pools.
-- **Queue system (cross-runner):** lock-free MPSC ring buffer. Pushers do `atomic_fetch_add`
-  to claim slot, write data, set ready flag. Consumer scans from read position, no atomics.
-  Single-runner case (push + drain on same thread) degenerates to plain vector — no overhead.
-  Auto-detect based on push/drain runner affinity.
-- **Devirtualize Pool:** replace virtual `PoolBase` with function pointers or template-erased
-  callables. Eliminates vtable dispatch on every remove. Linear scan of pools is fine —
-  `Pool::remove` fast-fails in 2 comparisons (~1-2ns per pool).
-- **Multi-hook support for Pool:** `set_change_hook()` / `set_swap_hook()` currently allow only
-  one observer per pool (raw function pointer, second call silently clobbers the first). Need to
-  support multiple hooks so e.g. network sync and debug/dirty-tracking can both observe the same
-  pool. Options: small inline vector of hooks, or a single dispatcher that fans out.
-- **Chunk allocation:** 16KB pages, cache-line aligned. Stable pointers across growth — no
-  realloc stalls. Tension with `sort_by` (cross-chunk moves). Consider sort within chunks only.
-
-### Phase 3 — API improvements & Advanced
-- **`Checked<T>`** for `pool->get(id)` — null check + throw `TaskFault`, caught at task boundary
-- **Join iterator:** `pool->each_with(other_pool, fn)` — iterate smaller, O(1) lookup larger
-- **Filtered views:** `pool->where(fn)` — bitset per pool, skip non-matching, composable
-  with `each_with` and parallel. Bitset rebuilt on structural change or explicitly.
-- **Variadic emplace:** `pool->emplace(id, args...)` construct in-place
-- **`pool->sort_by(fn)`:** reorder dense arrays, update sparse back-pointers
+**Next up:**
+- **C++20 adoption:**
+  - Concept constraints on `each()`/`each_mut()` — `requires` clauses for clean error messages
+  - Concept constraints on init functions — `std::invocable` on `task_add()`, `sdl_init`, etc.
+  - `std::span` in networking API — replace `void* data, len` pairs in `pm_udp.hpp`
+- **CI (4 jobs):** ASan, UBSan, TSan, clean release
+- **Test splitting:** `test_pool.cpp`, `test_kernel.cpp`, `test_net.cpp`, etc.
+- **`Checked<T>`:** `pool->get(id)` with null check + `TaskFault`
+- **Join iterator:** `pool->each_with(other_pool, fn)` — iterate smaller, lookup larger
 - **`pm.clear_world()`:** loop pools, clear_all, reset kernel state
-- **Typed event queues:** `ctx.push<T>("name", val)` / `ctx.drain<T>("name", fn)` for
-  inter-task data flow. Frame-scoped (drain clears every frame) vs persistent (consumed
-  explicitly). Critical for hot reload: mods push to queues core tasks drain.
-- **Query caching:** generation counter invalidation for joins — O(1) setup for stable pools
+- **Multi-hook support for Pool:** multiple observers per pool (currently limited to one)
+- **Typed event queues:** `push<T>()` / `drain<T>()` for inter-task data flow
+- **Module system:** named ownership groups, `unload_module()` tears down everything tagged
 
-### Phase 4 — Relationship system
-General-purpose entity-to-entity relationship module. Built on top of the framework —
-games that don't need it pay nothing.
-```cpp
-struct Rel { Id from; Id to; NameId type; };  // "parent_of", "held_by", "targets"
-auto* rels = pm.pool_get<Rel>("relationships");
-rels->from(entity_a, "parent_of");   // forward lookup
-rels->to(entity_b, "held_by");      // reverse lookup
-```
-- Forward/reverse hash map indexes, rebuilt on structural change (generation counter)
-- Parent-child, inventory, targeting — all use cases of the same primitive
-- Cascade removal: query `rels->from(id)`, destroy or orphan each target
-- Transform propagation: iterate `rels->from(id, "parent_of")`, propagate position
-- Network sync: send world positions, clients don't reconstruct hierarchy
-- Deep hierarchies (10+ levels): consider flattening to world-space
-- Dirty tracking on position change to skip clean subtrees
-
-## Planned work
-
-**Next up:** CI pipeline, doctest migration, test splitting, `-Wconversion` cleanup.
+### Ideas to evaluate
+- **Multi-runner model:** named threads with own tick loops, tasks assigned to runners
+- **Pool snapshots:** double-buffered dense arrays for lock-free cross-runner reads
+- **Queue system (cross-runner):** lock-free MPSC ring buffer for inter-runner communication
+- **Chunk allocation:** 16KB pages, cache-line aligned, stable pointers across growth
+- **Filtered views:** `pool->where(fn)` — bitset per pool, composable with joins and parallel
+- **Query caching:** generation counter invalidation for joins
+- **`pool->sort_by(fn)`:** reorder dense arrays, update sparse back-pointers
+- **Variadic emplace:** `pool->emplace(id, args...)`
+- **`-Wconversion`:** noisy in game code, needs dedicated cleanup pass
+- **Fuzz testing:** network recv path + mod loading via libFuzzer/AFL
+- **Deterministic replay:** record inputs (packets, player inputs, RNG seeds)
+- **Relationship system:** entity-to-entity (`parent_of`, `held_by`, `targets`), cascade removal
 
 See [src/examples/hellfire/README.md](src/examples/hellfire/README.md) for game-specific
 roadmap (SDL3_ttf, monster AI, spatial quad-tree, mod enhancements).
