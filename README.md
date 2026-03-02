@@ -218,6 +218,22 @@ single-owner generation, permanent pools/states, no entity names, TaskFault, no 
 - **Module system:** named ownership groups, `unload_module()` tears down everything tagged
 
 ### Ideas to evaluate
+- **Entity pooling:** mark entities inactive instead of removing — reuse on spawn, skip in
+  simulation/rendering, sync `active` flag over the network. Eliminates `id_add`/`id_remove`
+  churn and reliable removal packets. Options: grow-on-demand with pool scan for inactive
+  slots, or pre-allocate all entities upfront (fixed pool, hard cap). Needs a clean mutation
+  tracking story first (see `PoolRef<T>` below).
+- **`PoolRef<T>` (mutation handle):** `pool->get_mut(id)` returns an RAII handle that fires
+  `notify_change(id)` on destruction. Eliminates manual `notify_change` calls and the
+  `each_mut` problem (marks ALL entities dirty every frame via change hook). Direct iteration
+  with `get_mut` would only dirty entities actually touched. Prerequisite for clean entity
+  pooling.
+- **Spatial hash maps (`pm_spatial_grid.hpp`):** generalize the current hellfire-specific
+  `SpatialGrid` into a reusable framework primitive. Configurable cell size, typed queries,
+  integrate with `each()`/interest management.
+- **SDL_GPU + Slang:** replace SDL3 renderer with SDL_GPU for compute shaders, custom
+  pipelines, and Slang for cross-platform shader authoring. Enables GPU-driven particle
+  systems, instanced rendering, and post-processing.
 - **Multi-runner model:** named threads with own tick loops, tasks assigned to runners
 - **Pool snapshots:** double-buffered dense arrays for lock-free cross-runner reads
 - **Queue system (cross-runner):** lock-free MPSC ring buffer for inter-runner communication
