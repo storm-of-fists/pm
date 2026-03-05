@@ -216,6 +216,14 @@ single-owner generation, permanent pools/states, no entity names, TaskFault, no 
 - **Multi-hook support for Pool:** multiple observers per pool (currently limited to one)
 - **Typed event queues:** `push<T>()` / `drain<T>()` for inter-task data flow
 - **Module system:** named ownership groups, `unload_module()` tears down everything tagged
+- **Peer-owned Id redesign (client-side prediction):** Replace the current 64-bit generation-tracked
+  `Id` with a 32-bit `[8-bit peer_id | 24-bit sequence]`. Server is peer 0; each connected client
+  gets its own peer_id and allocates from its own sequence independently. IDs are globally unique
+  by construction — no reconciliation, no mapping table. Enables true client-side prediction: client
+  calls `id_add(my_peer_id)` immediately on input, server accepts any ID whose owner bits match the
+  sending peer. Eliminates generations (no index reuse, so no ABA problem), simplifies `id_sync`
+  to a bounds check + alive-bit set, and shrinks the wire format from 64-bit to 32-bit. `_free_ids`
+  and the generation bump in `id_process_removes` go away entirely.
 
 ### Ideas to evaluate
 - **Entity pooling:** mark entities inactive instead of removing — reuse on spawn, skip in
