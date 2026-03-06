@@ -233,30 +233,31 @@ inline size_t get_type_id()
 }
 
 // =============================================================================
-// Ids & Handles
+// Ids — monotonic, never-recycled, 32-bit
+//
+// Layout: [31..24] 8-bit peer, [23..0] 24-bit sequence
+// Peer 0 = server / single-player. Peer bits are provenance, not authority.
 // =============================================================================
 constexpr uint32_t NULL_INDEX = 0x00FFFFFF;
-constexpr uint16_t ID_FLAG_FREE = 0x0001;
 
-// Id layout: [63..40] 24-bit index, [39..16] 24-bit generation, [15..0] 16-bit flags
+constexpr uint8_t  ID_PEER_BITS = 8;
+constexpr uint32_t ID_SEQ_BITS  = 24;
+constexpr uint32_t ID_SEQ_MASK  = (1u << ID_SEQ_BITS) - 1; // 0x00FFFFFF
+
 struct Id
 {
-	uint64_t raw = 0xFFFFFFFFFFFFFFFFULL;
+	uint32_t raw = 0xFFFFFFFF;
 
 	Id() = default;
-	constexpr explicit Id(uint64_t v) : raw(v) {}
+	constexpr explicit Id(uint32_t v) : raw(v) {}
 
-	static Id make(uint32_t idx, uint32_t gen, uint16_t flags = 0)
+	static constexpr Id make(uint8_t peer, uint32_t seq)
 	{
-		return Id{(static_cast<uint64_t>(idx & 0xFFFFFF) << 40)
-				| (static_cast<uint64_t>(gen & 0xFFFFFF) << 16)
-				| flags};
+		return Id{(static_cast<uint32_t>(peer) << ID_SEQ_BITS) | (seq & ID_SEQ_MASK)};
 	}
 
-	uint32_t index()      const { return static_cast<uint32_t>((raw >> 40) & 0xFFFFFF); }
-	uint32_t generation() const { return static_cast<uint32_t>((raw >> 16) & 0xFFFFFF); }
-	uint16_t flags()      const { return static_cast<uint16_t>(raw & 0xFFFF); }
-	bool     is_free()    const { return (raw & ID_FLAG_FREE) != 0; }
+	uint8_t  peer()     const { return static_cast<uint8_t>(raw >> ID_SEQ_BITS); }
+	uint32_t sequence() const { return raw & ID_SEQ_MASK; }
 
 	bool operator==(Id o) const { return raw == o.raw; }
 	bool operator!=(Id o) const { return raw != o.raw; }
@@ -279,10 +280,69 @@ class PoolBase
 public:
 	virtual ~PoolBase() = default;
 	uint32_t pool_id = 0;
-	const std::vector<Id> *kernel_slots = nullptr; // set by Pm::pool_get<T>()
 	virtual void remove(Id id) = 0;
 	virtual void clear_all() = 0;
 	virtual void shrink_to_fit() = 0;
+};
+
+// =============================================================================
+// PagedSparse — two-level page table for sparse-to-dense index mapping
+//
+// Replaces a flat std::vector<uint32_t> sparse array. Pages are allocated on
+// demand so the structure handles sparse/monotonic ID spaces without wasting
+// memory on empty ranges. Lookup is two array reads (page pointer + offset).
+// =============================================================================
+struct PagedSparse
+{
+	static constexpr uint32_t PAGE_BITS = 12;
+	static constexpr uint32_t PAGE_SIZE = 1u << PAGE_BITS; // 4096 entries
+	static constexpr uint32_t PAGE_MASK = PAGE_SIZE - 1;
+
+	std::vector<uint32_t *> pages;
+
+	PagedSparse() = default;
+	~PagedSparse() { for (auto *p : pages) delete[] p; }
+
+	PagedSparse(const PagedSparse &) = delete;
+	PagedSparse &operator=(const PagedSparse &) = delete;
+	PagedSparse(PagedSparse &&o) noexcept : pages(std::move(o.pages)) { o.pages.clear(); }
+	PagedSparse &operator=(PagedSparse &&o) noexcept
+	{
+		if (this != &o) { for (auto *p : pages) delete[] p; pages = std::move(o.pages); o.pages.clear(); }
+		return *this;
+	}
+
+	uint32_t get(uint32_t index) const
+	{
+		uint32_t page = index >> PAGE_BITS;
+		if (page >= pages.size() || !pages[page]) return NULL_INDEX;
+		return pages[page][index & PAGE_MASK];
+	}
+
+	void set(uint32_t index, uint32_t value)
+	{
+		uint32_t page = index >> PAGE_BITS;
+		if (page >= pages.size()) pages.resize(page + 1, nullptr);
+		if (!pages[page])
+		{
+			pages[page] = new uint32_t[PAGE_SIZE];
+			std::fill_n(pages[page], PAGE_SIZE, NULL_INDEX);
+		}
+		pages[page][index & PAGE_MASK] = value;
+	}
+
+	void clear(uint32_t index)
+	{
+		uint32_t page = index >> PAGE_BITS;
+		if (page < pages.size() && pages[page])
+			pages[page][index & PAGE_MASK] = NULL_INDEX;
+	}
+
+	void reset()
+	{
+		for (auto *p : pages) delete[] p;
+		pages.clear();
+	}
 };
 
 // =============================================================================
@@ -303,7 +363,7 @@ public:
 	std::vector<T> items;
 	std::vector<uint32_t> dense_indices;  // slot index per dense entry
 	std::vector<Id> dense_ids;            // full Id per dense entry (cached for O(1) id_at)
-	std::vector<uint32_t> sparse_indices;
+	PagedSparse sparse;
 
 	// --- Change notification hook (optional) ---
 	using ChangeHook = void(*)(void*, Id);
@@ -345,22 +405,20 @@ public:
 
 	T *add(Id id, T val = T{})
 	{
-		uint32_t idx = id.index();
-		if (idx >= sparse_indices.size())
-			sparse_indices.resize(idx + 1, NULL_INDEX);
+		uint32_t idx = id.raw;
+		uint32_t existing = sparse.get(idx);
 
-		if (sparse_indices[idx] != NULL_INDEX)
+		if (existing != NULL_INDEX)
 		{
-			uint32_t dense_idx = sparse_indices[idx];
-			dense_indices[dense_idx] = idx;
-			dense_ids[dense_idx] = id;
-			items[dense_idx] = std::move(val);
+			dense_indices[existing] = idx;
+			dense_ids[existing] = id;
+			items[existing] = std::move(val);
 			notify_change(id);
-			return &items[dense_idx];
+			return &items[existing];
 		}
 
 		uint32_t dense_idx = static_cast<uint32_t>(items.size());
-		sparse_indices[idx] = dense_idx;
+		sparse.set(idx, dense_idx);
 		dense_indices.push_back(idx);
 		dense_ids.push_back(id);
 		items.push_back(std::move(val));
@@ -371,13 +429,10 @@ public:
 
 	void remove(Id id) override
 	{
-		uint32_t idx = id.index();
-		if (idx >= sparse_indices.size() || sparse_indices[idx] == NULL_INDEX)
-			return;
-
-		uint32_t dense_idx = sparse_indices[idx];
-		if (dense_indices[dense_idx] != idx)
-			return;
+		uint32_t idx = id.raw;
+		uint32_t dense_idx = sparse.get(idx);
+		if (dense_idx == NULL_INDEX) return;
+		if (dense_indices[dense_idx] != idx) return;
 
 		uint32_t last_dense_idx = static_cast<uint32_t>(items.size() - 1);
 		uint32_t last_slot_idx = dense_indices[last_dense_idx];
@@ -389,10 +444,10 @@ public:
 			items[dense_idx] = std::move(items[last_dense_idx]);
 			dense_indices[dense_idx] = last_slot_idx;
 			dense_ids[dense_idx] = dense_ids[last_dense_idx];
-			sparse_indices[last_slot_idx] = dense_idx;
+			sparse.set(last_slot_idx, dense_idx);
 		}
 
-		sparse_indices[idx] = NULL_INDEX;
+		sparse.clear(idx);
 		items.pop_back();
 		dense_indices.pop_back();
 		dense_ids.pop_back();
@@ -401,7 +456,7 @@ public:
 	void clear_all() override
 	{
 		for (uint32_t idx : dense_indices)
-			sparse_indices[idx] = NULL_INDEX;
+			sparse.clear(idx);
 		items.clear();
 		dense_indices.clear();
 		dense_ids.clear();
@@ -416,25 +471,17 @@ public:
 
 	void reset()
 	{
-		clear_all();
-		sparse_indices.clear();
-		sparse_indices.shrink_to_fit();
+		sparse.reset();
+		items.clear();
+		dense_indices.clear();
+		dense_ids.clear();
 		shrink_to_fit();
 	}
 
 	T *get(Id id)
 	{
-		uint32_t idx = id.index();
-		if (idx >= sparse_indices.size() || sparse_indices[idx] == NULL_INDEX)
-			return nullptr;
-		uint32_t dense_idx = sparse_indices[idx];
-		// Validate generation via kernel slots
-		if (kernel_slots)
-		{
-			Id slot = (*kernel_slots)[idx];
-			if (slot.generation() != id.generation() || slot.is_free())
-				return nullptr;
-		}
+		uint32_t dense_idx = sparse.get(id.raw);
+		if (dense_idx == NULL_INDEX) return nullptr;
 		return &items[dense_idx];
 	}
 	const T *get(Id id) const { return const_cast<Pool *>(this)->get(id); }
@@ -507,8 +554,8 @@ class Pm
 {
 	NameTable _name_table;
 
-	std::vector<Id> _slots;        // One packed Id per entity slot (index, gen, flags)
-	std::vector<uint32_t> _free_ids;
+	PagedSparse _alive;            // id.raw → 1 if alive, NULL_INDEX if dead
+	uint32_t _next_seq[256] = {};  // next sequence number per peer
 	std::vector<Id> _pending_removes;
 	std::mutex _remove_mtx;
 	std::unique_ptr<ThreadPool> _thread_pool;
@@ -542,8 +589,6 @@ class Pm
 	uint32_t _spawns_this_frame = 0;
 	uint32_t _removes_this_frame = 0;
 	uint32_t _alive_count = 0;
-
-	static constexpr uint32_t MAX_SYNC_INDEX = 1000000;
 
 public:
 	// --- Public members ---
@@ -685,29 +730,16 @@ public:
 	}
 
 	// ====== IDS ======
-	Id id_add()
+
+	// Allocate next monotonic Id for the given peer (default: peer 0).
+	Id id_add(uint8_t peer = 0)
 	{
-		uint32_t idx = UINT32_MAX;
-		while (!_free_ids.empty())
-		{
-			uint32_t candidate = _free_ids.back();
-			_free_ids.pop_back();
-			if (_slots[candidate].is_free())
-			{
-				idx = candidate;
-				break;
-			}
-		}
-		if (idx == UINT32_MAX)
-		{
-			idx = static_cast<uint32_t>(_slots.size());
-			_slots.push_back(Id::make(idx, 1, ID_FLAG_FREE));
-		}
-		uint32_t gen = _slots[idx].generation();
-		_slots[idx] = Id::make(idx, gen); // clear free flag
+		uint32_t seq = _next_seq[peer]++;
+		Id id = Id::make(peer, seq);
+		_alive.set(id.raw, 1);
 		_spawns_this_frame++;
 		_alive_count++;
-		return Id::make(idx, gen);
+		return id;
 	}
 
 	void id_remove(Id id)
@@ -722,54 +754,44 @@ public:
 	{
 		for (Id id : _pending_removes)
 		{
-			uint32_t idx = id.index();
-			if (idx >= _slots.size()) continue;
-			if (_slots[idx].generation() != id.generation()) continue;
-			if (_slots[idx].is_free()) continue;
-
-			uint32_t new_gen = (id.generation() + 1) & 0xFFFFFF;
-			if (new_gen == 0) new_gen = 1;
-			_slots[idx] = Id::make(idx, new_gen, ID_FLAG_FREE);
+			if (_alive.get(id.raw) == NULL_INDEX) continue;
+			_alive.clear(id.raw);
 
 			for (PoolBase *p : _pool_by_id)
 			{
 				if (p) p->remove(id);
 			}
 
-			_free_ids.push_back(idx);
 			_removes_this_frame++;
 			_alive_count--;
 		}
 		_pending_removes.clear();
 	}
 
+	// Accept a remote Id (networking). Marks it alive and advances the peer's
+	// sequence counter past it so future local id_add() won't collide.
 	bool id_sync(Id id)
 	{
-		uint32_t idx = id.index();
-		uint32_t gen = id.generation();
+		if (_alive.get(id.raw) == NULL_INDEX)
+			_alive_count++;
+		_alive.set(id.raw, 1);
 
-		if (idx > MAX_SYNC_INDEX)
-			return false;
-
-		if (idx >= _slots.size())
-		{
-			uint32_t old_size = static_cast<uint32_t>(_slots.size());
-			_slots.resize(idx + 1, Id::make(0, 0, ID_FLAG_FREE));
-			for (uint32_t i = old_size; i <= idx; ++i)
-			{
-				_slots[i] = Id::make(i, 0, ID_FLAG_FREE);
-				if (i < idx) _free_ids.push_back(i);
-			}
-		}
-
-		uint32_t current_gen = _slots[idx].generation();
-		if (current_gen > gen)
-			return false;
-
-		if (_slots[idx].is_free()) _alive_count++;
-		_slots[idx] = Id::make(idx, gen); // clear free flag
+		// Advance sequence high-water mark for this peer
+		uint8_t peer = id.peer();
+		uint32_t seq = id.sequence();
+		if (seq >= _next_seq[peer])
+			_next_seq[peer] = seq + 1;
 		return true;
 	}
+
+	// Forward-only: set the next sequence for a peer (e.g. from server handshake).
+	void id_set_next_sequence(uint8_t peer, uint32_t seq)
+	{
+		if (seq > _next_seq[peer])
+			_next_seq[peer] = seq;
+	}
+
+	bool id_alive(Id id) const { return _alive.get(id.raw) != NULL_INDEX; }
 
 	// ====== SCHEDULING ======
 	template <typename F>
@@ -834,7 +856,6 @@ public:
 		{
 			auto p = std::make_unique<Pool<T>>();
 			p->pool_id = _next_pool_id++;
-			p->kernel_slots = &_slots;
 			p->kernel = this;
 			r.type_id = get_type_id<T>();
 

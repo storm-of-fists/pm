@@ -103,6 +103,9 @@ namespace threshold {
     constexpr double POOL_GET_SEQ           = 5.2;
     constexpr double POOL_GET_STALE         = 2.1;
     constexpr double POOL_HAS               = 5.1;
+    // PagedSparse: raw lookup
+    constexpr double PAGED_GET_SEQ          = 8.0;   // generous initial threshold
+    constexpr double PAGED_GET_SPARSE       = 12.0;  // gapped IDs across pages
     // Pool: remove
     constexpr double POOL_REMOVE_SWAP       = 10.0;
     constexpr double POOL_REMOVE_20POOLS    = 147.0;
@@ -333,6 +336,51 @@ TEST_CASE("pool get") {
         assert(hits == 10000);
     });
     CHECK(r3.ns_per_op < threshold::POOL_HAS);
+}
+
+// --- PagedSparse: raw lookup ---
+
+TEST_CASE("paged sparse get") {
+    // Sequential IDs — measures raw two-level lookup overhead
+    {
+        pm::PagedSparse ps;
+        constexpr uint32_t N = 10000;
+        for (uint32_t i = 0; i < N; i++)
+            ps.set(i, i);
+
+        std::vector<uint32_t> indices(N);
+        for (uint32_t i = 0; i < N; i++) indices[i] = i;
+
+        auto r = bench("paged sparse get 10k (sequential)", N, [&]() {
+            uint32_t sum = 0;
+            for (uint32_t idx : indices)
+                sum += ps.get(idx);
+            assert(sum > 0);
+        });
+        CHECK(r.ns_per_op < threshold::PAGED_GET_SEQ);
+    }
+    // Sparse IDs — spread across many pages (simulates peer-prefixed monotonic IDs)
+    {
+        pm::PagedSparse ps;
+        constexpr uint32_t N = 10000;
+        constexpr uint32_t STRIDE = 5000; // each ID 5000 apart → different pages
+        std::vector<uint32_t> indices;
+        indices.reserve(N);
+        for (uint32_t i = 0; i < N; i++)
+        {
+            uint32_t idx = i * STRIDE;
+            ps.set(idx, i);
+            indices.push_back(idx);
+        }
+
+        auto r = bench("paged sparse get 10k (sparse, stride 5000)", N, [&]() {
+            uint32_t sum = 0;
+            for (uint32_t idx : indices)
+                sum += ps.get(idx);
+            assert(sum > 0);
+        });
+        CHECK(r.ns_per_op < threshold::PAGED_GET_SPARSE);
+    }
 }
 
 // --- Pool: remove ---

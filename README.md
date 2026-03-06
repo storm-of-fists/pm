@@ -114,9 +114,12 @@ Quick reference:
 - `pm.state_get<T>("name")` — singleton state, returns same pointer on re-fetch
 - `pm.pool_get<T>("name")` — sparse-set component pool
 - `pm.task_add("name", priority, lambda)` — register a task
-- `pm.id_add()` — immediate entity creation (returns Id). NOT thread-safe in parallel
-  `each`/`each_mut` (vector reallocation race). Future: deferred spawn queue or mutex.
+- `pm.id_add(peer)` — monotonic entity creation (returns 32-bit Id, `[8-bit peer | 24-bit seq]`).
+  Default peer 0. NOT thread-safe in parallel `each`/`each_mut`.
 - `pm.id_remove(id)` — deferred removal (flushed at end of `loop_once()`)
+- `pm.id_alive(id)` — check if an Id is currently alive
+- `pm.id_sync(id)` — accept a remote Id (networking), advances peer sequence
+- `pm.id_set_next_sequence(peer, seq)` — forward-only sequence set (server handshake)
 - `pool->each([](const T&) { ... })` — read-only iteration, no change hooks
 - `pool->each_mut([](T&) { ... })` — mutable iteration, fires change hooks
 - Tasks receive `Pm& pm` with `pm.loop_dt()`, `pm.loop_quit()`, `pm.id_add()`, etc.
@@ -162,7 +165,7 @@ and game-specific roadmap.
 
 ## Tests & Benchmarks
 
-97 tests + 23 benchmark cases in a single binary (`pm_tests`), powered by doctest.
+98 tests + 24 benchmark cases in a single binary (`pm_tests`), powered by doctest.
 Benchmarks have threshold-based pass/fail (~2x measured max) to catch regressions.
 
 ```bash
@@ -177,23 +180,23 @@ ctest --test-dir build                  # run all (tests + benchmarks)
 
 | Operation | ns/op |
 |-----------|------:|
-| `pool->get(id)` | ~2 |
-| `pm.id_add()` | 1.5 |
-| `pool->remove(id)` | ~9 |
-| `each()` trivial (100k, seq) | ~0.5 |
-| `each()` trig (100k, parallel) | ~6 |
-| `id_process_removes` (10k, 8 pools) | ~38 |
-| Monster AI (400, seq) | ~7 |
-| Collision frame (400m + 600b) | ~28 |
+| `pool->get(id)` | ~0.7 |
+| `pm.id_add()` | ~1.2 |
+| `pool->remove(id)` | ~3 |
+| `each()` trivial (100k, seq) | ~0.6 |
+| `each()` trig (100k, parallel) | ~3.6 |
+| `id_process_removes` (10k, 8 pools) | ~62 |
+| Monster AI (400, seq) | ~8 |
+| Collision frame (400m + 600b) | ~31 |
 | Server tick level 5 | 0.06ms total |
-| Cooldown::ready | ~0.5 |
+| Cooldown::ready | ~0.7 |
 
 ## v3 Roadmap
 
 ### Phase 1 — Kernel cleanup (DONE)
 
-Bitpacked Id slots, deferred removes, lambda `each()`/`each_mut()` with auto-parallel,
-single-owner generation, permanent pools/states, no entity names, TaskFault, no Hz sub-stepping.
+Deferred removes, lambda `each()`/`each_mut()` with auto-parallel,
+permanent pools/states, no entity names, TaskFault, no Hz sub-stepping.
 
 ### Phase 2 — Build system & Architecture
 
@@ -202,6 +205,10 @@ single-owner generation, permanent pools/states, no entity names, TaskFault, no 
 - Single build config: `RelWithDebInfo` (`-O2 -g`), sanitizer presets (`asan`, `tsan`)
 - doctest: test names, actual vs expected on failure, CLI filtering
 - Benchmark suite: median-of-5, threshold-based pass/fail via doctest
+- Monotonic peer-owned Ids: 32-bit `[8-bit peer | 24-bit sequence]`, never recycled, no
+  generations. Paged sparse array for Pool ID-to-index lookup (two-level page table, pages
+  allocated on demand). `id_add(peer)`, `id_alive(id)`, `id_sync(id)`,
+  `id_set_next_sequence(peer, seq)`. Peer 0 = server/single-player.
 
 **Next up:**
 - **C++20 adoption:**
@@ -216,14 +223,6 @@ single-owner generation, permanent pools/states, no entity names, TaskFault, no 
 - **Multi-hook support for Pool:** multiple observers per pool (currently limited to one)
 - **Typed event queues:** `push<T>()` / `drain<T>()` for inter-task data flow
 - **Module system:** named ownership groups, `unload_module()` tears down everything tagged
-- **Peer-owned Id redesign (client-side prediction):** Replace the current 64-bit generation-tracked
-  `Id` with a 32-bit `[8-bit peer_id | 24-bit sequence]`. Server is peer 0; each connected client
-  gets its own peer_id and allocates from its own sequence independently. IDs are globally unique
-  by construction — no reconciliation, no mapping table. Enables true client-side prediction: client
-  calls `id_add(my_peer_id)` immediately on input, server accepts any ID whose owner bits match the
-  sending peer. Eliminates generations (no index reuse, so no ABA problem), simplifies `id_sync`
-  to a bounds check + alive-bit set, and shrinks the wire format from 64-bit to 32-bit. `_free_ids`
-  and the generation bump in `id_process_removes` go away entirely.
 
 ### Ideas to evaluate
 - **Entity pooling:** mark entities inactive instead of removing — reuse on spawn, skip in

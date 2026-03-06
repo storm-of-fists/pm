@@ -178,83 +178,75 @@ TEST_CASE("scheduler") {
 
 TEST_CASE("id_sync") {
     pm::Pm pm;
-    pm::Id remote_id = pm::Id::make(42, 7);
+    pm::Id remote_id = pm::Id::make(3, 42); // peer 3, seq 42
     pm.id_sync(remote_id);
 
     auto *pos = pm.pool_get<Pos>("pos");
     pos->add(remote_id, {1, 2});
     CHECK(pos->has(remote_id));
+    CHECK(pm.id_alive(remote_id));
 }
 
 TEST_CASE("id_sync remove+resync cycle") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
 
-    for (uint32_t gen = 1; gen <= 100; gen++) {
-        pm::Id id = pm::Id::make(5, gen);
+    // Each iteration syncs a unique monotonic Id from peer 1, adds, removes
+    for (uint32_t seq = 0; seq < 100; seq++) {
+        pm::Id id = pm::Id::make(1, seq);
         pm.id_sync(id);
-        pool->add(id, {(float)gen, 0});
-        CHECK(pm.id_count() < 1000000);
+        pool->add(id, {(float)seq, 0});
         pm.id_remove(id);
         pm.loop_once();
     }
-    CHECK(pm.id_count() < 100);
+    CHECK(pm.id_count() == 0);
 }
 
-TEST_CASE("id_sync rejects stale") {
+TEST_CASE("id_sync advances peer sequence") {
+    pm::Pm pm;
+
+    pm::Id remote = pm::Id::make(2, 50);
+    pm.id_sync(remote);
+
+    // Local id_add for peer 2 should start past 50
+    pm::Id local = pm.id_add(2);
+    CHECK(local.sequence() == 51);
+}
+
+TEST_CASE("pool add overwrite same id") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
 
-    pm::Id id_v1 = pm::Id::make(5, 1);
-    CHECK(pm.id_sync(id_v1) == true);
-    pool->add(id_v1, {1, 2});
+    pm::Id id = pm::Id::make(0, 5);
+    pm.id_sync(id);
+    pool->add(id, {10, 20});
+    pool->add(id, {30, 40}); // overwrite
 
-    pm.id_remove(id_v1);
-    pm.loop_once();
-
-    CHECK(pm.id_sync(id_v1) == false);
-
-    pm::Id id_v2 = pm::Id::make(5, 2);
-    CHECK(pm.id_sync(id_v2) == true);
-    pool->add(id_v2, {3, 4});
-    CHECK(pool->has(id_v2));
-}
-
-TEST_CASE("pool add updates dense_indices on gen change") {
-    pm::Pm pm;
-    auto *pool = pm.pool_get<Pos>("pos");
-
-    pm::Id v1 = pm::Id::make(5, 1);
-    pm.id_sync(v1);
-    pool->add(v1, {10, 20});
-
-    pm::Id v2 = pm::Id::make(5, 2);
-    pm.id_sync(v2);
-    pool->add(v2, {30, 40});
-
-    CHECK(pool->has(v2));
-    CHECK(!pool->has(v1));
-    CHECK(pool->get(v2)->x == 30);
+    CHECK(pool->size() == 1);
+    CHECK(pool->get(id)->x == 30);
 }
 
 TEST_CASE("id_count under id_sync churn") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
 
+    // Sync 10 unique Ids from peer 1
     for (uint32_t i = 0; i < 10; i++) {
-        pm::Id id = pm::Id::make(i * 3, 1);
+        pm::Id id = pm::Id::make(1, i);
         pm.id_sync(id);
         pool->add(id, {(float)i, 0});
     }
     CHECK(pm.id_count() == 10);
 
+    // Remove first 5
     for (uint32_t i = 0; i < 5; i++)
-        pm.id_remove(pm::Id::make(i * 3, 1));
+        pm.id_remove(pm::Id::make(1, i));
     pm.loop_once();
     CHECK(pm.id_count() == 5);
 
-    for (uint32_t i = 0; i < 5; i++) {
-        pm::Id id = pm::Id::make(i * 3, 2);
+    // Sync 5 more new Ids from peer 1
+    for (uint32_t i = 10; i < 15; i++) {
+        pm::Id id = pm::Id::make(1, i);
         pm.id_sync(id);
         pool->add(id, {(float)i + 100, 0});
     }
@@ -265,34 +257,52 @@ TEST_CASE("id_sync after deferred remove") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
 
-    pm::Id v1 = pm::Id::make(5, 1);
-    pm.id_sync(v1);
-    pool->add(v1, {1, 1});
-    pm.id_remove(v1);
+    pm::Id id1 = pm::Id::make(1, 0);
+    pm.id_sync(id1);
+    pool->add(id1, {1, 1});
+    pm.id_remove(id1);
     pm.id_process_removes();
-    CHECK(!pool->has(v1));
+    CHECK(!pool->has(id1));
+    CHECK(!pm.id_alive(id1));
 
-    pm::Id v2 = pm::Id::make(5, 2);
-    CHECK(pm.id_sync(v2));
-    pool->add(v2, {99, 99});
+    pm::Id id2 = pm::Id::make(1, 1);
+    CHECK(pm.id_sync(id2));
+    pool->add(id2, {99, 99});
 
-    CHECK(pool->has(v2));
-    CHECK(pool->get(v2)->x == 99);
+    CHECK(pool->has(id2));
+    CHECK(pool->get(id2)->x == 99);
 }
 
 TEST_CASE("deferred remove cleans pool entry") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
 
-    pm::Id v1 = pm::Id::make(5, 1);
-    pm.id_sync(v1);
-    pool->add(v1, {10, 20});
-    CHECK(pool->has(v1));
+    pm::Id id = pm::Id::make(0, 5);
+    pm.id_sync(id);
+    pool->add(id, {10, 20});
+    CHECK(pool->has(id));
 
-    pm.id_remove(v1);
-    CHECK(pool->has(v1)); // still alive until flush
+    pm.id_remove(id);
+    CHECK(pool->has(id)); // still alive until flush
     pm.id_process_removes();
-    CHECK(!pool->has(v1));
+    CHECK(!pool->has(id));
+}
+
+TEST_CASE("id_add peer isolation") {
+    pm::Pm pm;
+    pm::Id a = pm.id_add(0);
+    pm::Id b = pm.id_add(1);
+    pm::Id c = pm.id_add(0);
+
+    CHECK(a.peer() == 0);
+    CHECK(b.peer() == 1);
+    CHECK(c.peer() == 0);
+    CHECK(a.sequence() == 0);
+    CHECK(b.sequence() == 0);
+    CHECK(c.sequence() == 1);
+    CHECK(a != b);
+    CHECK(a != c);
+    CHECK(pm.id_count() == 3);
 }
 
 TEST_CASE("id_remove + task_stop + pool reset") {
@@ -427,7 +437,7 @@ TEST_CASE("each_mut void(Id, T&) parallel") {
         pool->add(e, {(float)i, 0.f});
     }
     pool->each_mut([](pm::Id id, Pos& p) {
-        p.y = (float)id.index();
+        p.y = (float)id.raw;
     });
     for (size_t i = 0; i < pool->items.size(); i++) {
         uint32_t slot = pool->dense_indices[i];
