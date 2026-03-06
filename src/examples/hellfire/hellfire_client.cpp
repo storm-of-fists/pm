@@ -666,20 +666,36 @@ void client_net_init(Pm& pm) {
         d.total_removes += pm.loop_removes();
         d.duration = cn->gs.time;
 
-        if (net->conn_state == NetSys::ConnState::CONNECTED)
+        bool connected = (net->conn_state == NetSys::ConnState::CONNECTED);
+        auto& server_pn = net->peer_net[0];
+
+        if (connected) {
             d.track_snapshot_age(net->snapshot_age(0));
+            if (server_pn.rtt_samples > 0)
+                d.track_rtt(server_pn.rtt);
+            d.track_clock_offset(net->clock_offset);
+        }
 
         // Per-frame timeline sample
-        float snap_ms = (net->conn_state == NetSys::ConnState::CONNECTED)
-                        ? net->snapshot_age(0) * 1000.f : 0.f;
-        d.timeline.push_back({cn->gs.time, (int)cn->monsters->items.size(),
-                              (int)cn->bullets->items.size(), alive,
-                              cn->gs.score, cn->gs.kills, pm.loop_dt() * 1000.f,
-                              snap_ms});
+        DiagSample s{};
+        s.time = cn->gs.time;
+        s.monsters = (int)cn->monsters->items.size();
+        s.bullets = (int)cn->bullets->items.size();
+        s.players_alive = alive;
+        s.score = cn->gs.score;
+        s.kills = cn->gs.kills;
+        s.frame_ms = pm.loop_dt() * 1000.f;
+        d.compute_net_deltas(net->sock.total_bytes_sent, net->sock.total_bytes_recv,
+                             net->sock.total_packets_sent, net->sock.total_packets_recv, s);
+        s.rtt_ms = connected ? server_pn.rtt * 1000.f : 0.f;
+        s.snap_age_ms = connected ? net->snapshot_age(0) * 1000.f : 0.f;
+        s.clock_offset = net->clock_offset;
+        s.reliable_pending = (int)server_pn.reliable_outbox.size();
+        s.sync_pending = (int)server_pn.sync_outbox.size();
+        d.timeline.push_back(s);
 
         // Detect game over — log event + write report (one-shot)
-        static bool prev_go = false;
-        if (cn->gs.game_over && !prev_go) {
+        if (cn->gs.game_over && !d.written) {
             d.push_event(cn->gs.time, "game over — score %d", cn->gs.score);
 
             if (!g_report_dir.empty()) {
@@ -695,8 +711,8 @@ void client_net_init(Pm& pm) {
                 std::string path = g_report_dir + "/" + d.name + ".json";
                 d.write_json(path.c_str());
             }
+            d.written = true;
         }
-        prev_go = cn->gs.game_over;
     });
 }
 

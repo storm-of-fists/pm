@@ -414,14 +414,38 @@ void server_init(Pm& pm) {
         d.total_removes += pm.loop_removes();
         d.duration = gs->time;
 
+        // Aggregate per-peer RTT for summary tracking
+        float best_rtt = 0.f;
+        int reliable_q = 0, sync_q = 0;
+        for (uint8_t p : net->remote_peers()) {
+            auto& pn = net->peer_net[p];
+            if (pn.rtt_samples > 0) {
+                d.track_rtt(pn.rtt);
+                if (pn.rtt > best_rtt) best_rtt = pn.rtt;
+            }
+            reliable_q += (int)pn.reliable_outbox.size();
+            sync_q += (int)pn.sync_outbox.size();
+        }
+
         // Per-frame timeline sample
-        d.timeline.push_back({gs->time, (int)mp->items.size(), (int)bp->items.size(),
-                              alive, gs->score, gs->kills, pm.loop_dt() * 1000.f, 0});
+        DiagSample s{};
+        s.time = gs->time;
+        s.monsters = (int)mp->items.size();
+        s.bullets = (int)bp->items.size();
+        s.players_alive = alive;
+        s.score = gs->score;
+        s.kills = gs->kills;
+        s.frame_ms = pm.loop_dt() * 1000.f;
+        d.compute_net_deltas(net->sock.total_bytes_sent, net->sock.total_bytes_recv,
+                             net->sock.total_packets_sent, net->sock.total_packets_recv, s);
+        s.rtt_ms = best_rtt * 1000.f;
+        s.reliable_pending = reliable_q;
+        s.sync_pending = sync_q;
+        d.timeline.push_back(s);
 
         // Write report once on game over
-        static bool written = false;
-        if (gs->game_over && !written && !g_report_dir.empty()) {
-            written = true;
+        if (gs->game_over && !d.written && !g_report_dir.empty()) {
+            d.written = true;
             d.score = gs->score; d.kills = gs->kills;
             d.level = gs->current_level + 1;
             d.game_over = true; d.win = gs->win;
@@ -433,6 +457,10 @@ void server_init(Pm& pm) {
                 d.peers[i].connected_at = (pid < DiagReport::MAX_DIAG_PEERS) ? d.peer_connect_time[pid] : 0;
                 auto* p = gs->players->get(gs->peer_ids[pid]);
                 d.peers[i].alive_at_end = p && p->alive;
+                // Per-peer network stats
+                d.peers[i].rtt = net->peer_net[pid].rtt;
+                d.peers[i].rtt_samples = net->peer_net[pid].rtt_samples;
+                d.peers[i].packets_sent = net->peer_net[pid].packets_sent;
             }
             std::string path = g_report_dir + "/server.json";
             d.write_json(path.c_str());

@@ -410,8 +410,6 @@ public:
 
 		if (existing != NULL_INDEX)
 		{
-			dense_indices[existing] = idx;
-			dense_ids[existing] = id;
 			items[existing] = std::move(val);
 			notify_change(id);
 			return &items[existing];
@@ -964,14 +962,28 @@ void Pool<T>::each_mut(F &&fn, Parallel p, uint32_t threads)
 	}
 	else
 	{
-		for (size_t i = 0; i < n; i++)
+		constexpr bool needs_id = std::is_invocable_v<F, Id, T &>;
+		if constexpr (needs_id)
 		{
-			Id eid = id_at(i);
-			if constexpr (std::is_invocable_v<F, Id, T &>)
+			for (size_t i = 0; i < n; i++)
+			{
+				Id eid = id_at(i);
 				fn(eid, items[i]);
-			else
+				if (change_fn) change_fn(change_ctx, eid);
+			}
+		}
+		else if (change_fn)
+		{
+			for (size_t i = 0; i < n; i++)
+			{
 				fn(items[i]);
-			if (change_fn) change_fn(change_ctx, eid);
+				change_fn(change_ctx, id_at(i));
+			}
+		}
+		else
+		{
+			for (size_t i = 0; i < n; i++)
+				fn(items[i]);
 		}
 	}
 }

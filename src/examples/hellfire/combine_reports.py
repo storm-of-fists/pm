@@ -12,6 +12,11 @@ import os
 import sys
 import statistics
 
+def fmt_bytes(n):
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}MB"
+    if n >= 1_000: return f"{n/1_000:.1f}KB"
+    return f"{n}B"
+
 def load_reports(report_dir):
     reports = {}
     for fname in sorted(os.listdir(report_dir)):
@@ -21,6 +26,24 @@ def load_reports(report_dir):
         with open(path) as f:
             reports[fname] = json.load(f)
     return reports
+
+def percentile(data, pct):
+    if not data: return 0
+    s = sorted(data)
+    return s[min(int(len(s) * pct / 100), len(s) - 1)]
+
+def tl_stats(timeline, key):
+    vals = [s.get(key, 0) for s in timeline]
+    nonzero = [v for v in vals if v > 0]
+    if not nonzero:
+        return {}
+    return {
+        "min": round(min(nonzero), 3),
+        "max": round(max(nonzero), 3),
+        "median": round(statistics.median(nonzero), 3),
+        "p95": round(percentile(nonzero, 95), 3),
+        "sum": round(sum(vals), 3),
+    }
 
 def summarize(reports):
     server = None
@@ -33,33 +56,28 @@ def summarize(reports):
 
     out = {"server": None, "clients": [], "timeline_frames": 0}
 
-    # Server summary
     if server:
         tl = server.get("timeline", [])
-        frame_times = [s["frame_ms"] for s in tl if s["frame_ms"] > 0]
+        net = server.get("network", {})
         out["server"] = {
             "duration": server.get("duration", 0),
             "frames": server.get("frames", 0),
             "outcome": server.get("outcome", {}),
             "entities": server.get("entities", {}),
             "timing": server.get("timing", {}),
+            "network": net,
             "events": len(server.get("events", [])),
             "timeline_samples": len(tl),
             "peers": server.get("peers", []),
+            "tl_frame_ms": tl_stats(tl, "frame_ms"),
+            "tl_rtt_ms": tl_stats(tl, "rtt_ms"),
+            "tl_bytes_sent": tl_stats(tl, "bytes_sent"),
+            "tl_bytes_recv": tl_stats(tl, "bytes_recv"),
         }
-        if frame_times:
-            out["server"]["timeline_frame_ms"] = {
-                "min": round(min(frame_times), 3),
-                "max": round(max(frame_times), 3),
-                "median": round(statistics.median(frame_times), 3),
-                "p95": round(sorted(frame_times)[int(len(frame_times) * 0.95)], 3),
-            }
+        out["timeline_frames"] += len(tl)
 
-    # Client summaries
     for c in sorted(clients, key=lambda x: x.get("name", "")):
         tl = c.get("timeline", [])
-        frame_times = [s["frame_ms"] for s in tl if s["frame_ms"] > 0]
-        snap_ages = [s.get("snap_age_ms", 0) for s in tl]
         net = c.get("network", {})
         entry = {
             "name": c.get("name", "?"),
@@ -72,37 +90,26 @@ def summarize(reports):
             "network": net,
             "events": len(c.get("events", [])),
             "timeline_samples": len(tl),
+            "tl_frame_ms": tl_stats(tl, "frame_ms"),
+            "tl_rtt_ms": tl_stats(tl, "rtt_ms"),
+            "tl_snap_age_ms": tl_stats(tl, "snap_age_ms"),
+            "tl_bytes_sent": tl_stats(tl, "bytes_sent"),
+            "tl_bytes_recv": tl_stats(tl, "bytes_recv"),
         }
-        if frame_times:
-            entry["timeline_frame_ms"] = {
-                "min": round(min(frame_times), 3),
-                "max": round(max(frame_times), 3),
-                "median": round(statistics.median(frame_times), 3),
-                "p95": round(sorted(frame_times)[int(len(frame_times) * 0.95)], 3),
-            }
-        if any(a > 0 for a in snap_ages):
-            nonzero = [a for a in snap_ages if a > 0]
-            entry["timeline_snap_age_ms"] = {
-                "min": round(min(nonzero), 2),
-                "max": round(max(nonzero), 2),
-                "median": round(statistics.median(nonzero), 2),
-            }
         out["clients"].append(entry)
         out["timeline_frames"] += len(tl)
-
-    if server:
-        out["timeline_frames"] += len(server.get("timeline", []))
 
     return out
 
 def print_summary(s):
     p = lambda *a: print(*a, file=sys.stderr)
-    p("=" * 72)
+    p("=" * 100)
     p("HELLFIRE DIAGNOSTIC SUMMARY")
-    p("=" * 72)
+    p("=" * 100)
 
     if s["server"]:
         sv = s["server"]
+        net = sv.get("network", {})
         p(f"\nSERVER  duration={sv['duration']:.1f}s  frames={sv['frames']}")
         oc = sv["outcome"]
         p(f"  score={oc.get('score',0)}  kills={oc.get('kills',0)}  "
@@ -111,35 +118,53 @@ def print_summary(s):
         p(f"  peak: monsters={ent.get('peak_monsters',0)}  "
           f"bullets={ent.get('peak_bullets',0)}  players={ent.get('peak_players',0)}")
         p(f"  spawns={ent.get('total_spawns',0)}  removes={ent.get('total_removes',0)}")
-        if "timeline_frame_ms" in sv:
-            t = sv["timeline_frame_ms"]
-            p(f"  frame_ms: min={t['min']}  median={t['median']}  "
-              f"p95={t['p95']}  max={t['max']}")
+        ft = sv.get("tl_frame_ms", {})
+        if ft:
+            p(f"  frame_ms: min={ft['min']}  median={ft['median']}  "
+              f"p95={ft['p95']}  max={ft['max']}")
+        rt = sv.get("tl_rtt_ms", {})
+        if rt:
+            p(f"  rtt_ms:   min={rt['min']}  median={rt['median']}  "
+              f"p95={rt['p95']}  max={rt['max']}")
+        p(f"  bandwidth: sent={fmt_bytes(net.get('bytes_sent',0))}  "
+          f"recv={fmt_bytes(net.get('bytes_recv',0))}  "
+          f"packets_out={net.get('packets_sent',0)}  packets_in={net.get('packets_recv',0)}")
         p(f"  events={sv['events']}  timeline_samples={sv['timeline_samples']}")
+
         if sv.get("peers"):
-            p(f"  peers:")
+            p(f"\n  PEERS (server view)")
+            p(f"  {'name':<8} {'id':>3} {'conn_at':>8} {'alive':>6} "
+              f"{'rtt_ms':>7} {'rtt_n':>6} {'pkts':>7}")
+            p(f"  {'-'*8} {'-'*3} {'-'*8} {'-'*6} {'-'*7} {'-'*6} {'-'*7}")
             for peer in sv["peers"]:
-                p(f"    id={peer['id']} name={peer['name']} "
-                  f"connected_at={peer['connected_at']:.2f} alive={peer['alive_at_end']}")
+                p(f"  {peer['name']:<8} {peer['id']:>3} "
+                  f"{peer['connected_at']:>8.2f} {'yes' if peer['alive_at_end'] else 'no':>6} "
+                  f"{peer.get('rtt_ms', 0):>7.2f} {peer.get('rtt_samples', 0):>6} "
+                  f"{peer.get('packets_sent', 0):>7}")
 
     p(f"\nCLIENTS ({len(s['clients'])})")
     p(f"  {'name':<8} {'peer':>4} {'dur':>6} {'frames':>7} "
-      f"{'min_ms':>7} {'med_ms':>7} {'p95_ms':>7} {'max_ms':>7} "
-      f"{'snap_med':>8} {'snap_max':>8} {'events':>6}")
+      f"{'frm_med':>7} {'frm_p95':>7} "
+      f"{'rtt_med':>7} {'rtt_p95':>7} "
+      f"{'sent':>8} {'recv':>8} "
+      f"{'clk_min':>8} {'clk_max':>8}")
     p(f"  {'-'*8} {'-'*4} {'-'*6} {'-'*7} "
-      f"{'-'*7} {'-'*7} {'-'*7} {'-'*7} "
-      f"{'-'*8} {'-'*8} {'-'*6}")
+      f"{'-'*7} {'-'*7} "
+      f"{'-'*7} {'-'*7} "
+      f"{'-'*8} {'-'*8} "
+      f"{'-'*8} {'-'*8}")
     for c in s["clients"]:
-        ft = c.get("timeline_frame_ms", {})
-        sa = c.get("timeline_snap_age_ms", {})
+        ft = c.get("tl_frame_ms", {})
+        rt = c.get("tl_rtt_ms", {})
+        net = c.get("network", {})
         p(f"  {c['name']:<8} {c['peer_id']:>4} {c['duration']:>6.1f} {c['frames']:>7} "
-          f"{ft.get('min',''):>7} {ft.get('median',''):>7} "
-          f"{ft.get('p95',''):>7} {ft.get('max',''):>7} "
-          f"{sa.get('median',''):>8} {sa.get('max',''):>8} "
-          f"{c['events']:>6}")
+          f"{ft.get('median',''):>7} {ft.get('p95',''):>7} "
+          f"{rt.get('median',''):>7} {rt.get('p95',''):>7} "
+          f"{fmt_bytes(net.get('bytes_sent',0)):>8} {fmt_bytes(net.get('bytes_recv',0)):>8} "
+          f"{net.get('clock_offset_min',0):>8.4f} {net.get('clock_offset_max',0):>8.4f}")
 
     p(f"\ntotal timeline frames across all reports: {s['timeline_frames']}")
-    p("=" * 72)
+    p("=" * 100)
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))

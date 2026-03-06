@@ -125,9 +125,15 @@ struct UdpSocket {
 			close_sock();
 	}
 
+	// --- Stats (cumulative) ---
+	uint64_t total_bytes_sent = 0, total_bytes_recv = 0;
+	uint32_t total_packets_sent = 0, total_packets_recv = 0;
+
 	void send(const void* data, int len, struct sockaddr_in& dest) {
 		if (sock == INVALID_SOCKET) return;
 		sendto(sock, (const char*)data, len, 0, (struct sockaddr*)&dest, sizeof(dest));
+		total_bytes_sent += len;
+		total_packets_sent++;
 	}
 
 	int recv(uint8_t* buf, int buf_size, struct sockaddr_in& src) {
@@ -135,6 +141,8 @@ struct UdpSocket {
 		socklen_t slen = sizeof(src);
 		int n = recvfrom(sock, (char*)buf, buf_size, 0, (struct sockaddr*)&src, &slen);
 		if (n == SOCKET_ERROR) return -1;
+		total_bytes_recv += n;
+		total_packets_recv++;
 		return n;
 	}
 
@@ -633,6 +641,11 @@ struct NetSys {
 		float snapshot_age = 0.f;
 		uint32_t packets_sent = 0;
 
+		// RTT tracking (exponential moving average)
+		float rtt = 0.f;
+		float rtt_var = 0.f;
+		uint32_t rtt_samples = 0;
+
 		// --- Heartbeat / timeout ---
 		float last_recv_time = 0.f;
 		float last_send_time = 0.f;
@@ -659,6 +672,7 @@ struct NetSys {
 			uint8_t envelope[4 + MAX_RELIABLE_PAYLOAD];
 			uint16_t envelope_size;
 			uint8_t sends_remaining;
+			float first_send_time = 0.f;
 		};
 		std::vector<ReliableEntry> reliable_outbox;
 		uint16_t next_reliable_id = 1;
@@ -839,16 +853,31 @@ struct NetSys {
 
 	void ack_reliable(uint8_t peer, uint16_t msg_id) {
 		auto& pn = peer_net[peer];
-		pn.reliable_outbox.erase(
-			std::remove_if(pn.reliable_outbox.begin(), pn.reliable_outbox.end(),
-				[msg_id](auto& r) { return r.msg_id == msg_id; }),
-			pn.reliable_outbox.end());
+		for (auto it = pn.reliable_outbox.begin(); it != pn.reliable_outbox.end(); ++it) {
+			if (it->msg_id == msg_id) {
+				if (it->first_send_time > 0.f) {
+					float sample = local_time - it->first_send_time;
+					if (pn.rtt_samples == 0) {
+						pn.rtt = sample;
+						pn.rtt_var = sample * 0.5f;
+					} else {
+						float err = sample - pn.rtt;
+						pn.rtt_var = 0.75f * pn.rtt_var + 0.25f * (err < 0 ? -err : err);
+						pn.rtt = 0.875f * pn.rtt + 0.125f * sample;
+					}
+					pn.rtt_samples++;
+				}
+				pn.reliable_outbox.erase(it);
+				return;
+			}
+		}
 	}
 
 	void flush_reliable(uint8_t peer) {
 		auto& pn = peer_net[peer];
 		if (!has_addr[peer]) return;
 		for (auto& r : pn.reliable_outbox) {
+			if (r.first_send_time == 0.f) r.first_send_time = local_time;
 			sock.send(r.envelope, r.envelope_size, peer_addrs[peer]);
 			if (r.sends_remaining > 0) r.sends_remaining--;
 		}

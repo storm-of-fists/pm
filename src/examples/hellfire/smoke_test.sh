@@ -92,6 +92,10 @@ check "$HELLFIRE_REPORT_DIR/server.json" '"game_over": true'      "server: game 
 check "$HELLFIRE_REPORT_DIR/server.json" '"peak_monsters":'       "server: tracked monsters"
 check "$HELLFIRE_REPORT_DIR/server.json" '"peak_bullets":'        "server: tracked bullets"
 check "$HELLFIRE_REPORT_DIR/server.json" '"peak_players": 8'      "server: all 8 players seen"
+check "$HELLFIRE_REPORT_DIR/server.json" '"bytes_sent":'          "server: has bytes_sent"
+check "$HELLFIRE_REPORT_DIR/server.json" '"bytes_recv":'          "server: has bytes_recv"
+check "$HELLFIRE_REPORT_DIR/server.json" '"packets_sent":'        "server: has packets_sent"
+check "$HELLFIRE_REPORT_DIR/server.json" '"rtt_avg_ms":'          "server: has RTT stats"
 check "$HELLFIRE_REPORT_DIR/server.json" '"timeline": \['         "server: has timeline"
 check "$HELLFIRE_REPORT_DIR/server.json" '"events": \['           "server: has events"
 check "$HELLFIRE_REPORT_DIR/server.json" '"game started'          "server: game start event"
@@ -103,7 +107,11 @@ for i in 1 2 3 4 5 6 7 8; do
     check "$F" '"role": "client"'       "Bot$i: correct role"
     check "$F" '"game_over": true'      "Bot$i: saw game over"
     check "$F" '"frames":'              "Bot$i: has frame data"
-    check "$F" '"snapshot_age_avg_ms":' "Bot$i: has network stats"
+    check "$F" '"bytes_sent":'          "Bot$i: has bytes_sent"
+    check "$F" '"bytes_recv":'          "Bot$i: has bytes_recv"
+    check "$F" '"packets_sent":'        "Bot$i: has packets_sent"
+    check "$F" '"rtt_avg_ms":'          "Bot$i: has RTT stats"
+    check "$F" '"clock_offset_min":'    "Bot$i: has clock offset"
     check "$F" '"timeline": \['         "Bot$i: has timeline"
 done
 
