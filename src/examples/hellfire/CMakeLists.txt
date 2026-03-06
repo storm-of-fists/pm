@@ -44,3 +44,12 @@ add_custom_command(TARGET example_mod POST_BUILD
         $<TARGET_FILE_DIR:hellfire_client>/mods/example_mod.so
     COMMENT "Copying example_mod to mods/"
 )
+
+# ── Smoke test — 4 AI bots playing until they die ─────────────────────────
+add_custom_target(smoke_test
+    DEPENDS hellfire_server hellfire_client
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Running hellfire smoke test (8 bots)"
+    USES_TERMINAL
+)

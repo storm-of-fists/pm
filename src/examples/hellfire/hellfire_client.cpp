@@ -11,6 +11,7 @@
 #include "pm_debug.hpp"
 #include "pm_mod.hpp"
 #include "hellfire_common.hpp"
+#include "hellfire_diag.hpp"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -82,14 +83,25 @@ struct ChildProcess {
 static ChildProcess g_server_process;
 
 // =============================================================================
+// Bot mode — for smoke testing (--bot --host --name Bot1)
+// =============================================================================
+struct BotConfig {
+    bool enabled = false;
+    bool host = false;
+    std::string name = "bot";
+};
+static BotConfig g_bot;
+static std::string g_report_dir;
+
+// =============================================================================
 // SpriteStore — loaded sprites (one per shared SDL renderer lifetime)
 // =============================================================================
 struct SpriteStore {
     Sprite player_front;
     Sprite player_back;
     // Per-player facing: true = front sprite (toward camera), false = back sprite (away).
-    Hysteresis<bool> facing[4];
-    float prev_y[4] = {};
+    Hysteresis<bool> facing[MAX_PLAYERS];
+    float prev_y[MAX_PLAYERS] = {};
 };
 
 // =============================================================================
@@ -142,7 +154,7 @@ struct MenuState {
     bool needs_disconnect_cleanup = false; // signal stale_cleanup to remove entities
 
     // Roster
-    PlayerInfo roster[4]{};
+    PlayerInfo roster[MAX_PLAYERS]{};
     int roster_count = 0;
 
     void set_roster_name(uint8_t peer, const char* name) {
@@ -153,7 +165,7 @@ struct MenuState {
                 return;
             }
         }
-        if (roster_count < 4) {
+        if (roster_count < MAX_PLAYERS) {
             roster[roster_count].peer_id = peer;
             roster[roster_count].connected = true;
             strncpy(roster[roster_count].name, name, MAX_NAME);
@@ -223,9 +235,9 @@ struct MenuState {
         for (int i = 0; i < roster_count; i++) {
             int py = by + 32 + i * 30;
             uint8_t pi = roster[i].peer_id;
-            uint8_t cr = (pi < 4) ? PCOL[pi][0] : 180;
-            uint8_t cg = (pi < 4) ? PCOL[pi][1] : 180;
-            uint8_t cb = (pi < 4) ? PCOL[pi][2] : 180;
+            uint8_t cr = (pi < MAX_PLAYERS) ? PCOL[pi][0] : 180;
+            uint8_t cg = (pi < MAX_PLAYERS) ? PCOL[pi][1] : 180;
+            uint8_t cb = (pi < MAX_PLAYERS) ? PCOL[pi][2] : 180;
             q->push({(float)(bx + 16), (float)(py + 2), 10, 10, cr, cg, cb, at});
             push_str(q, roster[i].name, bx + 34, py, 2, cr, cg, cb);
             if (pi == 0) push_str(q, "host", bx + bw - 50, py, 2, 120, 120, 130);
@@ -237,14 +249,15 @@ struct MenuState {
 // ClientNetState — pools + network receive state
 // =============================================================================
 struct ClientNetState {
+    DiagReport diag;
     ClientState gs{};
     Pool<Player>* players = nullptr;
     Pool<Monster>* monsters = nullptr;
     Pool<Bullet>* bullets = nullptr;
-    Id peer_ids[4] = {NULL_ID, NULL_ID, NULL_ID, NULL_ID};
+    Id peer_ids[MAX_PLAYERS] = {};
 
     void add_player(Pm& pm, uint8_t peer) {
-        if (peer >= 4 || peer_ids[peer] != NULL_ID) return;
+        if (peer >= MAX_PLAYERS || peer_ids[peer] != NULL_ID) return;
         peer_ids[peer] = pm.id_add();
         players->add(peer_ids[peer], Player{{SPAWN_X[peer], SPAWN_Y[peer]}, PLAYER_HP, 0, 0, true,
                   PCOL[peer][0], PCOL[peer][1], PCOL[peer][2]});
@@ -350,6 +363,66 @@ void menu_init(Pm& pm) {
         if (menu->phase == GamePhase::LOBBY) { menu->draw_lobby(draw_q_ref, menu->is_host_client); return; }
         if (menu->show_players) menu->draw_player_list(draw_q_ref, 0.8f);
     });
+
+    // --- Bot auto-connect / auto-start / auto-quit ---
+    if (g_bot.enabled) {
+        auto* cn_ref = pm.state_get<ClientNetState>("client_net");
+        pm.task_add("bot/auto", Phase::INPUT, [menu, net, cn_ref](Pm& pm) {
+            if (menu->disconnected) {
+                printf("[bot %s] disconnected, exiting\n", g_bot.name.c_str());
+                pm.loop_quit();
+                return;
+            }
+
+            // Auto-connect on first frame
+            static bool started = false;
+            if (menu->phase == GamePhase::MENU && !started) {
+                menu->username = g_bot.name;
+                menu->ip_addr = "127.0.0.1";
+                if (g_bot.host) {
+                    menu->is_host_client = true;
+                    std::string server_bin = exe_dir() + "hellfire_server";
+                    char port_buf[8]; snprintf(port_buf, sizeof(port_buf), "%d", NET_PORT);
+                    if (!g_server_process.spawn(server_bin.c_str(), port_buf)) {
+                        printf("[bot] failed to spawn server!\n");
+                        pm.loop_quit();
+                        return;
+                    }
+                    printf("[bot] spawned server\n");
+                    SDL_Delay(200);
+                }
+                net->set_peer_id(255);
+                net->port = 0;
+                net->connect_ip = menu->ip_addr.c_str();
+                net->start_client();
+                menu->phase = GamePhase::LOBBY;
+                started = true;
+                return;
+            }
+
+            // Auto-start from lobby (host waits for all players or 10s timeout)
+            static float lobby_timer = 0;
+            if (menu->phase == GamePhase::LOBBY && g_bot.host) {
+                lobby_timer += pm.loop_dt();
+                bool conn = net->conn_state == NetSys::ConnState::CONNECTED;
+                if (conn && (menu->roster_count >= MAX_PLAYERS || lobby_timer > 10.f) && lobby_timer > 0) {
+                    PktStart pkt{PKT_START};
+                    net->send_to(0, &pkt, sizeof(pkt));
+                    lobby_timer = -999.f;
+                }
+            }
+
+            // Auto-quit on game over
+            static float gameover_timer = 0;
+            if (menu->phase == GamePhase::PLAYING && cn_ref->gs.game_over) {
+                gameover_timer += pm.loop_dt();
+                if (gameover_timer > 5.f) {
+                    printf("[bot %s] game over, exiting\n", g_bot.name.c_str());
+                    pm.loop_quit();
+                }
+            }
+        });
+    }
 }
 
 // =============================================================================
@@ -369,8 +442,9 @@ void client_net_init(Pm& pm) {
 
     // --- Connection handshake ---
     net->protocol_version = 1;
-    net->on_connected([menu](NetSys&, uint8_t peer_id, const uint8_t* payload, uint16_t size) {
+    net->on_connected([menu, cn](NetSys& n, uint8_t peer_id, const uint8_t* payload, uint16_t size) {
         printf("[client] assigned peer %d\n", peer_id);
+        cn->diag.push_event(n.local_time, "connected as peer %d", peer_id);
         menu->disconnected = false;
         // ACK payload contains roster
         if (size >= sizeof(PktRoster)) {
@@ -386,6 +460,7 @@ void client_net_init(Pm& pm) {
         if (peer_id != 0) return;  // only care about server (slot 0)
         if (menu->phase == GamePhase::MENU) return;
         printf("[client] lost connection to server\n");
+        cn->diag.push_event(n.local_time, "disconnected");
         n.conn_state = NetSys::ConnState::DISCONNECTED;
         n.connect_ip = nullptr;
         if (menu->is_host_client) { g_server_process.kill(); menu->is_host_client = false; }
@@ -404,8 +479,9 @@ void client_net_init(Pm& pm) {
         apply_roster(pkt, menu->roster, menu->roster_count);
     });
 
-    net->on_recv(PKT_START, [menu](Pm&, const uint8_t*, int, struct sockaddr_in&) {
+    net->on_recv(PKT_START, [menu, cn, net](Pm&, const uint8_t*, int, struct sockaddr_in&) {
         menu->phase = GamePhase::PLAYING;
+        cn->diag.push_event(net->local_time, "game started");
     });
 
     net->on_recv(PKT_DBG, [cn](Pm&, const uint8_t* buf, int n, struct sockaddr_in&) {
@@ -428,7 +504,7 @@ void client_net_init(Pm& pm) {
         if (new_level > cn->gs.current_level) cn->gs.level_flash = 3.0f;
         cn->gs.current_level = new_level;
         if (cn->gs.score >= WIN_SCORE) cn->gs.win = true;
-        for (int i = 0; i < pkt.pcnt && i < 4; i++) {
+        for (int i = 0; i < pkt.pcnt && i < MAX_PLAYERS; i++) {
             auto* p = cn->players->get(cn->peer_ids[i]);
             if (!p) { cn->add_player(pm, i); p = cn->players->get(cn->peer_ids[i]); }
             if (p) {
@@ -474,16 +550,45 @@ void client_net_init(Pm& pm) {
             return;
         }
 
-        const bool* k = SDL_GetKeyboardState(nullptr);
         Input in{};
-        if (k[SDL_SCANCODE_W] || k[SDL_SCANCODE_UP])    in.dy -= 1;
-        if (k[SDL_SCANCODE_S] || k[SDL_SCANCODE_DOWN])  in.dy += 1;
-        if (k[SDL_SCANCODE_A] || k[SDL_SCANCODE_LEFT])  in.dx -= 1;
-        if (k[SDL_SCANCODE_D] || k[SDL_SCANCODE_RIGHT]) in.dx += 1;
-        float mx, my; SDL_MouseButtonFlags mb = SDL_GetMouseState(&mx, &my);
-        Vec2 aim = cam->screen_to_world({mx, my});
-        in.ax = aim.x; in.ay = aim.y;
-        in.shooting = (mb & SDL_BUTTON_LMASK) != 0;
+        if (g_bot.enabled) {
+            // Bot AI: random movement, aim at nearest monster, always shooting
+            static uint32_t bseed = []{
+                uint32_t s = 5381;
+                for (char c : g_bot.name) s = s * 33 + (uint8_t)c;
+                return s ? s : 1;
+            }();
+            static Rng bot_rng{bseed};
+            static float dir_timer = 0;
+            static float bdx = 0, bdy = 0;
+            dir_timer -= pm.loop_dt();
+            if (dir_timer <= 0) {
+                dir_timer = bot_rng.rfr(0.2f, 1.0f);
+                float a = bot_rng.rf() * 6.283f;
+                bdx = cosf(a); bdy = sinf(a);
+            }
+            in.dx = bdx; in.dy = bdy;
+            in.shooting = true;
+            auto* p = cn->players->get(cn->peer_ids[net->peer_id()]);
+            Vec2 aim = p ? Vec2{p->pos.x + 100.f, p->pos.y} : Vec2{W * 0.5f, H * 0.5f};
+            float best_d = 1e9f;
+            cn->monsters->each([&](const Monster& m) {
+                if (!p) return;
+                float d = dist(m.pos, p->pos);
+                if (d < best_d) { best_d = d; aim = m.pos; }
+            }, Parallel::Off);
+            in.ax = aim.x; in.ay = aim.y;
+        } else {
+            const bool* k = SDL_GetKeyboardState(nullptr);
+            if (k[SDL_SCANCODE_W] || k[SDL_SCANCODE_UP])    in.dy -= 1;
+            if (k[SDL_SCANCODE_S] || k[SDL_SCANCODE_DOWN])  in.dy += 1;
+            if (k[SDL_SCANCODE_A] || k[SDL_SCANCODE_LEFT])  in.dx -= 1;
+            if (k[SDL_SCANCODE_D] || k[SDL_SCANCODE_RIGHT]) in.dx += 1;
+            float mx, my; SDL_MouseButtonFlags mb = SDL_GetMouseState(&mx, &my);
+            Vec2 aim = cam->screen_to_world({mx, my});
+            in.ax = aim.x; in.ay = aim.y;
+            in.shooting = (mb & SDL_BUTTON_LMASK) != 0;
+        }
 
         auto* p = cn->players->get(cn->peer_ids[net->peer_id()]);
         if (p && p->alive) {
@@ -519,7 +624,7 @@ void client_net_init(Pm& pm) {
                     cn->gs = ClientState{};
                     cn->monsters->each([&](Id id, const Monster&) { pm.id_remove(id); }, Parallel::Off);
                     cn->bullets->each([&](Id id, const Bullet&) { pm.id_remove(id); }, Parallel::Off);
-                    for (int i = 0; i < 4; i++) cn->peer_ids[i] = NULL_ID;
+                    for (int i = 0; i < MAX_PLAYERS; i++) cn->peer_ids[i] = NULL_ID;
                 }
                 else if (menu->is_host_client) {
                     PktPause pkt{PKT_PAUSE};
@@ -539,7 +644,7 @@ void client_net_init(Pm& pm) {
         if (menu->needs_disconnect_cleanup) {
             cn->monsters->each([&](Id id, const Monster&) { pm.id_remove(id); }, Parallel::Off);
             cn->bullets->each([&](Id id, const Bullet&) { pm.id_remove(id); }, Parallel::Off);
-            for (int i = 0; i < 4; i++) cn->peer_ids[i] = NULL_ID;
+            for (int i = 0; i < MAX_PLAYERS; i++) cn->peer_ids[i] = NULL_ID;
             menu->needs_disconnect_cleanup = false;
             return;
         }
@@ -547,6 +652,51 @@ void client_net_init(Pm& pm) {
         float dt = pm.loop_dt();
         cn->bullets->each_mut([&](Id id, Bullet& b)  { b.lifetime += dt; if (b.lifetime > 2.f) pm.id_remove(id); }, Parallel::Off);
         cn->monsters->each_mut([&](Id id, Monster& m) { m.shoot_timer += dt; if (m.shoot_timer > 2.f) pm.id_remove(id); }, Parallel::Off);
+    });
+
+    // --- Diagnostics: per-frame sampling ---
+    pm.task_add("diag/sample", Phase::HUD + 2.f, [cn, net, menu](Pm& pm) {
+        if (menu->phase != GamePhase::PLAYING) return;
+        auto& d = cn->diag;
+        d.sample_frame(pm.loop_dt());
+        int alive = 0;
+        for (auto& p : cn->players->items) if (p.alive) alive++;
+        d.track_entities((int)cn->monsters->items.size(), (int)cn->bullets->items.size(), alive);
+        d.total_spawns += pm.loop_spawns();
+        d.total_removes += pm.loop_removes();
+        d.duration = cn->gs.time;
+
+        if (net->conn_state == NetSys::ConnState::CONNECTED)
+            d.track_snapshot_age(net->snapshot_age(0));
+
+        // Per-frame timeline sample
+        float snap_ms = (net->conn_state == NetSys::ConnState::CONNECTED)
+                        ? net->snapshot_age(0) * 1000.f : 0.f;
+        d.timeline.push_back({cn->gs.time, (int)cn->monsters->items.size(),
+                              (int)cn->bullets->items.size(), alive,
+                              cn->gs.score, cn->gs.kills, pm.loop_dt() * 1000.f,
+                              snap_ms});
+
+        // Detect game over — log event + write report (one-shot)
+        static bool prev_go = false;
+        if (cn->gs.game_over && !prev_go) {
+            d.push_event(cn->gs.time, "game over — score %d", cn->gs.score);
+
+            if (!g_report_dir.empty()) {
+                d.peer_id = net->peer_id();
+                d.score = cn->gs.score; d.kills = cn->gs.kills;
+                d.level = cn->gs.current_level + 1;
+                d.game_over = true; d.win = cn->gs.win;
+                d.peer_count = menu->roster_count;
+                for (int i = 0; i < menu->roster_count && i < DiagReport::MAX_DIAG_PEERS; i++) {
+                    d.peers[i].id = menu->roster[i].peer_id;
+                    memcpy(d.peers[i].name, menu->roster[i].name, sizeof(d.peers[i].name));
+                }
+                std::string path = g_report_dir + "/" + d.name + ".json";
+                d.write_json(path.c_str());
+            }
+        }
+        prev_go = cn->gs.game_over;
     });
 }
 
@@ -619,7 +769,7 @@ void draw_init(Pm& pm) {
         cam->zoom += (cam->target_zoom - cam->zoom) * 8.0f * dt;
 
         // Follow local player
-        if (net->peer_id() < 4) {
+        if (net->peer_id() < MAX_PLAYERS) {
             auto* p = cn->players->get(cn->peer_ids[net->peer_id()]);
             if (p && p->alive)
                 cam->center += (p->pos - cam->center) * 6.0f * dt;
@@ -631,7 +781,8 @@ void draw_init(Pm& pm) {
         if (menu->phase != GamePhase::PLAYING) return;
         int pi = 0;
         for (auto& p : cn->players->items) {
-            float bx = (pi%2==0) ? 10.f : (float)(W-170); float by = (pi<2) ? 10.f : 28.f;
+            float bx = (pi < MAX_PLAYERS/2) ? 10.f : (float)(W-170);
+            float by = 10.f + (float)(pi % (MAX_PLAYERS/2)) * 18.f;
             float pct = p.hp / PLAYER_HP;
             draw_q->push({bx, by, 160, 14, 40, 40, 50, 255});
             draw_q->push({bx+1, by+1, 158*pct, 12, (uint8_t)(p.r*pct+255*(1-pct)), (uint8_t)(p.g*pct), (uint8_t)(p.b*pct), 255});
@@ -736,12 +887,31 @@ void draw_init(Pm& pm) {
 // =============================================================================
 // Main
 // =============================================================================
-int main(int, char**) {
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--bot") == 0) g_bot.enabled = true;
+        else if (strcmp(argv[i], "--host") == 0) g_bot.host = true;
+        else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) g_bot.name = argv[++i];
+        else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) g_report_dir = argv[++i];
+    }
+    { const char* env = getenv("HELLFIRE_REPORT_DIR"); if (env && g_report_dir.empty()) g_report_dir = env; }
+
     Pm pm;
-    // No set_loop_rate() — SDL vsync paces frames
+
+    // Setup diag identity early so all inits can capture it
+    auto* cn_pre = pm.state_get<ClientNetState>("client_net");
+    cn_pre->diag.role = "client";
+    snprintf(cn_pre->diag.name, sizeof(cn_pre->diag.name), "%s",
+             g_bot.enabled ? g_bot.name.c_str() : "player");
 
     auto* sdl = pm.state_get<SdlSystem>("sdl");
-    sdl->open("hellfire", W, H);
+    if (g_bot.enabled) {
+        char title[64];
+        snprintf(title, sizeof(title), "hellfire [%s]", g_bot.name.c_str());
+        sdl->open(title, W, H);
+    } else {
+        sdl->open("hellfire", W, H);
+    }
     sdl_init(pm, sdl, Phase::INPUT, Phase::RENDER);
 
     auto* net = pm.state_get<NetSys>("net");
@@ -755,15 +925,17 @@ int main(int, char**) {
     debug_init(pm, debug, Phase::INPUT, Phase::HUD);
 
     ModLoader mods;
-    mods.watch(exe_dir() + "mods/example_mod.so");
-    mods.load_all(pm);
-    pm.task_add("mods/poll", Phase::INPUT - 5.f, [&mods](Pm& pm) {
-        mods.poll(pm);
-    });
+    if (!g_bot.enabled) {
+        mods.watch(exe_dir() + "mods/example_mod.so");
+        mods.load_all(pm);
+        pm.task_add("mods/poll", Phase::INPUT - 5.f, [&mods](Pm& pm) {
+            mods.poll(pm);
+        });
+    }
 
     pm.loop_run();
 
-    mods.unload_all(pm);
+    if (!g_bot.enabled) mods.unload_all(pm);
     g_server_process.kill();
 
     return 0;

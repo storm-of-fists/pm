@@ -59,10 +59,14 @@ static constexpr int MAX_NAME = 12;
 static constexpr int MAX_IP = 15;
 static constexpr int WIN_SCORE = 8000;
 static constexpr uint32_t STATE_ID_GAME = 1;  // state sync id for game state
+static constexpr int MAX_PLAYERS = 8;
 
-static const uint8_t PCOL[4][3] = {{0,220,255}, {0,255,120}, {255,160,40}, {255,80,200}};
-static const float SPAWN_X[4] = {W*.25f, W*.75f, W*.25f, W*.75f};
-static const float SPAWN_Y[4] = {H*.4f, H*.4f, H*.6f, H*.6f};
+static const uint8_t PCOL[MAX_PLAYERS][3] = {
+    {0,220,255}, {0,255,120}, {255,160,40}, {255,80,200},
+    {255,220,40}, {255,80,80}, {160,80,255}, {220,220,220},
+};
+static const float SPAWN_X[MAX_PLAYERS] = {W*.2f, W*.4f, W*.6f, W*.8f, W*.2f, W*.4f, W*.6f, W*.8f};
+static const float SPAWN_Y[MAX_PLAYERS] = {H*.35f, H*.35f, H*.35f, H*.35f, H*.65f, H*.65f, H*.65f, H*.65f};
 
 // =============================================================================
 // Levels
@@ -112,11 +116,11 @@ struct PktWelcome { uint8_t type=PKT_WELCOME; uint8_t peer_id, pcnt; };
 struct PktState {
     uint8_t type=PKT_STATE; uint32_t frame; float time;
     int score, kills; uint8_t paused, gameover, pcnt; uint16_t round;
-    struct { float x,y,hp; uint8_t alive; } p[4];
+    struct { float x,y,hp; uint8_t alive; } p[MAX_PLAYERS];
 };
 struct PktRoster {
     uint8_t type=PKT_ROSTER; uint8_t count;
-    struct Entry { uint8_t peer_id; char name[MAX_NAME+1]; } entries[4];
+    struct Entry { uint8_t peer_id; char name[MAX_NAME+1]; } entries[MAX_PLAYERS];
 };
 struct PktStart   { uint8_t type=PKT_START; };
 struct PktPause   { uint8_t type=PKT_PAUSE; };
@@ -158,13 +162,13 @@ static inline void read_bullets(Pm& pm, Pool<Bullet>* pool, const uint8_t* data,
 // =============================================================================
 static inline void build_roster(const PlayerInfo* roster, int count, PktRoster& pkt) {
     pkt.type = PKT_ROSTER; pkt.count = (uint8_t)count;
-    for (int i = 0; i < count && i < 4; i++) {
+    for (int i = 0; i < count && i < MAX_PLAYERS; i++) {
         pkt.entries[i].peer_id = roster[i].peer_id;
         memcpy(pkt.entries[i].name, roster[i].name, MAX_NAME + 1);
     }
 }
 static inline void apply_roster(const PktRoster& pkt, PlayerInfo* roster, int& count) {
-    count = std::min((int)pkt.count, 4);
+    count = std::min((int)pkt.count, MAX_PLAYERS);
     for (int i = 0; i < count; i++) {
         roster[i].peer_id = pkt.entries[i].peer_id;
         roster[i].connected = true;

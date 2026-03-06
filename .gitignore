@@ -37,3 +37,6 @@ build-release/
 # Debug information / dependency files
 *.dwo
 *.d
+
+# Local working directory (reports, logs, etc.)
+work/
