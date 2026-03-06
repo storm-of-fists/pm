@@ -196,7 +196,7 @@ private:
 
 			size_t total = work_total;
 			uint32_t active = work_active;
-			auto fn = work_fn;
+			auto *fn = &work_fn;
 			lk.unlock();
 
 			if (id < active)
@@ -207,7 +207,7 @@ private:
 
 				try
 				{
-					if (begin < end) fn(begin, end);
+					if (begin < end) (*fn)(begin, end);
 				}
 				catch (...)
 				{

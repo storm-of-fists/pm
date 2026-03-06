@@ -59,6 +59,12 @@ re-run `cmake --preset dev`.
 | `pm_mod.hpp` | Mod hot-reload: ModLoader watches .so files, dlopen/dlclose on mtime change |
 | `pm_spatial_grid.hpp` | Spatial hashing for collision queries |
 
+## Conventions
+
+- **`noun_verb` naming:** all public API methods follow `noun_verb` order — `id_add()`, `pool_get()`, `task_stop()`, `loop_run()`
+- **`_prefix` for private members:** private/internal fields use a leading underscore (`_next_seq`, `_alive`), not `m_` prefix
+- **All game logic runs inside tasks:** never put simulation code after `loop_run()` or outside a task lambda — tasks are the only execution unit
+
 ## Key patterns
 
 ```cpp
@@ -89,25 +95,8 @@ pm.loop_rate = 60;
 pm.loop_run();
 ```
 
-### Init-time capture
-
-Fetch pools, states, and other pointers **during init** and capture them in the lambda
-closure. Don't call `pool_get<T>()` or `state_get<T>()` inside a task — those are init-time
-operations. Tasks receive `Pm&` directly, giving access to per-frame info (`loop_dt()`, `id_add()`,
-`id_remove()`) and everything else.
-
-```cpp
-void physics_init(Pm& pm) {
-    auto* pos = pm.pool_get<Pos>("pos");   // capture at init
-    auto* vel = pm.pool_get<Vel>("vel");
-
-    pm.task_add("physics", 30.f, [pos, vel](Pm& pm) {
-        // Good: pos/vel already captured, no lookup per frame
-        float dt = pm.loop_dt();
-        pos->each_mut([dt](Pos& p) { p.x += p.vx * dt; });
-    });
-}
-```
+Fetch pools and states **during init** and capture them in the lambda closure — don't call
+`pool_get<T>()` or `state_get<T>()` inside a task.
 
 Quick reference:
 
@@ -127,35 +116,6 @@ Quick reference:
 - All time is `float` seconds (matches `pm.loop_dt()`)
 - Mods: `.so` files exporting `extern "C" pm_mod_load(Pm&)` / `pm_mod_unload(Pm&)`
 - `pm.task_stop("name")` — stop a task (clears fn + deactivates, safe for dlclose)
-
-### Networking
-
-```cpp
-auto* net = pm.state_get<NetSys>("net");
-net->port = 9998;
-net->start();
-net_init(pm, net, Phase::NET_RECV, Phase::NET_SEND);
-
-net->on_recv(PKT_INPUT, [](Pm&, const uint8_t* buf, int n, sockaddr_in&) {
-    // handle packet
-});
-
-net->bind_send(pm, pool, "sync_name", Phase::NET_SEND, write_fn);
-```
-
-### Modding
-
-```cpp
-// In your .so mod:
-extern "C" void pm_mod_load(Pm& pm) {
-    pm.task_add("mod_task", 50.f, [](Pm& pm) { /* ... */ });
-}
-extern "C" void pm_mod_unload(Pm& pm) {
-    pm.task_stop("mod_task");
-}
-```
-
-ModLoader watches `.so` files for mtime changes and hot-reloads via dlopen/dlclose.
 
 ## Example game: Hellfire
 
@@ -256,13 +216,6 @@ permanent pools/states, no entity names, TaskFault, no Hz sub-stepping.
 
 See [src/examples/hellfire/README.md](src/examples/hellfire/README.md) for game-specific
 roadmap (SDL3_ttf, monster AI, spatial quad-tree, mod enhancements).
-
-## Environment
-
-This project lives inside WSL (Ubuntu-24.04). When running from Windows, prefix commands:
-```
-wsl -d Ubuntu-24.04 -- bash -c "cd /home/clatham/pm && <command>"
-```
 
 ## License
 
