@@ -505,18 +505,19 @@ void client_net_init(Pm& pm) {
         cn->gs.current_level = new_level;
         if (cn->gs.score >= WIN_SCORE) cn->gs.win = true;
         for (int i = 0; i < pkt.pcnt && i < MAX_PLAYERS; i++) {
-            auto* p = cn->players->get(cn->peer_ids[i]);
-            if (!p) { cn->add_player(pm, i); p = cn->players->get(cn->peer_ids[i]); }
-            if (p) {
+            auto pe = cn->players->get(cn->peer_ids[i]);
+            if (!pe) { cn->add_player(pm, i); pe = cn->players->get(cn->peer_ids[i]); }
+            if (pe) {
+                auto& p = pe.get_mut();
                 Vec2 srv = {pkt.p[i].x, pkt.p[i].y};
-                float err = dist(p->pos, srv);
-                if (err > 120.f) p->pos = srv;
+                float err = dist(p.pos, srv);
+                if (err > 120.f) p.pos = srv;
                 else if (err > 1.f) {
                     float a = 0.1f + (err / 120.f) * 0.3f;
-                    p->pos.x += (srv.x - p->pos.x) * a;
-                    p->pos.y += (srv.y - p->pos.y) * a;
+                    p.pos.x += (srv.x - p.pos.x) * a;
+                    p.pos.y += (srv.y - p.pos.y) * a;
                 }
-                p->hp = pkt.p[i].hp; p->alive = pkt.p[i].alive;
+                p.hp = pkt.p[i].hp; p.alive = pkt.p[i].alive;
             }
         }
     });
@@ -569,13 +570,14 @@ void client_net_init(Pm& pm) {
             }
             in.dx = bdx; in.dy = bdy;
             in.shooting = true;
-            auto* p = cn->players->get(cn->peer_ids[net->peer_id()]);
-            Vec2 aim = p ? Vec2{p->pos.x + 100.f, p->pos.y} : Vec2{W * 0.5f, H * 0.5f};
+            auto pe = cn->players->get(cn->peer_ids[net->peer_id()]);
+            Vec2 ppos = pe ? pe.get().pos : Vec2{W * 0.5f, H * 0.5f};
+            Vec2 aim = pe ? Vec2{ppos.x + 100.f, ppos.y} : Vec2{W * 0.5f, H * 0.5f};
             float best_d = 1e9f;
-            cn->monsters->each([&](const Monster& m) {
-                if (!p) return;
-                float d = dist(m.pos, p->pos);
-                if (d < best_d) { best_d = d; aim = m.pos; }
+            cn->monsters->each([&](PoolEntry<Monster>& e) {
+                if (!pe) return;
+                float d = dist(e.get().pos, ppos);
+                if (d < best_d) { best_d = d; aim = e.get().pos; }
             }, Parallel::Off);
             in.ax = aim.x; in.ay = aim.y;
         } else {
@@ -590,16 +592,17 @@ void client_net_init(Pm& pm) {
             in.shooting = (mb & SDL_BUTTON_LMASK) != 0;
         }
 
-        auto* p = cn->players->get(cn->peer_ids[net->peer_id()]);
-        if (p && p->alive) {
+        auto pe = cn->players->get(cn->peer_ids[net->peer_id()]);
+        if (pe && pe.get().alive) {
+            auto& p = pe.get_mut();
             float dt = pm.loop_dt();
             Vec2 move = {in.dx, in.dy};
             float ml = len(move);
             if (ml > 0.001f) move = move * (1.f / ml);
-            p->pos += move * (PLAYER_SPEED * dt);
+            p.pos += move * (PLAYER_SPEED * dt);
             float hs = PLAYER_SIZE * 0.5f;
-            p->pos.x = std::clamp(p->pos.x, hs, (float)W - hs);
-            p->pos.y = std::clamp(p->pos.y, hs, (float)H - hs);
+            p.pos.x = std::clamp(p.pos.x, hs, (float)W - hs);
+            p.pos.y = std::clamp(p.pos.y, hs, (float)H - hs);
         }
 
         PktInput pkt{PKT_INPUT, net->peer_id(), in.dx, in.dy, in.ax, in.ay,
@@ -650,8 +653,8 @@ void client_net_init(Pm& pm) {
         }
         if (menu->phase != GamePhase::PLAYING || cn->gs.paused) return;
         float dt = pm.loop_dt();
-        cn->bullets->each_mut([&](Id id, Bullet& b)  { b.lifetime += dt; if (b.lifetime > 2.f) pm.id_remove(id); }, Parallel::Off);
-        cn->monsters->each_mut([&](Id id, Monster& m) { m.shoot_timer += dt; if (m.shoot_timer > 2.f) pm.id_remove(id); }, Parallel::Off);
+        cn->bullets->each([&](PoolEntry<Bullet>& e)  { auto& b = e.get_mut(); b.lifetime += dt; if (b.lifetime > 2.f) pm.id_remove(e.id); }, Parallel::Off);
+        cn->monsters->each([&](PoolEntry<Monster>& e) { auto& m = e.get_mut(); m.shoot_timer += dt; if (m.shoot_timer > 2.f) pm.id_remove(e.id); }, Parallel::Off);
     });
 
     // --- Diagnostics: per-frame sampling ---
@@ -781,9 +784,9 @@ void draw_init(Pm& pm) {
 
         // Follow local player
         if (net->peer_id() < MAX_PLAYERS) {
-            auto* p = cn->players->get(cn->peer_ids[net->peer_id()]);
-            if (p && p->alive)
-                cam->center += (p->pos - cam->center) * 6.0f * dt;
+            auto pe = cn->players->get(cn->peer_ids[net->peer_id()]);
+            if (pe && pe.get().alive)
+                cam->center += (pe.get().pos - cam->center) * 6.0f * dt;
         }
     });
 

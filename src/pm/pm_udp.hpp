@@ -239,10 +239,10 @@ static inline bool seq_after(uint16_t a, uint16_t b) { return (int16_t)(a - b) >
 // =============================================================================
 // PoolSyncState — Per-pool sync tracking
 //
-// Change-tracked: sparse synced[] bitmask + pending list.
-// Only entities that called notify_change() (or were just added/removed) are
-// transmitted. O(dirty) per flush.
-// Installed automatically by bind_send().
+// Sparse synced[] bitmask + pending list.
+// bind_send() calls diff_scan() each tick to compare per-entity change counters
+// against stored snapshots, adding only mutated entities to pending. O(changed)
+// amortized per tick. repend_all() is kept for activate_peer (new peer joins).
 // =============================================================================
 struct PoolSyncState
 {
@@ -252,6 +252,7 @@ struct PoolSyncState
 	std::vector<uint64_t> synced;
 	std::vector<Id> pending;
 	std::vector<uint8_t> pending_flag;
+	std::vector<uint32_t> _last_cc;  // last-seen change count per entity (sparse, indexed by id.raw)
 
 	// === Change-tracked mode API ===
 
@@ -321,7 +322,7 @@ struct PoolSyncState
 			if (!(s & bit))
 			{
 				size_t di = pool->sparse.get(idx);
-				fn(id, pool->values_mut()[di], di);
+				fn(id, pool->items[di], di);
 			}
 		}
 		pending.resize(w);
@@ -339,6 +340,31 @@ struct PoolSyncState
 			Id id = pool->id_at(i);
 			uint32_t idx = id.raw;
 			pending_add(idx, id);
+		}
+	}
+
+	// Incremental scan: compare per-entity change counters against stored
+	// snapshots. Only entities whose _change_count increased get added to
+	// pending (with synced[] reset to 0 so all peers re-receive them).
+	template <typename T>
+	void diff_scan(Pool<T>* pool)
+	{
+		for (size_t i = 0; i < pool->size(); i++)
+		{
+			Id id = pool->id_at(i);
+			uint32_t idx = id.raw;
+			uint32_t cc = pool->change_count_at(i);
+
+			if (idx >= _last_cc.size())
+				_last_cc.resize(idx + 1, 0);
+
+			if (cc != _last_cc[idx])
+			{
+				_last_cc[idx] = cc;
+				ensure_size(idx);
+				synced[idx] = 0;
+				pending_add(idx, id);
+			}
 		}
 	}
 
@@ -719,9 +745,9 @@ struct NetSys {
 
 	template<typename T>
 	void clear_pool(Pm& pm, Pool<T>* pool) {
-		pool->each([&](Id id, const T&) {
-			track_removal(pool->pool_id, id);
-			pm.id_remove(id);
+		pool->each([&](PoolEntry<T>& e) {
+			track_removal(pool->pool_id, e.id);
+			pm.id_remove(e.id);
 		}, Parallel::Off);
 	}
 
@@ -914,30 +940,28 @@ struct NetSys {
 			});
 	}
 
-	// --- bind_send(): change-tracked send (sparse synced[], pending list) ---
-	// Entities are only transmitted when they call notify_change() or are newly
-	// added/removed. Install a change hook via Pool::set_change_hook before use,
-	// or call notify_change() manually each frame for always-moving entities.
+	// --- bind_send(): pool sync (change-counter diffing + pending list) ---
+	// Each tick, diff_scan() compares per-entity change counters against stored
+	// snapshots, adding only mutated entities to pending. repend_all() is used
+	// on peer connect (via sync_registry) to ensure full initial sync.
 	template <typename T, typename WriteFn, typename InterestFn = std::nullptr_t>
 	void bind_send(Pm& pm, Pool<T>* pool, const char* task_name, float priority,
 				   WriteFn write_fn, InterestFn interest_fn = nullptr, float hysteresis = 0.f) {
 
 		auto* ss = get_sync_state(pool->pool_id);
 
+		// activate_peer calls repend_fn — ensures new peer gets full sync
 		sync_registry[pool->pool_id] = {
 			ss,
 			[ss, pool]() { ss->repend_all(pool); }
 		};
 
-		pool->set_change_hook([](void* ctx, Id id) {
-			static_cast<PoolSyncState*>(ctx)->mark_changed(id);
-		}, ss);
-
-		ss->repend_all(pool);
+		ss->diff_scan(pool);
 
 		pm.task_add(task_name, priority, [this, pool, ss, write_fn, interest_fn, hysteresis](Pm& pm) {
 			(void)pm;
 			if (!should_send) return;
+			ss->diff_scan(pool);
 			constexpr bool has_interest = !std::is_same_v<InterestFn, std::nullptr_t>;
 
 			uint64_t remote_mask = remote_peers().bits;

@@ -347,14 +347,35 @@ struct PagedSparse
 };
 
 // =============================================================================
+// PoolEntry<T> — Lightweight handle to a pool entry
+//
+// Returned by Pool::get() and passed to Pool::each() lambdas.
+// get()     returns const T& — read-only access.
+// get_mut() returns T& and bumps the per-entity change counter.
+// =============================================================================
+
+template <typename T>
+struct PoolEntry
+{
+	Id id = NULL_ID;
+
+	operator bool() const { return _item != nullptr; }
+	const T &get() const { return *_item; }
+	T &get_mut() { ++(*_change_count); return *_item; }
+
+private:
+	T *_item = nullptr;
+	uint32_t *_change_count = nullptr;
+
+	template <typename U> friend class Pool;
+	PoolEntry(Id id, T *item, uint32_t *cc) : id(id), _item(item), _change_count(cc) {}
+	PoolEntry() = default;
+};
+
 // Pool<T> — Contiguous DOD Sparse Set
 //
 // Pure data container. No lifecycle methods.
 // Created via pm.pool_get<T>("name"). Pm wires up entity→pool removal.
-//
-// Optional change hook: set via set_change_hook() to get notified when
-// entries are added or modified. Used by the network layer (pm_udp) to
-// track dirty entries without Pool knowing about sync bitmasks.
 // =============================================================================
 
 template <typename T>
@@ -362,39 +383,9 @@ class Pool : public PoolBase
 {
 public:
 	std::vector<T> items;
-	std::vector<uint32_t> dense_indices;  // slot index per dense entry
-	std::vector<Id> dense_ids;            // full Id per dense entry (cached for O(1) id_at)
+	std::vector<Id> dense_ids;            // Id per dense entry — also serves as reverse map for swap-remove
+	std::vector<uint32_t> _change_count;  // per-entity change counter, parallel to items/dense_ids
 	PagedSparse sparse;
-
-	// --- Change notification hook (optional) ---
-	using ChangeHook = void(*)(void*, Id);
-	ChangeHook change_fn = nullptr;
-	void *change_ctx = nullptr;
-
-	// --- Swap-remove notification hook (optional) ---
-	// Fires during remove() after the swap. Observer mirrors the swap
-	// on its own dense-parallel arrays.
-	// Args: (ctx, removed_dense_idx, last_dense_idx_before_pop)
-	using SwapHook = void(*)(void*, uint32_t, uint32_t);
-	SwapHook swap_fn = nullptr;
-	void *swap_ctx = nullptr;
-
-	void set_change_hook(ChangeHook fn, void *data)
-	{
-		change_fn = fn;
-		change_ctx = data;
-	}
-
-	void set_swap_hook(SwapHook fn, void *data)
-	{
-		swap_fn = fn;
-		swap_ctx = data;
-	}
-
-	void notify_change(Id id)
-	{
-		if (change_fn) change_fn(change_ctx, id);
-	}
 
 	// Full Id for a given dense position (O(1) direct lookup)
 	Id id_at(size_t dense_idx) const
@@ -412,17 +403,16 @@ public:
 		if (existing != NULL_INDEX)
 		{
 			items[existing] = std::move(val);
-			notify_change(id);
+			_change_count[existing]++;
 			return &items[existing];
 		}
 
 		uint32_t dense_idx = static_cast<uint32_t>(items.size());
 		sparse.set(idx, dense_idx);
-		dense_indices.push_back(idx);
 		dense_ids.push_back(id);
 		items.push_back(std::move(val));
+		_change_count.push_back(1);
 
-		notify_change(id);
 		return &items.back();
 	}
 
@@ -431,65 +421,75 @@ public:
 		uint32_t idx = id.raw;
 		uint32_t dense_idx = sparse.get(idx);
 		if (dense_idx == NULL_INDEX) return;
-		if (dense_indices[dense_idx] != idx) return;
+		if (dense_ids[dense_idx].raw != idx) return;
 
 		uint32_t last_dense_idx = static_cast<uint32_t>(items.size() - 1);
-		uint32_t last_slot_idx = dense_indices[last_dense_idx];
-
-		if (swap_fn) swap_fn(swap_ctx, dense_idx, last_dense_idx);
+		uint32_t last_slot_idx = dense_ids[last_dense_idx].raw;
 
 		if (dense_idx != last_dense_idx)
 		{
 			items[dense_idx] = std::move(items[last_dense_idx]);
-			dense_indices[dense_idx] = last_slot_idx;
 			dense_ids[dense_idx] = dense_ids[last_dense_idx];
+			_change_count[dense_idx] = _change_count[last_dense_idx];
 			sparse.set(last_slot_idx, dense_idx);
 		}
 
 		sparse.clear(idx);
 		items.pop_back();
-		dense_indices.pop_back();
 		dense_ids.pop_back();
+		_change_count.pop_back();
 	}
 
 	void clear_all() override
 	{
-		for (uint32_t idx : dense_indices)
-			sparse.clear(idx);
+		for (Id id : dense_ids)
+			sparse.clear(id.raw);
 		items.clear();
-		dense_indices.clear();
 		dense_ids.clear();
+		_change_count.clear();
 	}
 
 	void shrink_to_fit() override
 	{
 		items.shrink_to_fit();
-		dense_indices.shrink_to_fit();
 		dense_ids.shrink_to_fit();
+		_change_count.shrink_to_fit();
 	}
 
 	void reset()
 	{
 		sparse.reset();
 		items.clear();
-		dense_indices.clear();
 		dense_ids.clear();
+		_change_count.clear();
 		shrink_to_fit();
 	}
 
-	T *get(Id id)
+	PoolEntry<T> get(Id id)
 	{
 		uint32_t dense_idx = sparse.get(id.raw);
-		if (dense_idx == NULL_INDEX) return nullptr;
-		return &items[dense_idx];
+		if (dense_idx == NULL_INDEX) return {};
+		return {id, &items[dense_idx], &_change_count[dense_idx]};
 	}
-	const T *get(Id id) const { return const_cast<Pool *>(this)->get(id); }
 
-	bool has(Id id) const { return get(id) != nullptr; }
+	bool has(Id id) const
+	{
+		uint32_t dense_idx = sparse.get(id.raw);
+		return dense_idx != NULL_INDEX;
+	}
+
+	uint32_t change_count(Id id) const
+	{
+		uint32_t dense_idx = sparse.get(id.raw);
+		if (dense_idx == NULL_INDEX) return 0;
+		return _change_count[dense_idx];
+	}
+
+	uint32_t change_count_at(size_t dense_idx) const { return _change_count[dense_idx]; }
+
 	size_t size() const { return items.size(); }
 	bool empty() const { return items.empty(); }
 	std::span<const T> values() const { return {items.data(), items.size()}; }
-	std::span<T> values_mut() { return {items.data(), items.size()}; }
 	std::span<const Id> ids() const { return {dense_ids.data(), dense_ids.size()}; }
 
 	// Deferred removal of all entities in this pool (via pm.id_remove).
@@ -498,8 +498,7 @@ public:
 
 	// --- Iteration (lambda form, auto-parallelizes) ---
 	// Defined out-of-line after Pm class.
-	// each():     void(const T&) or void(Id, const T&) — read-only, no change hooks
-	// each_mut(): void(T&) or void(Id, T&) — mutable, fires change hooks
+	// each(): void(PoolEntry<T>&) — unified iteration with tracked mutation
 	Pm *kernel = nullptr; // set by Pm::pool_get<T>()
 
 	static constexpr size_t PARALLEL_THRESHOLD = 1024;
@@ -507,9 +506,6 @@ public:
 	// threads: 0 = use all workers, N = use at most N workers for this call.
 	template <typename F>
 	void each(F &&fn, Parallel p = Parallel::Auto, uint32_t threads = 0);
-
-	template <typename F>
-	void each_mut(F &&fn, Parallel p = Parallel::Auto, uint32_t threads = 0);
 };
 
 // =============================================================================
@@ -917,8 +913,8 @@ public:
 };
 
 // =============================================================================
-// Pool<T>::each — read-only iteration, no change hooks
-// Signatures: void(const T&) or void(Id, const T&)
+// Pool<T>::each — unified iteration via PoolEntry
+// Signature: void(PoolEntry<T>&)
 // =============================================================================
 template <typename T>
 template <typename F>
@@ -937,10 +933,8 @@ void Pool<T>::each(F &&fn, Parallel p, uint32_t threads)
 		tp->dispatch(n, [this, &fn](size_t begin, size_t end) {
 			for (size_t i = begin; i < end; i++)
 			{
-				if constexpr (std::is_invocable_v<F, Id, const T &>)
-					fn(id_at(i), static_cast<const T &>(items[i]));
-				else
-					fn(static_cast<const T &>(items[i]));
+				PoolEntry<T> entry(id_at(i), &items[i], &_change_count[i]);
+				fn(entry);
 			}
 		}, threads);
 	}
@@ -948,68 +942,8 @@ void Pool<T>::each(F &&fn, Parallel p, uint32_t threads)
 	{
 		for (size_t i = 0; i < n; i++)
 		{
-			if constexpr (std::is_invocable_v<F, Id, const T &>)
-				fn(id_at(i), static_cast<const T &>(items[i]));
-			else
-				fn(static_cast<const T &>(items[i]));
-		}
-	}
-}
-
-// =============================================================================
-// Pool<T>::each_mut — mutable iteration, fires change hooks
-// Signatures: void(T&) or void(Id, T&)
-// If change_fn is installed and parallel requested, falls back to sequential.
-// =============================================================================
-template <typename T>
-template <typename F>
-void Pool<T>::each_mut(F &&fn, Parallel p, uint32_t threads)
-{
-	size_t n = items.size();
-	if (n == 0) return;
-
-	bool use_parallel = (p == Parallel::On)
-		|| (p == Parallel::Auto && n >= PARALLEL_THRESHOLD && kernel);
-	if (p == Parallel::Off) use_parallel = false;
-	if (change_fn) use_parallel = false;
-
-	if (use_parallel && kernel)
-	{
-		auto *tp = kernel->thread_pool();
-		tp->dispatch(n, [this, &fn](size_t begin, size_t end) {
-			for (size_t i = begin; i < end; i++)
-			{
-				if constexpr (std::is_invocable_v<F, Id, T &>)
-					fn(id_at(i), items[i]);
-				else
-					fn(items[i]);
-			}
-		}, threads);
-	}
-	else
-	{
-		constexpr bool needs_id = std::is_invocable_v<F, Id, T &>;
-		if constexpr (needs_id)
-		{
-			for (size_t i = 0; i < n; i++)
-			{
-				Id eid = id_at(i);
-				fn(eid, items[i]);
-				if (change_fn) change_fn(change_ctx, eid);
-			}
-		}
-		else if (change_fn)
-		{
-			for (size_t i = 0; i < n; i++)
-			{
-				fn(items[i]);
-				change_fn(change_ctx, id_at(i));
-			}
-		}
-		else
-		{
-			for (size_t i = 0; i < n; i++)
-				fn(items[i]);
+			PoolEntry<T> entry(id_at(i), &items[i], &_change_count[i]);
+			fn(entry);
 		}
 	}
 }

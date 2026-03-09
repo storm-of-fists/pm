@@ -79,7 +79,8 @@ auto* pos = pm.pool_get<Pos>("pos");
 // Task scheduling (runs lowest priority first)
 pm.task_add("physics", 30.f, [pos](Pm& pm) {
     float dt = pm.loop_dt();
-    pos->each_mut([dt](Pos& p) {
+    pos->each([dt](PoolEntry<Pos>& e) {
+        auto& p = e.get_mut();
         p.x += p.vx * dt;
         p.y += p.vy * dt;
     });
@@ -105,18 +106,18 @@ Quick reference:
 - `pm.task_add("name", priority, lambda)` — register a task (runs every tick)
 - `pm.task_add("name", priority, interval, lambda)` — register a periodic task (runs once per `interval` seconds)
 - `pm.id_add(peer)` — monotonic entity creation (returns 32-bit Id, `[8-bit peer | 24-bit seq]`).
-  Default peer 0. NOT thread-safe in parallel `each`/`each_mut`.
+  Default peer 0. NOT thread-safe in parallel `each`.
 - `pm.id_remove(id)` — deferred removal (flushed at end of `loop_once()`)
 - `pm.id_alive(id)` — check if an Id is currently alive
 - `pm.id_sync(id)` — accept a remote Id (networking), advances peer sequence
 - `pm.id_set_next_sequence(peer, seq)` — forward-only sequence set (server handshake)
 - `pool->values()` — `std::span<const T>` for range-for without IDs
-- `pool->values_mut()` — `std::span<T>` for mutable range-for (no change hooks)
 - `pool->ids()` — `std::span<const Id>` of dense Id array
 - `pool->size()`, `pool->empty()` — element count / emptiness check
 - `pool->remove_all()` — deferred removal of all entities in the pool
-- `pool->each([](const T&) { ... })` — read-only iteration, no change hooks
-- `pool->each_mut([](T&) { ... })` — mutable iteration, fires change hooks
+- `pool->get(id)` — returns `PoolEntry<T>` (nullable handle with `.get()` / `.get_mut()`)
+- `pool->each([](PoolEntry<T>&) { ... })` — unified iteration, `.get_mut()` bumps change counter
+- `pool->change_count(id)` — per-entity mutation counter (for sync layer diffing)
 - Tasks receive `Pm& pm` with `pm.loop_dt()`, `pm.loop_quit()`, `pm.id_add()`, etc.
 - Networking: `net->on_recv(type, handler)`, `net->send_to(peer, data, size)`
 - Net diagnostics: `net->peer_rtt(p)`, `net->peer_reliable_pending(p)`, `net->is_open()`, `net->bytes_sent()`
@@ -133,7 +134,7 @@ and game-specific roadmap.
 
 ## Tests & Benchmarks
 
-98 tests + 24 benchmark cases in a single binary (`pm_tests`), powered by doctest.
+Tests and benchmarks in a single binary (`pm_tests`), powered by doctest.
 Benchmarks have threshold-based pass/fail (~2x measured max) to catch regressions.
 
 ```bash
@@ -163,7 +164,7 @@ ctest --test-dir build                  # run all (tests + benchmarks)
 
 ### Phase 1 — Kernel cleanup (DONE)
 
-Deferred removes, lambda `each()`/`each_mut()` with auto-parallel,
+Deferred removes, lambda `each()` with auto-parallel via `PoolEntry`,
 permanent pools/states, no entity names, TaskFault, no Hz sub-stepping.
 
 ### Phase 2 — Build system & Architecture
@@ -180,7 +181,7 @@ permanent pools/states, no entity names, TaskFault, no Hz sub-stepping.
 
 **Next up:**
 - **C++20 adoption:**
-  - Concept constraints on `each()`/`each_mut()` — `requires` clauses for clean error messages
+  - Concept constraints on `each()` — `requires` clauses for clean error messages
   - Concept constraints on init functions — `std::invocable` on `task_add()`, `sdl_init`, etc.
   - `std::span` in networking API — replace `void* data, len` pairs in `pm_udp.hpp`
 - **CI (4 jobs):** ASan, UBSan, TSan, clean release
@@ -188,7 +189,6 @@ permanent pools/states, no entity names, TaskFault, no Hz sub-stepping.
 - **`Checked<T>`:** `pool->get(id)` with null check + `TaskFault`
 - **Join iterator:** `pool->each_with(other_pool, fn)` — iterate smaller, lookup larger
 - **`pm.clear_world()`:** loop pools, clear_all, reset kernel state
-- **Multi-hook support for Pool:** multiple observers per pool (currently limited to one)
 - **Typed event queues:** `push<T>()` / `drain<T>()` for inter-task data flow
 - **Module system:** named ownership groups, `unload_module()` tears down everything tagged
 
@@ -197,12 +197,7 @@ permanent pools/states, no entity names, TaskFault, no Hz sub-stepping.
   simulation/rendering, sync `active` flag over the network. Eliminates `id_add`/`id_remove`
   churn and reliable removal packets. Options: grow-on-demand with pool scan for inactive
   slots, or pre-allocate all entities upfront (fixed pool, hard cap). Needs a clean mutation
-  tracking story first (see `PoolRef<T>` below).
-- **`PoolRef<T>` (mutation handle):** `pool->get_mut(id)` returns an RAII handle that fires
-  `notify_change(id)` on destruction. Eliminates manual `notify_change` calls and the
-  `each_mut` problem (marks ALL entities dirty every frame via change hook). Direct iteration
-  with `get_mut` would only dirty entities actually touched. Prerequisite for clean entity
-  pooling.
+  tracking story first.
 - **Spatial hash maps (`pm_spatial_grid.hpp`):** generalize the current hellfire-specific
   `SpatialGrid` into a reusable framework primitive. Configurable cell size, typed queries,
   integrate with `each()`/interest management.

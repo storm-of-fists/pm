@@ -75,8 +75,8 @@ struct ServerState {
         net->clear_pool(pm, mp);
         net->clear_pool(pm, bp);
         for (int i = 0; i < MAX_PLAYERS; i++) {
-            auto* p = players->get(peer_ids[i]);
-            if (p) { p->hp = PLAYER_HP; p->alive = true; p->pos = {SPAWN_X[i], SPAWN_Y[i]}; p->cooldown = 0; p->invuln = 0; }
+            auto pe = players->get(peer_ids[i]);
+            if (pe) { auto& p = pe.get_mut(); p.hp = PLAYER_HP; p.alive = true; p.pos = {SPAWN_X[i], SPAWN_Y[i]}; p.cooldown = 0; p.invuln = 0; }
         }
     }
 };
@@ -124,9 +124,9 @@ void server_init(Pm& pm) {
     net->bind_send(pm, mp, "monster_sync", Phase::NET_SEND, write_monster,
         [gs](Pm&, uint8_t peer, Id, const Monster& m, float margin) -> bool {
             if (peer >= MAX_PLAYERS) return true;
-            auto* p = gs->players->get(gs->peer_ids[peer]);
-            if (!p || !p->alive) return true;
-            return dist(m.pos, p->pos) <= INTEREST_RADIUS * (1.f + margin);
+            auto pe = gs->players->get(gs->peer_ids[peer]);
+            if (!pe || !pe.get().alive) return true;
+            return dist(m.pos, pe.get().pos) <= INTEREST_RADIUS * (1.f + margin);
         }, 0.3f);
 
     net->bind_send(pm, bp, "bullet_sync", Phase::NET_SEND, write_bullet);
@@ -197,23 +197,24 @@ void server_init(Pm& pm) {
         if (!gs->started || gs->game_over) return;
         float dt = pm.loop_dt();
         for (int pi = 0; pi < MAX_PLAYERS; pi++) {
-            auto* p = gs->players->get(gs->peer_ids[pi]);
-            if (!p || !p->alive) continue;
+            auto pe = gs->players->get(gs->peer_ids[pi]);
+            if (!pe || !pe.get().alive) continue;
+            auto& p = pe.get_mut();
             auto& in = gs->axes[pi];
             Vec2 move = {in.dx, in.dy};
             float ml = len(move);
             if (ml > 0.001f) move = move * (1.f / ml);
-            p->pos += move * (PLAYER_SPEED * dt);
+            p.pos += move * (PLAYER_SPEED * dt);
             float hs = PLAYER_SIZE * 0.5f;
-            p->pos.x = std::clamp(p->pos.x, hs, (float)W - hs);
-            p->pos.y = std::clamp(p->pos.y, hs, (float)H - hs);
-            if (p->cooldown > 0) p->cooldown -= dt;
-            if (p->invuln > 0) p->invuln -= dt;
-            if (in.shooting && p->cooldown <= 0) {
-                p->cooldown = PLAYER_COOLDOWN;
-                Vec2 aim = norm(Vec2{in.ax, in.ay} - p->pos);
+            p.pos.x = std::clamp(p.pos.x, hs, (float)W - hs);
+            p.pos.y = std::clamp(p.pos.y, hs, (float)H - hs);
+            if (p.cooldown > 0) p.cooldown -= dt;
+            if (p.invuln > 0) p.invuln -= dt;
+            if (in.shooting && p.cooldown <= 0) {
+                p.cooldown = PLAYER_COOLDOWN;
+                Vec2 aim = norm(Vec2{in.ax, in.ay} - p.pos);
                 if (len(aim) < 0.001f) aim = {1, 0};
-                bp->add(pm.id_add(), Bullet{p->pos, aim*PBULLET_SPEED, PBULLET_LIFE, PBULLET_SIZE, true});
+                bp->add(pm.id_add(), Bullet{p.pos, aim*PBULLET_SPEED, PBULLET_LIFE, PBULLET_SIZE, true});
             }
         }
     }, true);
@@ -231,11 +232,12 @@ void server_init(Pm& pm) {
             gs->round++;
             gs->spawn_accum = 0.f; gs->level_flash = 3.0f; gs->level_hold = 3.0f;
             for (int i = 0; i < MAX_PLAYERS; i++) {
-                auto* p = gs->players->get(gs->peer_ids[i]);
-                if (p && p->alive) {
-                    p->pos.x = SPAWN_X[i] + gs->rng.rfr(-80, 80);
-                    p->pos.y = SPAWN_Y[i] + gs->rng.rfr(-60, 60);
-                    p->invuln = 2.0f;
+                auto pe = gs->players->get(gs->peer_ids[i]);
+                if (pe && pe.get().alive) {
+                    auto& p = pe.get_mut();
+                    p.pos.x = SPAWN_X[i] + gs->rng.rfr(-80, 80);
+                    p.pos.y = SPAWN_Y[i] + gs->rng.rfr(-60, 60);
+                    p.invuln = 2.0f;
                 }
             }
             net->clear_pool(pm, mp);
@@ -264,7 +266,8 @@ void server_init(Pm& pm) {
     pm.task_add("monster_ai", Phase::SIMULATE + 1.f, [gs, mp, bp](Pm& pm) {
         if (!gs->started || gs->game_over) return;
         float dt = pm.loop_dt();
-        mp->each_mut([&](Monster& m) {
+        mp->each([&](PoolEntry<Monster>& e) {
+            auto& m = e.get_mut();
             Vec2 tgt = m.pos; float best = 1e9f;
             for (auto& p : gs->players->values())
                 if (p.alive && dist(m.pos, p.pos) < best) { best = dist(m.pos, p.pos); tgt = p.pos; }
@@ -288,10 +291,11 @@ void server_init(Pm& pm) {
     pm.task_add("bullet_physics", Phase::SIMULATE, [gs, net, bp](Pm& pm) {
         if (!gs->started || gs->game_over) return;
         float dt = pm.loop_dt();
-        bp->each_mut([&](Id id, Bullet& b) {
+        bp->each([&](PoolEntry<Bullet>& e) {
+            auto& b = e.get_mut();
             b.pos += b.vel * dt;
             b.lifetime -= dt;
-            if (b.lifetime <= 0) { net->tracked_remove(pm, bp, id); }
+            if (b.lifetime <= 0) { net->tracked_remove(pm, bp, e.id); }
         }, Parallel::Off);
     }, true);
 
@@ -306,20 +310,21 @@ void server_init(Pm& pm) {
 
         // Build monster grid for this frame (O(monsters)).
         gs->monster_grid.clear();
-        mp->each([&](Id mid, const Monster& m) {
-            gs->monster_grid.insert(mid, m.pos);
+        mp->each([&](PoolEntry<Monster>& e) {
+            gs->monster_grid.insert(e.id, e.get().pos);
         }, Parallel::Off);
 
         // Player bullets vs monsters — O(bullets × few) instead of O(b × m).
-        bp->each([&](Id bid, const Bullet& b) {
+        bp->each([&](PoolEntry<Bullet>& e) {
+            auto& b = e.get();
             if (!b.player_owned) return;
             bool hit = false;
             gs->monster_grid.query(b.pos, MON_QUERY_R, [&](Id mid, Vec2) {
                 if (hit) return;
-                const Monster* m = mp->get(mid);
-                if (!m || dist(b.pos, m->pos) >= b.size + m->size * 0.5f) return;
+                auto me = mp->get(mid);
+                if (!me || dist(b.pos, me.get().pos) >= b.size + me.get().size * 0.5f) return;
                 net->tracked_remove(pm, mp, mid);
-                net->tracked_remove(pm, bp, bid);
+                net->tracked_remove(pm, bp, e.id);
                 gs->score += 10; gs->kills++;
                 hit = true;
             });
@@ -327,18 +332,21 @@ void server_init(Pm& pm) {
 
         // Players vs enemy bullets and monster contact — O(p × b/m), already cheap.
         for (int i = 0; i < MAX_PLAYERS; i++) {
-            auto* p = gs->players->get(gs->peer_ids[i]);
-            if (!p || !p->alive || p->invuln > 0) continue;
-            bp->each([&](Id bid, const Bullet& b) {
-                if (!b.player_owned && dist(b.pos, p->pos) < b.size + pr) {
-                    p->hp -= BULLET_DMG; p->invuln = PLAYER_INVULN;
-                    net->tracked_remove(pm, bp, bid);
+            auto pe = gs->players->get(gs->peer_ids[i]);
+            if (!pe || !pe.get().alive || pe.get().invuln > 0) continue;
+            auto& p = pe.get_mut();
+            bp->each([&](PoolEntry<Bullet>& e) {
+                auto& b = e.get();
+                if (!b.player_owned && dist(b.pos, p.pos) < b.size + pr) {
+                    p.hp -= BULLET_DMG; p.invuln = PLAYER_INVULN;
+                    net->tracked_remove(pm, bp, e.id);
                 }
             }, Parallel::Off);
-            mp->each([&](const Monster& m) {
-                if (dist(m.pos, p->pos) < m.size*0.5f + pr) { p->hp -= CONTACT_DMG; p->invuln = PLAYER_INVULN*0.5f; }
+            mp->each([&](PoolEntry<Monster>& e) {
+                auto& m = e.get();
+                if (dist(m.pos, p.pos) < m.size*0.5f + pr) { p.hp -= CONTACT_DMG; p.invuln = PLAYER_INVULN*0.5f; }
             }, Parallel::Off);
-            if (p->hp <= 0) { p->hp = 0; p->alive = false; gs->diag.push_event(net->local_time, "player %d died", i); }
+            if (p.hp <= 0) { p.hp = 0; p.alive = false; gs->diag.push_event(net->local_time, "player %d died", i); }
         }
 
         bool any = false;
@@ -354,11 +362,13 @@ void server_init(Pm& pm) {
     // --- Cleanup OOB ---
     pm.task_add("cleanup", Phase::CLEANUP, [gs, mp, bp, net](Pm& pm) {
         if (!gs->started) return;
-        mp->each([&](Id id, const Monster& m) {
-            if (m.pos.x<-100||m.pos.x>W+100||m.pos.y<-100||m.pos.y>H+100) { net->tracked_remove(pm, mp, id); }
+        mp->each([&](PoolEntry<Monster>& e) {
+            auto& m = e.get();
+            if (m.pos.x<-100||m.pos.x>W+100||m.pos.y<-100||m.pos.y>H+100) { net->tracked_remove(pm, mp, e.id); }
         }, Parallel::Off);
-        bp->each([&](Id id, const Bullet& b) {
-            if (b.pos.x<-50||b.pos.x>W+50||b.pos.y<-50||b.pos.y>H+50) { net->tracked_remove(pm, bp, id); }
+        bp->each([&](PoolEntry<Bullet>& e) {
+            auto& b = e.get();
+            if (b.pos.x<-50||b.pos.x>W+50||b.pos.y<-50||b.pos.y>H+50) { net->tracked_remove(pm, bp, e.id); }
         }, Parallel::Off);
     }, true);
 
@@ -367,8 +377,8 @@ void server_init(Pm& pm) {
         if (!gs->started) return 0;
         PktState pkt{PKT_STATE, net->net_frame, gs->time, gs->score, gs->kills, (uint8_t)pm.paused, gs->game_over, 0, gs->round, {}};
         for (int i = 0; i < MAX_PLAYERS; i++) {
-            auto* p = gs->players->get(gs->peer_ids[i]);
-            if (p) { pkt.p[pkt.pcnt++] = {p->pos.x, p->pos.y, p->hp, (uint8_t)p->alive}; }
+            auto pe = gs->players->get(gs->peer_ids[i]);
+            if (pe) { auto& p = pe.get(); pkt.p[pkt.pcnt++] = {p.pos.x, p.pos.y, p.hp, (uint8_t)p.alive}; }
         }
         memcpy(buf, &pkt, sizeof(pkt));
         return sizeof(pkt);
@@ -446,8 +456,8 @@ void server_init(Pm& pm) {
                 d.peers[i].id = pid;
                 memcpy(d.peers[i].name, gs->roster[i].name, sizeof(d.peers[i].name));
                 d.peers[i].connected_at = (pid < DiagReport::MAX_DIAG_PEERS) ? d.peer_connect_time[pid] : 0;
-                auto* p = gs->players->get(gs->peer_ids[pid]);
-                d.peers[i].alive_at_end = p && p->alive;
+                auto pe = gs->players->get(gs->peer_ids[pid]);
+                d.peers[i].alive_at_end = pe && pe.get().alive;
                 // Per-peer network stats
                 d.peers[i].rtt = net->peer_rtt(pid);
                 d.peers[i].rtt_samples = net->peer_rtt_samples(pid);

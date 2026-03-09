@@ -120,7 +120,7 @@ namespace threshold {
     constexpr double EACH_JOIN_PAR          = 6.2;
     constexpr double EACH_500K_TRIG_SEQ     = 14.0;
     constexpr double EACH_500K_TRIG_PAR     = 3.0;
-    // Pool: each_mut (mutable)
+    // Pool: each get_mut (mutable)
     constexpr double EACH_MUT_TRIV_SEQ      = 1.4;
     constexpr double EACH_MUT_TRIV_PAR      = 11.1;
     constexpr double EACH_MUT_PHYS_SEQ      = 24.2;
@@ -129,7 +129,6 @@ namespace threshold {
     constexpr double EACH_MUT_256B_PAR      = 156.0;
     constexpr double EACH_MUT_JOIN_SEQ      = 36.0;
     constexpr double EACH_MUT_JOIN_PAR      = 10.2;
-    constexpr double EACH_MUT_HOOK          = 2.4;
     constexpr double EACH_MUT_500K_SEQ      = 24.0;
     constexpr double EACH_MUT_500K_PAR      = 4.8;
     // Pool: clear
@@ -295,8 +294,8 @@ TEST_CASE("pool get") {
         float sum = 0;
         for (auto id : ids)
         {
-            auto *p = pool->get(id);
-            if (p) sum += p->x;
+            auto p = pool->get(id);
+            if (p) sum += p.get().x;
         }
         assert(sum > 0);
     });
@@ -470,13 +469,13 @@ TEST_CASE("pool each") {
 
         auto r1 = bench("each 100k trivial (seq)", 100000, [&]() {
             float sum = 0;
-            pool->each([&](const Pos &p) { sum += p.x; }, pm::Parallel::Off);
+            pool->each([&](pm::PoolEntry<Pos> &e) { sum += e.get().x; }, pm::Parallel::Off);
             do_not_optimize(sum);
         });
         CHECK(r1.ns_per_op < threshold::EACH_TRIVIAL_SEQ);
 
         auto r2 = bench("each 100k trivial (parallel)", 100000, [&]() {
-            pool->each([](const Pos &p) { do_not_optimize(p.x); }, pm::Parallel::On);
+            pool->each([](pm::PoolEntry<Pos> &e) { do_not_optimize(e.get().x); }, pm::Parallel::On);
         });
         CHECK(r2.ns_per_op < threshold::EACH_TRIVIAL_PAR);
     }
@@ -492,7 +491,8 @@ TEST_CASE("pool each") {
         }
 
         auto r1 = bench("each 100k trig (seq)", 100000, [&]() {
-            pool->each([](const Pos &p) {
+            pool->each([](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get();
                 float d = sqrtf(p.x * p.x + p.y * p.y);
                 float a = atan2f(p.y, p.x);
                 float r = sinf(a) * cosf(d);
@@ -502,7 +502,8 @@ TEST_CASE("pool each") {
         CHECK(r1.ns_per_op < threshold::EACH_TRIG_SEQ);
 
         auto r2 = bench("each 100k trig (parallel)", 100000, [&]() {
-            pool->each([](const Pos &p) {
+            pool->each([](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get();
                 float d = sqrtf(p.x * p.x + p.y * p.y);
                 float a = atan2f(p.y, p.x);
                 float r = sinf(a) * cosf(d);
@@ -526,7 +527,8 @@ TEST_CASE("pool each") {
         }
 
         auto r1 = bench("each 100k 256B read-all (seq)", 100000, [&]() {
-            pool->each([](const BigComp &c) {
+            pool->each([](pm::PoolEntry<BigComp> &e) {
+                auto& c = e.get();
                 float sum = 0;
                 for (int j = 0; j < 64; j++)
                     sum += sinf(c.data[j]);
@@ -536,7 +538,8 @@ TEST_CASE("pool each") {
         CHECK(r1.ns_per_op < threshold::EACH_256B_SEQ);
 
         auto r2 = bench("each 100k 256B read-all (parallel)", 100000, [&]() {
-            pool->each([](const BigComp &c) {
+            pool->each([](pm::PoolEntry<BigComp> &e) {
+                auto& c = e.get();
                 float sum = 0;
                 for (int j = 0; j < 64; j++)
                     sum += sinf(c.data[j]);
@@ -561,24 +564,26 @@ TEST_CASE("pool each") {
         }
 
         auto r1 = bench("each 100k join 2 pools + branch (seq)", 100000, [&]() {
-            pos->each([&](pm::Id id, const Pos &p) {
-                auto *v = vel->get(id);
-                auto *h = hp->get(id);
+            pos->each([&](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get();
+                auto v = vel->get(e.id);
+                auto h = hp->get(e.id);
                 float r = p.x + p.y;
-                if (v) r += sqrtf(v->dx * v->dx + v->dy * v->dy);
-                if (h) r *= static_cast<float>(h->hp) * 0.01f;
+                if (v) r += sqrtf(v.get().dx * v.get().dx + v.get().dy * v.get().dy);
+                if (h) r *= static_cast<float>(h.get().hp) * 0.01f;
                 do_not_optimize(r);
             }, pm::Parallel::Off);
         });
         CHECK(r1.ns_per_op < threshold::EACH_JOIN_SEQ);
 
         auto r2 = bench("each 100k join 2 pools + branch (parallel)", 100000, [&]() {
-            pos->each([&](pm::Id id, const Pos &p) {
-                auto *v = vel->get(id);
-                auto *h = hp->get(id);
+            pos->each([&](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get();
+                auto v = vel->get(e.id);
+                auto h = hp->get(e.id);
                 float r = p.x + p.y;
-                if (v) r += sqrtf(v->dx * v->dx + v->dy * v->dy);
-                if (h) r *= static_cast<float>(h->hp) * 0.01f;
+                if (v) r += sqrtf(v.get().dx * v.get().dx + v.get().dy * v.get().dy);
+                if (h) r *= static_cast<float>(h.get().hp) * 0.01f;
                 do_not_optimize(r);
             }, pm::Parallel::On);
         });
@@ -596,7 +601,8 @@ TEST_CASE("pool each") {
         }
 
         auto r1 = bench("each 500k trig (seq)", 500000, [&]() {
-            pool->each([](const Pos &p) {
+            pool->each([](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get();
                 float d = sqrtf(p.x * p.x + p.y * p.y);
                 float r = sinf(d) * cosf(d);
                 do_not_optimize(r);
@@ -605,7 +611,8 @@ TEST_CASE("pool each") {
         CHECK(r1.ns_per_op < threshold::EACH_500K_TRIG_SEQ);
 
         auto r2 = bench("each 500k trig (parallel)", 500000, [&]() {
-            pool->each([](const Pos &p) {
+            pool->each([](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get();
                 float d = sqrtf(p.x * p.x + p.y * p.y);
                 float r = sinf(d) * cosf(d);
                 do_not_optimize(r);
@@ -615,9 +622,9 @@ TEST_CASE("pool each") {
     }
 }
 
-// --- Pool: each_mut (mutable) ---
+// --- Pool: each get_mut (mutable) ---
 
-TEST_CASE("pool each_mut") {
+TEST_CASE("pool each get_mut") {
     // Trivial work
     {
         pm::Pm pm;
@@ -628,13 +635,13 @@ TEST_CASE("pool each_mut") {
             pool->add(id, {static_cast<float>(i), static_cast<float>(i)});
         }
 
-        auto r1 = bench("each_mut 100k trivial (seq)", 100000, [&]() {
-            pool->each_mut([](Pos &p) { p.x += 1.0f; }, pm::Parallel::Off);
+        auto r1 = bench("each get_mut 100k trivial (seq)", 100000, [&]() {
+            pool->each([](pm::PoolEntry<Pos> &e) { e.get_mut().x += 1.0f; }, pm::Parallel::Off);
         });
         CHECK(r1.ns_per_op < threshold::EACH_MUT_TRIV_SEQ);
 
-        auto r2 = bench("each_mut 100k trivial (parallel)", 100000, [&]() {
-            pool->each_mut([](Pos &p) { p.x += 1.0f; }, pm::Parallel::On);
+        auto r2 = bench("each get_mut 100k trivial (parallel)", 100000, [&]() {
+            pool->each([](pm::PoolEntry<Pos> &e) { e.get_mut().x += 1.0f; }, pm::Parallel::On);
         });
         CHECK(r2.ns_per_op < threshold::EACH_MUT_TRIV_PAR);
     }
@@ -649,8 +656,9 @@ TEST_CASE("pool each_mut") {
             pool->add(id, {static_cast<float>(i) * 0.1f, static_cast<float>(i) * 0.05f});
         }
 
-        auto r1 = bench("each_mut 100k physics sim (seq)", 100000, [&]() {
-            pool->each_mut([](Pos &p) {
+        auto r1 = bench("each get_mut 100k physics sim (seq)", 100000, [&]() {
+            pool->each([](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get_mut();
                 float angle = atan2f(p.y, p.x);
                 float dist = sqrtf(p.x * p.x + p.y * p.y);
                 angle += 0.01f;
@@ -660,8 +668,9 @@ TEST_CASE("pool each_mut") {
         });
         CHECK(r1.ns_per_op < threshold::EACH_MUT_PHYS_SEQ);
 
-        auto r2 = bench("each_mut 100k physics sim (parallel)", 100000, [&]() {
-            pool->each_mut([](Pos &p) {
+        auto r2 = bench("each get_mut 100k physics sim (parallel)", 100000, [&]() {
+            pool->each([](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get_mut();
                 float angle = atan2f(p.y, p.x);
                 float dist = sqrtf(p.x * p.x + p.y * p.y);
                 angle += 0.01f;
@@ -685,16 +694,18 @@ TEST_CASE("pool each_mut") {
             pool->add(id, c);
         }
 
-        auto r1 = bench("each_mut 100k 256B transform (seq)", 100000, [&]() {
-            pool->each_mut([](BigComp &c) {
+        auto r1 = bench("each get_mut 100k 256B transform (seq)", 100000, [&]() {
+            pool->each([](pm::PoolEntry<BigComp> &e) {
+                auto& c = e.get_mut();
                 for (int j = 0; j < 64; j++)
                     c.data[j] = sinf(c.data[j]) * 0.99f + 0.01f;
             }, pm::Parallel::Off);
         });
         CHECK(r1.ns_per_op < threshold::EACH_MUT_256B_SEQ);
 
-        auto r2 = bench("each_mut 100k 256B transform (parallel)", 100000, [&]() {
-            pool->each_mut([](BigComp &c) {
+        auto r2 = bench("each get_mut 100k 256B transform (parallel)", 100000, [&]() {
+            pool->each([](pm::PoolEntry<BigComp> &e) {
+                auto& c = e.get_mut();
                 for (int j = 0; j < 64; j++)
                     c.data[j] = sinf(c.data[j]) * 0.99f + 0.01f;
             }, pm::Parallel::On);
@@ -714,12 +725,13 @@ TEST_CASE("pool each_mut") {
             vel->add(id, {sinf(static_cast<float>(i)), cosf(static_cast<float>(i))});
         }
 
-        auto r1 = bench("each_mut 100k join + physics (seq)", 100000, [&]() {
-            pos->each_mut([&](pm::Id id, Pos &p) {
-                auto *v = vel->get(id);
+        auto r1 = bench("each get_mut 100k join + physics (seq)", 100000, [&]() {
+            pos->each([&](pm::PoolEntry<Pos> &e) {
+                auto v = vel->get(e.id);
                 if (v)
                 {
-                    float speed = sqrtf(v->dx * v->dx + v->dy * v->dy);
+                    auto& p = e.get_mut();
+                    float speed = sqrtf(v.get().dx * v.get().dx + v.get().dy * v.get().dy);
                     float angle = atan2f(p.y, p.x);
                     p.x += cosf(angle) * speed * 0.016f;
                     p.y += sinf(angle) * speed * 0.016f;
@@ -728,12 +740,13 @@ TEST_CASE("pool each_mut") {
         });
         CHECK(r1.ns_per_op < threshold::EACH_MUT_JOIN_SEQ);
 
-        auto r2 = bench("each_mut 100k join + physics (parallel)", 100000, [&]() {
-            pos->each_mut([&](pm::Id id, Pos &p) {
-                auto *v = vel->get(id);
+        auto r2 = bench("each get_mut 100k join + physics (parallel)", 100000, [&]() {
+            pos->each([&](pm::PoolEntry<Pos> &e) {
+                auto v = vel->get(e.id);
                 if (v)
                 {
-                    float speed = sqrtf(v->dx * v->dx + v->dy * v->dy);
+                    auto& p = e.get_mut();
+                    float speed = sqrtf(v.get().dx * v.get().dx + v.get().dy * v.get().dy);
                     float angle = atan2f(p.y, p.x);
                     p.x += cosf(angle) * speed * 0.016f;
                     p.y += sinf(angle) * speed * 0.016f;
@@ -741,31 +754,6 @@ TEST_CASE("pool each_mut") {
             }, pm::Parallel::On);
         });
         CHECK(r2.ns_per_op < threshold::EACH_MUT_JOIN_PAR);
-    }
-
-    // Change hook overhead
-    {
-        pm::Pm pm;
-        auto *pool = pm.pool_get<Pos>("pos");
-        for (int i = 0; i < 100000; i++)
-        {
-            pm::Id id = pm.id_add();
-            pool->add(id, {static_cast<float>(i), static_cast<float>(i)});
-        }
-
-        int hook_count = 0;
-        pool->set_change_hook([](void *ctx, pm::Id) {
-            (*static_cast<int *>(ctx))++;
-        }, &hook_count);
-
-        auto r = bench("each_mut 100k with change hook", 100000, [&]() {
-            hook_count = 0;
-            pool->each_mut([](Pos &p) { p.x += 1.0f; });
-            assert(hook_count == 100000);
-        });
-        CHECK(r.ns_per_op < threshold::EACH_MUT_HOOK);
-
-        pool->set_change_hook(nullptr, nullptr);
     }
 
     // Scale: 500k
@@ -778,8 +766,9 @@ TEST_CASE("pool each_mut") {
             pool->add(id, {static_cast<float>(i) * 0.1f, static_cast<float>(i) * 0.05f});
         }
 
-        auto r1 = bench("each_mut 500k physics sim (seq)", 500000, [&]() {
-            pool->each_mut([](Pos &p) {
+        auto r1 = bench("each get_mut 500k physics sim (seq)", 500000, [&]() {
+            pool->each([](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get_mut();
                 float angle = atan2f(p.y, p.x);
                 float dist = sqrtf(p.x * p.x + p.y * p.y);
                 angle += 0.01f;
@@ -789,8 +778,9 @@ TEST_CASE("pool each_mut") {
         });
         CHECK(r1.ns_per_op < threshold::EACH_MUT_500K_SEQ);
 
-        auto r2 = bench("each_mut 500k physics sim (parallel)", 500000, [&]() {
-            pool->each_mut([](Pos &p) {
+        auto r2 = bench("each get_mut 500k physics sim (parallel)", 500000, [&]() {
+            pool->each([](pm::PoolEntry<Pos> &e) {
+                auto& p = e.get_mut();
                 float angle = atan2f(p.y, p.x);
                 float dist = sqrtf(p.x * p.x + p.y * p.y);
                 angle += 0.01f;
@@ -842,8 +832,8 @@ TEST_CASE("pool mixed ops") {
         float sum = 0;
         for (auto id : ids)
         {
-            auto *p = pool->get(id);
-            if (p) sum += p->x;
+            auto p = pool->get(id);
+            if (p) sum += p.get().x;
         }
         assert(sum > 0);
 
@@ -1072,19 +1062,20 @@ TEST_CASE("integrated game tick") {
     float dt = 0.016f;
 
     auto r = bench("game tick: 5k physics + 500 health checks", 5500, [&]() {
-        pos->each_mut([&](pm::Id id, Pos &p) {
-            auto *v = vel->get(id);
+        pos->each([&](pm::PoolEntry<Pos> &e) {
+            auto v = vel->get(e.id);
             if (v)
             {
-                p.x += v->dx * dt;
-                p.y += v->dy * dt;
+                auto& p = e.get_mut();
+                p.x += v.get().dx * dt;
+                p.y += v.get().dy * dt;
             }
         }, pm::Parallel::Off);
 
-        hp->each([&](pm::Id id, const Health &h) {
-            (void)h;
-            auto *p = pos->get(id);
-            if (p && p->x > 50.0f) {}
+        hp->each([&](pm::PoolEntry<Health> &e) {
+            (void)e.get();
+            auto p = pos->get(e.id);
+            if (p && p.get().x > 50.0f) {}
         }, pm::Parallel::Off);
     });
     CHECK(r.ns_per_op < threshold::GAME_TICK);
@@ -1150,20 +1141,21 @@ TEST_CASE("integrated multi-archetype") {
     float dt = 0.016f;
 
     auto r = bench("multi-archetype: 3100 entities, 8 pools, tick sim", 3100, [&]() {
-        pos->each_mut([&](pm::Id id, Pos &p) {
-            auto *v = vel->get(id);
-            if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
+        pos->each([&](pm::PoolEntry<Pos> &e) {
+            auto v = vel->get(e.id);
+            if (v) { auto& p = e.get_mut(); p.x += v.get().dx * dt; p.y += v.get().dy * dt; }
         }, pm::Parallel::Off);
 
-        cd->each_mut([&](Cooldown &c) {
+        cd->each([&](pm::PoolEntry<Cooldown> &e) {
+            auto& c = e.get_mut();
             c.remaining -= dt;
             if (c.remaining < 0) c.remaining = 0;
         }, pm::Parallel::Off);
 
         for (auto bid : bullet_ids)
         {
-            auto *c = cd->get(bid);
-            if (c && c->remaining <= 0)
+            auto c = cd->get(bid);
+            if (c && c.get().remaining <= 0)
                 pm.id_remove(bid);
         }
 
@@ -1190,26 +1182,26 @@ TEST_CASE("integrated heavy iteration") {
 
     auto r1 = bench("iterate 50k pos, lookup vel (join pattern, seq)", 50000, [&]() {
         float dt = 0.016f;
-        pos->each_mut([&](pm::Id id, Pos &p) {
-            auto *v = vel->get(id);
-            if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
+        pos->each([&](pm::PoolEntry<Pos> &e) {
+            auto v = vel->get(e.id);
+            if (v) { auto& p = e.get_mut(); p.x += v.get().dx * dt; p.y += v.get().dy * dt; }
         }, pm::Parallel::Off);
     });
     CHECK(r1.ns_per_op < threshold::JOIN_50K_SEQ);
 
     auto r2 = bench("iterate 50k pos, lookup vel (join pattern, parallel)", 50000, [&]() {
         float dt = 0.016f;
-        pos->each_mut([&](pm::Id id, Pos &p) {
-            auto *v = vel->get(id);
-            if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
+        pos->each([&](pm::PoolEntry<Pos> &e) {
+            auto v = vel->get(e.id);
+            if (v) { auto& p = e.get_mut(); p.x += v.get().dx * dt; p.y += v.get().dy * dt; }
         }, pm::Parallel::On);
     });
     CHECK(r2.ns_per_op < threshold::JOIN_50K_PAR);
 
     auto r3 = bench("iterate 10k health, lookup pos (smaller iterates larger)", 10000, [&]() {
-        hp->each([&](pm::Id id, const Health &h) {
-            (void)h;
-            auto *p = pos->get(id);
+        hp->each([&](pm::PoolEntry<Health> &e) {
+            (void)e.get();
+            auto p = pos->get(e.id);
             if (p) { /* read position */ }
         }, pm::Parallel::Off);
     });
@@ -1240,9 +1232,9 @@ TEST_CASE("integrated sustained churn") {
 
         for (int frame = 0; frame < 30; frame++)
         {
-            pos->each_mut([&](pm::Id id, Pos &p) {
-                auto *v = vel->get(id);
-                if (v) { p.x += v->dx * dt; p.y += v->dy * dt; }
+            pos->each([&](pm::PoolEntry<Pos> &e) {
+                auto v = vel->get(e.id);
+                if (v) { auto& p = e.get_mut(); p.x += v.get().dx * dt; p.y += v.get().dy * dt; }
             }, pm::Parallel::Off);
 
             int to_remove = std::min(1000, static_cast<int>(live_ids.size()));
@@ -1293,7 +1285,8 @@ TEST_CASE("thread scaling") {
             char label[64];
             snprintf(label, sizeof(label), "each 200k trig — %u thread%s", n, n == 1 ? "" : "s");
             bench(label, 200000, [&, n]() {
-                pool->each([](const Pos &p) {
+                pool->each([](pm::PoolEntry<Pos> &e) {
+                    auto& p = e.get();
                     float d = sqrtf(p.x * p.x + p.y * p.y);
                     float a = atan2f(p.y, p.x);
                     float r = sinf(a) * cosf(d);
@@ -1314,9 +1307,10 @@ TEST_CASE("thread scaling") {
         for (uint32_t n : counts)
         {
             char label[64];
-            snprintf(label, sizeof(label), "each_mut 200k physics — %u thread%s", n, n == 1 ? "" : "s");
+            snprintf(label, sizeof(label), "each get_mut 200k physics — %u thread%s", n, n == 1 ? "" : "s");
             bench(label, 200000, [&, n]() {
-                pool->each_mut([](Pos &p) {
+                pool->each([](pm::PoolEntry<Pos> &e) {
+                    auto& p = e.get_mut();
                     float angle = atan2f(p.y, p.x);
                     float dist = sqrtf(p.x * p.x + p.y * p.y);
                     angle += 0.01f;
@@ -1341,9 +1335,10 @@ TEST_CASE("thread scaling") {
         for (uint32_t n : counts)
         {
             char label[64];
-            snprintf(label, sizeof(label), "each_mut 100k 256B — %u thread%s", n, n == 1 ? "" : "s");
+            snprintf(label, sizeof(label), "each get_mut 100k 256B — %u thread%s", n, n == 1 ? "" : "s");
             bench(label, 100000, [&, n]() {
-                pool->each_mut([](BigComp &c) {
+                pool->each([](pm::PoolEntry<BigComp> &e) {
+                    auto& c = e.get_mut();
                     for (int j = 0; j < 64; j++)
                         c.data[j] = sinf(c.data[j]) * 0.99f + 0.01f;
                 }, n == 1 ? pm::Parallel::Off : pm::Parallel::On, n);
@@ -1504,7 +1499,7 @@ TEST_CASE("bullet churn") {
     });
     CHECK(r2.ns_per_op < threshold::BULLET_CHURN_200);
 
-    auto r3 = bench("bullet physics: each_mut 600 (pos += vel*dt)", 600, []() {
+    auto r3 = bench("bullet physics: each get_mut 600 (pos += vel*dt)", 600, []() {
         pm::Pm pm;
         auto* bp = pm.pool_get<BBullet>("bullets");
         pm::Rng rng{42};
@@ -1515,7 +1510,8 @@ TEST_CASE("bullet churn") {
                                 rng.rfr(0.5f, 1.5f), 4, true});
         }
         float dt = 0.016f;
-        bp->each_mut([dt](BBullet& b) {
+        bp->each([dt](pm::PoolEntry<BBullet>& e) {
+            auto& b = e.get_mut();
             b.pos.x += b.vel.x * dt;
             b.pos.y += b.vel.y * dt;
             b.lifetime -= dt;
@@ -1548,7 +1544,8 @@ TEST_CASE("monster AI") {
 
         auto r1 = bench("monster AI 400 (closest of 4 + steer, seq)", 400, [&]() {
             float dt = 0.016f;
-            mp->each_mut([dt](BMonster& m) {
+            mp->each([dt](pm::PoolEntry<BMonster>& e) {
+                auto& m = e.get_mut();
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
                 for (int i = 0; i < 4; i++) {
                     float d = pm::dist(m.pos, player_pos[i]);
@@ -1566,7 +1563,8 @@ TEST_CASE("monster AI") {
 
         auto r2 = bench("monster AI 400 (closest of 4 + steer, parallel)", 400, [&]() {
             float dt = 0.016f;
-            mp->each_mut([dt](BMonster& m) {
+            mp->each([dt](pm::PoolEntry<BMonster>& e) {
+                auto& m = e.get_mut();
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
                 for (int i = 0; i < 4; i++) {
                     float d = pm::dist(m.pos, player_pos[i]);
@@ -1600,7 +1598,8 @@ TEST_CASE("monster AI") {
 
         auto r = bench("monster AI 2000 (5x stress, sequential)", 2000, [&]() {
             float dt = 0.016f;
-            mp->each_mut([dt](BMonster& m) {
+            mp->each([dt](pm::PoolEntry<BMonster>& e) {
+                auto& m = e.get_mut();
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
                 for (int i = 0; i < 4; i++) {
                     float d = pm::dist(m.pos, player_pos[i]);
@@ -1654,23 +1653,25 @@ TEST_CASE("collision frame") {
         }
 
         grid.clear();
-        mp->each([&](pm::Id mid, const BMonster& m) {
-            grid.insert(mid, m.pos);
+        mp->each([&](pm::PoolEntry<BMonster>& e) {
+            grid.insert(e.id, e.get().pos);
         }, pm::Parallel::Off);
 
         int kills = 0;
-        bp->each([&](pm::Id, const BBullet& b) {
+        bp->each([&](pm::PoolEntry<BBullet>& e) {
+            auto& b = e.get();
             if (!b.player_owned) return;
             grid.query(b.pos, QUERY_R, [&](pm::Id mid, pm::Vec2) {
-                const BMonster* m = mp->get(mid);
-                if (m && pm::dist(b.pos, m->pos) < b.size + m->size * 0.5f)
+                auto me = mp->get(mid);
+                if (me && pm::dist(b.pos, me.get().pos) < b.size + me.get().size * 0.5f)
                     kills++;
             });
         }, pm::Parallel::Off);
 
         int player_hits = 0;
         for (int pi = 0; pi < 4; pi++) {
-            bp->each([&](const BBullet& b) {
+            bp->each([&](pm::PoolEntry<BBullet>& e) {
+                auto& b = e.get();
                 if (!b.player_owned && pm::dist(b.pos, player_pos[pi]) < b.size + PLAYER_R)
                     player_hits++;
             }, pm::Parallel::Off);
@@ -1708,23 +1709,25 @@ TEST_CASE("collision frame") {
         }
 
         grid.clear();
-        mp->each([&](pm::Id mid, const BMonster& m) {
-            grid.insert(mid, m.pos);
+        mp->each([&](pm::PoolEntry<BMonster>& e) {
+            grid.insert(e.id, e.get().pos);
         }, pm::Parallel::Off);
 
         int kills = 0;
-        bp->each([&](pm::Id, const BBullet& b) {
+        bp->each([&](pm::PoolEntry<BBullet>& e) {
+            auto& b = e.get();
             if (!b.player_owned) return;
             grid.query(b.pos, QUERY_R, [&](pm::Id mid, pm::Vec2) {
-                const BMonster* m = mp->get(mid);
-                if (m && pm::dist(b.pos, m->pos) < b.size + m->size * 0.5f)
+                auto me = mp->get(mid);
+                if (me && pm::dist(b.pos, me.get().pos) < b.size + me.get().size * 0.5f)
                     kills++;
             });
         }, pm::Parallel::Off);
 
         int player_hits = 0;
         for (int pi = 0; pi < 4; pi++) {
-            bp->each([&](const BBullet& b) {
+            bp->each([&](pm::PoolEntry<BBullet>& e) {
+                auto& b = e.get();
                 if (!b.player_owned && pm::dist(b.pos, player_pos[pi]) < b.size + PLAYER_R)
                     player_hits++;
             }, pm::Parallel::Off);
@@ -1796,7 +1799,8 @@ TEST_CASE("server tick") {
 
             float dt = 0.016f;
 
-            mp->each_mut([dt](BMonster& m) {
+            mp->each([dt](pm::PoolEntry<BMonster>& e) {
+                auto& m = e.get_mut();
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
                 for (int i = 0; i < 4; i++) {
                     float d = pm::dist(m.pos, player_pos[i]);
@@ -1810,39 +1814,43 @@ TEST_CASE("server tick") {
                 m.pos.y += m.vel.y * dt;
             }, pm::Parallel::Off);
 
-            bp->each_mut([&](pm::Id id, BBullet& b) {
+            bp->each([&](pm::PoolEntry<BBullet>& e) {
+                auto& b = e.get_mut();
                 b.pos.x += b.vel.x * dt;
                 b.pos.y += b.vel.y * dt;
                 b.lifetime -= dt;
-                if (b.lifetime <= 0) pm.id_remove(id);
+                if (b.lifetime <= 0) pm.id_remove(e.id);
             }, pm::Parallel::Off);
 
             grid.clear();
-            mp->each([&](pm::Id mid, const BMonster& m) {
-                grid.insert(mid, m.pos);
+            mp->each([&](pm::PoolEntry<BMonster>& e) {
+                grid.insert(e.id, e.get().pos);
             }, pm::Parallel::Off);
 
-            bp->each([&](pm::Id bid, const BBullet& b) {
+            bp->each([&](pm::PoolEntry<BBullet>& e) {
+                auto& b = e.get();
                 if (!b.player_owned) return;
                 bool hit = false;
                 grid.query(b.pos, 20.f, [&](pm::Id mid, pm::Vec2) {
                     if (hit) return;
-                    const BMonster* m = mp->get(mid);
-                    if (m && pm::dist(b.pos, m->pos) < b.size + m->size * 0.5f) {
+                    auto me = mp->get(mid);
+                    if (me && pm::dist(b.pos, me.get().pos) < b.size + me.get().size * 0.5f) {
                         pm.id_remove(mid);
-                        pm.id_remove(bid);
+                        pm.id_remove(e.id);
                         hit = true;
                     }
                 });
             }, pm::Parallel::Off);
 
-            mp->each([&](pm::Id id, const BMonster& m) {
+            mp->each([&](pm::PoolEntry<BMonster>& e) {
+                auto& m = e.get();
                 if (m.pos.x < -100 || m.pos.x > 1000 || m.pos.y < -100 || m.pos.y > 800)
-                    pm.id_remove(id);
+                    pm.id_remove(e.id);
             }, pm::Parallel::Off);
-            bp->each([&](pm::Id id, const BBullet& b) {
+            bp->each([&](pm::PoolEntry<BBullet>& e) {
+                auto& b = e.get();
                 if (b.pos.x < -50 || b.pos.x > 950 || b.pos.y < -50 || b.pos.y > 750)
-                    pm.id_remove(id);
+                    pm.id_remove(e.id);
             }, pm::Parallel::Off);
 
             pm.id_process_removes();
@@ -1885,7 +1893,8 @@ TEST_CASE("server tick") {
         float dt = 0.016f;
 
         for (int tick = 0; tick < 30; tick++) {
-            mp->each_mut([dt](BMonster& m) {
+            mp->each([dt](pm::PoolEntry<BMonster>& e) {
+                auto& m = e.get_mut();
                 pm::Vec2 tgt = m.pos; float best = 1e9f;
                 for (int i = 0; i < 4; i++) {
                     float d = pm::dist(m.pos, player_pos[i]);
@@ -1899,39 +1908,43 @@ TEST_CASE("server tick") {
                 m.pos.y += m.vel.y * dt;
             }, pm::Parallel::Off);
 
-            bp->each_mut([&](pm::Id id, BBullet& b) {
+            bp->each([&](pm::PoolEntry<BBullet>& e) {
+                auto& b = e.get_mut();
                 b.pos.x += b.vel.x * dt;
                 b.pos.y += b.vel.y * dt;
                 b.lifetime -= dt;
-                if (b.lifetime <= 0) pm.id_remove(id);
+                if (b.lifetime <= 0) pm.id_remove(e.id);
             }, pm::Parallel::Off);
 
             grid.clear();
-            mp->each([&](pm::Id mid, const BMonster& m) {
-                grid.insert(mid, m.pos);
+            mp->each([&](pm::PoolEntry<BMonster>& e) {
+                grid.insert(e.id, e.get().pos);
             }, pm::Parallel::Off);
 
-            bp->each([&](pm::Id bid, const BBullet& b) {
+            bp->each([&](pm::PoolEntry<BBullet>& e) {
+                auto& b = e.get();
                 if (!b.player_owned) return;
                 bool hit = false;
                 grid.query(b.pos, 20.f, [&](pm::Id mid, pm::Vec2) {
                     if (hit) return;
-                    const BMonster* m = mp->get(mid);
-                    if (m && pm::dist(b.pos, m->pos) < b.size + m->size * 0.5f) {
+                    auto me = mp->get(mid);
+                    if (me && pm::dist(b.pos, me.get().pos) < b.size + me.get().size * 0.5f) {
                         pm.id_remove(mid);
-                        pm.id_remove(bid);
+                        pm.id_remove(e.id);
                         hit = true;
                     }
                 });
             }, pm::Parallel::Off);
 
-            mp->each([&](pm::Id id, const BMonster& m) {
+            mp->each([&](pm::PoolEntry<BMonster>& e) {
+                auto& m = e.get();
                 if (m.pos.x < -100 || m.pos.x > 1000 || m.pos.y < -100 || m.pos.y > 800)
-                    pm.id_remove(id);
+                    pm.id_remove(e.id);
             }, pm::Parallel::Off);
-            bp->each([&](pm::Id id, const BBullet& b) {
+            bp->each([&](pm::PoolEntry<BBullet>& e) {
+                auto& b = e.get();
                 if (b.pos.x < -50 || b.pos.x > 950 || b.pos.y < -50 || b.pos.y > 750)
-                    pm.id_remove(id);
+                    pm.id_remove(e.id);
             }, pm::Parallel::Off);
 
             pm.id_process_removes();
@@ -2058,14 +2071,17 @@ TEST_CASE("multi-pool tick") {
 
         float dt = 0.016f;
 
-        pp->each_mut([dt](BPlayer& p) {
+        pp->each([dt](pm::PoolEntry<BPlayer>& e) {
+            auto& p = e.get_mut();
             if (p.cooldown > 0) p.cooldown -= dt;
             if (p.invuln > 0) p.invuln -= dt;
         }, pm::Parallel::Off);
 
-        mp->each_mut([&, dt](BMonster& m) {
+        mp->each([&, dt](pm::PoolEntry<BMonster>& e) {
+            auto& m = e.get_mut();
             pm::Vec2 tgt = m.pos; float best = 1e9f;
-            pp->each([&](const BPlayer& p) {
+            pp->each([&](pm::PoolEntry<BPlayer>& pe) {
+                auto& p = pe.get();
                 if (!p.alive) return;
                 float d = pm::dist(m.pos, p.pos);
                 if (d < best) { best = d; tgt = p.pos; }
@@ -2077,7 +2093,8 @@ TEST_CASE("multi-pool tick") {
             m.pos.y += m.vel.y * dt;
         }, pm::Parallel::Off);
 
-        bp->each_mut([dt](BBullet& b) {
+        bp->each([dt](pm::PoolEntry<BBullet>& e) {
+            auto& b = e.get_mut();
             b.pos.x += b.vel.x * dt;
             b.pos.y += b.vel.y * dt;
             b.lifetime -= dt;
@@ -2118,14 +2135,17 @@ TEST_CASE("multi-pool tick") {
 
         float dt = 0.016f;
 
-        pp->each_mut([dt](BPlayer& p) {
+        pp->each([dt](pm::PoolEntry<BPlayer>& e) {
+            auto& p = e.get_mut();
             if (p.cooldown > 0) p.cooldown -= dt;
             if (p.invuln > 0) p.invuln -= dt;
         }, pm::Parallel::Off);
 
-        mp->each_mut([&, dt](BMonster& m) {
+        mp->each([&, dt](pm::PoolEntry<BMonster>& e) {
+            auto& m = e.get_mut();
             pm::Vec2 tgt = m.pos; float best = 1e9f;
-            pp->each([&](const BPlayer& p) {
+            pp->each([&](pm::PoolEntry<BPlayer>& pe) {
+                auto& p = pe.get();
                 if (!p.alive) return;
                 float d = pm::dist(m.pos, p.pos);
                 if (d < best) { best = d; tgt = p.pos; }
@@ -2137,23 +2157,25 @@ TEST_CASE("multi-pool tick") {
             m.pos.y += m.vel.y * dt;
         }, pm::Parallel::Off);
 
-        bp->each_mut([dt](BBullet& b) {
+        bp->each([dt](pm::PoolEntry<BBullet>& e) {
+            auto& b = e.get_mut();
             b.pos.x += b.vel.x * dt;
             b.pos.y += b.vel.y * dt;
             b.lifetime -= dt;
         }, pm::Parallel::Off);
 
         grid.clear();
-        mp->each([&](pm::Id mid, const BMonster& m) {
-            grid.insert(mid, m.pos);
+        mp->each([&](pm::PoolEntry<BMonster>& e) {
+            grid.insert(e.id, e.get().pos);
         }, pm::Parallel::Off);
 
         int kills = 0;
-        bp->each([&](pm::Id, const BBullet& b) {
+        bp->each([&](pm::PoolEntry<BBullet>& e) {
+            auto& b = e.get();
             if (!b.player_owned) return;
             grid.query(b.pos, 20.f, [&](pm::Id mid, pm::Vec2) {
-                const BMonster* m = mp->get(mid);
-                if (m && pm::dist(b.pos, m->pos) < b.size + m->size * 0.5f)
+                auto me = mp->get(mid);
+                if (me && pm::dist(b.pos, me.get().pos) < b.size + me.get().size * 0.5f)
                     kills++;
             });
         }, pm::Parallel::Off);

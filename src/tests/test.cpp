@@ -16,12 +16,13 @@ void physics_init(pm::Pm& pm)
     auto* vel_pool = pm.pool_get<Vel>("vel");
     pm.task_add("physics/tick", 30.f, [ps, pos_pool, vel_pool](pm::Pm& pm) {
         (void)ps;
-        pos_pool->each_mut([&](pm::Id id, Pos& pos) {
-            auto* vel = vel_pool->get(id);
+        pos_pool->each([&](pm::PoolEntry<Pos>& e) {
+            auto vel = vel_pool->get(e.id);
             if (vel)
             {
-                pos.x += vel->dx * pm.loop_dt();
-                pos.y += vel->dy * pm.loop_dt();
+                auto& pos = e.get_mut();
+                pos.x += vel.get().dx * pm.loop_dt();
+                pos.y += vel.get().dy * pm.loop_dt();
             }
         }, pm::Parallel::Off);
     });
@@ -93,10 +94,10 @@ TEST_CASE("pool basics") {
     pos->add(e, {10.f, 20.f});
     vel->add(e, {1.f, 2.f});
 
-    auto *p = pos->get(e);
-    REQUIRE(p != nullptr);
-    CHECK(p->x == 10.f);
-    CHECK(p->y == 20.f);
+    auto p = pos->get(e);
+    REQUIRE(p);
+    CHECK(p.get().x == 10.f);
+    CHECK(p.get().y == 20.f);
     CHECK(pos->has(e));
     CHECK(vel->has(e));
     CHECK(pos->size() == 1);
@@ -119,30 +120,6 @@ TEST_CASE("entity->pool remove") {
     CHECK(!pos->has(e));
     CHECK(!vel->has(e));
     CHECK(!hp->has(e));
-}
-
-TEST_CASE("change hook on add and each_mut") {
-    pm::Pm pm;
-    auto *pos = pm.pool_get<Pos>("pos");
-
-    int change_count = 0;
-    pos->set_change_hook([](void* ctx, pm::Id) {
-        auto* count = static_cast<int*>(ctx);
-        (*count)++;
-    }, &change_count);
-
-    pm::Id e1 = pm.id_add();
-    pos->add(e1, {1.f, 0.f});
-    CHECK(change_count == 1);
-
-    pm::Id e2 = pm.id_add();
-    pos->add(e2, {2.f, 0.f});
-    CHECK(change_count == 2);
-
-    pos->each_mut([&](pm::Id, Pos& p) {
-        p.x += 10.f;
-    }, pm::Parallel::Off);
-    CHECK(change_count == 4);
 }
 
 TEST_CASE("state + init function") {
@@ -223,7 +200,7 @@ TEST_CASE("pool add overwrite same id") {
     pool->add(id, {30, 40}); // overwrite
 
     CHECK(pool->size() == 1);
-    CHECK(pool->get(id)->x == 30);
+    CHECK(pool->get(id).get().x == 30);
 }
 
 TEST_CASE("id_count under id_sync churn") {
@@ -270,7 +247,7 @@ TEST_CASE("id_sync after deferred remove") {
     pool->add(id2, {99, 99});
 
     CHECK(pool->has(id2));
-    CHECK(pool->get(id2)->x == 99);
+    CHECK(pool->get(id2).get().x == 99);
 }
 
 TEST_CASE("deferred remove cleans pool entry") {
@@ -333,7 +310,7 @@ TEST_CASE("add overwrite") {
     pm::Id e = pm.id_add();
     pos->add(e, {1, 2});
     pos->add(e, {5, 6});
-    CHECK(pos->get(e)->x == 5.f);
+    CHECK(pos->get(e).get().x == 5.f);
     CHECK(pos->size() == 1);
 }
 
@@ -403,9 +380,9 @@ TEST_CASE("deferred remove during each") {
     pos->add(e3, {3, 0});
 
     int visited = 0;
-    pos->each([&](pm::Id id, const Pos& val) {
+    pos->each([&](pm::PoolEntry<Pos>& e) {
         visited++;
-        if (val.x == 2.f) pm.id_remove(id);
+        if (e.get().x == 2.f) pm.id_remove(e.id);
     }, pm::Parallel::Off);
     CHECK(visited == 3);
     // Deferred: entity still in pool until flush
@@ -417,49 +394,49 @@ TEST_CASE("deferred remove during each") {
     CHECK(pos->has(e3));
 }
 
-TEST_CASE("each_mut void(T&) parallel") {
+TEST_CASE("each get_mut void(PoolEntry&) parallel") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
     for (int i = 0; i < 2000; i++) {
         pm::Id e = pm.id_add();
         pool->add(e, {(float)i, 0.f});
     }
-    pool->each_mut([](Pos& p) { p.y = p.x * 2.f; });
+    pool->each([](pm::PoolEntry<Pos>& e) { auto& p = e.get_mut(); p.y = p.x * 2.f; });
     for (size_t i = 0; i < pool->size(); i++)
         CHECK(pool->values()[i].y == pool->values()[i].x * 2.f);
 }
 
-TEST_CASE("each_mut void(Id, T&) parallel") {
+TEST_CASE("each get_mut void(PoolEntry&) with id parallel") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
     for (int i = 0; i < 2000; i++) {
         pm::Id e = pm.id_add();
         pool->add(e, {(float)i, 0.f});
     }
-    pool->each_mut([](pm::Id id, Pos& p) {
-        p.y = (float)id.raw;
+    pool->each([](pm::PoolEntry<Pos>& e) {
+        e.get_mut().y = (float)e.id.raw;
     });
     for (size_t i = 0; i < pool->size(); i++) {
-        uint32_t slot = pool->dense_indices[i];
+        uint32_t slot = pool->dense_ids[i].raw;
         CHECK(pool->values()[i].y == (float)slot);
     }
 }
 
-TEST_CASE("each_mut empty pool") {
+TEST_CASE("each get_mut empty pool") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
-    pool->each_mut([](Pos& p) { p.x = 999.f; });
+    pool->each([](pm::PoolEntry<Pos>& e) { e.get_mut().x = 999.f; });
     CHECK(pool->size() == 0);
 }
 
-TEST_CASE("each_mut Parallel::Off") {
+TEST_CASE("each get_mut Parallel::Off") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
     for (int i = 0; i < 10; i++) {
         pm::Id e = pm.id_add();
         pool->add(e, {(float)i, 0.f});
     }
-    pool->each_mut([](Pos& p) { p.y = 42.f; }, pm::Parallel::Off);
+    pool->each([](pm::PoolEntry<Pos>& e) { e.get_mut().y = 42.f; }, pm::Parallel::Off);
     for (auto& p : pool->values()) CHECK(p.y == 42.f);
 }
 
@@ -475,8 +452,8 @@ TEST_CASE("each + deferred remove via tick") {
     pool->add(e3, {3, 0});
 
     pm.task_add("test", 1.f, [pool](pm::Pm& pm) {
-        pool->each([&](pm::Id id, const Pos& p) {
-            if (p.x == 2.f) pm.id_remove(id);
+        pool->each([&](pm::PoolEntry<Pos>& e) {
+            if (e.get().x == 2.f) pm.id_remove(e.id);
         }, pm::Parallel::Off);
     });
     pm.loop_once();
@@ -484,22 +461,6 @@ TEST_CASE("each + deferred remove via tick") {
     CHECK(pool->has(e1));
     CHECK(!pool->has(e2));
     CHECK(pool->has(e3));
-}
-
-TEST_CASE("each_mut auto-fires change hooks") {
-    pm::Pm pm;
-    auto *pool = pm.pool_get<Pos>("pos");
-    int changes = 0;
-    pool->set_change_hook([](void* ctx, pm::Id) {
-        (*static_cast<int*>(ctx))++;
-    }, &changes);
-    for (int i = 0; i < 100; i++) {
-        pm::Id e = pm.id_add();
-        pool->add(e, {(float)i, 0.f});
-    }
-    int before = changes;
-    pool->each_mut([](Pos& p) { p.y = 99.f; }, pm::Parallel::Off);
-    CHECK(changes == before + 100);
 }
 
 TEST_CASE("generation wrap-around fix") {
@@ -511,40 +472,6 @@ TEST_CASE("generation wrap-around fix") {
 
     uint32_t normal_gen = (5 + 1) & 0xFFFFFF;
     CHECK(normal_gen == 6);
-}
-
-TEST_CASE("each does not fire change hooks") {
-    pm::Pm pm;
-    auto *pool = pm.pool_get<Pos>("pos");
-    int changes = 0;
-    pool->set_change_hook([](void* ctx, pm::Id) {
-        (*static_cast<int*>(ctx))++;
-    }, &changes);
-    for (int i = 0; i < 50; i++) {
-        pm::Id e = pm.id_add();
-        pool->add(e, {(float)i, 0.f});
-    }
-    int before = changes;
-    pool->each([](const Pos& p) { (void)p; }, pm::Parallel::Off);
-    CHECK(changes == before);
-    pool->each([](pm::Id, const Pos& p) { (void)p; }, pm::Parallel::Off);
-    CHECK(changes == before);
-}
-
-TEST_CASE("each_mut does fire change hooks") {
-    pm::Pm pm;
-    auto *pool = pm.pool_get<Pos>("pos");
-    int changes = 0;
-    pool->set_change_hook([](void* ctx, pm::Id) {
-        (*static_cast<int*>(ctx))++;
-    }, &changes);
-    for (int i = 0; i < 50; i++) {
-        pm::Id e = pm.id_add();
-        pool->add(e, {(float)i, 0.f});
-    }
-    int before = changes;
-    pool->each_mut([](Pos& p) { p.y = 1.f; }, pm::Parallel::Off);
-    CHECK(changes == before + 50);
 }
 
 TEST_CASE("dense_ids tracks full Ids") {
@@ -569,29 +496,13 @@ TEST_CASE("dense_ids tracks full Ids") {
     CHECK(pool->id_at(1) == b);
 }
 
-TEST_CASE("each_mut parallel with hook falls back to sequential") {
-    pm::Pm pm;
-    auto *pool = pm.pool_get<Pos>("pos");
-    int changes = 0;
-    pool->set_change_hook([](void* ctx, pm::Id) {
-        (*static_cast<int*>(ctx))++;
-    }, &changes);
-    for (int i = 0; i < 2000; i++) {
-        pm::Id e = pm.id_add();
-        pool->add(e, {(float)i, 0.f});
-    }
-    int before = changes;
-    pool->each_mut([](Pos& p) { p.y = 1.f; }, pm::Parallel::On);
-    CHECK(changes == before + 2000);
-}
-
 TEST_CASE("each passes const reference") {
     pm::Pm pm;
     auto *pool = pm.pool_get<Pos>("pos");
     pm::Id e = pm.id_add();
     pool->add(e, {1.f, 2.f});
-    pool->each([](const Pos& p) { CHECK(p.x == 1.f); }, pm::Parallel::Off);
-    pool->each([](pm::Id, const Pos& p) { CHECK(p.x == 1.f); }, pm::Parallel::Off);
+    pool->each([](pm::PoolEntry<Pos>& e) { CHECK(e.get().x == 1.f); }, pm::Parallel::Off);
+    pool->each([](pm::PoolEntry<Pos>& e) { CHECK(e.get().x == 1.f); }, pm::Parallel::Off);
 }
 
 TEST_CASE("fault handling") {
@@ -748,10 +659,6 @@ TEST_CASE("pool sync state basics") {
     pm::PoolSyncState ss;
     ss.pool_id = pool->pool_id;
 
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
-
     pm::Id a = pm.id_add(); pool->add(a, 10);
     pm::Id b = pm.id_add(); pool->add(b, 20);
     pm::Id c = pm.id_add(); pool->add(c, 30);
@@ -777,9 +684,6 @@ TEST_CASE("pool sync state each_unsynced") {
     auto* pool = pm.pool_get<Pos>("pos");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     uint8_t peer = net->connect();
 
@@ -787,6 +691,7 @@ TEST_CASE("pool sync state each_unsynced") {
         pm::Id e = pm.id_add();
         pool->add(e, {(float)i, 0});
     }
+    ss.repend_all(pool);
 
     int count = 0;
     uint64_t remote_mask = net->remote_peers().bits;
@@ -809,15 +714,13 @@ TEST_CASE("pending list compaction") {
     auto* pool = pm.pool_get<Pos>("pos");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     pm::Id ids[100];
     for (int i = 0; i < 100; i++) {
         ids[i] = pm.id_add();
         pool->add(ids[i], {(float)i, 0});
     }
+    ss.repend_all(pool);
     CHECK(ss.pending_count() == 100);
 
     uint8_t peer = net->connect();
@@ -849,9 +752,6 @@ TEST_CASE("interest unsync_for + re-sync") {
     auto* pool = pm.pool_get<float>("positions");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     uint8_t p1 = net->connect();
     uint64_t remote_mask = net->remote_peers().bits;
@@ -859,6 +759,7 @@ TEST_CASE("interest unsync_for + re-sync") {
     pm::Id near1 = pm.id_add(); pool->add(near1, 50.f);
     pm::Id near2 = pm.id_add(); pool->add(near2, 100.f);
     pm::Id far1  = pm.id_add(); pool->add(far1, 900.f);
+    ss.repend_all(pool);
 
     float interest_radius = 200.f;
     float peer_pos = 80.f;
@@ -890,9 +791,6 @@ TEST_CASE("sync tracking immune to swap-remove") {
     auto* pool = pm.pool_get<Pos>("pos");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     pm::Id a = pm.id_add();
     pm::Id b = pm.id_add();
@@ -900,6 +798,7 @@ TEST_CASE("sync tracking immune to swap-remove") {
     pool->add(a, {1, 0});
     pool->add(b, {2, 0});
     pool->add(c, {3, 0});
+    ss.repend_all(pool);
 
     ss.mark_synced(1, a);
     CHECK(ss.is_synced_to(1, a));
@@ -918,12 +817,10 @@ TEST_CASE("repend_all on connect") {
     auto* pool = pm.pool_get<Pos>("pos");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     pm::Id a = pm.id_add(); pool->add(a, {1, 2});
     pm::Id b = pm.id_add(); pool->add(b, {3, 4});
+    ss.repend_all(pool);
 
     uint8_t p1 = net->connect();
     uint64_t remote_mask = net->remote_peers().bits;
@@ -950,49 +847,12 @@ TEST_CASE("net_init registers tasks") {
     CHECK(pm.task_get("net/flush") != nullptr);
 }
 
-TEST_CASE("pool swap hook") {
-    pm::Pm pm;
-    auto* pool = pm.pool_get<Pos>("pos");
-
-    // Track swaps
-    struct SwapLog { uint32_t removed, last; };
-    static std::vector<SwapLog> swaps;
-    swaps.clear();
-    pool->set_swap_hook([](void*, uint32_t removed_di, uint32_t last_di) {
-        swaps.push_back({removed_di, last_di});
-    }, nullptr);
-
-    pm::Id a = pm.id_add(); pool->add(a, {1, 0});  // dense 0
-    pm::Id b = pm.id_add(); pool->add(b, {2, 0});  // dense 1
-    pm::Id c = pm.id_add(); pool->add(c, {3, 0});  // dense 2
-
-    pool->remove(a);  // swap: dense[0] gets dense[2], pop
-    CHECK(swaps.size() == 1);
-    CHECK(swaps[0].removed == 0);
-    CHECK(swaps[0].last == 2);
-    CHECK(pool->size() == 2);
-
-    pool->remove(c);  // c was at dense[0] after swap, last=dense[1]
-    CHECK(swaps.size() == 2);
-    CHECK(swaps[1].removed == 0);
-    CHECK(swaps[1].last == 1);
-
-    pool->remove(b);  // only element, removed == last
-    CHECK(swaps.size() == 3);
-    CHECK(swaps[2].removed == 0);
-    CHECK(swaps[2].last == 0);
-    CHECK(pool->empty());
-}
-
 TEST_CASE("pool sync state change-tracked basics") {
     pm::Pm pm;
     auto* net = pm.state_get<pm::NetSys>("net");
     auto* pool = pm.pool_get<Pos>("pos");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     uint8_t peer = net->connect();
     uint64_t remote_mask = net->remote_peers().bits;
@@ -1000,8 +860,9 @@ TEST_CASE("pool sync state change-tracked basics") {
     pm::Id a = pm.id_add(); pool->add(a, {1, 0});
     pm::Id b = pm.id_add(); pool->add(b, {2, 0});
     pm::Id c = pm.id_add(); pool->add(c, {3, 0});
+    ss.repend_all(pool);
 
-    // All 3 should appear in pending (add calls notify_change)
+    // All 3 should appear in pending (repend_all rebuilds from dense array)
     int count = 0;
     ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id, Pos&, size_t) {
         ss.mark_synced(peer, a); // dummy; real code marks each id
@@ -1025,9 +886,6 @@ TEST_CASE("change-tracked remove leaves no ghost entries") {
     auto* pool = pm.pool_get<Pos>("pos");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     uint8_t peer = net->connect();
     uint64_t remote_mask = net->remote_peers().bits;
@@ -1035,6 +893,7 @@ TEST_CASE("change-tracked remove leaves no ghost entries") {
     pm::Id a = pm.id_add(); pool->add(a, {10, 0});
     pm::Id b = pm.id_add(); pool->add(b, {20, 0});
     pm::Id c = pm.id_add(); pool->add(c, {30, 0});
+    ss.repend_all(pool);
 
     // Sync all
     ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
@@ -1056,14 +915,12 @@ TEST_CASE("change-tracked new entries start unsynced") {
     auto* pool = pm.pool_get<int>("items");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     uint8_t peer = net->connect();
     uint64_t remote_mask = net->remote_peers().bits;
 
     pm::Id a = pm.id_add(); pool->add(a, 10);
+    ss.repend_all(pool);
 
     // Sync a
     ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, int&, size_t) {
@@ -1071,8 +928,9 @@ TEST_CASE("change-tracked new entries start unsynced") {
     });
     ss.clear_pending();
 
-    // Add a new entry — triggers change hook, goes into pending
+    // Add a new entry — repend_all picks it up
     pm::Id b = pm.id_add(); pool->add(b, 20);
+    ss.repend_all(pool);
 
     int count = 0;
     pm::Id found = pm::NULL_ID;
@@ -1090,9 +948,6 @@ TEST_CASE("change-tracked multi-peer independence") {
     auto* pool = pm.pool_get<int>("vals");
 
     pm::PoolSyncState ss;
-    pool->set_change_hook([](void* ctx, pm::Id id) {
-        static_cast<pm::PoolSyncState*>(ctx)->mark_changed(id);
-    }, &ss);
 
     uint8_t p1 = net->connect();
     uint8_t p2 = net->connect();
@@ -1100,6 +955,7 @@ TEST_CASE("change-tracked multi-peer independence") {
 
     pm::Id a = pm.id_add(); pool->add(a, 1);
     pm::Id b = pm.id_add(); pool->add(b, 2);
+    ss.repend_all(pool);
 
     // Sync only to p1
     ss.each_unsynced(pool, p1, remote_mask, [&](pm::Id id, int&, size_t) {
@@ -1120,6 +976,141 @@ TEST_CASE("change-tracked multi-peer independence") {
     int p1_count = 0;
     ss.each_unsynced(pool, p1, remote_mask, [&](pm::Id, int&, size_t) { p1_count++; });
     CHECK(p1_count == 0);
+}
+
+TEST_CASE("diff_scan detects new entities") {
+    pm::Pm pm;
+    auto* net = pm.state_get<pm::NetSys>("net");
+    auto* pool = pm.pool_get<Pos>("pos");
+
+    pm::PoolSyncState ss;
+
+    uint8_t peer = net->connect();
+    uint64_t remote_mask = net->remote_peers().bits;
+
+    pm::Id a = pm.id_add(); pool->add(a, {1, 0});
+    pm::Id b = pm.id_add(); pool->add(b, {2, 0});
+    ss.diff_scan(pool);
+    CHECK(ss.pending_count() == 2);
+
+    // Sync both
+    ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
+        ss.mark_synced(peer, id);
+    });
+    ss.each_unsynced(pool, peer, remote_mask, [](pm::Id, Pos&, size_t) {});
+    CHECK(ss.pending_count() == 0);
+
+    // Add a third — diff_scan picks it up without touching a or b
+    pm::Id c = pm.id_add(); pool->add(c, {3, 0});
+    ss.diff_scan(pool);
+    CHECK(ss.pending_count() == 1);
+
+    int count = 0;
+    pm::Id found = pm::NULL_ID;
+    ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
+        count++;
+        found = id;
+    });
+    CHECK(count == 1);
+    CHECK(found == c);
+}
+
+TEST_CASE("diff_scan detects get_mut changes") {
+    pm::Pm pm;
+    auto* net = pm.state_get<pm::NetSys>("net");
+    auto* pool = pm.pool_get<Pos>("pos");
+
+    pm::PoolSyncState ss;
+
+    uint8_t peer = net->connect();
+    uint64_t remote_mask = net->remote_peers().bits;
+
+    pm::Id a = pm.id_add(); pool->add(a, {1, 0});
+    pm::Id b = pm.id_add(); pool->add(b, {2, 0});
+    ss.diff_scan(pool);
+
+    // Sync all
+    ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
+        ss.mark_synced(peer, id);
+    });
+    ss.each_unsynced(pool, peer, remote_mask, [](pm::Id, Pos&, size_t) {});
+    CHECK(ss.pending_count() == 0);
+
+    // Mutate b via get_mut — bumps change counter
+    auto entry = pool->get(b);
+    entry.get_mut().x = 99.f;
+
+    // diff_scan detects only b changed
+    ss.diff_scan(pool);
+    CHECK(ss.pending_count() == 1);
+
+    int count = 0;
+    pm::Id found = pm::NULL_ID;
+    ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
+        count++;
+        found = id;
+    });
+    CHECK(count == 1);
+    CHECK(found == b);
+}
+
+TEST_CASE("diff_scan skips unchanged entities") {
+    pm::Pm pm;
+    auto* net = pm.state_get<pm::NetSys>("net");
+    auto* pool = pm.pool_get<Pos>("pos");
+
+    pm::PoolSyncState ss;
+
+    uint8_t peer = net->connect();
+    uint64_t remote_mask = net->remote_peers().bits;
+
+    for (int i = 0; i < 100; i++) {
+        pm::Id e = pm.id_add();
+        pool->add(e, {(float)i, 0});
+    }
+    ss.diff_scan(pool);
+
+    // Sync all
+    ss.each_unsynced(pool, peer, remote_mask, [&](pm::Id id, Pos&, size_t) {
+        ss.mark_synced(peer, id);
+    });
+    ss.each_unsynced(pool, peer, remote_mask, [](pm::Id, Pos&, size_t) {});
+    CHECK(ss.pending_count() == 0);
+
+    // No mutations — diff_scan adds nothing
+    ss.diff_scan(pool);
+    CHECK(ss.pending_count() == 0);
+
+    // Second call still adds nothing
+    ss.diff_scan(pool);
+    CHECK(ss.pending_count() == 0);
+}
+
+TEST_CASE("diff_scan resets synced bits on change") {
+    pm::Pm pm;
+    auto* net = pm.state_get<pm::NetSys>("net");
+    auto* pool = pm.pool_get<Pos>("pos");
+
+    pm::PoolSyncState ss;
+
+    uint8_t p1 = net->connect();
+    uint8_t p2 = net->connect();
+    uint64_t remote_mask = net->remote_peers().bits;
+
+    pm::Id a = pm.id_add(); pool->add(a, {1, 0});
+    ss.diff_scan(pool);
+
+    // Sync to both peers
+    ss.each_unsynced(pool, p1, remote_mask, [&](pm::Id id, Pos&, size_t) { ss.mark_synced(p1, id); });
+    ss.each_unsynced(pool, p2, remote_mask, [&](pm::Id id, Pos&, size_t) { ss.mark_synced(p2, id); });
+    CHECK(ss.is_synced_to(p1, a));
+    CHECK(ss.is_synced_to(p2, a));
+
+    // Mutate — diff_scan should reset synced bits for all peers
+    pool->get(a).get_mut().x = 5.f;
+    ss.diff_scan(pool);
+    CHECK(!ss.is_synced_to(p1, a));
+    CHECK(!ss.is_synced_to(p2, a));
 }
 
 TEST_CASE("ordered custom packet sequencing") {
