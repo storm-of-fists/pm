@@ -336,7 +336,7 @@ void menu_init(Pm& pm) {
                     net->send_to(0, &pkt, sizeof(pkt));
                 }
                 else if (key == SDLK_ESCAPE) {
-                    net->sock.close_sock();
+                    net->close();
                     if (menu->is_host_client) { g_server_process.kill(); menu->is_host_client = false; }
                     menu->phase = GamePhase::MENU;
                     menu->field = 0;
@@ -524,7 +524,7 @@ void client_net_init(Pm& pm) {
     // --- Send input to server ---
     auto* cam = pm.state_get<Camera>("camera");
     pm.task_add("client_send", Phase::NET_SEND, [cn, net, menu, cam](Pm& pm) {
-        if (net->sock.sock == INVALID_SOCKET) return;
+        if (!net->is_open()) return;
 
         // Initiate connection handshake if not yet connecting/connected
         if (net->conn_state == NetSys::ConnState::DISCONNECTED && net->connect_ip) {
@@ -609,21 +609,21 @@ void client_net_init(Pm& pm) {
 
     // --- Game key handling (pause, restart, back to menu) ---
     auto* keys_q = pm.state_get<KeyQueue>("keys");
-    pm.task_add("game_keys", Phase::INPUT + 1.f, [cn, net, menu, keys_q](Pm& pm) {
+    pm.task_add("game_keys", Phase::INPUT + 1.f, [cn, net, menu, keys_q](Pm&) {
         if (menu->phase != GamePhase::PLAYING) return;
         for (auto key : *keys_q) {
             if (key <= 0) continue;
             if (key == SDLK_ESCAPE) {
                 if (cn->gs.game_over) {
-                    net->sock.close_sock();
+                    net->close();
                     if (menu->is_host_client) { g_server_process.kill(); menu->is_host_client = false; }
                     menu->phase = GamePhase::MENU;
                     menu->field = 0;
                     menu->username.clear();
                     menu->roster_count = 0;
                     cn->gs = ClientState{};
-                    cn->monsters->each([&](Id id, const Monster&) { pm.id_remove(id); }, Parallel::Off);
-                    cn->bullets->each([&](Id id, const Bullet&) { pm.id_remove(id); }, Parallel::Off);
+                    cn->monsters->remove_all();
+                    cn->bullets->remove_all();
                     for (int i = 0; i < MAX_PLAYERS; i++) cn->peer_ids[i] = NULL_ID;
                 }
                 else if (menu->is_host_client) {
@@ -642,8 +642,8 @@ void client_net_init(Pm& pm) {
     // --- Client-side staleness cleanup ---
     pm.task_add("stale_cleanup", Phase::CLEANUP, [cn, menu](Pm& pm) {
         if (menu->needs_disconnect_cleanup) {
-            cn->monsters->each([&](Id id, const Monster&) { pm.id_remove(id); }, Parallel::Off);
-            cn->bullets->each([&](Id id, const Bullet&) { pm.id_remove(id); }, Parallel::Off);
+            cn->monsters->remove_all();
+            cn->bullets->remove_all();
             for (int i = 0; i < MAX_PLAYERS; i++) cn->peer_ids[i] = NULL_ID;
             menu->needs_disconnect_cleanup = false;
             return;
@@ -660,38 +660,37 @@ void client_net_init(Pm& pm) {
         auto& d = cn->diag;
         d.sample_frame(pm.loop_dt());
         int alive = 0;
-        for (auto& p : cn->players->items) if (p.alive) alive++;
-        d.track_entities((int)cn->monsters->items.size(), (int)cn->bullets->items.size(), alive);
+        for (auto& p : cn->players->values()) if (p.alive) alive++;
+        d.track_entities((int)cn->monsters->size(), (int)cn->bullets->size(), alive);
         d.total_spawns += pm.loop_spawns();
         d.total_removes += pm.loop_removes();
         d.duration = cn->gs.time;
 
         bool connected = (net->conn_state == NetSys::ConnState::CONNECTED);
-        auto& server_pn = net->peer_net[0];
 
         if (connected) {
             d.track_snapshot_age(net->snapshot_age(0));
-            if (server_pn.rtt_samples > 0)
-                d.track_rtt(server_pn.rtt);
+            if (net->peer_rtt_samples(0) > 0)
+                d.track_rtt(net->peer_rtt(0));
             d.track_clock_offset(net->clock_offset);
         }
 
         // Per-frame timeline sample
         DiagSample s{};
         s.time = cn->gs.time;
-        s.monsters = (int)cn->monsters->items.size();
-        s.bullets = (int)cn->bullets->items.size();
+        s.monsters = (int)cn->monsters->size();
+        s.bullets = (int)cn->bullets->size();
         s.players_alive = alive;
         s.score = cn->gs.score;
         s.kills = cn->gs.kills;
         s.frame_ms = pm.loop_dt() * 1000.f;
-        d.compute_net_deltas(net->sock.total_bytes_sent, net->sock.total_bytes_recv,
-                             net->sock.total_packets_sent, net->sock.total_packets_recv, s);
-        s.rtt_ms = connected ? server_pn.rtt * 1000.f : 0.f;
+        d.compute_net_deltas(net->bytes_sent(), net->bytes_recv(),
+                             net->packets_sent(), net->packets_recv(), s);
+        s.rtt_ms = connected ? net->peer_rtt(0) * 1000.f : 0.f;
         s.snap_age_ms = connected ? net->snapshot_age(0) * 1000.f : 0.f;
         s.clock_offset = net->clock_offset;
-        s.reliable_pending = (int)server_pn.reliable_outbox.size();
-        s.sync_pending = (int)server_pn.sync_outbox.size();
+        s.reliable_pending = net->peer_reliable_pending(0);
+        s.sync_pending = net->peer_sync_pending(0);
         d.timeline.push_back(s);
 
         // Detect game over — log event + write report (one-shot)
@@ -725,9 +724,9 @@ void draw_init(Pm& pm) {
     auto* net   = pm.state_get<NetSys>("net");
     auto* debug = pm.state_get<DebugOverlay>("debug");
 
-    debug->add_size("players", [cn]{ return cn->players->items.size(); });
-    debug->add_size("monsters", [cn]{ return cn->monsters->items.size(); });
-    debug->add_size("bullets", [cn]{ return cn->bullets->items.size(); });
+    debug->add_size("players", [cn]{ return cn->players->size(); });
+    debug->add_size("monsters", [cn]{ return cn->monsters->size(); });
+    debug->add_size("bullets", [cn]{ return cn->bullets->size(); });
     debug->add_stat("net", [net](char* b, int n) {
         snprintf(b, n, "snap:%.1fms", net->snapshot_age(0)*1000.f);
     });
@@ -753,11 +752,7 @@ void draw_init(Pm& pm) {
     }
 
     // --- Hot-reload sprites if files change on disk (runs ~1Hz) ---
-    pm.task_add("sprite/hotreload", Phase::HUD, [sdl, sprites](Pm& pm) {
-        static float timer = 0.f;
-        timer += pm.loop_dt();
-        if (timer < 1.f) return;
-        timer = 0.f;
+    pm.task_add("sprite/hotreload", Phase::HUD, 1.f, [sdl, sprites](Pm&) {
         if (sprites->player_front.changed()) { printf("[sprite] reloading player_front\n"); sprites->player_front.reload(sdl->renderer); }
         if (sprites->player_back.changed())  { printf("[sprite] reloading player_back\n");  sprites->player_back.reload(sdl->renderer); }
     });
@@ -796,7 +791,7 @@ void draw_init(Pm& pm) {
     pm.task_add("draw_players", Phase::DRAW - 1.f, [cn, menu, draw_q](Pm&) {
         if (menu->phase != GamePhase::PLAYING) return;
         int pi = 0;
-        for (auto& p : cn->players->items) {
+        for (auto& p : cn->players->values()) {
             float bx = (pi < MAX_PLAYERS/2) ? 10.f : (float)(W-170);
             float by = 10.f + (float)(pi % (MAX_PLAYERS/2)) * 18.f;
             float pct = p.hp / PLAYER_HP;
@@ -810,7 +805,7 @@ void draw_init(Pm& pm) {
     pm.task_add("sprite/players", Phase::RENDER + 0.5f, [cn, menu, sdl, sprites, cam](Pm& pm) {
         if (menu->phase != GamePhase::PLAYING) return;
         int pi = 0;
-        for (auto& p : cn->players->items) {
+        for (auto& p : cn->players->values()) {
             // Facing: front = moving down (toward camera), back = moving up (away).
             float dy = p.pos.y - sprites->prev_y[pi];
             sprites->facing[pi].update(pm.loop_dt());
@@ -839,7 +834,7 @@ void draw_init(Pm& pm) {
     pm.task_add("draw_monsters", Phase::DRAW + 1.f, [cn, net, menu, draw_q, cam](Pm&) {
         if (menu->phase != GamePhase::PLAYING) return;
         float age = cn->gs.paused ? 0.f : net->snapshot_age(0);
-        for (auto& m : cn->monsters->items) {
+        for (auto& m : cn->monsters->values()) {
             float rx = m.pos.x + m.vel.x * age;
             float ry = m.pos.y + m.vel.y * age;
             Vec2 sp = cam->world_to_screen({rx, ry});
@@ -853,7 +848,7 @@ void draw_init(Pm& pm) {
     pm.task_add("draw_bullets", Phase::DRAW, [cn, net, menu, draw_q, cam](Pm&) {
         if (menu->phase != GamePhase::PLAYING) return;
         float age = cn->gs.paused ? 0.f : net->snapshot_age(0);
-        for (auto& b : cn->bullets->items) {
+        for (auto& b : cn->bullets->values()) {
             float rx = b.pos.x + b.vel.x * age;
             float ry = b.pos.y + b.vel.y * age;
             Vec2 sp = cam->world_to_screen({rx, ry});

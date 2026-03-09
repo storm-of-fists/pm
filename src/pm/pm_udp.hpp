@@ -321,7 +321,7 @@ struct PoolSyncState
 			if (!(s & bit))
 			{
 				size_t di = pool->sparse.get(idx);
-				fn(id, pool->items[di], di);
+				fn(id, pool->values_mut()[di], di);
 			}
 		}
 		pending.resize(w);
@@ -334,7 +334,7 @@ struct PoolSyncState
 	{
 		pending.clear();
 		std::fill(pending_flag.begin(), pending_flag.end(), 0);
-		for (size_t i = 0; i < pool->items.size(); i++)
+		for (size_t i = 0; i < pool->size(); i++)
 		{
 			Id id = pool->id_at(i);
 			uint32_t idx = id.raw;
@@ -944,10 +944,10 @@ struct NetSys {
 
 			for (uint8_t p : remote_peers()) {
 				if constexpr (has_interest) {
-					for (size_t di = 0; di < pool->items.size(); di++) {
+					for (size_t di = 0; di < pool->size(); di++) {
 						Id id = pool->id_at(di);
 						if (!ss->is_synced_to(p, id)) continue;
-						if (!interest_fn(pm, p, id, pool->items[di], hysteresis)) {
+						if (!interest_fn(pm, p, id, pool->values()[di], hysteresis)) {
 							ss->mark_unsynced_for(p, id);
 							peer_net[p].pending_removals.push_back({pool->pool_id, id});
 						}
@@ -1055,6 +1055,21 @@ struct NetSys {
 	void start_client() { sock.init(0); }
 
 	float snapshot_age(uint8_t peer) const { return peer_net[peer].snapshot_age; }
+
+	// --- Peer diagnostics (avoids direct peer_net[] access) ---
+	float peer_rtt(uint8_t peer) const { return peer_net[peer].rtt; }
+	uint32_t peer_rtt_samples(uint8_t peer) const { return peer_net[peer].rtt_samples; }
+	uint32_t peer_packets_sent(uint8_t peer) const { return peer_net[peer].packets_sent; }
+	int peer_reliable_pending(uint8_t peer) const { return (int)peer_net[peer].reliable_outbox.size(); }
+	int peer_sync_pending(uint8_t peer) const { return (int)peer_net[peer].sync_outbox.size(); }
+
+	// --- Socket diagnostics (avoids direct sock access) ---
+	bool is_open() const { return sock.sock != INVALID_SOCKET; }
+	uint64_t bytes_sent() const { return sock.total_bytes_sent; }
+	uint64_t bytes_recv() const { return sock.total_bytes_recv; }
+	uint32_t packets_sent() const { return sock.total_packets_sent; }
+	uint32_t packets_recv() const { return sock.total_packets_recv; }
+	void close() { sock.close_sock(); }
 
 private:
 	std::unordered_map<uint32_t, std::unique_ptr<PoolSyncState>> sync_states;

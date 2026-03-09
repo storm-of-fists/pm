@@ -32,6 +32,7 @@
 #include <typeinfo>
 #include <stdexcept>
 #include <memory>
+#include <span>
 
 // =============================================================================
 // Platform intrinsics
@@ -486,6 +487,14 @@ public:
 
 	bool has(Id id) const { return get(id) != nullptr; }
 	size_t size() const { return items.size(); }
+	bool empty() const { return items.empty(); }
+	std::span<const T> values() const { return {items.data(), items.size()}; }
+	std::span<T> values_mut() { return {items.data(), items.size()}; }
+	std::span<const Id> ids() const { return {dense_ids.data(), dense_ids.size()}; }
+
+	// Deferred removal of all entities in this pool (via pm.id_remove).
+	// Defined out-of-line after Pm class.
+	void remove_all();
 
 	// --- Iteration (lambda form, auto-parallelizes) ---
 	// Defined out-of-line after Pm class.
@@ -529,6 +538,8 @@ struct Task
 	float priority = 0;
 	bool active = true;
 	bool pauseable = false;
+	float interval = 0.f;       // 0 = every tick, >0 = run at most once per interval seconds
+	float _interval_accum = 0.f;
 
 	std::function<void(Pm &)> fn;
 
@@ -701,6 +712,13 @@ public:
 				continue;
 			if (task_list[ti].pauseable && paused && !_stepping_active)
 				continue;
+			if (task_list[ti].interval > 0.f)
+			{
+				task_list[ti]._interval_accum += _raw_dt;
+				if (task_list[ti]._interval_accum < task_list[ti].interval)
+					continue;
+				task_list[ti]._interval_accum -= task_list[ti].interval;
+			}
 
 			auto exec_t = [&, ti]()
 			{
@@ -809,6 +827,14 @@ public:
 	void task_add(const char *name, float priority, F &&fn, bool pauseable = false)
 	{
 		task_add(name_new(name), priority, std::forward<F>(fn), pauseable);
+	}
+
+	// Interval overloads: task runs at most once per `interval` seconds.
+	template <typename F>
+	void task_add(const char *name, float priority, float interval, F &&fn, bool pauseable = false)
+	{
+		task_add(name_new(name), priority, std::forward<F>(fn), pauseable);
+		task_list.back().interval = interval;
 	}
 
 	const std::vector<uint16_t> &task_order() const { return _task_order_indices; }
@@ -986,6 +1012,17 @@ void Pool<T>::each_mut(F &&fn, Parallel p, uint32_t threads)
 				fn(items[i]);
 		}
 	}
+}
+
+// =============================================================================
+// Pool<T>::remove_all — deferred removal of all entities in the pool
+// =============================================================================
+template <typename T>
+void Pool<T>::remove_all()
+{
+	assert(kernel && "Pool::remove_all requires kernel (use pm.pool_get to create pools)");
+	for (size_t i = 0; i < dense_ids.size(); i++)
+		kernel->id_remove(dense_ids[i]);
 }
 
 } // namespace pm

@@ -102,17 +102,25 @@ Quick reference:
 
 - `pm.state_get<T>("name")` — singleton state, returns same pointer on re-fetch
 - `pm.pool_get<T>("name")` — sparse-set component pool
-- `pm.task_add("name", priority, lambda)` — register a task
+- `pm.task_add("name", priority, lambda)` — register a task (runs every tick)
+- `pm.task_add("name", priority, interval, lambda)` — register a periodic task (runs once per `interval` seconds)
 - `pm.id_add(peer)` — monotonic entity creation (returns 32-bit Id, `[8-bit peer | 24-bit seq]`).
   Default peer 0. NOT thread-safe in parallel `each`/`each_mut`.
 - `pm.id_remove(id)` — deferred removal (flushed at end of `loop_once()`)
 - `pm.id_alive(id)` — check if an Id is currently alive
 - `pm.id_sync(id)` — accept a remote Id (networking), advances peer sequence
 - `pm.id_set_next_sequence(peer, seq)` — forward-only sequence set (server handshake)
+- `pool->values()` — `std::span<const T>` for range-for without IDs
+- `pool->values_mut()` — `std::span<T>` for mutable range-for (no change hooks)
+- `pool->ids()` — `std::span<const Id>` of dense Id array
+- `pool->size()`, `pool->empty()` — element count / emptiness check
+- `pool->remove_all()` — deferred removal of all entities in the pool
 - `pool->each([](const T&) { ... })` — read-only iteration, no change hooks
 - `pool->each_mut([](T&) { ... })` — mutable iteration, fires change hooks
 - Tasks receive `Pm& pm` with `pm.loop_dt()`, `pm.loop_quit()`, `pm.id_add()`, etc.
 - Networking: `net->on_recv(type, handler)`, `net->send_to(peer, data, size)`
+- Net diagnostics: `net->peer_rtt(p)`, `net->peer_reliable_pending(p)`, `net->is_open()`, `net->bytes_sent()`
+- Net lifecycle: `net->close()` — close socket
 - All time is `float` seconds (matches `pm.loop_dt()`)
 - Mods: `.so` files exporting `extern "C" pm_mod_load(Pm&)` / `pm_mod_unload(Pm&)`
 - `pm.task_stop("name")` — stop a task (clears fn + deactivates, safe for dlclose)

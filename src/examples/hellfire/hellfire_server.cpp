@@ -252,9 +252,9 @@ void server_init(Pm& pm) {
         }
         float intensity = (sinf(gs->time * 0.4f) * 0.5f + 0.5f) * 0.6f
                         + (sinf(gs->time * 0.08f) * 0.5f + 0.5f) * 0.4f;
-        if ((int)mp->items.size() >= lvl.max_monsters) return;
+        if ((int)mp->size() >= lvl.max_monsters) return;
         gs->spawn_accum += (1.f + 8.f * intensity) * lvl.spawn_mult * dt;
-        while (gs->spawn_accum >= 1.f && (int)mp->items.size() < lvl.max_monsters) {
+        while (gs->spawn_accum >= 1.f && (int)mp->size() < lvl.max_monsters) {
             gs->spawn_accum -= 1.f;
             spawn_monster(pm, mp, gs);
         }
@@ -266,7 +266,7 @@ void server_init(Pm& pm) {
         float dt = pm.loop_dt();
         mp->each_mut([&](Monster& m) {
             Vec2 tgt = m.pos; float best = 1e9f;
-            for (auto& p : gs->players->items)
+            for (auto& p : gs->players->values())
                 if (p.alive && dist(m.pos, p.pos) < best) { best = dist(m.pos, p.pos); tgt = p.pos; }
             Vec2 desired = norm(tgt - m.pos) * len(m.vel);
             m.vel.x += (desired.x - m.vel.x) * 0.5f * dt;
@@ -342,8 +342,8 @@ void server_init(Pm& pm) {
         }
 
         bool any = false;
-        for (auto& p : gs->players->items) if (p.alive) any = true;
-        if (!any && !gs->players->items.empty()) {
+        for (auto& p : gs->players->values()) if (p.alive) any = true;
+        if (!any && !gs->players->empty()) {
             gs->game_over = true;
             gs->diag.push_event(net->local_time, "game over — score %d", gs->score);
             net->clear_pool(pm, mp);
@@ -375,28 +375,20 @@ void server_init(Pm& pm) {
     });
 
     // --- Debug info broadcast — once per second to all connected clients ---
-    pm.task_add("debug_send", Phase::HUD, [mp, bp, net](Pm& pm) {
-        static float timer = 0.f;
-        timer += pm.loop_dt();
-        if (timer < 1.f) return;
-        timer -= 1.f;
+    pm.task_add("debug_send", Phase::HUD, 1.f, [mp, bp, net](Pm& pm) {
         PktDbg pkt{};
-        pkt.monsters    = (uint16_t)mp->items.size();
-        pkt.bullets     = (uint16_t)bp->items.size();
+        pkt.monsters    = (uint16_t)mp->size();
+        pkt.bullets     = (uint16_t)bp->size();
         pkt.ms_per_tick = pm.loop_dt() * 1000.f;
         for (uint8_t p : net->remote_peers())
             net->send_to(p, &pkt, sizeof(pkt));
     });
 
     // --- Status print ---
-    pm.task_add("status", Phase::HUD, [gs, mp, bp](Pm& pm) {
-        static float accum = 0;
-        accum += pm.loop_dt();
-        if (accum < 5.f) return;
-        accum = 0;
+    pm.task_add("status", Phase::HUD, 5.f, [gs, mp, bp](Pm&) {
         if (gs->started) {
             printf("[server] t=%.0f  score=%d  lvl=%d  m=%zu  b=%zu  players=%zu\n",
-                   gs->time, gs->score, gs->current_level+1, mp->items.size(), bp->items.size(), gs->players->items.size());
+                   gs->time, gs->score, gs->current_level+1, mp->size(), bp->size(), gs->players->size());
         } else {
             printf("[server] lobby — %d player(s) waiting\n", gs->roster_count);
         }
@@ -408,8 +400,8 @@ void server_init(Pm& pm) {
         auto& d = gs->diag;
         d.sample_frame(pm.loop_dt());
         int alive = 0;
-        for (auto& p : gs->players->items) if (p.alive) alive++;
-        d.track_entities((int)mp->items.size(), (int)bp->items.size(), alive);
+        for (auto& p : gs->players->values()) if (p.alive) alive++;
+        d.track_entities((int)mp->size(), (int)bp->size(), alive);
         d.total_spawns += pm.loop_spawns();
         d.total_removes += pm.loop_removes();
         d.duration = gs->time;
@@ -418,26 +410,25 @@ void server_init(Pm& pm) {
         float best_rtt = 0.f;
         int reliable_q = 0, sync_q = 0;
         for (uint8_t p : net->remote_peers()) {
-            auto& pn = net->peer_net[p];
-            if (pn.rtt_samples > 0) {
-                d.track_rtt(pn.rtt);
-                if (pn.rtt > best_rtt) best_rtt = pn.rtt;
+            if (net->peer_rtt_samples(p) > 0) {
+                d.track_rtt(net->peer_rtt(p));
+                if (net->peer_rtt(p) > best_rtt) best_rtt = net->peer_rtt(p);
             }
-            reliable_q += (int)pn.reliable_outbox.size();
-            sync_q += (int)pn.sync_outbox.size();
+            reliable_q += net->peer_reliable_pending(p);
+            sync_q += net->peer_sync_pending(p);
         }
 
         // Per-frame timeline sample
         DiagSample s{};
         s.time = gs->time;
-        s.monsters = (int)mp->items.size();
-        s.bullets = (int)bp->items.size();
+        s.monsters = (int)mp->size();
+        s.bullets = (int)bp->size();
         s.players_alive = alive;
         s.score = gs->score;
         s.kills = gs->kills;
         s.frame_ms = pm.loop_dt() * 1000.f;
-        d.compute_net_deltas(net->sock.total_bytes_sent, net->sock.total_bytes_recv,
-                             net->sock.total_packets_sent, net->sock.total_packets_recv, s);
+        d.compute_net_deltas(net->bytes_sent(), net->bytes_recv(),
+                             net->packets_sent(), net->packets_recv(), s);
         s.rtt_ms = best_rtt * 1000.f;
         s.reliable_pending = reliable_q;
         s.sync_pending = sync_q;
@@ -458,9 +449,9 @@ void server_init(Pm& pm) {
                 auto* p = gs->players->get(gs->peer_ids[pid]);
                 d.peers[i].alive_at_end = p && p->alive;
                 // Per-peer network stats
-                d.peers[i].rtt = net->peer_net[pid].rtt;
-                d.peers[i].rtt_samples = net->peer_net[pid].rtt_samples;
-                d.peers[i].packets_sent = net->peer_net[pid].packets_sent;
+                d.peers[i].rtt = net->peer_rtt(pid);
+                d.peers[i].rtt_samples = net->peer_rtt_samples(pid);
+                d.peers[i].packets_sent = net->peer_packets_sent(pid);
             }
             std::string path = g_report_dir + "/server.json";
             d.write_json(path.c_str());

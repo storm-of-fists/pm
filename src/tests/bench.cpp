@@ -1936,7 +1936,7 @@ TEST_CASE("server tick") {
 
             pm.id_process_removes();
 
-            while (static_cast<int>(mp->items.size()) < 400) {
+            while (static_cast<int>(mp->size()) < 400) {
                 pm::Id id = pm.id_add();
                 BMonster m;
                 m.pos = {rng.rfr(0, 900), rng.rfr(0, 700)};
@@ -1945,7 +1945,7 @@ TEST_CASE("server tick") {
                 m.shoot_timer = rng.rfr(1.5f, 4.f);
                 mp->add(id, m);
             }
-            while (static_cast<int>(bp->items.size()) < 600) {
+            while (static_cast<int>(bp->size()) < 600) {
                 pm::Id id = pm.id_add();
                 BBullet b;
                 b.pos = {rng.rfr(0, 900), rng.rfr(0, 700)};

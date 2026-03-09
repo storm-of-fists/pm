@@ -319,7 +319,7 @@ TEST_CASE("id_remove + task_stop + pool reset") {
     pm::Id e2 = pm.id_add();
     pos->add(e2, {3, 4});
     pos->reset();
-    CHECK(pos->items.size() == 0);
+    CHECK(pos->size() == 0);
 
     pm::Id e3 = pm.id_add();
     pos->add(e3, {5, 6});
@@ -425,8 +425,8 @@ TEST_CASE("each_mut void(T&) parallel") {
         pool->add(e, {(float)i, 0.f});
     }
     pool->each_mut([](Pos& p) { p.y = p.x * 2.f; });
-    for (size_t i = 0; i < pool->items.size(); i++)
-        CHECK(pool->items[i].y == pool->items[i].x * 2.f);
+    for (size_t i = 0; i < pool->size(); i++)
+        CHECK(pool->values()[i].y == pool->values()[i].x * 2.f);
 }
 
 TEST_CASE("each_mut void(Id, T&) parallel") {
@@ -439,9 +439,9 @@ TEST_CASE("each_mut void(Id, T&) parallel") {
     pool->each_mut([](pm::Id id, Pos& p) {
         p.y = (float)id.raw;
     });
-    for (size_t i = 0; i < pool->items.size(); i++) {
+    for (size_t i = 0; i < pool->size(); i++) {
         uint32_t slot = pool->dense_indices[i];
-        CHECK(pool->items[i].y == (float)slot);
+        CHECK(pool->values()[i].y == (float)slot);
     }
 }
 
@@ -460,7 +460,7 @@ TEST_CASE("each_mut Parallel::Off") {
         pool->add(e, {(float)i, 0.f});
     }
     pool->each_mut([](Pos& p) { p.y = 42.f; }, pm::Parallel::Off);
-    for (auto& p : pool->items) CHECK(p.y == 42.f);
+    for (auto& p : pool->values()) CHECK(p.y == 42.f);
 }
 
 TEST_CASE("each + deferred remove via tick") {
@@ -906,7 +906,7 @@ TEST_CASE("sync tracking immune to swap-remove") {
     CHECK(!ss.is_synced_to(1, c));
 
     pool->remove(a);
-    CHECK(pool->items.size() == 2);
+    CHECK(pool->size() == 2);
 
     CHECK(!ss.is_synced_to(1, c));
     CHECK(!ss.is_synced_to(1, b));
@@ -970,7 +970,7 @@ TEST_CASE("pool swap hook") {
     CHECK(swaps.size() == 1);
     CHECK(swaps[0].removed == 0);
     CHECK(swaps[0].last == 2);
-    CHECK(pool->items.size() == 2);
+    CHECK(pool->size() == 2);
 
     pool->remove(c);  // c was at dense[0] after swap, last=dense[1]
     CHECK(swaps.size() == 2);
@@ -981,7 +981,7 @@ TEST_CASE("pool swap hook") {
     CHECK(swaps.size() == 3);
     CHECK(swaps[2].removed == 0);
     CHECK(swaps[2].last == 0);
-    CHECK(pool->items.empty());
+    CHECK(pool->empty());
 }
 
 TEST_CASE("pool sync state change-tracked basics") {

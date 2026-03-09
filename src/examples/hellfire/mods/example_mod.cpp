@@ -13,10 +13,8 @@ static const char *MESSAGE = "EXAMPLE MOD v1";
 
 extern "C" void pm_mod_load(Pm &pm)
 {
-    pm.task_add("example_mod/hud", Phase::HUD + 9.f, [](Pm &pm) {
-        auto *draw = pm.state_get<DrawQueue>("draw");
-        if (!draw)
-            return;
+    auto *draw = pm.state_get<DrawQueue>("draw");
+    pm.task_add("example_mod/hud", Phase::HUD + 9.f, [draw](Pm &) {
         push_str(draw, MESSAGE, 4, 4, 1, 255, 220, 0);
     });
 }

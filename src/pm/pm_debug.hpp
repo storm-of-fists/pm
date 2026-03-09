@@ -12,7 +12,7 @@
 //
 // API:
 //   debug->add_stat("label", [](char* buf, int n) { snprintf(...); });
-//   debug->add_size("pool_name", []{ return pool->items.size(); });
+//   debug->add_size("pool_name", []{ return pool->size(); });
 //
 // Usage:
 //   auto* debug = pm.state_get<DebugOverlay>("debug");
