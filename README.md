@@ -126,6 +126,13 @@ Quick reference:
 - Mods: `.so` files exporting `extern "C" pm_mod_load(Pm&)` / `pm_mod_unload(Pm&)`
 - `pm.task_stop("name")` — stop a task (clears fn + deactivates, safe for dlclose)
 
+## Rust restart (`src_rust/`)
+
+A ground-up rewrite of the kernel in Rust is underway in [src_rust/](src_rust/) —
+same philosophy, redesigned for the borrow checker rather than transliterated.
+See [src_rust/README.md](src_rust/README.md) for the C++→Rust mapping, design
+decisions, and its own roadmap. Build with `cd src_rust && cargo test`.
+
 ## Example game: Hellfire
 
 A networked multiplayer top-down shooter. See

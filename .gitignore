@@ -2,6 +2,9 @@
 build/
 build-release/
 
+# Rust (src_rust/)
+src_rust/target/
+
 # Compiled Object files
 *.slo
 *.lo

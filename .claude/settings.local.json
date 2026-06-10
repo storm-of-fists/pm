@@ -9,7 +9,20 @@
       "Bash(g++:*)",
       "Bash(grep:*)",
       "Bash(ls:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(cargo test *)",
+      "Bash(cargo run *)",
+      "Bash(cargo clippy *)",
+      "Bash(xargs sed -i 's/\\\\bgen: u8\\\\b/generation: u8/g; s/\\\\bgen\\(\\)\\\\b/generation\\(\\)/g; s/\\(\\(gen as u32\\)/\\(\\(generation as u32\\)/g')",
+      "Bash(sed -i 's/Some\\(DatagramEvent::Response { response }\\) => {/Some\\(DatagramEvent::Response\\(response\\)\\) => {/' pm/src/transport.rs)",
+      "Bash(cargo build *)",
+      "Bash(python3 -)",
+      "Bash(PM_LAG_MS=80 PM_LOSS=0.05 timeout 10 cargo run --release --example demo)",
+      "Bash(stty sane *)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f 'examples/demo')",
+      "Bash(timeout -s KILL 10 ./target/release/examples/demo)",
+      "Bash(pkill -x demo)"
     ]
   }
 }

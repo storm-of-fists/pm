@@ -1,0 +1,7 @@
+[workspace]
+members = ["pm"]
+resolver = "3"
+
+# Mirror the C++ RelWithDebInfo default: optimized but debuggable.
+[profile.release]
+debug = true
