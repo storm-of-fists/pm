@@ -1,9 +1,10 @@
-//! The Pm kernel: flat task scheduler, named state singletons, named
-//! component pools, entity id lifecycle with end-of-tick deferred removal.
+//! The Pm kernel: flat task scheduler, named component pools (singletons
+//! are just single-entity pools — see `single`), entity id lifecycle with
+//! end-of-tick deferred removal.
 //!
-//! Usage pattern (mirrors the C++ framework): fetch pools and states during
-//! init, clone the `Rc` handles into the task closure, and `borrow_mut()`
-//! inside the task. A `RefCell` borrow panic is the Rust equivalent of a
+//! Usage pattern (mirrors the C++ framework): fetch pools and singletons
+//! during init, clone the handles into the task closure, and
+//! `borrow_mut()` inside the task. A `RefCell` borrow panic is the Rust equivalent of a
 //! C++ TaskFault: it means two tasks (or one task, twice) held the same
 //! pool mutably at the same time.
 
@@ -40,16 +41,53 @@ impl<E: Into<TaskError>> IntoTaskResult for Result<(), E> {
     }
 }
 
-type TaskFn = Box<dyn FnMut(&mut Pm) -> Result<(), TaskError>>;
+/// A unit of work in the loop, with a lifecycle: `start` once on the
+/// first tick it's scheduled, `run` every scheduled tick, `end` once
+/// when it leaves the schedule (`task_stop`, `module_remove`, a fault,
+/// or `loop_run` winding down after `loop_quit`).
+///
+/// State the task works on lives in fields — typically `Rc<RefCell<..>>`
+/// pool/state handles fetched from `&mut Pm` in the constructor. (A
+/// closure task is the same thing implicitly: the compiler builds an
+/// anonymous struct from the captures. This trait just makes the struct
+/// nameable and adds the lifecycle.)
+///
+/// `start` and `run` are fallible; an `Err` benches the task (recorded
+/// in `task_faults`) and the loop survives. `end` still runs on a fault
+/// from `run`, so cleanup is unconditional once a task has started.
+pub trait Task {
+    fn start(&mut self, pm: &mut Pm) -> Result<(), TaskError> {
+        let _ = pm;
+        Ok(())
+    }
+    fn run(&mut self, pm: &mut Pm) -> Result<(), TaskError>;
+    fn end(&mut self, pm: &mut Pm) {
+        let _ = pm;
+    }
+}
 
-struct Task {
+/// Adapter for the closure registration path (`task_fn`): a closure is
+/// a Task whose whole life is `run`. Kept as a named wrapper (instead of
+/// a blanket `impl Task for F`) so closure parameter types infer from
+/// the direct `FnMut` bound — a blanket impl breaks that inference and
+/// can pin the `&mut Pm` lifetime ("not general enough" errors).
+struct FnTask<F>(F);
+
+impl<R: IntoTaskResult, F: FnMut(&mut Pm) -> R> Task for FnTask<F> {
+    fn run(&mut self, pm: &mut Pm) -> Result<(), TaskError> {
+        (self.0)(pm).into_task_result()
+    }
+}
+
+struct TaskEntry {
     name: String,
     module: Option<Rc<str>>,
     priority: f32,
     interval: f32, // 0 = every tick
     accum: f32,
+    started: bool,
     faulted: bool,
-    func: TaskFn,
+    task: Box<dyn Task>,
 }
 
 /// Record of a task that returned `Err` and was benched. The task no
@@ -62,6 +100,44 @@ pub struct TaskFault {
     pub error: String,
 }
 
+/// Handle to a named singleton: one entity in an ordinary pool. Mirrors
+/// the `RefCell` API (`borrow`/`borrow_mut`) so it drops into the same
+/// task-closure pattern as pool handles. `borrow_mut` stamps the
+/// changed-tick, so a synced singleton replicates on write.
+pub struct Single<T> {
+    pool: Rc<RefCell<Pool<T>>>,
+    id: Id,
+}
+
+impl<T> Clone for Single<T> {
+    fn clone(&self) -> Self {
+        Self { pool: self.pool.clone(), id: self.id }
+    }
+}
+
+impl<T: 'static> Single<T> {
+    pub fn id(&self) -> Id {
+        self.id
+    }
+
+    /// The underlying pool (e.g. to register it for sync).
+    pub fn pool(&self) -> &Rc<RefCell<Pool<T>>> {
+        &self.pool
+    }
+
+    pub fn borrow(&self) -> std::cell::Ref<'_, T> {
+        std::cell::Ref::map(self.pool.borrow(), |p| {
+            p.get(self.id).expect("singleton entity was removed")
+        })
+    }
+
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
+        std::cell::RefMut::map(self.pool.borrow_mut(), |p| {
+            p.get_mut_stamped(self.id).expect("singleton entity was removed")
+        })
+    }
+}
+
 /// Cumulative per-task timing, collected by `loop_once` (~80 ns overhead
 /// per task call). Reset with `task_stats_reset`.
 #[derive(Default, Clone, Debug)]
@@ -72,10 +148,9 @@ pub struct TaskStat {
 }
 
 pub struct Pm {
-    states: HashMap<String, Box<dyn Any>>,
     pools: HashMap<String, Box<dyn Any>>,
     erased_pools: Vec<(String, Rc<RefCell<dyn ErasedPool>>)>,
-    tasks: Vec<Task>,
+    tasks: Vec<TaskEntry>,
     tasks_dirty: bool,
     stop_requests: Vec<String>,
     module_stops: Vec<String>,
@@ -83,7 +158,6 @@ pub struct Pm {
     /// registered during that window is tagged as the module's.
     current_module: Option<Rc<str>>,
     pool_owners: HashMap<String, Rc<str>>,
-    state_owners: HashMap<String, Rc<str>>,
     faults: Vec<TaskFault>,
     stats: HashMap<String, TaskStat>,
     ids: IdAllocator,
@@ -110,7 +184,6 @@ pub struct Pm {
 impl Default for Pm {
     fn default() -> Self {
         Self {
-            states: HashMap::new(),
             pools: HashMap::new(),
             erased_pools: Vec::new(),
             tasks: Vec::new(),
@@ -119,7 +192,6 @@ impl Default for Pm {
             module_stops: Vec::new(),
             current_module: None,
             pool_owners: HashMap::new(),
-            state_owners: HashMap::new(),
             faults: Vec::new(),
             stats: HashMap::new(),
             ids: IdAllocator::new(),
@@ -143,23 +215,29 @@ impl Pm {
         Self::default()
     }
 
-    // --- states & pools ------------------------------------------------
+    // --- pools & singletons ---------------------------------------------
 
-    /// Named singleton state. Created (via Default) on first fetch; returns
-    /// a handle to the same instance on re-fetch. A state first created
-    /// while a module is active belongs to that module.
-    pub fn state_get<T: Default + 'static>(&mut self, name: &str) -> Rc<RefCell<T>> {
-        if !self.states.contains_key(name) {
-            if let Some(m) = &self.current_module {
-                self.state_owners.insert(name.to_string(), m.clone());
+    /// Named singleton: a single-entity pool. Created (with one
+    /// `T::default()` entity) on first fetch; re-fetch returns a handle
+    /// to the same entity. There is no separate "state" concept — a
+    /// singleton is ordinary pool state, so it syncs, hot-swaps, and
+    /// tears down with modules like everything else.
+    ///
+    /// Authority rule: only the side that owns a replicated singleton
+    /// may `single()` it (creation adds an entity). A replica fetches
+    /// the pool with `pool_get` and reads the synced entity instead.
+    pub fn single<T: Default + 'static>(&mut self, name: &str) -> Single<T> {
+        let pool = self.pool_get::<T>(name);
+        let existing = pool.borrow().ids().first().copied();
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = self.id_add();
+                pool.borrow_mut().add(id, T::default());
+                id
             }
-            self.states
-                .insert(name.to_string(), Box::new(Rc::new(RefCell::new(T::default()))));
-        }
-        self.states[name]
-            .downcast_ref::<Rc<RefCell<T>>>()
-            .unwrap_or_else(|| panic!("state '{name}' already registered with a different type"))
-            .clone()
+        };
+        Single { pool, id }
     }
 
     /// Named sparse-set component pool. Created on first fetch. A pool
@@ -182,38 +260,57 @@ impl Pm {
 
     // --- tasks ----------------------------------------------------------
 
-    /// Register a task that runs every tick. Lowest priority runs first.
-    /// Tasks added from inside a task start on the next tick.
+    /// Register a [`Task`] that runs every tick. Lowest priority runs
+    /// first. Tasks added from inside a task start on the next tick.
     ///
-    /// The closure may return `()` (infallible) or `Result<(), E>` for any
-    /// boxable error. A task that returns `Err` is benched: it stops
-    /// running, the fault is recorded in `task_faults`, and the loop
-    /// carries on.
-    pub fn task_add<R: IntoTaskResult>(
+    /// A task whose `start` or `run` returns `Err` is benched: it stops
+    /// running (its `end` hook fires if it had started), the fault is
+    /// recorded in `task_faults`, and the loop carries on. For a quick
+    /// closure task without the lifecycle, see [`Pm::task_fn`].
+    pub fn task_add(&mut self, name: &str, priority: f32, task: impl Task + 'static) {
+        self.task_add_every(name, priority, 0.0, task);
+    }
+
+    /// Register a closure as a task — sugar for a [`Task`] that is all
+    /// `run`. The closure may return `()` or `Result<(), E>`.
+    pub fn task_fn<R: IntoTaskResult>(
         &mut self,
         name: &str,
         priority: f32,
         func: impl FnMut(&mut Pm) -> R + 'static,
     ) {
-        self.task_add_every(name, priority, 0.0, func);
+        self.task_add_every(name, priority, 0.0, FnTask(func));
     }
 
-    /// Register a periodic task that runs once per `interval` seconds.
-    pub fn task_add_every<R: IntoTaskResult>(
+    /// Register a closure as a periodic task running once per `interval`
+    /// seconds.
+    pub fn task_fn_every<R: IntoTaskResult>(
         &mut self,
         name: &str,
         priority: f32,
         interval: f32,
-        mut func: impl FnMut(&mut Pm) -> R + 'static,
+        func: impl FnMut(&mut Pm) -> R + 'static,
     ) {
-        self.tasks.push(Task {
+        self.task_add_every(name, priority, interval, FnTask(func));
+    }
+
+    /// Register a periodic task that runs once per `interval` seconds.
+    pub fn task_add_every(
+        &mut self,
+        name: &str,
+        priority: f32,
+        interval: f32,
+        task: impl Task + 'static,
+    ) {
+        self.tasks.push(TaskEntry {
             name: name.to_string(),
             module: self.current_module.clone(),
             priority,
             interval,
             accum: 0.0,
+            started: false,
             faulted: false,
-            func: Box::new(move |pm| func(pm).into_task_result()),
+            task: Box::new(task),
         });
         self.tasks_dirty = true;
     }
@@ -239,11 +336,32 @@ impl Pm {
         self.stats.clear();
     }
 
-    /// Stop a task by name. If called from inside a task, takes effect at
-    /// the end of the current tick.
+    /// Stop a task by name, running its `end` hook. If called from inside
+    /// a task, takes effect at the end of the current tick.
     pub fn task_stop(&mut self, name: &str) {
-        self.tasks.retain(|t| t.name != name);
+        self.tasks_end_where(|t| t.name == name);
         self.stop_requests.push(name.to_string());
+    }
+
+    /// Remove every task matching `pred` from the schedule, running `end`
+    /// on each one that had started. The save/restore of `current_module`
+    /// keeps runtime registrations correctly owned when this runs from
+    /// inside another task.
+    fn tasks_end_where(&mut self, pred: impl Fn(&TaskEntry) -> bool) {
+        let mut i = 0;
+        while i < self.tasks.len() {
+            if pred(&self.tasks[i]) {
+                let mut entry = self.tasks.remove(i);
+                if entry.started {
+                    let prev =
+                        std::mem::replace(&mut self.current_module, entry.module.clone());
+                    entry.task.end(self);
+                    self.current_module = prev;
+                }
+            } else {
+                i += 1;
+            }
+        }
     }
 
     // --- modules ----------------------------------------------------------
@@ -278,7 +396,9 @@ impl Pm {
     /// a new, empty pool. If called from inside a task, the module's
     /// tasks stop at the end of the current tick.
     pub fn module_remove(&mut self, name: &str) {
-        self.tasks.retain(|t| t.module.as_deref() != Some(name));
+        // Tasks first (running their `end` hooks), then pools/states, so
+        // an `end` can still reach the module's data for cleanup.
+        self.tasks_end_where(|t| t.module.as_deref() == Some(name));
         self.module_stops.push(name.to_string());
 
         let pools: Vec<String> = self
@@ -291,17 +411,6 @@ impl Pm {
             self.pool_owners.remove(&pool_name);
             self.pools.remove(&pool_name);
             self.erased_pools.retain(|(n, _)| *n != pool_name);
-        }
-
-        let states: Vec<String> = self
-            .state_owners
-            .iter()
-            .filter(|(_, owner)| &***owner == name)
-            .map(|(n, _)| n.clone())
-            .collect();
-        for state_name in states {
-            self.state_owners.remove(&state_name);
-            self.states.remove(&state_name);
         }
     }
 
@@ -408,31 +517,37 @@ impl Pm {
         // task_add during a tick pushes into the (now empty) self.tasks
         // and is merged back in below, sorted at the start of next tick.
         let mut running = std::mem::take(&mut self.tasks);
-        for task in &mut running {
-            if task.interval > 0.0 {
-                task.accum += dt;
-                if task.accum < task.interval {
+        for entry in &mut running {
+            // Anything the task registers at runtime inherits its module.
+            self.current_module = entry.module.clone();
+            if !entry.started {
+                // First scheduled tick: run `start` (before interval
+                // gating, so even slow periodic tasks set up promptly).
+                match entry.task.start(self) {
+                    Ok(()) => entry.started = true,
+                    Err(err) => {
+                        self.task_fault(entry, &err, "start");
+                        self.current_module = None;
+                        continue;
+                    }
+                }
+            }
+            if entry.interval > 0.0 {
+                entry.accum += dt;
+                if entry.accum < entry.interval {
+                    self.current_module = None;
                     continue;
                 }
-                task.accum -= task.interval;
+                entry.accum -= entry.interval;
             }
-            // Anything the task registers at runtime inherits its module.
-            self.current_module = task.module.clone();
-            let started = Instant::now();
-            let result = (task.func)(self);
-            let ns = started.elapsed().as_nanos() as u64;
+            let started_at = Instant::now();
+            let result = entry.task.run(self);
+            let ns = started_at.elapsed().as_nanos() as u64;
             self.current_module = None;
             if let Err(err) = result {
-                eprintln!("pm: task '{}' faulted at tick {}: {err}", task.name, self.tick);
-                task.faulted = true;
-                self.faults.push(TaskFault {
-                    task: task.name.clone(),
-                    module: task.module.as_deref().map(str::to_string),
-                    tick: self.tick,
-                    error: err.to_string(),
-                });
+                self.task_fault(entry, &err, "run");
             }
-            match self.stats.get_mut(&task.name) {
+            match self.stats.get_mut(&entry.name) {
                 Some(s) => {
                     s.calls += 1;
                     s.ns_total += ns;
@@ -440,21 +555,48 @@ impl Pm {
                 }
                 None => {
                     self.stats
-                        .insert(task.name.clone(), TaskStat { calls: 1, ns_total: ns, ns_max: ns });
+                        .insert(entry.name.clone(), TaskStat { calls: 1, ns_total: ns, ns_max: ns });
                 }
             }
         }
-        running.retain(|t| !t.faulted);
-        running.append(&mut self.tasks);
-        self.tasks = running;
+        // Bench faulted tasks, running `end` on those that had started.
+        let mut kept = Vec::with_capacity(running.len());
+        for mut entry in running {
+            if entry.faulted {
+                if entry.started {
+                    let prev =
+                        std::mem::replace(&mut self.current_module, entry.module.clone());
+                    entry.task.end(self);
+                    self.current_module = prev;
+                }
+            } else {
+                kept.push(entry);
+            }
+        }
+        kept.append(&mut self.tasks);
+        self.tasks = kept;
         for name in std::mem::take(&mut self.stop_requests) {
-            self.tasks.retain(|t| t.name != name);
+            self.tasks_end_where(|t| t.name == name);
         }
         for name in std::mem::take(&mut self.module_stops) {
-            self.tasks.retain(|t| t.module.as_deref() != Some(name.as_str()));
+            self.tasks_end_where(|t| t.module.as_deref() == Some(name.as_str()));
         }
 
         self.id_process_removes();
+    }
+
+    fn task_fault(&mut self, entry: &mut TaskEntry, err: &TaskError, hook: &str) {
+        eprintln!(
+            "pm: task '{}' faulted in {hook} at tick {}: {err}",
+            entry.name, self.tick
+        );
+        entry.faulted = true;
+        self.faults.push(TaskFault {
+            task: entry.name.clone(),
+            module: entry.module.as_deref().map(str::to_string),
+            tick: self.tick,
+            error: err.to_string(),
+        });
     }
 
     /// Run the loop at `loop_rate` ticks per second until `loop_quit`.
@@ -509,5 +651,8 @@ impl Pm {
                 deadline = now;
             }
         }
+        // The loop is over: drain the schedule, running every started
+        // task's `end` hook — shutdown is teardown, symmetric to `start`.
+        self.tasks_end_where(|_| true);
     }
 }

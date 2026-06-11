@@ -105,9 +105,9 @@ struct Garage(HashMap<u8, Id>); // peer -> vehicle
 fn run_server(quiet: bool) {
     let mut pm = Pm::new();
     let car = pm.pool_get::<Car>("car");
-    let inbox = pm.state_get::<Inbox>("inbox");
-    let last_cmd = pm.state_get::<LastCmd>("last_cmd");
-    let garage = pm.state_get::<Garage>("garage");
+    let inbox = pm.single::<Inbox>("inbox");
+    let last_cmd = pm.single::<LastCmd>("last_cmd");
+    let garage = pm.single::<Garage>("garage");
 
     let mut net = NetServer::new(&mut pm);
     net.pool_sync("car", &car);
@@ -122,7 +122,7 @@ fn run_server(quiet: bool) {
         eprintln!("pm demo server on {ADDR}");
     }
 
-    pm.task_add("net", 5.0, {
+    pm.task_fn("net", 5.0, {
         let car = car.clone();
         let inbox = inbox.clone();
         let last_cmd = last_cmd.clone();
@@ -179,7 +179,8 @@ fn run_server(quiet: bool) {
             }
             let peers: Vec<u8> = net.peers().collect();
             for p in peers {
-                if let Some(snap) = net.snapshot(pm, p) {
+                let budget = quic.snapshot_budget(p);
+                if let Some(snap) = net.snapshot_budgeted(pm, p, budget) {
                     quic.snapshot_send(p, &snap);
                 }
             }
@@ -187,7 +188,7 @@ fn run_server(quiet: bool) {
         }
     });
 
-    pm.task_add("drive", 30.0, {
+    pm.task_fn("drive", 30.0, {
         let car = car.clone();
         let inbox = inbox.clone();
         let last_cmd = last_cmd.clone();
@@ -216,7 +217,7 @@ fn run_server(quiet: bool) {
 
     // Dedicated-server profiling: task table every 5 seconds.
     if !quiet {
-        pm.task_add_every("prof", 90.0, 5.0, {
+        pm.task_fn_every("prof", 90.0, 5.0, {
             let mut prev: HashMap<String, pm::TaskStat> = HashMap::new();
             move |pm| {
                 eprintln!("-- task stats (last 5s) --");
@@ -249,7 +250,7 @@ fn run_bot(phase: f32) {
     net.pool_sync("car", &car);
     let Ok(mut quic) = QuicClient::connect(ADDR, &net.schema()) else { return };
 
-    pm.task_add("net", 5.0, move |pm| {
+    pm.task_fn("net", 5.0, move |pm| {
         quic.pump();
         if quic.is_gone() {
             pm.loop_quit();
@@ -364,13 +365,13 @@ fn add_client_tasks(
     car: &Rc<RefCell<Pool<Car>>>,
     draw: &Rc<RefCell<Pool<Car>>>,
 ) {
-    let cmd = pm.state_get::<CurCmd>("cmd");
-    let pred = pm.state_get::<Pred>("pred");
-    let stats = pm.state_get::<Stats>("stats");
+    let cmd = pm.single::<CurCmd>("cmd");
+    let pred = pm.single::<Pred>("pred");
+    let stats = pm.single::<Stats>("stats");
     let car = car.clone();
     let draw = draw.clone();
 
-    pm.task_add("net", 5.0, {
+    pm.task_fn("net", 5.0, {
         let cmd = cmd.clone();
         let pred = pred.clone();
         let car = car.clone();
@@ -472,7 +473,7 @@ fn add_client_tasks(
     // response); remote cars dead-reckon along their last known velocity
     // and ease toward fresh server state as it arrives. A jump wider than
     // the world means a wrap — snap instead of streaking across.
-    pm.task_add("smooth", 30.0, {
+    pm.task_fn("smooth", 30.0, {
         let car = car.clone();
         let draw = draw.clone();
         let pred = pred.clone();
@@ -515,7 +516,7 @@ fn add_client_tasks(
 
     // Profiling panel data: per-second deltas of the kernel task stats,
     // plus any drop-in probes on this thread.
-    pm.task_add_every("prof", 55.0, 1.0, {
+    pm.task_fn_every("prof", 55.0, 1.0, {
         let stats = stats.clone();
         let mut prev: HashMap<String, pm::TaskStat> = HashMap::new();
         move |pm| {
@@ -548,9 +549,9 @@ fn run_player() {
     let mut pm = Pm::new();
     let car = pm.pool_get::<Car>("car"); // net state from the server (synced)
     let draw = pm.pool_get::<Car>("car_draw"); // display state (local)
-    let keys = pm.state_get::<Keys>("keys");
-    let cmd = pm.state_get::<CurCmd>("cmd");
-    let stats = pm.state_get::<Stats>("stats");
+    let keys = pm.single::<Keys>("keys");
+    let cmd = pm.single::<CurCmd>("cmd");
+    let stats = pm.single::<Stats>("stats");
 
     let mut net = NetClient::new();
     net.pool_sync("car", &car);
@@ -561,7 +562,7 @@ fn run_player() {
 
     // Keyboard first in the tick so this tick's input rides this tick's
     // datagram.
-    pm.task_add("keys", 4.0, {
+    pm.task_fn("keys", 4.0, {
         let keys = keys.clone();
         let cmd = cmd.clone();
         let stats = stats.clone();
@@ -602,7 +603,7 @@ fn run_player() {
     });
 
 
-    pm.task_add_every("render", 50.0, 1.0 / 30.0, {
+    pm.task_fn_every("render", 50.0, 1.0 / 30.0, {
         let draw = draw.clone();
         let stats = stats.clone();
         move |pm| {

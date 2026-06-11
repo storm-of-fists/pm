@@ -34,7 +34,7 @@ fn main() {
 
     let pos = pm.pool_get::<Pos>("pos");
     let vel = pm.pool_get::<Vel>("vel");
-    let sim = pm.state_get::<Sim>("sim");
+    let sim = pm.single::<Sim>("sim");
     sim.borrow_mut().ticks_left = TICKS;
 
     for i in 0..ENTITIES {
@@ -45,7 +45,7 @@ fn main() {
     }
 
     // Join pattern: iterate one pool, look the other up by id.
-    pm.task_add("physics", 30.0, {
+    pm.task_fn("physics", 30.0, {
         let pos = pos.clone();
         let vel = vel.clone();
         move |pm| {
@@ -61,7 +61,7 @@ fn main() {
         }
     });
 
-    pm.task_add("control", 100.0, {
+    pm.task_fn("control", 100.0, {
         let sim = sim.clone();
         move |pm| {
             let mut sim = sim.borrow_mut();

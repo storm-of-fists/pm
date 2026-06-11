@@ -149,6 +149,20 @@ impl<T> Pool<T> {
         &self.values
     }
 
+    /// Change-tick per entry, parallel to `ids()`/`values()` (sync layer).
+    pub(crate) fn changed_ticks(&self) -> &[u32] {
+        &self.changed
+    }
+
+    /// Plain `&mut` access that stamps the changed-tick immediately —
+    /// the `Single` handle's mutable path. Prefer `get_mut` (write-gated
+    /// stamping) for entity iteration.
+    pub(crate) fn get_mut_stamped(&mut self, id: Id) -> Option<&mut T> {
+        let idx = self.dense_index(id)?;
+        self.changed[idx] = self.tick;
+        Some(&mut self.values[idx])
+    }
+
     /// Read-only iteration over (id, value) pairs in dense order.
     pub fn iter(&self) -> impl Iterator<Item = (Id, &T)> {
         self.ids.iter().copied().zip(self.values.iter())

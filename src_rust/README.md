@@ -26,6 +26,25 @@ everything in one process). Feel a real link on the player's connection:
 PM_LAG_MS=80 PM_LOSS=0.05 cargo run --release --example demo
 ```
 
+**hellfire** is the bigger example — the C++ flagship game ported: a
+networked top-down wave shooter (authoritative headless server, up to 8
+players, 5 score-gated monster waves to 8000 points, sprite rendering
+with hot-reload, mouse-aim command-frame input):
+
+```bash
+cargo run --release --features sdl --example hellfire           # play: server + 3 bots + you
+cargo run --release --example hellfire server                   # dedicated server
+cargo run --release --features sdl --example hellfire client    # join 127.0.0.1
+cargo run --release --example hellfire bot 4                    # headless bot
+```
+
+WASD moves, mouse aims, left-click/space shoots, R restarts after game
+over, Esc quits. Edit `examples/hellfire/resources/*.png` while it runs
+to see sprite hot-reload. Monsters/bullets are change-dense pools
+streaming through the snapshot byte budget; players/status/roster are
+change-sparse and converge — same replication mechanism (see Networking
+model).
+
 ## Profiling
 
 - `pm.task_stats()` — always-on per-task timing (calls / total / max ns),
@@ -43,8 +62,9 @@ PM_LAG_MS=80 PM_LOSS=0.05 cargo run --release --example demo
 |-----|------|-------|
 | `pm.pool_get<T>("name")` → `Pool<T>*` | `pm.pool_get::<T>("name")` → `Rc<RefCell<Pool<T>>>` | Clone the handle into the task closure at init, `borrow_mut()` inside the task |
 | `pm.state_get<T>("name")` → `T*` | `pm.state_get::<T>("name")` → `Rc<RefCell<T>>` | Same singleton-on-refetch behavior; `T: Default` |
-| `pm.task_add(name, prio, lambda)` | `pm.task_add(name, prio, closure)` | Same flat priority scheduler, lowest first |
-| `pm.task_add(name, prio, interval, fn)` | `pm.task_add_every(name, prio, interval, fn)` | |
+| `pm.task_add(name, prio, lambda)` | `pm.task_fn(name, prio, closure)` | Same flat priority scheduler, lowest first |
+| `pm.task_add(name, prio, interval, fn)` | `pm.task_fn_every(name, prio, interval, fn)` | |
+| — | `pm.task_add(name, prio, impl Task)` | **New:** struct tasks with a `start`/`run`/`end` lifecycle; handles live in named fields. Closures are the same thing implicitly (captures = fields), so `task_fn` is sugar over the same machinery |
 | `pool->each(fn)` + `PoolEntry::get_mut()` | `pool.iter()` (reads) / `pool.iter_mut()` (writes) | `iter_mut` yields `Mut` handles — exact `PoolEntry` semantics: stamped changed only when written through |
 | `pool->get(id)` → `PoolEntry` | `pool.get(id)` / `pool.get_mut(id)` → `Option<&T>` / `Option<Mut<T>>` | `Mut` derefs like `&mut T`, stamps the changed-tick on mutable deref only |
 | `pool->change_count(id)` | `pool.changed_tick(id)` / `pool.changed_since(tick)` | Tick stamps instead of counters — a peer's whole view state is one acked tick (see Networking model below) |
@@ -67,6 +87,25 @@ PM_LAG_MS=80 PM_LOSS=0.05 cargo run --release --example demo
 - **Tasks take `&mut Pm`.** The scheduler moves the task list out of `Pm`
   during a tick so tasks can borrow the kernel mutably (`id_add`, `loop_dt`,
   `task_add`, `loop_quit`). Tasks added mid-tick start next tick.
+- **Tasks are `Box<dyn Task>` with a lifecycle.** `start` runs once on the
+  first scheduled tick (fallible — an `Err` benches the task before it
+  ever runs), `run` every scheduled tick, `end` exactly once when the
+  task leaves the schedule (`task_stop`, `module_remove`, a fault from
+  `run`, or `loop_run` draining the schedule after `loop_quit`). Pool and
+  state handles live in fields, fetched in the constructor or in `start`.
+  Closure tasks (`task_fn`) wrap into the same machinery — a closure *is*
+  an anonymous struct of its captures, so the two registration paths are
+  performance-identical (~80 ns/tick fixed overhead either way; see
+  `examples/taskbench.rs`). `task_fn` keeps a direct `FnMut` bound rather
+  than a blanket `impl Task for F` because closure parameter inference
+  and higher-ranked lifetimes only work through `Fn`-family bounds.
+- **Tasks report failure as values, not panics.** `start`/`run` return
+  `Result<(), TaskError>`; closures may return `()` or `Result` (the
+  `IntoTaskResult` conversion trait — axum-handler-style return
+  polymorphism). A faulted task lands in `pm.task_faults()` with its
+  module, tick, and error; the loop survives. Deliberately no
+  `catch_unwind`: a panic (e.g. a `RefCell` double-borrow) is a bug and
+  stays loud.
 
 ## Networking model (implemented)
 
@@ -76,9 +115,24 @@ is now code, summarized here:
 
 - **Tick-versioned change tracking.** The kernel tick stamps every pool
   entry on insert/mutation (`Mut` guard: stamped only when written
-  through). A peer's entire view state is one u32 ack cursor; a snapshot
-  is `changed_since(acked)` per synced pool plus removals since. Adds are
-  upserts — snapshots are idempotent, loss just means resend.
+  through). Adds are upserts — snapshots are idempotent, loss just means
+  resend.
+- **Per-entity confirmation, byte-budgeted snapshots.** Per peer and
+  entity slot the server tracks the confirmed change-tick (peer acked a
+  snapshot carrying it) and the in-flight one (sent, ack pending); an
+  entry packs when it has changed past both, in rotation order, until
+  the budget (`snapshot_budgeted` + `QuicServer::snapshot_budget`) runs
+  out. An ack confirms exactly that snapshot's entries and declares
+  older unacked snapshots lost (entries resend); a silent ack gap
+  expires in-flight state after 60 ticks. This one mechanism covers both
+  replication temperaments: change-sparse pools converge to silence
+  (delta), change-dense pools larger than the budget stream through it
+  round-robin with bounded staleness that dead reckoning hides (the
+  Tribes prioritized-replication shape, vs Quake 3's per-client
+  snapshot diffs). No per-pool mode setting — behavior emerges from
+  change density vs budget. If bandwidth ever pinches, quantize by
+  making the synced pool's component type compact (i16 positions); the
+  replicated pool *is* the wire format.
 - **Removal log gates id recycling.** Removed indices return to the free
   list only after every peer acked the removal, so a recycled id can never
   race its predecessor's death on the wire. Generational ids catch stale
@@ -98,12 +152,12 @@ is now code, summarized here:
   request needs no message: state never confirms it and reconciliation
   rolls it back.
 
-Known limits, deliberate until a workload demands them: snapshots must fit
-one datagram (~1200 B; `oversize_drops` counts violations — fragmentation
-or per-object packets later); per-peer delta gather is O(entities) per net
-tick (dirty lists if profiles ever say so); interest management,
-lag-compensation history, bandwidth budgeting, and reconnect/peer-id
-reassignment are future sync-layer work; u32 ticks last ~2.2 years.
+Known limits, deliberate until a workload demands them: per-peer pack
+scan is O(entities) per net tick (dirty lists if profiles ever say so);
+removals always pack in full (tiny, but unbounded in principle); interest
+management, lag-compensation history, per-pool priority weights, and
+reconnect/peer-id reassignment are future sync-layer work; u32 ticks
+last ~2.2 years.
 
 ## Threaded stores (design sketch, not built)
 
@@ -146,7 +200,11 @@ entities.)
 ## Roadmap
 
 Multiplayer sync is the core concern and came first — the model is
-implemented (see Networking model above).
+implemented (see Networking model above). The hellfire port (first cut)
+landed: server/client/bot modes on the QUIC stack, struct tasks with
+the start/run/end lifecycle, sprite hot-reload. Still missing from C++
+parity: menu/lobby UI, bitmap-font text + debug overlay, diag JSON
+reports + smoke script, camera zoom/follow, mod hot-reload (item 12).
 
 1. ~~**Sync foundations**~~ — DONE: kernel tick + removal-log-gated id
    recycling, generational ids, `changed_tick` + `Mut` guard,
@@ -177,8 +235,12 @@ implemented (see Networking model above).
    rolls the module back. The unit game features compose from, and
    the unit mods load as). Still open: `remove_all` (deferred),
    `clear_world`, typed event queues, join iterator (`each_with`)
-6. **Math + util** — Vec2, Rng (xorshift32), Hysteresis/Cooldown/Latch/
-   edges, spatial grid (port of `pm_spatial_grid.hpp`)
+6. ~~**Math + util**~~ — DONE: `Vec2` (std::ops operators, `Pod` so it
+   nests in replicated components), `Rng` (xorshift32), the PLC helpers
+   (Hysteresis/Cooldown/DelayTimer/RisingEdge/FallingEdge/Latch/Counter),
+   and `SpatialGrid` (one cell per entity, exact-distance query, zero
+   steady-state allocation) — straight ports of pm_math/pm_util/
+   pm_spatial_grid with unit tests
 7. **Benchmarks** — threshold-based regression gates like the C++ suite
 8. **Parallel iteration** — rayon over dense slices behind an explicit opt-in
 9. ~~**SDL3**~~ — DONE (first cut): `sdl3` crate behind the `sdl`
@@ -189,9 +251,12 @@ implemented (see Networking model above).
    X11/Wayland dev headers (notably libxtst-dev, libxss-dev).
 10. **Threaded stores** — explicit opt-in shared state between `Pm`
     threads with passive phase alignment (see design sketch above)
-11. **Assets & debug** — sprite loading with mtime hot-reload
-    (`pm_sprite.hpp` parity), on-screen debug overlay (task table, entity
-    stats) on top of the existing `task_stats`/probe machinery
+11. **Assets & debug** — partly DONE: ~~sprite loading with mtime
+    hot-reload~~ (`pm::Sprite` behind the `sdl` feature: pure-Rust `png`
+    decode — no SDL3_image build dep — `unsafe_textures` for storable
+    textures, `changed()`/`reload()` keep the old texture when a load
+    fails mid-save). Still open: on-screen debug overlay (task table,
+    entity stats) on top of the existing `task_stats`/probe machinery
 12. **Mods** — tiered, built on the module system (item 5) + threaded
     store (item 10):
     - *Tier 1 — store mods (the default):* a mod is a dylib exposing one

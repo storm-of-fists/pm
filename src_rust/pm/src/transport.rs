@@ -465,6 +465,18 @@ impl QuicServer {
         std::mem::take(&mut self.events)
     }
 
+    /// How many snapshot bytes fit in one datagram to `peer` right now
+    /// (~1200 until MTU discovery raises it). Feed this to
+    /// `NetServer::snapshot_budgeted` so snapshots never oversize.
+    pub fn snapshot_budget(&mut self, peer: u8) -> usize {
+        self.peer_conns
+            .get(&peer)
+            .and_then(|ch| self.conns.get_mut(ch))
+            .and_then(|st| st.conn.datagrams().max_size())
+            .map(|m| m.saturating_sub(1)) // DGRAM_SNAPSHOT type byte
+            .unwrap_or(1100)
+    }
+
     /// Send a snapshot as an unreliable datagram. Oversize snapshots are
     /// dropped and counted — keep synced state per snapshot under the
     /// datagram limit (~1200 bytes until MTU discovery raises it).

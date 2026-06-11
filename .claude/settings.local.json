@@ -22,7 +22,9 @@
       "Read(//tmp/**)",
       "Bash(pkill -f 'examples/demo')",
       "Bash(timeout -s KILL 10 ./target/release/examples/demo)",
-      "Bash(pkill -x demo)"
+      "Bash(pkill -x demo)",
+      "Bash(SDL_VIDEODRIVER=dummy timeout -s KILL 8 ./target/release/examples/demo)",
+      "Bash(echo \"exit: $?\")"
     ]
   }
 }

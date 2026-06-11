@@ -39,11 +39,11 @@ pub fn run() {
     let mut canvas = window.into_canvas();
     let mut pump = sdl.event_pump().expect("event pump");
 
-    let cmd = pm.state_get::<CurCmd>("cmd");
-    let stats = pm.state_get::<Stats>("stats");
+    let cmd = pm.single::<CurCmd>("cmd");
+    let stats = pm.single::<Stats>("stats");
 
     // Real key-up events at last: held state read once per tick.
-    pm.task_add("input", 4.0, {
+    pm.task_fn("input", 4.0, {
         let cmd = cmd.clone();
         move |pm| {
             for ev in pump.poll_iter() {
@@ -74,7 +74,7 @@ pub fn run() {
         }
     });
 
-    pm.task_add("render", 50.0, {
+    pm.task_fn("render", 50.0, {
         let draw = draw.clone();
         let stats = stats.clone();
         move |pm| {
