@@ -12,7 +12,7 @@ mod pool;
 mod transport;
 
 pub use id::Id;
-pub use kernel::{Pm, TaskStat};
+pub use kernel::{IntoTaskResult, Pm, TaskError, TaskFault, TaskStat};
 pub use net::{Applied, NetClient, NetError, NetServer};
 pub use pool::{Mut, Pool};
 pub use transport::{EVENT_USER_BASE, QuicClient, QuicServer};

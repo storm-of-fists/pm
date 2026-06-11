@@ -2,7 +2,7 @@
 //!
 //! No async runtime and no net thread — quinn-proto is a sans-IO state
 //! machine, so a pm task pumps a non-blocking UDP socket through it every
-//! tick. Channel assignment per SYNC_DESIGN.md:
+//! tick. Channel assignment per the README networking notes:
 //!
 //! - unreliable datagrams: snapshots (server -> client), acks and later
 //!   input (client -> server)
@@ -22,7 +22,7 @@ use bytes::BytesMut;
 use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn_proto::{
     ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig,
-    Event, ServerConfig, StreamEvent, StreamId, TransportConfig,
+    Event, IdleTimeout, ServerConfig, StreamEvent, StreamId, TransportConfig,
 };
 
 const ALPN: &[u8] = b"pm/1";
@@ -124,7 +124,11 @@ fn transmits_flush(conn: &mut Connection, socket: &mut LagSocket, now: Instant) 
 
 fn transport_config() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
+    // Live connections ping every 2s; anything silent for 5s is dead and
+    // gets reaped (ConnectionLost -> left_drain), so a killed client's
+    // entities don't linger server-side.
     tc.keep_alive_interval(Some(Duration::from_secs(2)));
+    tc.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(5)).unwrap()));
     Arc::new(tc)
 }
 
@@ -247,7 +251,7 @@ pub struct QuicServer {
     acks: Vec<(u8, u32)>,
     inputs: Vec<(u8, u32, Vec<u8>)>,
     events: Vec<(u8, u16, Vec<u8>)>,
-    /// Snapshots dropped for exceeding the datagram size (see SYNC_DESIGN).
+    /// Snapshots dropped for exceeding the datagram size (see README).
     pub oversize_drops: u32,
 }
 

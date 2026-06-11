@@ -226,3 +226,40 @@ fn converges_under_lag_and_loss() {
     assert!(converged, "did not converge under 15ms lag + 15% loss");
     assert!(cquic.rtt() >= Duration::from_millis(25), "RTT should reflect the simulated lag");
 }
+
+#[test]
+fn dead_clients_are_reaped_by_idle_timeout() {
+    let mut spm = Pm::new();
+    let s_pos = spm.pool_get::<Pos>("pos");
+    let mut snet = NetServer::new(&mut spm);
+    snet.pool_sync("pos", &s_pos);
+    let mut squic = QuicServer::bind("127.0.0.1:0", &snet.schema()).expect("bind");
+    let addr = squic.local_addr().unwrap().to_string();
+
+    let mut cpm = Pm::new();
+    let c_pos = cpm.pool_get::<Pos>("pos");
+    let mut cnet = NetClient::new();
+    cnet.pool_sync("pos", &c_pos);
+    let mut cquic = Some(QuicClient::connect(&addr, &cnet.schema()).expect("connect"));
+
+    let mut joined = None;
+    let mut reaped = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        squic.pump();
+        if let Some(p) = squic.joined_drain().pop() {
+            joined = Some(p);
+            cquic = None; // client process "dies": no close, just silence
+        }
+        if let Some(p) = squic.left_drain().pop() {
+            reaped = Some(p);
+            break;
+        }
+        if let Some(c) = cquic.as_mut() {
+            c.pump();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(joined.is_some(), "client never connected");
+    assert_eq!(reaped, joined, "dead client must be reaped by idle timeout");
+}

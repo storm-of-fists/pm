@@ -2,7 +2,7 @@
 //! Transport-agnostic — `NetServer` produces byte buffers and `NetClient`
 //! consumes them; QUIC (quinn-proto) will carry them later.
 //!
-//! Model (SYNC_DESIGN.md): per peer the server keeps one cursor,
+//! Model (the README networking notes): per peer the server keeps one cursor,
 //! `acked_tick`. A snapshot for a peer carries every synced-pool entry
 //! changed since that cursor plus every logged removal since it. Acks
 //! advance the cursor; a lost snapshot just means the next one re-carries
