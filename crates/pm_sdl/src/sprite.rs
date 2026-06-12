@@ -135,7 +135,7 @@ mod tests {
             [("connor-front.png", 148, 272), ("connor-back.png", 147, 270)]
         {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../examples/hellfire/resources")
+                .join("../../examples/hellfire/game/resources")
                 .join(name);
             let (dw, dh, rgba) = decode_png(&path).expect(name);
             assert_eq!((dw, dh), (w, h));

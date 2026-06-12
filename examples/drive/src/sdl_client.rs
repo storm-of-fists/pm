@@ -50,22 +50,7 @@ pub fn run() {
     let chase = pm.single::<Chase>("chase");
     let draw_pool = draw.clone();
 
-    let sdl = sdl3::init().expect("sdl init");
-    let video = sdl.video().expect("sdl video");
-    let mut window = video
-        .window("pm drive — wasd, esc quits", W, H)
-        .position_centered()
-        .build()
-        .expect("window");
-    let mut pump = sdl.event_pump().expect("event pump");
-
-    let refresh = window
-        .get_display()
-        .and_then(|d| d.get_mode())
-        .map(|m| m.refresh_rate.round() as u32)
-        .unwrap_or(60)
-        .max(30);
-
+    let (mut window, mut pump, refresh) = pm_sdl::window("pm drive — wasd, esc quits", W, H);
     let mut r3d = Renderer3d::new(&window).expect("renderer");
     r3d.fog_distance = 160.0;
     let ground = r3d
@@ -93,7 +78,7 @@ pub fn run() {
         ))
         .expect("wall");
 
-    pm.task_add("input", 4.0, {
+    pm.task_add("input", 4.0, 0.0, {
         let cmd = cmd.clone();
         move |pm| {
             for ev in pump.poll_iter() {
@@ -113,7 +98,7 @@ pub fn run() {
     });
 
     // Chase camera: spring toward a point behind the predicted car.
-    pm.task_add("camera", 35.0, {
+    pm.task_add("camera", 35.0, 0.0, {
         let chase = chase.clone();
         let pred = pred.clone();
         move |pm| {
@@ -132,7 +117,7 @@ pub fn run() {
         }
     });
 
-    pm.task_add("render", 70.0, {
+    pm.task_add("render", 70.0, 0.0, {
         let chase = chase.clone();
         let stats = stats.clone();
         move |pm| {

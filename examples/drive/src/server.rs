@@ -32,7 +32,7 @@ pub fn run(quiet: bool) {
     let out = pm.single::<ServerOutbox>("net.out");
 
     // Joins and leaves: a car per peer (prio 10 — after the net task).
-    pm.task_add("roster", 10.0, {
+    pm.task_add("roster", 10.0, 0.0, {
         let car = car.clone();
         let garage = garage.clone();
         move |pm| {
@@ -56,7 +56,7 @@ pub fn run(quiet: bool) {
         }
     });
 
-    pm.task_add("drive", 30.0, {
+    pm.task_add("drive", 30.0, 0.0, {
         let car = car.clone();
         let garage = garage.clone();
         move |_pm| {
@@ -75,7 +75,7 @@ pub fn run(quiet: bool) {
     });
 
     if !quiet {
-        pm.task_add_every("status", 90.0, 5.0, {
+        pm.task_add("status", 90.0, 5.0, {
             let car = car.clone();
             move |pm| {
                 let cars = car.borrow();

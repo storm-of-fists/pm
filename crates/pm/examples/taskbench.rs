@@ -31,7 +31,7 @@ fn main() {
     let pool = pm.pool::<P>("p");
     let id = pm.id_add();
     pool.borrow_mut().add(id, P::default());
-    pm.task_add("borrow", 1.0, {
+    pm.task_add("borrow", 1.0, 0.0, {
         let pool = pool.clone();
         move |_| {
             pool.borrow_mut().get_mut(id).unwrap().x += 1.0;
@@ -44,7 +44,7 @@ fn main() {
     let pool = pm.pool::<P>("p");
     let id = pm.id_add();
     pool.borrow_mut().add(id, P::default());
-    pm.task_add("try", 1.0, {
+    pm.task_add("try", 1.0, 0.0, {
         let pool = pool.clone();
         move |_| -> Result<(), TaskError> {
             pool.try_mut(id)?.x += 1.0;
@@ -56,7 +56,7 @@ fn main() {
     // Singleton access.
     let mut pm = Pm::new();
     let single = pm.single::<P>("p");
-    pm.task_add("single", 1.0, {
+    pm.task_add("single", 1.0, 0.0, {
         let single = single.clone();
         move |_| {
             single.borrow_mut().x += 1.0;
@@ -66,6 +66,6 @@ fn main() {
 
     // Empty task: scheduler floor.
     let mut pm = Pm::new();
-    pm.task_add("empty", 1.0, |_| {});
+    pm.task_add("empty", 1.0, 0.0, |_| {});
     bench("empty task (floor)", pm);
 }

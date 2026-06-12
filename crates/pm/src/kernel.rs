@@ -339,22 +339,13 @@ impl Pm {
 
     // --- tasks ----------------------------------------------------------
 
-    /// Register a task that runs every tick. Lowest priority runs first;
-    /// tasks added from inside a task start on the next tick. A task is
-    /// a closure over its captures (pool/singleton handles, counters,
-    /// sockets...). It may return `()` or `Result<(), E>`; returning
-    /// `Err` benches it — recorded in `task_faults`, loop survives.
+    /// Register a task. Lowest priority runs first; `interval` is
+    /// seconds between runs (0.0 = every tick); tasks added from inside
+    /// a task start on the next tick. A task is a closure over its
+    /// captures (pool/singleton handles, counters, sockets...). It may
+    /// return `()` or `Result<(), E>`; returning `Err` benches it —
+    /// recorded in `task_faults`, loop survives.
     pub fn task_add<R: IntoTaskResult>(
-        &mut self,
-        name: &str,
-        priority: f32,
-        func: impl FnMut(&mut Pm) -> R + 'static,
-    ) {
-        self.task_add_every(name, priority, 0.0, func);
-    }
-
-    /// Register a periodic task that runs once per `interval` seconds.
-    pub fn task_add_every<R: IntoTaskResult>(
         &mut self,
         name: &str,
         priority: f32,
@@ -477,7 +468,7 @@ impl Pm {
     }
 
     /// Accept a remote id (networking): mark alive, record its generation.
-    pub fn id_sync(&mut self, id: Id) {
+    pub(crate) fn id_sync(&mut self, id: Id) {
         self.ids.sync(id);
     }
 

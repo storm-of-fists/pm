@@ -84,7 +84,7 @@ pub fn run(quiet: bool) {
     }
 
     // --- lobby: joins, leaves, reliable events (prio 10, after net) ----
-    pm.task_add("lobby", 10.0, {
+    pm.task_add("lobby", 10.0, 0.0, {
         let game = game.clone();
         let player = player.clone();
         let player_srv = player_srv.clone();
@@ -162,7 +162,7 @@ pub fn run(quiet: bool) {
     });
 
     // --- player movement + shooting (prio 29) --------------------------
-    pm.task_add("player_move", 29.0, {
+    pm.task_add("player_move", 29.0, 0.0, {
         let game = game.clone();
         let player = player.clone();
         let player_srv = player_srv.clone();
@@ -219,7 +219,7 @@ pub fn run(quiet: bool) {
     });
 
     // --- spawning + level progression (prio 28) ------------------------
-    pm.task_add("spawn", 28.0, {
+    pm.task_add("spawn", 28.0, 0.0, {
         let game = game.clone();
         let player = player.clone();
         let player_srv = player_srv.clone();
@@ -325,7 +325,7 @@ pub fn run(quiet: bool) {
     });
 
     // --- bullet physics (prio 30) ---------------------------------------
-    pm.task_add("bullet_phys", 30.0, {
+    pm.task_add("bullet_phys", 30.0, 0.0, {
         let game = game.clone();
         let bullet = bullet.clone();
         let bullet_srv = bullet_srv.clone();
@@ -349,7 +349,7 @@ pub fn run(quiet: bool) {
     });
 
     // --- monster AI (prio 31) --------------------------------------------
-    pm.task_add("monster_ai", 31.0, {
+    pm.task_add("monster_ai", 31.0, 0.0, {
         let game = game.clone();
         let player = player.clone();
         let monster = monster.clone();
@@ -405,7 +405,7 @@ pub fn run(quiet: bool) {
     });
 
     // --- collision (prio 50) ----------------------------------------------
-    pm.task_add("collision", 50.0, {
+    pm.task_add("collision", 50.0, 0.0, {
         let game = game.clone();
         let player = player.clone();
         let player_srv = player_srv.clone();
@@ -501,7 +501,7 @@ pub fn run(quiet: bool) {
     });
 
     // --- cleanup out-of-bounds (prio 55) ---------------------------------
-    pm.task_add("cleanup", 55.0, {
+    pm.task_add("cleanup", 55.0, 0.0, {
         let game = game.clone();
         let monster = monster.clone();
         let bullet = bullet.clone();
@@ -525,7 +525,7 @@ pub fn run(quiet: bool) {
     });
 
     // --- publish status (prio 60): write only on change -------------------
-    pm.task_add("status_pub", 60.0, {
+    pm.task_add("status_pub", 60.0, 0.0, {
         let game = game.clone();
         let status = status.clone();
         move |_pm| {
@@ -580,7 +580,7 @@ pub fn run(quiet: bool) {
     });
 
     // --- replicated diagnostics + diag sampling (1 Hz, prio 61) -----------
-    pm.task_add_every("dbg_pub", 61.0, 1.0, {
+    pm.task_add("dbg_pub", 61.0, 1.0, {
         let game = game.clone();
         let dbg = dbg.clone();
         let monster = monster.clone();
@@ -605,7 +605,7 @@ pub fn run(quiet: bool) {
     });
 
     if !quiet {
-        pm.task_add_every("status_print", 99.0, 5.0, {
+        pm.task_add("status_print", 99.0, 5.0, {
             let game = game.clone();
             let monster = monster.clone();
             let bullet = bullet.clone();
@@ -651,7 +651,7 @@ pub fn run(quiet: bool) {
         );
         mods.watch(path);
     }
-    pm.task_add_every("mods", 2.0, 1.0, move |pm| mods.poll(pm));
+    pm.task_add("mods", 2.0, 1.0, move |pm| mods.poll(pm));
 
     pm.loop_rate = 60;
     pm.loop_run();

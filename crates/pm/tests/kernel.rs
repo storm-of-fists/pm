@@ -38,7 +38,7 @@ fn tasks_run_in_priority_order() {
     let order = Rc::new(RefCell::new(Vec::new()));
     for (name, prio) in [("c", 30.0), ("a", 10.0), ("b", 20.0)] {
         let order = order.clone();
-        pm.task_add(name, prio, move |_| order.borrow_mut().push(name));
+        pm.task_add(name, prio, 0.0, move |_| order.borrow_mut().push(name));
     }
     pm.loop_once(1.0 / 60.0);
     assert_eq!(*order.borrow(), vec!["a", "b", "c"]);
@@ -53,7 +53,7 @@ fn the_canonical_pattern_works() {
     let id = pm.id_add();
     pos.borrow_mut().add(id, Pos { x: 0.0, y: 0.0 });
 
-    pm.task_add("physics", 30.0, {
+    pm.task_add("physics", 30.0, 0.0, {
         let pos = pos.clone();
         move |pm| {
             let dt = pm.loop_dt();
@@ -79,7 +79,7 @@ fn id_remove_is_deferred_and_flushes_all_pools() {
     hp.borrow_mut().add(id, 100);
 
     let seen_alive_after_remove = Rc::new(RefCell::new(false));
-    pm.task_add("reaper", 10.0, {
+    pm.task_add("reaper", 10.0, 0.0, {
         let seen = seen_alive_after_remove.clone();
         move |pm| {
             pm.id_remove(id);
@@ -123,7 +123,7 @@ fn tick_advances_and_stamps_changes() {
     hp.borrow_mut().add(id, 100); // init-time add, stamped tick 1
     let init_tick = pm.tick();
 
-    pm.task_add("damage", 10.0, {
+    pm.task_add("damage", 10.0, 0.0, {
         let hp = hp.clone();
         move |_| {
             if let Some(mut h) = hp.borrow_mut().get_mut(id) {
@@ -145,7 +145,7 @@ fn tick_advances_and_stamps_changes() {
 fn periodic_task_fires_once_per_interval() {
     let mut pm = Pm::new();
     let count = Rc::new(RefCell::new(0));
-    pm.task_add_every("slow", 10.0, 1.0, {
+    pm.task_add("slow", 10.0, 1.0, {
         let count = count.clone();
         move |_| *count.borrow_mut() += 1
     });
@@ -160,12 +160,12 @@ fn task_add_and_stop_from_inside_a_task() {
     let mut pm = Pm::new();
     let log = Rc::new(RefCell::new(Vec::new()));
 
-    pm.task_add("spawner", 10.0, {
+    pm.task_add("spawner", 10.0, 0.0, {
         let log = log.clone();
         move |pm| {
             log.borrow_mut().push("spawner");
             let log = log.clone();
-            pm.task_add("spawned", 5.0, move |_| log.borrow_mut().push("spawned"));
+            pm.task_add("spawned", 5.0, 0.0, move |_| log.borrow_mut().push("spawned"));
             pm.task_stop("spawner");
         }
     });
@@ -181,7 +181,7 @@ fn quit_stops_loop_run() {
     let mut pm = Pm::new();
     pm.loop_rate = 0; // uncapped, finishes instantly
     let ticks = Rc::new(RefCell::new(0));
-    pm.task_add("control", 0.0, {
+    pm.task_add("control", 0.0, 0.0, {
         let ticks = ticks.clone();
         move |pm| {
             *ticks.borrow_mut() += 1;
@@ -197,7 +197,7 @@ fn quit_stops_loop_run() {
 #[test]
 fn task_stats_record_timings() {
     let mut pm = Pm::new();
-    pm.task_add("busy", 1.0, |_| {
+    pm.task_add("busy", 1.0, 0.0, |_| {
         std::hint::black_box((0..10_000u64).sum::<u64>());
     });
     pm.loop_once(1.0 / 60.0);
@@ -215,7 +215,7 @@ fn task_stats_record_timings() {
 fn loop_rate_is_accurate_on_average() {
     let mut pm = Pm::new();
     pm.loop_rate = 240;
-    pm.task_add("count", 0.0, |pm| {
+    pm.task_add("count", 0.0, 0.0, |pm| {
         if pm.tick() >= 121 {
             pm.loop_quit();
         }
@@ -238,7 +238,7 @@ fn jitter_probe() {
         pm.loop_rate = 60;
         pm.loop_spin_us = spin_us;
         let times = Rc::new(RefCell::new(Vec::<std::time::Instant>::new()));
-        pm.task_add("probe", 0.0, {
+        pm.task_add("probe", 0.0, 0.0, {
             let times = times.clone();
             move |pm| {
                 times.borrow_mut().push(std::time::Instant::now());
@@ -272,14 +272,14 @@ fn faulting_task_is_benched_and_the_loop_survives() {
     let mut pm = Pm::new();
     let counts = Rc::new(RefCell::new((0u32, 0u32)));
 
-    pm.task_add("flaky", 10.0, {
+    pm.task_add("flaky", 10.0, 0.0, {
         let counts = counts.clone();
         move |_| -> Result<(), String> {
             counts.borrow_mut().0 += 1;
             Err("disk on fire".to_string())
         }
     });
-    pm.task_add("steady", 20.0, {
+    pm.task_add("steady", 20.0, 0.0, {
         let counts = counts.clone();
         move |_| counts.borrow_mut().1 += 1
     });
@@ -301,7 +301,7 @@ fn faulting_task_is_benched_and_the_loop_survives() {
 #[test]
 fn tasks_can_use_question_mark() {
     let mut pm = Pm::new();
-    pm.task_add("parse", 10.0, |_| -> Result<(), Box<dyn std::error::Error>> {
+    pm.task_add("parse", 10.0, 0.0, |_| -> Result<(), Box<dyn std::error::Error>> {
         let n: i32 = "not a number".parse()?;
         let _ = n;
         Ok(())
@@ -321,7 +321,7 @@ fn module_add_and_remove_tear_down_as_a_unit() {
         let pos = pm.pool::<Pos>("mod_pos");
         let _hits = pm.single::<Hits>("mod_hits");
         let runs = runs.clone();
-        pm.task_add("mod_task", 10.0, move |_| {
+        pm.task_add("mod_task", 10.0, 0.0, move |_| {
             *runs.borrow_mut() += 1;
             let _ = &pos;
         });
@@ -349,7 +349,7 @@ fn module_init_error_rolls_back_registration() {
     let mut pm = Pm::new();
     let result = pm.module_add("broken", |pm| -> Result<(), String> {
         let _pool = pm.pool::<Pos>("broken_pool");
-        pm.task_add("broken_task", 10.0, |_| {});
+        pm.task_add("broken_task", 10.0, 0.0, |_| {});
         Err("init failed".to_string())
     });
     assert!(result.is_err());
@@ -369,9 +369,9 @@ fn runtime_additions_by_module_tasks_belong_to_the_module() {
 
     pm.module_add("spawner_mod", |pm| {
         let spawned_runs = spawned_runs.clone();
-        pm.task_add("spawner", 10.0, move |pm| {
+        pm.task_add("spawner", 10.0, 0.0, move |pm| {
             let spawned_runs = spawned_runs.clone();
-            pm.task_add("late_task", 5.0, move |_| *spawned_runs.borrow_mut() += 1);
+            pm.task_add("late_task", 5.0, 0.0, move |_| *spawned_runs.borrow_mut() += 1);
             pm.task_stop("spawner");
         });
     })
@@ -391,7 +391,7 @@ fn runtime_additions_by_module_tasks_belong_to_the_module() {
 fn faulting_module_task_records_its_module() {
     let mut pm = Pm::new();
     pm.module_add("m", |pm| {
-        pm.task_add("doomed", 10.0, |_| -> Result<(), String> { Err("oops".into()) });
+        pm.task_add("doomed", 10.0, 0.0, |_| -> Result<(), String> { Err("oops".into()) });
     })
     .unwrap();
     pm.loop_once(1.0 / 60.0);
@@ -407,7 +407,7 @@ fn bad_entity_access_faults_the_task_instead_of_crashing() {
     let ghost = pm.id_add(); // never added to the pool
 
     let healthy_runs = Rc::new(RefCell::new(0u32));
-    pm.task_add("reader", 10.0, {
+    pm.task_add("reader", 10.0, 0.0, {
         let pos = pos.clone();
         move |_| -> Result<(), pm::TaskError> {
             let p = pos.try_get(ghost)?; // Missing -> AccessError -> fault
@@ -415,7 +415,7 @@ fn bad_entity_access_faults_the_task_instead_of_crashing() {
             Ok(())
         }
     });
-    pm.task_add("healthy", 20.0, {
+    pm.task_add("healthy", 20.0, 0.0, {
         let healthy_runs = healthy_runs.clone();
         move |_| *healthy_runs.borrow_mut() += 1
     });

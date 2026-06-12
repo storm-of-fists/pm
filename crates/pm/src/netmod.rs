@@ -190,7 +190,7 @@ impl NetServer {
             let cmds = pm.single::<Commands<C>>("net.cmds");
             let events = pm.single::<ServerEvents>("net.events");
             let out = pm.single::<ServerOutbox>("net.out");
-            pm.task_add("net", NET_PRIO, move |pm| {
+            pm.task_add("net", NET_PRIO, 0.0, move |pm| {
                 quic.pump();
                 {
                     let mut pe = peers.borrow_mut();
@@ -258,7 +258,7 @@ impl NetClient {
             let events = pm.single::<ClientEvents>("net.events");
             let out = pm.single::<Outbox>("net.out");
             let mut accum = 0.0f32;
-            pm.task_add("net", NET_PRIO, move |pm| {
+            pm.task_add("net", NET_PRIO, 0.0, move |pm| {
                 quic.pump();
                 if let Some(err) = quic.error() {
                     eprintln!("[net] disconnected: {err}");

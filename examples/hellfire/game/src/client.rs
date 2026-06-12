@@ -94,7 +94,7 @@ pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, net: NetClient, pools: &P
     let report_name = name;
 
     // One-shot diag report when the game ends (HELLFIRE_REPORT_DIR).
-    pm.task_add_every("diag", 90.0, 0.5, {
+    pm.task_add("diag", 90.0, 0.5, {
         let status = pools.status.clone();
         let stats = stats.clone();
         let name = report_name;
@@ -124,7 +124,7 @@ pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, net: NetClient, pools: &P
     // Dead-reckon the draw pools between (budget-rotated) refreshes:
     // pm::pool_mirror handles add/blend/stale-drop; the closures are
     // just the per-type blend math.
-    pm.task_add("smooth", 30.0, {
+    pm.task_add("smooth", 30.0, 0.0, {
         let pools_m = pools.monster.clone();
         let pools_b = pools.bullet.clone();
         let pools_p = pools.player.clone();
@@ -160,7 +160,7 @@ pub fn run_bot(n: u32) {
 
     let cmd = pm.single::<NetInput<InputCmd>>("net.input");
     let outbox = pm.single::<Outbox>("net.out");
-    pm.task_add("bot", 4.0, {
+    pm.task_add("bot", 4.0, 0.0, {
         let monster = pools.monster.clone();
         let player = pools.player.clone();
         let status = pools.status.clone();

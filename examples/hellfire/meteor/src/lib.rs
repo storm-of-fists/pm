@@ -26,7 +26,7 @@ pub extern "C-unwind" fn pm_mod_init(pm: &mut Pm) -> bool {
     let mut rng = Rng::new(0xE7E0);
     eprintln!("[meteor] shower armed: every 6 s");
 
-    pm.task_add_every("meteor_shower", 32.0, 6.0, move |pm| {
+    pm.task_add("meteor_shower", 32.0, 6.0, move |pm| {
         let center = vec2(W * 0.5, H * 0.5);
         let count = 22;
         for k in 0..count {

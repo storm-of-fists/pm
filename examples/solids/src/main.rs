@@ -146,27 +146,8 @@ fn main() {
     let cam = pm.single::<Cam>("cam");
     let cull = pm.single::<Cull>("cull");
 
-    let sdl = sdl3::init().expect("sdl init");
-    let video = sdl.video().expect("sdl video");
-    let mut window = video
-        .window("pm solids (gpu) — wasd+eq fly, hold RMB to look, wheel = speed", W, H)
-        .position_centered()
-        .build()
-        .expect("window");
-    let mut pump = sdl.event_pump().expect("event pump");
-
-    // Pacing: the swapchain is created vsync (SDL's default) but WSLg
-    // doesn't honor it — uncapped, this free-ran at ~700 fps. The
-    // kernel loop is the pacemaker instead, locked to the display's
-    // refresh rate so the compositor samples nearly 1:1. (On platforms
-    // where vsync does block, the absolute-deadline loop absorbs it.)
-    let refresh = window
-        .get_display()
-        .and_then(|d| d.get_mode())
-        .map(|m| m.refresh_rate.round() as u32)
-        .unwrap_or(60)
-        .max(30);
-
+    let (mut window, mut pump, refresh) =
+        pm_sdl::window("pm solids (gpu) — wasd+eq fly, hold RMB to look, wheel = speed", W, H);
     let mut r3d = Renderer3d::new(&window).expect("renderer");
     let ground = r3d
         .upload_mesh(&checker_ground(14, 1.0, (0.24, 0.27, 0.33), (0.16, 0.18, 0.22)))
@@ -180,7 +161,7 @@ fn main() {
     let tetra = r3d.upload_mesh(&bake(&tetra_tris(), (0.95, 0.78, 0.25))).expect("tetra");
     let octa = r3d.upload_mesh(&bake(&octa_tris(), (0.85, 0.35, 0.42))).expect("octa");
 
-    pm.task_add("input", 4.0, {
+    pm.task_add("input", 4.0, 0.0, {
         let cam = cam.clone();
         let cull = cull.clone();
         move |pm| {
@@ -221,7 +202,7 @@ fn main() {
         }
     });
 
-    pm.task_add("spin", 30.0, {
+    pm.task_add("spin", 30.0, 0.0, {
         let solids = solids.clone();
         move |pm| {
             let dt = pm.loop_dt();
@@ -232,7 +213,7 @@ fn main() {
         }
     });
 
-    pm.task_add("render", 70.0, {
+    pm.task_add("render", 70.0, 0.0, {
         let solids = solids.clone();
         let cam = cam.clone();
         let cull = cull.clone();

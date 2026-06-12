@@ -220,7 +220,7 @@ fn two_pms_converge_through_tasked_net_loop() {
         .collect();
 
     // Physics runs for 30 ticks, then holds still so both sides settle.
-    server.task_add("physics", 30.0, {
+    server.task_add("physics", 30.0, 0.0, {
         let pos = s_pos.clone();
         move |pm| {
             if pm.tick() <= 30 {
@@ -233,7 +233,7 @@ fn two_pms_converge_through_tasked_net_loop() {
     });
 
     // Net-send first in the tick (low priority): drain acks, snapshot, prune.
-    server.task_add("net_send", 5.0, {
+    server.task_add("net_send", 5.0, 0.0, {
         let s2c = s2c.clone();
         let acks = c2s_acks.clone();
         move |pm| {
@@ -253,7 +253,7 @@ fn two_pms_converge_through_tasked_net_loop() {
     cnet_setup.pool_sync("pos", &c_pos);
     let cnet = cnet_setup;
 
-    client.task_add("net_recv", 5.0, {
+    client.task_add("net_recv", 5.0, 0.0, {
         let s2c = s2c.clone();
         let acks = c2s_acks.clone();
         move |pm| {

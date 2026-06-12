@@ -47,7 +47,7 @@ fn main() {
     // The join: iterate one pool densely, look the other up by id —
     // each_with does exactly that (callback style; see pool.rs for why
     // a streaming two-Mut iterator can't exist).
-    pm.task_add("physics", 30.0, {
+    pm.task_add("physics", 30.0, 0.0, {
         let pos = pos.clone();
         let vel = vel.clone();
         move |pm| {
@@ -59,7 +59,7 @@ fn main() {
         }
     });
 
-    pm.task_add("control", 100.0, {
+    pm.task_add("control", 100.0, 0.0, {
         let sim = sim.clone();
         move |pm| {
             let mut sim = sim.borrow_mut();

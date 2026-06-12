@@ -119,7 +119,7 @@ fn run_server(quiet: bool) {
     let cmds = pm.single::<Commands<Drive>>("net.cmds");
     let out = pm.single::<ServerOutbox>("net.out");
 
-    pm.task_add("roster", 10.0, {
+    pm.task_add("roster", 10.0, 0.0, {
         let car = car.clone();
         let garage = garage.clone();
         move |pm| {
@@ -152,7 +152,7 @@ fn run_server(quiet: bool) {
         }
     });
 
-    pm.task_add("drive", 30.0, {
+    pm.task_add("drive", 30.0, 0.0, {
         let car = car.clone();
         let garage = garage.clone();
         move |_pm| {
@@ -172,7 +172,7 @@ fn run_server(quiet: bool) {
 
     // Dedicated-server profiling: task table every 5 seconds.
     if !quiet {
-        pm.task_add_every("prof", 90.0, 5.0, {
+        pm.task_add("prof", 90.0, 5.0, {
             let mut prev: HashMap<String, pm::TaskStat> = HashMap::new();
             move |pm| {
                 eprintln!("-- task stats (last 5s) --");
@@ -207,7 +207,7 @@ fn run_bot(phase: f32) {
     net.connect::<Drive>(&mut pm, quic, 1.0 / FIXED_DT);
 
     let cmd = pm.single::<NetInput<Drive>>("net.input");
-    pm.task_add("bot", 4.0, move |pm| {
+    pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0;
         cmd.borrow_mut().0 = Drive {
             thrust: 0.7 + 0.3 * (t * 0.6 + phase).sin(),
@@ -305,7 +305,7 @@ fn add_client_tasks(
     // Prediction, right after the net module's tick (prio 6): reconcile
     // against each applied snapshot's echo of the last input the server
     // applied, then feed this tick's sent inputs into the rewind ring.
-    pm.task_add("predict", 6.0, {
+    pm.task_add("predict", 6.0, 0.0, {
         let pred = pred.clone();
         let car = car.clone();
         let stats = stats.clone();
@@ -353,7 +353,7 @@ fn add_client_tasks(
     // handles add/blend/stale-drop; the closure is just the blend math.
     // A jump wider than the world means a wrap — snap instead of
     // streaking across.
-    pm.task_add("smooth", 30.0, {
+    pm.task_add("smooth", 30.0, 0.0, {
         let car = car.clone();
         let draw = draw.clone();
         let pred = pred.clone();
@@ -382,7 +382,7 @@ fn add_client_tasks(
 
     // Profiling panel data: per-second deltas of the kernel task stats,
     // plus any drop-in probes on this thread.
-    pm.task_add_every("prof", 55.0, 1.0, {
+    pm.task_add("prof", 55.0, 1.0, {
         let stats = stats.clone();
         let mut prev: HashMap<String, pm::TaskStat> = HashMap::new();
         move |pm| {
@@ -429,7 +429,7 @@ fn run_player() {
 
     // Keyboard first in the tick so this tick's input rides this tick's
     // datagram.
-    pm.task_add("keys", 4.0, {
+    pm.task_add("keys", 4.0, 0.0, {
         let keys = keys.clone();
         let cmd = cmd.clone();
         let stats = stats.clone();
@@ -470,7 +470,7 @@ fn run_player() {
     });
 
 
-    pm.task_add_every("render", 50.0, 1.0 / 30.0, {
+    pm.task_add("render", 50.0, 1.0 / 30.0, {
         let draw = draw.clone();
         let stats = stats.clone();
         move |_pm| {

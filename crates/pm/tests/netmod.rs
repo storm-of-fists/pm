@@ -59,7 +59,7 @@ fn net_modules_loopback() {
         let garage = garage.clone();
         let sseen = sseen.clone();
         let s_pos = s_pos.clone();
-        spm.task_add("game", 30.0, move |pm| {
+        spm.task_add("game", 30.0, 0.0, move |pm| {
             for &p in &peers.borrow().joined {
                 let id = pm.id_add();
                 s_pos.borrow_mut().add(id, Pos::default());
@@ -107,7 +107,7 @@ fn net_modules_loopback() {
         let events = cpm.single::<pm::ClientEvents>("net.events");
         let applied = cpm.single::<pm::AppliedLog>("net.applied");
         let cseen = cseen.clone();
-        cpm.task_add("game", 30.0, move |_pm| {
+        cpm.task_add("game", 30.0, 0.0, move |_pm| {
             for (ty, payload) in &events.borrow().0 {
                 if *ty == 16 && payload == b"welcome" {
                     cseen.borrow_mut().event = true;

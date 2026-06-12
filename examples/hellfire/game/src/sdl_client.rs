@@ -2,7 +2,6 @@
 //! zoom (wheel) with player follow, sprite rendering with hot-reload,
 //! TTF HUD, lobby screen, and an F1 debug overlay.
 
-use pm_sdl::sdl3;
 use pm::{Cooldown, Hysteresis, Pm, QuicClient, vec2};
 use pm_sdl::{Font, Sprite};
 use pm_sdl::sdl3::event::Event;
@@ -32,15 +31,8 @@ pub fn run() {
     let name = std::env::var("HELLFIRE_NAME").unwrap_or_else(|_| "player".into());
     add_client_tasks(&mut pm, quic, net, &pools, name);
 
-    let sdl = sdl3::init().expect("sdl init");
-    let video = sdl.video().expect("sdl video");
-    let window = video
-        .window("hellfire", W as u32, H as u32)
-        .position_centered()
-        .build()
-        .expect("window");
+    let (window, mut pump, refresh) = pm_sdl::window("hellfire", W as u32, H as u32);
     let mut canvas = window.into_canvas();
-    let mut pump = sdl.event_pump().expect("event pump");
 
     let cmd = pm.single::<NetInput<InputCmd>>("net.input");
     let stats = pm.single::<NetStatus>("net.status");
@@ -51,7 +43,7 @@ pub fn run() {
     // Input + camera: wheel zooms (toward 0.5x..3x), camera follows your
     // player, mouse aim goes through the inverse camera transform so it
     // stays correct at any zoom.
-    pm.task_add("input", 4.0, {
+    pm.task_add("input", 4.0, 0.0, {
         let cmd = cmd.clone();
         let stats = stats.clone();
         let cam = cam.clone();
@@ -121,7 +113,7 @@ pub fn run() {
 
     // Render: all world drawing goes through the camera transform; HUD
     // and overlay text draw in screen space with the TTF font.
-    pm.task_add("render", 70.0, {
+    pm.task_add("render", 70.0, 0.0, {
         let stats = stats.clone();
         let cam = cam.clone();
         let ui = ui.clone();
@@ -324,6 +316,8 @@ pub fn run() {
         }
     });
 
-    pm.loop_rate = 60;
+    // Display refresh paces the loop (WSLg ignores vsync; input still
+    // goes out at a fixed 60 Hz via the net module's send cadence).
+    pm.loop_rate = refresh;
     pm.loop_run();
 }

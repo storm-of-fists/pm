@@ -56,7 +56,7 @@ pub fn add_client_tasks(
     // Prediction, right after the net module's tick (prio 6): reconcile
     // against each applied snapshot's input-seq echo, then feed this
     // tick's sent inputs into the rewind ring.
-    pm.task_add("predict", 6.0, {
+    pm.task_add("predict", 6.0, 0.0, {
         let pred = pred.clone();
         let car = car.clone();
         let stats = stats.clone();
@@ -89,7 +89,7 @@ pub fn add_client_tasks(
     });
 
     // Remote cars dead-reckon between budget-rotated refreshes.
-    pm.task_add("smooth", 30.0, {
+    pm.task_add("smooth", 30.0, 0.0, {
         let stats = stats.clone();
         move |pm| {
             let dt = pm.loop_dt();
@@ -121,7 +121,7 @@ pub fn run_bot(n: u32) {
 
     let cmd = pm.single::<NetInput<Drive>>("net.input");
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
-    pm.task_add("bot", 4.0, move |pm| {
+    pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;
         // Wander on a sine, but steer home before grinding a wall —
         // the original pure-sine bot looped into the back wall and sat
