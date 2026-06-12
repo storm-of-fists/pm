@@ -1,0 +1,11 @@
+[package]
+name = "meteor"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hellfire_core = { path = "../hellfire_core" }
+pm = { path = "../../crates/pm" }

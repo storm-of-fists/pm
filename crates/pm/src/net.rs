@@ -1,0 +1,485 @@
+//! Headless sync layer: server-authoritative snapshot-delta replication.
+//! Transport-agnostic — `NetServer` produces byte buffers and `NetClient`
+//! consumes them; QUIC (quinn-proto) will carry them later.
+//!
+//! Model (the README networking notes): per peer the server tracks, per
+//! entity slot, the change-tick the peer last confirmed and the one in
+//! flight (Tribes-style prioritized replication, per-entity rather than
+//! Quake 3's per-client snapshot diffs). A snapshot carries unconfirmed
+//! entries in rotation order up to a byte budget, plus unacked removals.
+//! An ack confirms exactly what that snapshot carried and declares older
+//! unacked snapshots lost (their entries resend). Everything is an
+//! upsert, so snapshots are idempotent. Change-sparse pools converge to
+//! silence; change-dense pools stream through the budget round-robin —
+//! one mechanism, both behaviors. The single `acked_tick` cursor remains
+//! only as the removal-log gate.
+//!
+//! Tick semantics: a snapshot is labeled `pm.tick() - 1` — the last
+//! *completed* tick — because stamps from the in-progress tick may still
+//! be written by tasks that haven't run yet. Entries from the current tick
+//! may ride along early; the conservative label only means they get sent
+//! again next time, never lost. Run the net-send task at low priority
+//! (first in the tick) to avoid the duplicate sends entirely.
+
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+
+use bytemuck::Pod;
+
+use crate::id::Id;
+use crate::kernel::{Handle, Pm};
+use crate::paged::PagedArray;
+use crate::pool::Pool;
+
+/// Client-side reliable-event outbox, as ordinary singleton data: any
+/// task (input, UI, a mod) pushes events; the net task — the one owner
+/// of the QUIC handle — drains it and sends. Exists so tasks don't need
+/// transport access (or pseudo-button hacks) to emit a reliable event.
+///
+/// ```ignore
+/// let outbox = pm.single::<Outbox>("outbox");
+/// outbox.borrow_mut().send(EV_START, &[]);            // any task
+/// for (ty, p) in outbox.borrow_mut().drain() { quic.event_send(ty, &p); } // net task
+/// ```
+#[derive(Default)]
+pub struct Outbox {
+    events: Vec<(u16, Vec<u8>)>,
+}
+
+impl Outbox {
+    pub fn send(&mut self, ty: u16, payload: &[u8]) {
+        self.events.push((ty, payload.to_vec()));
+    }
+
+    pub fn drain(&mut self) -> Vec<(u16, Vec<u8>)> {
+        std::mem::take(&mut self.events)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NetError {
+    Truncated,
+    UnknownPool(u16),
+}
+
+// --- byte reading -------------------------------------------------------
+
+struct Reader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    fn bytes(&mut self, n: usize) -> Result<&'a [u8], NetError> {
+        if self.data.len() < n {
+            return Err(NetError::Truncated);
+        }
+        let (head, rest) = self.data.split_at(n);
+        self.data = rest;
+        Ok(head)
+    }
+
+    fn u16(&mut self) -> Result<u16, NetError> {
+        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32, NetError> {
+        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+}
+
+// --- type-erased pool sync adapters ------------------------------------
+
+/// Per-peer, per-pool replication state — the unification of "delta"
+/// and "stream" behavior. For every entity slot the server tracks the
+/// change-tick the peer last *confirmed* (acked a snapshot carrying it)
+/// and the change-tick currently *in flight* (sent, ack pending). An
+/// entry needs sending iff it changed past both. Change-sparse pools
+/// converge to silence; change-dense pools rotate through the byte
+/// budget via `cursor` — same bookkeeping, opposite emergent behavior.
+struct PeerPool {
+    confirmed: PagedArray<u32>,
+    inflight_tick: PagedArray<u32>,
+    inflight_label: PagedArray<u32>,
+    /// Dense-index rotation start, so a budget-limited snapshot resumes
+    /// where the last one stopped instead of restarting at entity 0.
+    cursor: usize,
+}
+
+impl PeerPool {
+    fn new() -> Self {
+        Self {
+            confirmed: PagedArray::new(0),
+            inflight_tick: PagedArray::new(0),
+            inflight_label: PagedArray::new(0),
+            cursor: 0,
+        }
+    }
+}
+
+/// (pool index, slot, change-tick) recorded per snapshot so an ack can
+/// confirm exactly what that snapshot carried.
+type SentEntry = (u16, u32, u32);
+
+trait SyncAdapter {
+    fn name(&self) -> &str;
+    fn value_size(&self) -> usize;
+    /// Append `[id u32][value]` entries the peer hasn't confirmed, in
+    /// rotation order, while `budget` lasts; returns count.
+    fn pack_dirty(
+        &self,
+        pp: &mut PeerPool,
+        label: u32,
+        budget: &mut usize,
+        out: &mut Vec<u8>,
+        sent: &mut Vec<SentEntry>,
+        pool_idx: u16,
+    ) -> u32;
+    fn apply(&self, pm: &mut Pm, count: u32, r: &mut Reader) -> Result<(), NetError>;
+}
+
+struct PoolAdapter<T: Pod> {
+    name: String,
+    pool: Rc<RefCell<Pool<T>>>,
+}
+
+impl<T: Pod> SyncAdapter for PoolAdapter<T> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn value_size(&self) -> usize {
+        size_of::<T>()
+    }
+
+    fn pack_dirty(
+        &self,
+        pp: &mut PeerPool,
+        label: u32,
+        budget: &mut usize,
+        out: &mut Vec<u8>,
+        sent: &mut Vec<SentEntry>,
+        pool_idx: u16,
+    ) -> u32 {
+        let pool = self.pool.borrow();
+        let ids = pool.ids();
+        let values = pool.values();
+        let ticks = pool.changed_ticks();
+        let n = ids.len();
+        if n == 0 {
+            return 0;
+        }
+        let entry_size = 4 + size_of::<T>();
+        let start = if pp.cursor >= n { 0 } else { pp.cursor };
+        let mut count = 0u32;
+        let mut resume_at = start;
+        for k in 0..n {
+            let i = (start + k) % n;
+            let tick = ticks[i];
+            let slot = ids[i].slot();
+            if tick <= pp.confirmed.get(slot) || tick <= pp.inflight_tick.get(slot) {
+                continue;
+            }
+            if *budget < entry_size {
+                resume_at = i;
+                break;
+            }
+            *budget -= entry_size;
+            out.extend_from_slice(&ids[i].0.to_le_bytes());
+            out.extend_from_slice(bytemuck::bytes_of(&values[i]));
+            pp.inflight_tick.set(slot, tick);
+            pp.inflight_label.set(slot, label);
+            sent.push((pool_idx, slot, tick));
+            count += 1;
+        }
+        pp.cursor = resume_at;
+        count
+    }
+
+    fn apply(&self, pm: &mut Pm, count: u32, r: &mut Reader) -> Result<(), NetError> {
+        let mut pool = self.pool.borrow_mut();
+        for _ in 0..count {
+            let id = Id(r.u32()?);
+            let value: T = bytemuck::pod_read_unaligned(r.bytes(size_of::<T>())?);
+            pm.id_sync(id);
+            pool.add(id, value);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SyncSet {
+    adapters: Vec<Box<dyn SyncAdapter>>,
+}
+
+impl SyncSet {
+    fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &Handle<T>) {
+        self.adapters
+            .push(Box::new(PoolAdapter { name: name.to_string(), pool: pool.rc().clone() }));
+    }
+
+    /// (pool name, value size) per registered pool, in registration order.
+    /// Server and client schemas must match; the QUIC handshake will
+    /// verify this — until then, tests assert it.
+    fn schema(&self) -> Vec<(String, usize)> {
+        self.adapters.iter().map(|a| (a.name().to_string(), a.value_size())).collect()
+    }
+}
+
+// --- snapshot wire format -------------------------------------------------
+//
+//   u32 tick label (last completed tick)
+//   u32 removal count, then count x [id u32]
+//   u16 section count, then per section:
+//     u16 pool index (registration order)
+//     u32 entry count, then count x [id u32][value bytes]
+
+/// In-flight snapshots older than this many ticks past the newest label
+/// are declared lost even without a later ack (covers a silent ack gap:
+/// the entries become resendable again).
+const INFLIGHT_EXPIRY_TICKS: u32 = 60;
+
+struct Peer {
+    peer: u8,
+    acked_tick: u32,
+    input_seq: u32,
+    pools: Vec<PeerPool>,
+    /// What each unacked snapshot carried, oldest first, so an ack can
+    /// confirm exactly that snapshot's entries — and declare everything
+    /// older lost (a later snapshot arrived; earlier ones didn't).
+    sent: VecDeque<(u32, Vec<SentEntry>)>,
+}
+
+/// What a successfully applied snapshot tells the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    /// Snapshot tick label — the ack to send back.
+    pub tick: u32,
+    /// Last input sequence the server processed for this peer — the
+    /// reconciliation point for client-side prediction.
+    pub input_seq: u32,
+}
+
+/// Server side: owns the peer table, packs per-peer deltas, gates id
+/// recycling on acks. Create during init and move into the net task.
+pub struct NetServer {
+    sync: SyncSet,
+    peers: Vec<Peer>,
+}
+
+impl NetServer {
+    /// Attaching a server holds the kernel's removal log so removed
+    /// indices aren't recycled before every peer has acked the removal.
+    pub fn new(pm: &mut Pm) -> Self {
+        pm.removal_hold_set(true);
+        Self { sync: SyncSet::default(), peers: Vec::new() }
+    }
+
+    pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &Handle<T>) {
+        self.sync.pool_sync(name, pool);
+    }
+
+    pub fn schema(&self) -> Vec<(String, usize)> {
+        self.sync.schema()
+    }
+
+    pub fn peer_add(&mut self, peer: u8) {
+        if !self.peers.iter().any(|p| p.peer == peer) {
+            self.peers.push(Peer {
+                peer,
+                acked_tick: 0,
+                input_seq: 0,
+                pools: (0..self.sync.adapters.len()).map(|_| PeerPool::new()).collect(),
+                sent: VecDeque::new(),
+            });
+        }
+    }
+
+    pub fn peer_remove(&mut self, peer: u8) {
+        self.peers.retain(|p| p.peer != peer);
+    }
+
+    pub fn peers(&self) -> impl Iterator<Item = u8> + '_ {
+        self.peers.iter().map(|p| p.peer)
+    }
+
+    /// Record a peer's ack of snapshot `tick`: its entries are confirmed
+    /// for that peer, and every older unacked snapshot is declared lost
+    /// (its entries become resendable). Out-of-order acks are harmless —
+    /// a late ack for an already-dropped label is ignored, costing at
+    /// most a redundant resend (snapshots are idempotent upserts).
+    pub fn ack(&mut self, peer: u8, tick: u32) {
+        let Some(p) = self.peers.iter_mut().find(|p| p.peer == peer) else {
+            return;
+        };
+        p.acked_tick = p.acked_tick.max(tick);
+        while let Some(&(label, _)) = p.sent.front() {
+            if label > tick {
+                break;
+            }
+            let (label, entries) = p.sent.pop_front().unwrap();
+            let received = label == tick;
+            for (pool_idx, slot, sent_tick) in entries {
+                let pp = &mut p.pools[pool_idx as usize];
+                if received {
+                    let c = pp.confirmed.get(slot);
+                    pp.confirmed.set(slot, c.max(sent_tick));
+                }
+                // Either way this snapshot is settled: clear the
+                // in-flight marker (unless a newer send superseded it)
+                // so lost entries re-qualify for packing.
+                if pp.inflight_label.get(slot) == label {
+                    pp.inflight_tick.set(slot, 0);
+                    pp.inflight_label.set(slot, 0);
+                }
+            }
+        }
+    }
+
+    /// Record the newest input sequence consumed for `peer`; echoed in
+    /// every snapshot header so the client can reconcile predictions.
+    pub fn input_processed(&mut self, peer: u8, seq: u32) {
+        if let Some(p) = self.peers.iter_mut().find(|p| p.peer == peer) {
+            p.input_seq = p.input_seq.max(seq);
+        }
+    }
+
+    /// Pack everything `peer` hasn't confirmed, without a size cap.
+    /// Prefer `snapshot_budgeted` when the transport bounds datagrams.
+    pub fn snapshot(&mut self, pm: &Pm, peer: u8) -> Option<Vec<u8>> {
+        self.snapshot_budgeted(pm, peer, usize::MAX)
+    }
+
+    /// Pack at most `budget` bytes of unconfirmed state for `peer`,
+    /// oldest-rotation first. None if the peer is unknown.
+    ///
+    /// What doesn't fit stays unconfirmed and rotates into later
+    /// snapshots, so a change-dense pool larger than the budget streams
+    /// through it round-robin while change-sparse pools still converge
+    /// to silence — one mechanism, both behaviors. Removals are always
+    /// included (small, and they gate id recycling).
+    pub fn snapshot_budgeted(&mut self, pm: &Pm, peer: u8, budget: usize) -> Option<Vec<u8>> {
+        let state = self.peers.iter_mut().find(|p| p.peer == peer)?;
+        // Lazily grow per-pool state for pools registered after peer_add.
+        while state.pools.len() < self.sync.adapters.len() {
+            state.pools.push(PeerPool::new());
+        }
+        let acked = state.acked_tick;
+        let label = pm.tick().saturating_sub(1);
+
+        // A long silent ack gap (every ack lost, or none sent): declare
+        // stale in-flight snapshots lost so their entries resend.
+        while let Some(&(l, _)) = state.sent.front() {
+            if l.saturating_add(INFLIGHT_EXPIRY_TICKS) >= label {
+                break;
+            }
+            let (l, entries) = state.sent.pop_front().unwrap();
+            for (pool_idx, slot, _) in entries {
+                let pp = &mut state.pools[pool_idx as usize];
+                if pp.inflight_label.get(slot) == l {
+                    pp.inflight_tick.set(slot, 0);
+                    pp.inflight_label.set(slot, 0);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&label.to_le_bytes());
+        out.extend_from_slice(&state.input_seq.to_le_bytes());
+
+        let removals: Vec<u32> =
+            pm.removal_log().iter().filter(|&&(_, t)| t > acked).map(|&(id, _)| id.0).collect();
+        out.extend_from_slice(&(removals.len() as u32).to_le_bytes());
+        for id in removals {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+
+        out.extend_from_slice(&(self.sync.adapters.len() as u16).to_le_bytes());
+        let mut sent = Vec::new();
+        // 6 bytes of section header (index + count) per pool.
+        let mut remaining =
+            budget.saturating_sub(out.len() + 6 * self.sync.adapters.len());
+        for (i, adapter) in self.sync.adapters.iter().enumerate() {
+            out.extend_from_slice(&(i as u16).to_le_bytes());
+            let count_at = out.len();
+            out.extend_from_slice(&0u32.to_le_bytes());
+            let count = adapter.pack_dirty(
+                &mut state.pools[i],
+                label,
+                &mut remaining,
+                &mut out,
+                &mut sent,
+                i as u16,
+            );
+            out[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
+        }
+        if !sent.is_empty() {
+            state.sent.push_back((label, sent));
+        }
+        Some(out)
+    }
+
+    /// Recycle removal-log entries every peer has acked. Call once per net
+    /// tick, after processing acks.
+    pub fn prune(&self, pm: &mut Pm) {
+        let min = self.peers.iter().map(|p| p.acked_tick).min().unwrap_or(pm.tick());
+        pm.removal_release_upto(min);
+    }
+}
+
+/// Client side: applies snapshots into registered pools. Removals go
+/// through the normal deferred path; ids foreign to this peer are never
+/// recycled locally (`Pm::local_peer`).
+#[derive(Default)]
+pub struct NetClient {
+    sync: SyncSet,
+}
+
+impl NetClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &Handle<T>) {
+        self.sync.pool_sync(name, pool);
+    }
+
+    pub fn schema(&self) -> Vec<(String, usize)> {
+        self.sync.schema()
+    }
+
+    /// Apply a snapshot; returns its tick label (the ack to send back)
+    /// and the server's input-sequence echo.
+    pub fn apply(&self, pm: &mut Pm, snapshot: &[u8]) -> Result<Applied, NetError> {
+        let mut r = Reader::new(snapshot);
+        let tick = r.u32()?;
+        let input_seq = r.u32()?;
+
+        let removal_count = r.u32()?;
+        for _ in 0..removal_count {
+            let id = Id(r.u32()?);
+            if pm.id_alive(id) {
+                pm.id_remove(id); // deferred, flushed at end of this tick
+            }
+        }
+
+        let section_count = r.u16()?;
+        for _ in 0..section_count {
+            let index = r.u16()?;
+            let count = r.u32()?;
+            let adapter =
+                self.sync.adapters.get(index as usize).ok_or(NetError::UnknownPool(index))?;
+            adapter.apply(pm, count, &mut r)?;
+        }
+        Ok(Applied { tick, input_seq })
+    }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "pm_sdl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pm = { path = "../pm" }
+sdl3 = { version = "0.14", features = ["build-from-source", "static-link", "unsafe_textures"] }
+png = "0.17"
+fontdue = "0.9"
+
+[build-dependencies]
+naga = { version = "29", features = ["wgsl-in", "spv-out"] }

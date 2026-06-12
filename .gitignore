@@ -41,5 +41,4 @@ src_rust/target/
 *.dwo
 *.d
 
-# Local working directory (reports, logs, etc.)
-work/
+target/

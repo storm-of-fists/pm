@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pm",
+    "crates/pm_sdl",
+    "examples/demo",
+    "examples/drive",
+    "examples/hellfire",
+    "examples/hellfire_core",
+    "examples/meteor",
+    "examples/solids",
+]
+
+# Optimized but debuggable (the old C++ RelWithDebInfo default).
+[profile.release]
+debug = true

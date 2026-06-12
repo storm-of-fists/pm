@@ -1,0 +1,16 @@
+[package]
+name = "pm"
+version = "0.1.0"
+edition = "2024"
+
+# Deliberately ZERO cargo features: a mod dylib must link the exact same
+# compiled pm as its host (TypeId equality), and features change crate
+# metadata. No features = no way to get that wrong. SDL lives in pm_sdl.
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+libloading = "0.8"
+bytes = "1"
+quinn-proto = "0.11"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
