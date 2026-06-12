@@ -1,25 +1,22 @@
-//! Drive client netcode, shared by the SDL player and headless bots:
-//! snapshot apply + ack, prediction/reconciliation via pm::Predictor,
-//! input at a FIXED 60 Hz cadence (the render loop may run at any
-//! display rate — prediction must step exactly like the server), and
-//! remote-car smoothing via pm::pool_mirror.
+//! Drive client gameplay, shared by the SDL player and headless bots.
+//! The transport (pump, snapshot apply + ack, fixed-cadence input send)
+//! is pm's net module; this file adds what the module can't know: which
+//! entity is ours, how to predict it (`pm::Predictor` over the shared
+//! step fn), and how remote cars smooth (`pm::pool_mirror`).
 
 use std::time::Duration;
 
-use pm::{Id, NetClient, Pm, Predictor, QuicClient, coast_blend, pool_mirror, vec2};
+use pm::{
+    AppliedLog, ClientEvents, Id, NetClient, NetInput, Pm, Predictor, QuicClient, SentLog,
+    coast_blend, pool_mirror, vec2,
+};
 
 use crate::common::*;
 
 #[derive(Default)]
-pub struct CurCmd(pub Drive);
-
-#[derive(Default)]
 pub struct Stats {
     pub mine: Option<Id>,
-    pub rtt_ms: f32,
-    pub snapshots: u32,
     pub corrections: u32,
-    pub peer: u8,
 }
 
 fn err_metric(a: &Car, b: &Car) -> f32 {
@@ -37,55 +34,46 @@ pub fn connect(net: &NetClient) -> QuicClient {
 }
 
 /// Everything but input generation and rendering. The input layer
-/// writes `CurCmd`; rendering reads `car_draw` + the predictor's car
-/// for the local one.
+/// writes the `"net.input"` single; rendering reads `car_draw` plus the
+/// predictor's car for the local one.
 pub fn add_client_tasks(
     pm: &mut Pm,
-    mut quic: QuicClient,
+    quic: QuicClient,
     net: NetClient,
     car: &pm::Handle<Car>,
     draw: &pm::Handle<Car>,
 ) {
-    let cmd = pm.single::<CurCmd>("cmd");
+    net.connect::<Drive>(pm, quic, 1.0 / FIXED_DT);
+
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
     let stats = pm.single::<Stats>("stats");
+    let events = pm.single::<ClientEvents>("net.events");
+    let applied = pm.single::<AppliedLog>("net.applied");
+    let sent = pm.single::<SentLog<Drive>>("net.sent");
     let car = car.clone();
     let draw = draw.clone();
 
-    // Pump + apply every loop tick (snappy at any display rate).
-    pm.task_add("net", 5.0, {
+    // Prediction, right after the net module's tick (prio 6): reconcile
+    // against each applied snapshot's input-seq echo, then feed this
+    // tick's sent inputs into the rewind ring.
+    pm.task_add("predict", 6.0, {
         let pred = pred.clone();
         let car = car.clone();
         let stats = stats.clone();
-        let mut input_accum = 0.0f32;
-        move |pm| {
-            quic.pump();
-            if let Some(err) = quic.error() {
-                eprintln!("disconnected: {err}");
-                pm.loop_quit();
-                return;
-            }
-            if quic.is_gone() {
-                eprintln!("server closed the connection");
-                pm.loop_quit();
-                return;
-            }
-            for (ty, payload) in quic.events_drain() {
-                if ty == EV_VEHICLE && payload.len() == 4 {
+        move |_pm| {
+            for (ty, payload) in &events.borrow().0 {
+                if *ty == EV_VEHICLE && payload.len() == 4 {
                     stats.borrow_mut().mine =
                         Some(Id(u32::from_le_bytes(payload.as_slice().try_into().unwrap())));
                 }
             }
-            for snap in quic.snapshots_drain() {
-                let Ok(applied) = net.apply(pm, &snap) else { continue };
-                quic.ack_send(applied.tick);
-                stats.borrow_mut().snapshots += 1;
-                let mine = stats.borrow().mine;
+            let mine = stats.borrow().mine;
+            for a in &applied.borrow().0 {
                 let auth = mine.and_then(|id| car.borrow().get(id).copied());
                 let Some(auth) = auth else { continue };
                 let corrected = pred.borrow_mut().reconcile(
                     auth,
-                    applied.input_seq,
+                    a.input_seq,
                     |s, c| drive_step(s, c, FIXED_DT),
                     err_metric,
                     1e-4,
@@ -94,23 +82,8 @@ pub fn add_client_tasks(
                     stats.borrow_mut().corrections += 1;
                 }
             }
-            if let Some(peer) = quic.handshake_done() {
-                pm.local_peer = peer;
-                stats.borrow_mut().peer = peer;
-            }
-            stats.borrow_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
-
-            // Input at a fixed 60 Hz cadence regardless of loop rate:
-            // the server consumes one per tick and prediction must step
-            // FIXED_DT per send, or replay diverges from authority.
-            input_accum += pm.loop_dt();
-            while input_accum >= FIXED_DT {
-                input_accum -= FIXED_DT;
-                if quic.handshake_done().is_some() {
-                    let cmd = cmd.borrow().0;
-                    let seq = quic.input_send(bytemuck::bytes_of(&cmd));
-                    pred.borrow_mut().predict(seq, cmd, |s, c| drive_step(s, c, FIXED_DT));
-                }
+            for &(seq, cmd) in &sent.borrow().0 {
+                pred.borrow_mut().predict(seq, cmd, |s, c| drive_step(s, c, FIXED_DT));
             }
         }
     });
@@ -146,7 +119,7 @@ pub fn run_bot(n: u32) {
     let quic = connect(&net);
     add_client_tasks(&mut pm, quic, net, &car, &draw);
 
-    let cmd = pm.single::<CurCmd>("cmd");
+    let cmd = pm.single::<NetInput<Drive>>("net.input");
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
     pm.task_add("bot", 4.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;

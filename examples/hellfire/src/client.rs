@@ -1,14 +1,11 @@
-//! Hellfire client side: shared netcode + smoothing for every client
-//! flavor (SDL player, headless bot), plus the bot's input task. The SDL
+//! Hellfire client side: pool registration, smoothing, and diag
+//! reporting shared by every client flavor (SDL player, headless bot),
+//! plus the bot's input task. The transport is pm's net module; the SDL
 //! window/input/render live in sdl_client.rs.
 
-
-use pm::{NetClient, Outbox, Pm, QuicClient, Rng, coast_blend, pool_mirror, vec2};
+use pm::{NetClient, NetInput, NetStatus, Outbox, Pm, QuicClient, Rng, coast_blend, pool_mirror, vec2};
 
 use crate::common::*;
-
-#[derive(Default)]
-pub struct CurInput(pub InputCmd);
 
 /// Client camera: world-space center + zoom, shared by input (mouse ->
 /// world aim) and render (world -> screen). Only the SDL client builds
@@ -43,13 +40,6 @@ impl Camera {
 #[derive(Default)]
 pub struct Ui {
     pub show_debug: bool,
-}
-
-#[derive(Default)]
-pub struct NetStats {
-    pub peer: u8,
-    pub rtt_ms: f32,
-    pub snapshots: u32,
 }
 
 pub struct Pools {
@@ -90,56 +80,18 @@ pub fn current_status(status: &pm::Handle<Status>) -> Status {
     status.borrow().values().first().copied().unwrap_or_default()
 }
 
-/// Net + smoothing tasks shared by player and bot clients. The input
-/// layer (SDL or bot) writes `CurInput`; rendering reads the draw pools.
-pub fn add_client_tasks(pm: &mut Pm, mut quic: QuicClient, net: NetClient, pools: &Pools, name: String) {
-    let cmd = pm.single::<CurInput>("cmd");
-    let stats = pm.single::<NetStats>("net_stats");
-    let outbox = pm.single::<Outbox>("outbox");
+/// Smoothing + diag tasks shared by player and bot clients; the
+/// transport is the net module. The input layer (SDL or bot) writes the
+/// `"net.input"` single; rendering reads the draw pools.
+pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, net: NetClient, pools: &Pools, name: String) {
+    net.connect::<InputCmd>(pm, quic, 60.0);
+    let stats = pm.single::<NetStatus>("net.status");
 
-    let report_name = name.clone();
-    pm.task_add("net", 5.0, {
-        let cmd = cmd.clone();
-        let stats = stats.clone();
-        let outbox = outbox.clone();
-        let mut name_sent = false;
-        move |pm| {
-            quic.pump();
-            if let Some(err) = quic.error() {
-                eprintln!("disconnected: {err}");
-                pm.loop_quit();
-                return;
-            }
-            if quic.is_gone() {
-                eprintln!("server closed the connection");
-                pm.loop_quit();
-                return;
-            }
-            for snap in quic.snapshots_drain() {
-                if let Ok(applied) = net.apply(pm, &snap) {
-                    quic.ack_send(applied.tick);
-                    stats.borrow_mut().snapshots += 1;
-                }
-            }
-            if let Some(peer) = quic.handshake_done() {
-                pm.local_peer = peer;
-                stats.borrow_mut().peer = peer;
-                if !name_sent {
-                    name_sent = true;
-                    quic.event_send(EV_NAME, name.as_bytes());
-                }
-                quic.input_send(bytemuck::bytes_of(&cmd.borrow().0));
-                // Reliable events queued by any task (input, UI, bots,
-                // mods) — drained here by the one owner of the socket.
-                for (ty, payload) in outbox.borrow_mut().drain() {
-                    quic.event_send(ty, &payload);
-                }
-            }
-            // Restart request rides the reliable stream (a true must-see
-            // instant — not state).
-            stats.borrow_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
-        }
-    });
+    // Queued before the handshake even exists — the module holds
+    // reliable events until connected.
+    pm.single::<Outbox>("net.out").borrow_mut().send(EV_NAME, name.as_bytes());
+
+    let report_name = name;
 
     // One-shot diag report when the game ends (HELLFIRE_REPORT_DIR).
     pm.task_add_every("diag", 90.0, 0.5, {
@@ -206,8 +158,8 @@ pub fn run_bot(n: u32) {
     let quic = QuicClient::connect(ADDR, &net.schema()).expect("bot connect");
     add_client_tasks(&mut pm, quic, net, &pools, format!("bot{n}"));
 
-    let cmd = pm.single::<CurInput>("cmd");
-    let outbox = pm.single::<Outbox>("outbox");
+    let cmd = pm.single::<NetInput<InputCmd>>("net.input");
+    let outbox = pm.single::<Outbox>("net.out");
     pm.task_add("bot", 4.0, {
         let monster = pools.monster.clone();
         let player = pools.player.clone();

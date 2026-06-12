@@ -219,9 +219,9 @@ impl<T> Pool<T> {
     }
 
     /// Mutable join: call `f(id, Mut<A>, Mut<B>)` for every entity in
-    /// both pools. Callback style (like the C++ `each`) because a
-    /// streaming iterator of two `Mut` borrows can't be expressed
-    /// safely; each pair is disjoint, so the callback is.
+    /// both pools. Callback style because a streaming iterator of two
+    /// `Mut` borrows can't be expressed safely; each pair is disjoint,
+    /// so the callback is.
     pub fn each_with<U>(&mut self, other: &mut Pool<U>, mut f: impl FnMut(Id, Mut<'_, T>, Mut<'_, U>)) {
         for i in 0..self.ids.len() {
             let id = self.ids[i];

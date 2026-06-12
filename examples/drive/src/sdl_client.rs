@@ -8,7 +8,9 @@ use pm_sdl::sdl3;
 use sdl3::event::Event;
 use sdl3::keyboard::Scancode;
 
-use crate::client::{CurCmd, Stats, add_client_tasks, connect};
+use pm::{NetInput, NetStatus};
+
+use crate::client::{Stats, add_client_tasks, connect};
 use crate::common::*;
 
 const W: u32 = 1280;
@@ -41,7 +43,8 @@ pub fn run() {
     eprintln!("connecting to {ADDR} ...");
     add_client_tasks(&mut pm, quic, net, &car, &draw);
 
-    let cmd = pm.single::<CurCmd>("cmd");
+    let cmd = pm.single::<NetInput<Drive>>("net.input");
+    let status = pm.single::<NetStatus>("net.status");
     let stats = pm.single::<Stats>("stats");
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
     let chase = pm.single::<Chase>("chase");
@@ -153,12 +156,12 @@ pub fn run() {
                 }
             }
             if pm.tick() % 30 == 0 {
-                let s = stats.borrow();
+                let st = status.borrow();
                 let speed =
                     pred.borrow().state().map(|c| c.speed * 3.6 / 1.6).unwrap_or(0.0); // ~mph, for flavor
                 let title = format!(
                     "pm drive — peer {}  {:.0} mph  rtt {:.0} ms  corrections {}  (wasd, esc)",
-                    s.peer, speed.abs(), s.rtt_ms, s.corrections,
+                    st.peer, speed.abs(), st.rtt_ms, stats.borrow().corrections,
                 );
                 let _ = window.set_title(&title);
             }

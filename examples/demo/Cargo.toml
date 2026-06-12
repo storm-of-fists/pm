@@ -3,10 +3,6 @@ name = "demo"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-sdl = ["dep:pm_sdl"]
-
 [dependencies]
 bytemuck = "1"
 pm = { path = "../../crates/pm" }
-pm_sdl = { path = "../../crates/pm_sdl", optional = true }

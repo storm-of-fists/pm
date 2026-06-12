@@ -1,9 +1,9 @@
-//! PLC-inspired logic helpers (port of pm_util.hpp). All time is float
-//! seconds, matching `pm.loop_dt()`.
+//! PLC-inspired logic helpers (hysteresis, cooldowns, edges, latches).
+//! All time is float seconds, matching `pm.loop_dt()`.
 //!
-//! Rust note: the C++ versions convert implicitly to their value
-//! (`operator T()`); Rust has no implicit conversions, so these expose
-//! `get()` / `is_on()` instead.
+//! Rust note: Rust has no implicit conversions, so these expose
+//! explicit `get()` / `is_on()` accessors rather than converting to
+//! their value.
 
 /// Value with dead-zone persistence: changes are blocked for `hold`
 /// seconds after each transition (anti-flicker).

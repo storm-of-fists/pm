@@ -6,8 +6,10 @@
 //! links the same compiled `pm` and `hellfire_core` as the host, its
 //! `Monster` IS the host's `Monster` — `pool("monster")` resolves to the
 //! live replicated pool, and spawned meteors flow to every client
-//! through the ordinary sync path. Edit, `cargo build -p meteor`, and
-//! watch it hot-swap.
+//! through the ordinary sync path. Edit, rebuild with the exact command
+//! the server prints (`cargo build --release -p meteor -p hellfire` —
+//! JOINT selection and matching profile, or cargo resolves a different
+//! pm unit and the ABI check refuses the load), and watch it hot-swap.
 
 use hellfire_core::{H, Monster, MonsterSrv, W};
 use pm::{Pm, Rng, vec2};

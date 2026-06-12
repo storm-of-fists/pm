@@ -11,10 +11,8 @@ use pm_sdl::sdl3::mouse::MouseButton;
 use pm_sdl::sdl3::pixels::Color;
 use pm_sdl::sdl3::render::FRect;
 
-use crate::client::{
-    Camera, CurInput, NetStats, Ui, add_client_tasks, client_pools, current_status,
-};
-use pm::Outbox;
+use crate::client::{Camera, Ui, add_client_tasks, client_pools, current_status};
+use pm::{NetInput, NetStatus, Outbox};
 use crate::common::*;
 
 fn resource(name: &str) -> String {
@@ -44,11 +42,11 @@ pub fn run() {
     let mut canvas = window.into_canvas();
     let mut pump = sdl.event_pump().expect("event pump");
 
-    let cmd = pm.single::<CurInput>("cmd");
-    let stats = pm.single::<NetStats>("net_stats");
+    let cmd = pm.single::<NetInput<InputCmd>>("net.input");
+    let stats = pm.single::<NetStatus>("net.status");
     let cam = pm.single::<Camera>("camera");
     let ui = pm.single::<Ui>("ui");
-    let outbox = pm.single::<Outbox>("outbox");
+    let outbox = pm.single::<Outbox>("net.out");
 
     // Input + camera: wheel zooms (toward 0.5x..3x), camera follows your
     // player, mouse aim goes through the inverse camera transform so it

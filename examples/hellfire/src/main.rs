@@ -1,6 +1,7 @@
-//! hellfire — networked top-down wave shooter (Rust port of the C++
-//! example). Authoritative server, replicated-pool clients, up to 8
-//! players racing 5 monster waves to 8000 points.
+//! hellfire — networked top-down wave shooter. Authoritative server,
+//! replicated-pool clients, up to 8 players racing 5 monster waves to
+//! 8000 points. The flagship example: sprites, lobby, HUD, debug
+//! overlay, diag reports, and dylib mod hot-reload (see meteor).
 //!
 //!   cargo run --release -p hellfire           # play (server + 3 bots + you)
 //!   cargo run --release -p hellfire server    # dedicated server

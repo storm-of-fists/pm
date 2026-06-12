@@ -1,8 +1,8 @@
 //! Headless sim: 100k entities integrating position from velocity for 600
-//! ticks. Doubles as a perf sanity check against the C++ benchmark numbers
-//! (`each()` trivial ~0.6 ns/op sequential on the reference machine).
+//! ticks. The perf sanity check — the README's ns-per-entity-update number
+//! comes from here.
 //!
-//!     cargo run --release --example sim
+//!     cargo run --release -p pm --example sim
 
 use std::time::Instant;
 
@@ -44,20 +44,18 @@ fn main() {
         vel.borrow_mut().add(id, Vel { x: (i % 7) as f32, y: (i % 3) as f32 });
     }
 
-    // Join pattern: iterate one pool, look the other up by id.
+    // The join: iterate one pool densely, look the other up by id —
+    // each_with does exactly that (callback style; see pool.rs for why
+    // a streaming two-Mut iterator can't exist).
     pm.task_add("physics", 30.0, {
         let pos = pos.clone();
         let vel = vel.clone();
         move |pm| {
             let dt = pm.loop_dt();
-            let vel = vel.borrow();
-            let mut pos = pos.borrow_mut();
-            for (id, v) in vel.iter() {
-                if let Some(mut p) = pos.get_mut(id) {
-                    p.x += v.x * dt;
-                    p.y += v.y * dt;
-                }
-            }
+            vel.borrow_mut().each_with(&mut pos.borrow_mut(), |_, v, mut p| {
+                p.x += v.x * dt;
+                p.y += v.y * dt;
+            });
         }
     });
 
@@ -78,7 +76,7 @@ fn main() {
 
     let ops = ENTITIES as u64 * TICKS as u64;
     println!(
-        "{} entities x {} ticks in {:.1} ms — {:.2} ns per entity-update (join: iter + get_mut)",
+        "{} entities x {} ticks in {:.1} ms — {:.2} ns per entity-update (join: each_with)",
         ENTITIES,
         TICKS,
         elapsed.as_secs_f64() * 1e3,

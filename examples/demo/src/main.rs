@@ -7,10 +7,13 @@
 //! the server's input-seq echo (rewind + replay on divergence). Remote
 //! cars are dead-reckoned along their last known heading/speed.
 //!
-//!   cargo run --release --example demo            # server + 7 bots + you
-//!   cargo run --release --example demo -- server  # dedicated server on :47777
-//!   cargo run --release --example demo -- client  # player client only
-//!   cargo run --release --example demo -- bot     # one bot client only
+//! Renders in the terminal — the netcode reference that works over ssh.
+//! For windowed clients on the same stack see drive (3D) and hellfire.
+//!
+//!   cargo run --release -p demo           # server + 7 bots + you
+//!   cargo run --release -p demo server    # dedicated server on :47777
+//!   cargo run --release -p demo client    # player client only
+//!   cargo run --release -p demo bot       # one bot client only
 //!
 //! Controls: w go (latched), s reverse (latched), space coast, a/d steer,
 //! p profiling panel, q quit. Your vehicle is the arrow; bots are digits.
@@ -18,16 +21,16 @@
 //!
 //! Simulate a real link on the player's connection:
 //!
-//!   PM_LAG_MS=80 PM_LOSS=0.05 cargo run --release --example demo
+//!   PM_LAG_MS=80 PM_LOSS=0.05 cargo run --release -p demo
 
-#[cfg(feature = "sdl")]
-mod sdl_client;
-
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use pm::{Id, NetClient, NetServer, Pm, QuicClient, QuicServer};
+use pm::{
+    AppliedLog, ClientEvents, Commands, Id, NetClient, NetInput, NetServer, NetStatus,
+    PeerEvents, Pm, Predictor, QuicClient, QuicServer, SentLog, ServerOutbox, pool_mirror,
+};
 
 const ADDR: &str = "127.0.0.1:47777";
 const WORLD: f32 = 12.0; // world is [-WORLD, WORLD] on both axes
@@ -89,29 +92,19 @@ fn env_f32(name: &str) -> f32 {
 
 // --- server -------------------------------------------------------------
 
-/// Per-peer input queue: the command-frame model. The drive task consumes
-/// ONE input per tick (matching the one prediction step the client took
-/// for it), holds the last command when the queue runs dry, and skips
-/// ahead if the queue backs up.
-#[derive(Default)]
-struct Inbox(HashMap<u8, VecDeque<(u32, Drive)>>);
-#[derive(Default)]
-struct LastCmd(HashMap<u8, (u32, Drive)>); // last applied (seq, cmd)
 #[derive(Default)]
 struct Garage(HashMap<u8, Id>); // peer -> vehicle
 
 fn run_server(quiet: bool) {
     let mut pm = Pm::new();
     let car = pm.pool::<Car>("car");
-    let inbox = pm.single::<Inbox>("inbox");
-    let last_cmd = pm.single::<LastCmd>("last_cmd");
     let garage = pm.single::<Garage>("garage");
 
     let mut net = NetServer::new(&mut pm);
     net.pool_sync("car", &car);
     // Bind failure must kill the whole process loudly — a silent thread
     // panic here once let the demo piggyback a stale server on the port.
-    let mut quic = QuicServer::bind(ADDR, &net.schema()).unwrap_or_else(|e| {
+    let quic = QuicServer::bind(ADDR, &net.schema()).unwrap_or_else(|e| {
         eprintln!("cannot bind {ADDR}: {e}");
         eprintln!("(a previous demo may still be running: pkill -x demo)");
         std::process::exit(1);
@@ -119,16 +112,18 @@ fn run_server(quiet: bool) {
     if !quiet {
         eprintln!("pm demo server on {ADDR}");
     }
+    // The pump/ack/echo/snapshot loop is pm's net module; the game reads
+    // the "net.*" singles it publishes.
+    net.serve::<Drive>(&mut pm, quic);
+    let peers = pm.single::<PeerEvents>("net.peers");
+    let cmds = pm.single::<Commands<Drive>>("net.cmds");
+    let out = pm.single::<ServerOutbox>("net.out");
 
-    pm.task_add("net", 5.0, {
+    pm.task_add("roster", 10.0, {
         let car = car.clone();
-        let inbox = inbox.clone();
-        let last_cmd = last_cmd.clone();
         let garage = garage.clone();
         move |pm| {
-            quic.pump();
-            for p in quic.joined_drain() {
-                net.peer_add(p);
+            for &p in &peers.borrow().joined {
                 let id = pm.id_add();
                 let spread = p as f32 * 0.8;
                 car.borrow_mut().add(
@@ -141,15 +136,12 @@ fn run_server(quiet: bool) {
                     },
                 );
                 garage.borrow_mut().0.insert(p, id);
-                quic.event_send(p, EV_VEHICLE, &id.0.to_le_bytes());
+                out.borrow_mut().send(p, EV_VEHICLE, &id.0.to_le_bytes());
                 if !quiet {
                     eprintln!("peer {p} joined, vehicle index {}", id.index());
                 }
             }
-            for p in quic.left_drain() {
-                net.peer_remove(p);
-                inbox.borrow_mut().0.remove(&p);
-                last_cmd.borrow_mut().0.remove(&p);
+            for &p in &peers.borrow().left {
                 if let Some(id) = garage.borrow_mut().0.remove(&p) {
                     pm.id_remove(id);
                 }
@@ -157,55 +149,20 @@ fn run_server(quiet: bool) {
                     eprintln!("peer {p} left");
                 }
             }
-            for (p, seq, bytes) in quic.inputs_drain() {
-                if bytes.len() == size_of::<Drive>() {
-                    inbox
-                        .borrow_mut()
-                        .0
-                        .entry(p)
-                        .or_default()
-                        .push_back((seq, bytemuck::pod_read_unaligned(&bytes)));
-                }
-            }
-            for (p, tick) in quic.acks_drain() {
-                net.ack(p, tick);
-            }
-            // Echo what the drive task actually APPLIED (last tick) — the
-            // client reconciles its prediction against exactly this.
-            for (&p, &(seq, _)) in &last_cmd.borrow().0 {
-                net.input_processed(p, seq);
-            }
-            let peers: Vec<u8> = net.peers().collect();
-            for p in peers {
-                let budget = quic.snapshot_budget(p);
-                if let Some(snap) = net.snapshot_budgeted(pm, p, budget) {
-                    quic.snapshot_send(p, &snap);
-                }
-            }
-            net.prune(pm);
         }
     });
 
     pm.task_add("drive", 30.0, {
         let car = car.clone();
-        let inbox = inbox.clone();
-        let last_cmd = last_cmd.clone();
         let garage = garage.clone();
         move |_pm| {
-            let mut inbox = inbox.borrow_mut();
-            let mut last_cmd = last_cmd.borrow_mut();
+            let mut cmds = cmds.borrow_mut();
             let mut car = car.borrow_mut();
             for (&peer, &id) in &garage.borrow().0 {
-                let q = inbox.0.entry(peer).or_default();
-                // Bound queue-induced input latency to ~2 ticks.
-                while q.len() > 2 {
-                    let skipped = q.pop_front().unwrap();
-                    last_cmd.0.insert(peer, skipped);
-                }
-                if let Some(next) = q.pop_front() {
-                    last_cmd.0.insert(peer, next);
-                }
-                let (_, cmd) = last_cmd.0.get(&peer).copied().unwrap_or_default();
+                // Command-frame consumption: one input per tick (one
+                // prediction step on the client), hold-when-dry, bounded
+                // skip-ahead. The applied seq echoes back automatically.
+                let cmd = cmds.pop(peer);
                 if let Some(mut c) = car.get_mut(id) {
                     drive_step(&mut c, cmd, FIXED_DT);
                 }
@@ -246,28 +203,16 @@ fn run_bot(phase: f32) {
     let car = pm.pool::<Car>("car");
     let mut net = NetClient::new();
     net.pool_sync("car", &car);
-    let Ok(mut quic) = QuicClient::connect(ADDR, &net.schema()) else { return };
+    let Ok(quic) = QuicClient::connect(ADDR, &net.schema()) else { return };
+    net.connect::<Drive>(&mut pm, quic, 1.0 / FIXED_DT);
 
-    pm.task_add("net", 5.0, move |pm| {
-        quic.pump();
-        if quic.is_gone() {
-            pm.loop_quit();
-            return;
-        }
-        if let Some(peer) = quic.handshake_done() {
-            pm.local_peer = peer;
-            let t = pm.tick() as f32 / 60.0;
-            let cmd = Drive {
-                thrust: 0.7 + 0.3 * (t * 0.6 + phase).sin(),
-                turn: (t * 0.8 + phase * 2.0).sin(),
-            };
-            quic.input_send(bytemuck::bytes_of(&cmd));
-        }
-        for snap in quic.snapshots_drain() {
-            if let Ok(applied) = net.apply(pm, &snap) {
-                quic.ack_send(applied.tick);
-            }
-        }
+    let cmd = pm.single::<NetInput<Drive>>("net.input");
+    pm.task_add("bot", 4.0, move |pm| {
+        let t = pm.tick() as f32 / 60.0;
+        cmd.borrow_mut().0 = Drive {
+            thrust: 0.7 + 0.3 * (t * 0.6 + phase).sin(),
+            turn: (t * 0.8 + phase * 2.0).sin(),
+        };
     });
 
     pm.loop_rate = 60;
@@ -308,18 +253,11 @@ struct Keys {
     right: f32,
 }
 
-/// The command the input layer wants sent this tick — written by the
-/// input task (terminal keys or SDL keyboard), read by the net task.
-#[derive(Default)]
-struct CurCmd(Drive);
-
 #[derive(Default)]
 struct Stats {
-    snapshots: u32,
     acked: u32,
     input_echo: u32,
     corrections: u32,
-    rtt_ms: f32,
     mine: Option<Id>,
     show_prof: bool,
     prof: Vec<String>,
@@ -342,65 +280,54 @@ fn client_connect(net: &NetClient) -> QuicClient {
     quic
 }
 
-/// Everything a player client needs except input and rendering: the net
-/// task (pump, snapshot apply, prediction + reconciliation, input send),
-/// the smoothing/dead-reckoning task, and the profiling collector. Shared
-/// by the terminal and SDL clients — the input layer writes `CurCmd`, the
-/// renderer reads `car_draw` and `Stats`.
+/// Everything a player client needs except input and rendering: the
+/// prediction task (driven by the net module's sent/applied logs), the
+/// smoothing/dead-reckoning task, and the profiling collector. The
+/// input layer writes the `"net.input"` single, the renderer reads
+/// `car_draw`, `Stats`, and `"net.status"`.
 fn add_client_tasks(
     pm: &mut Pm,
-    mut quic: QuicClient,
+    quic: QuicClient,
     net: NetClient,
     car: &pm::Handle<Car>,
     draw: &pm::Handle<Car>,
 ) {
-    let cmd = pm.single::<CurCmd>("cmd");
-    let pred = pm.single::<pm::Predictor<Car, Drive>>("pred");
+    net.connect::<Drive>(pm, quic, 1.0 / FIXED_DT);
+
+    let pred = pm.single::<Predictor<Car, Drive>>("pred");
     let stats = pm.single::<Stats>("stats");
+    let events = pm.single::<ClientEvents>("net.events");
+    let applied = pm.single::<AppliedLog>("net.applied");
+    let sent = pm.single::<SentLog<Drive>>("net.sent");
     let car = car.clone();
     let draw = draw.clone();
 
-    pm.task_add("net", 5.0, {
-        let cmd = cmd.clone();
+    // Prediction, right after the net module's tick (prio 6): reconcile
+    // against each applied snapshot's echo of the last input the server
+    // applied, then feed this tick's sent inputs into the rewind ring.
+    pm.task_add("predict", 6.0, {
         let pred = pred.clone();
         let car = car.clone();
         let stats = stats.clone();
-        move |pm| {
-            quic.pump();
-            if let Some(err) = quic.error() {
-                eprintln!("\r\ndisconnected: {err}");
-                pm.loop_quit();
-                return;
-            }
-            if quic.is_gone() {
-                eprintln!("\r\nserver closed the connection");
-                pm.loop_quit();
-                return;
-            }
-            for (ty, payload) in quic.events_drain() {
-                if ty == EV_VEHICLE && payload.len() == 4 {
+        move |_pm| {
+            for (ty, payload) in &events.borrow().0 {
+                if *ty == EV_VEHICLE && payload.len() == 4 {
                     stats.borrow_mut().mine =
                         Some(Id(u32::from_le_bytes(payload.as_slice().try_into().unwrap())));
                 }
             }
-
-            // 1) Apply snapshots, reconciling the prediction against the
-            //    server's echo of the last input it actually applied.
-            for snap in quic.snapshots_drain() {
-                let Ok(applied) = net.apply(pm, &snap) else { continue };
-                quic.ack_send(applied.tick);
-                let mut s = stats.borrow_mut();
-                s.snapshots += 1;
-                s.acked = applied.tick;
-                s.input_echo = applied.input_seq;
-                let mine = s.mine;
-                drop(s);
-
+            let mine = stats.borrow().mine;
+            for a in &applied.borrow().0 {
+                {
+                    let mut s = stats.borrow_mut();
+                    s.acked = a.tick;
+                    s.input_echo = a.input_seq;
+                }
                 let auth = mine.and_then(|id| car.borrow().get(id).copied());
                 let Some(auth) = auth else { continue };
                 let corrected = pred.borrow_mut().reconcile(
                     auth,
-                    applied.input_seq,
+                    a.input_seq,
                     |s, c| drive_step(s, c, FIXED_DT),
                     |a, b| {
                         (a.x - b.x).abs()
@@ -414,22 +341,18 @@ fn add_client_tasks(
                     stats.borrow_mut().corrections += 1;
                 }
             }
-
-            // 2) Send this tick's input and predict its result instantly.
-            if let Some(peer) = quic.handshake_done() {
-                pm.local_peer = peer;
-                let cmd = cmd.borrow().0;
-                let seq = quic.input_send(bytemuck::bytes_of(&cmd));
+            for &(seq, cmd) in &sent.borrow().0 {
                 pred.borrow_mut().predict(seq, cmd, |s, c| drive_step(s, c, FIXED_DT));
             }
-            stats.borrow_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
         }
     });
 
     // Display: own car comes straight from the prediction (instant input
     // response); remote cars dead-reckon along their last known velocity
-    // and ease toward fresh server state as it arrives. A jump wider than
-    // the world means a wrap — snap instead of streaking across.
+    // and ease toward fresh server state as it arrives. pm::pool_mirror
+    // handles add/blend/stale-drop; the closure is just the blend math.
+    // A jump wider than the world means a wrap — snap instead of
+    // streaking across.
     pm.task_add("smooth", 30.0, {
         let car = car.clone();
         let draw = draw.clone();
@@ -437,35 +360,22 @@ fn add_client_tasks(
         let stats = stats.clone();
         move |pm| {
             let _p = pm::probe::scope("smooth.reckon");
+            let dt = pm.loop_dt();
             let mine = stats.borrow().mine;
-            let net_car = car.borrow();
-            let mut draw = draw.borrow_mut();
-            for (id, t) in net_car.iter() {
+            pool_mirror(&car, &draw, |id, mut d, a: &Car| {
                 if Some(id) == mine {
-                    continue;
+                    return *a; // overwritten below from the predictor
                 }
-                let mut cur = draw.get(id).copied().unwrap_or(*t);
-                coast_step(&mut cur, FIXED_DT);
-                let wrapped = (t.x - cur.x).abs() > WORLD || (t.y - cur.y).abs() > WORLD;
-                let next = if wrapped {
-                    *t
+                coast_step(&mut d, dt);
+                let wrapped = (a.x - d.x).abs() > WORLD || (a.y - d.y).abs() > WORLD;
+                if wrapped {
+                    *a
                 } else {
-                    Car {
-                        x: cur.x + (t.x - cur.x) * 0.12,
-                        y: cur.y + (t.y - cur.y) * 0.12,
-                        heading: t.heading,
-                        speed: t.speed,
-                    }
-                };
-                draw.add(id, next);
-            }
+                    Car { x: d.x + (a.x - d.x) * 0.12, y: d.y + (a.y - d.y) * 0.12, ..*a }
+                }
+            });
             if let (Some(id), Some(predicted)) = (mine, pred.borrow().state()) {
-                draw.add(id, predicted);
-            }
-            let dead: Vec<Id> =
-                draw.iter().map(|(id, _)| id).filter(|&id| !pm.id_alive(id)).collect();
-            for id in dead {
-                draw.remove(id);
+                draw.borrow_mut().add(id, predicted);
             }
         }
     });
@@ -506,7 +416,6 @@ fn run_player() {
     let car = pm.pool::<Car>("car"); // net state from the server (synced)
     let draw = pm.pool::<Car>("car_draw"); // display state (local)
     let keys = pm.single::<Keys>("keys");
-    let cmd = pm.single::<CurCmd>("cmd");
     let stats = pm.single::<Stats>("stats");
 
     let mut net = NetClient::new();
@@ -515,6 +424,8 @@ fn run_player() {
     eprintln!("connecting to {ADDR} ...");
     let _raw = RawTerm::enable();
     add_client_tasks(&mut pm, quic, net, &car, &draw);
+    let cmd = pm.single::<NetInput<Drive>>("net.input");
+    let status = pm.single::<NetStatus>("net.status");
 
     // Keyboard first in the tick so this tick's input rides this tick's
     // datagram.
@@ -562,7 +473,7 @@ fn run_player() {
     pm.task_add_every("render", 50.0, 1.0 / 30.0, {
         let draw = draw.clone();
         let stats = stats.clone();
-        move |pm| {
+        move |_pm| {
             let s = stats.borrow();
             let mut grid = vec![b' '; (COLS * ROWS) as usize];
             for (id, c) in draw.borrow().iter() {
@@ -586,13 +497,14 @@ fn run_player() {
                 out.push_str("|\r\n");
             }
             out.push_str(&edge);
+            let st = status.borrow();
             out.push_str(&format!(
                 "you are the arrow (peer {})  w go, s reverse, space coast, a/d steer, q quit\r\n\
                  vehicles {}  rtt {:.1}ms  snapshots {}  tick {}  echo {}  corrections {}\r\n",
-                pm.local_peer,
+                st.peer,
                 draw.borrow().len(),
-                s.rtt_ms,
-                s.snapshots,
+                st.rtt_ms,
+                st.snapshots,
                 s.acked,
                 s.input_echo,
                 s.corrections,
@@ -613,23 +525,10 @@ fn run_player() {
     pm.loop_run();
 }
 
-/// Default player: SDL window when compiled with `--features sdl`,
-/// terminal renderer otherwise.
-fn run_player_default() {
-    #[cfg(feature = "sdl")]
-    sdl_client::run();
-    #[cfg(not(feature = "sdl"))]
-    run_player();
-}
-
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("server") => run_server(false),
         Some("client") => run_player(),
-        #[cfg(feature = "sdl")]
-        Some("sdl") => sdl_client::run(),
-        #[cfg(not(feature = "sdl"))]
-        Some("sdl") => eprintln!("rebuild with: cargo run --release --features sdl --example demo"),
         Some("bot") => run_bot(0.0),
         _ => {
             std::thread::spawn(|| run_server(true));
@@ -638,7 +537,7 @@ fn main() {
                 std::thread::spawn(move || run_bot(i as f32 * 0.9));
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
-            run_player_default();
+            run_player();
         }
     }
 }

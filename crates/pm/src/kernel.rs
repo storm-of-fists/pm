@@ -2,9 +2,8 @@
 //! are just single-entity pools — see `single`), entity id lifecycle with
 //! end-of-tick deferred removal.
 //!
-//! Usage pattern (mirrors the C++ framework): fetch pool/singleton
-//! handles during init, clone them into the task closure, and access
-//! inside the task. Tasks are plain closures; a task's "state" is its
+//! Usage pattern: fetch pool/singleton handles during init, clone them
+//! into the task closure, and access inside the task. Tasks are plain closures; a task's "state" is its
 //! captures. Closures may return `Result` — an `Err` benches the task
 //! (recorded in `task_faults`) and the loop survives, so fallible data
 //! access (`try_get`/`try_mut` + `?`) turns bad-access bugs into

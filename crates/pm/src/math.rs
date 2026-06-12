@@ -1,9 +1,10 @@
-//! Lightweight math primitives (port of pm_math.hpp): Vec2 and a fast
-//! xorshift32 Rng.
+//! Lightweight math primitives: Vec2/Vec3/Mat4 and a fast xorshift32
+//! Rng.
 //!
-//! Rust note: C++ operator overloads map to the `std::ops` traits —
-//! implementing `Add` gives you `a + b`, `Mul<f32>` gives `v * s`. Vec2
-//! is `Pod` so it can sit directly inside replicated components.
+//! Rust note: operator overloading is done by implementing the
+//! `std::ops` traits — `Add` gives you `a + b`, `Mul<f32>` gives
+//! `v * s`. The vector types are `Pod` so they can sit directly inside
+//! replicated components.
 
 use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 

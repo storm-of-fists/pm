@@ -1,10 +1,9 @@
 //! Hellfire authoritative server: headless, owns all gameplay. Clients
-//! send command-frame input; everything they see is replicated pool
-//! state. Port of hellfire_server.cpp.
+//! send input; everything they see is replicated pool state.
 
 use std::collections::HashMap;
 
-use pm::{Id, NetServer, Pm, QuicServer, Rng, SpatialGrid, Vec2, vec2};
+use pm::{Commands, Id, NetServer, PeerEvents, Pm, QuicServer, Rng, ServerEvents, SpatialGrid, Vec2, vec2};
 
 use crate::common::*;
 
@@ -24,7 +23,6 @@ struct Game {
     rng: Rng,
     players: HashMap<u8, Id>,
     rosters: HashMap<u8, Id>,
-    axes: HashMap<u8, InputCmd>,
     grid: SpatialGrid,
     win_score: i32,
     samples: Vec<String>,
@@ -67,10 +65,12 @@ pub fn run(quiet: bool) {
     if !quiet {
         eprintln!("hellfire server on {ADDR}");
     }
-    // Receive (prio 15) and send (prio 95) are separate tasks bracketing
-    // the sim, so they share the endpoint and peer table by handle.
-    let quic = std::rc::Rc::new(std::cell::RefCell::new(quic));
-    let net = std::rc::Rc::new(std::cell::RefCell::new(net));
+    // The pump/ack/echo/snapshot loop is pm's net module; gameplay reads
+    // the "net.*" singles it publishes.
+    net.serve::<InputCmd>(&mut pm, quic);
+    let peers = pm.single::<PeerEvents>("net.peers");
+    let cmds = pm.single::<Commands<InputCmd>>("net.cmds");
+    let events = pm.single::<ServerEvents>("net.events");
 
     let game = pm.single::<Game>("game");
     {
@@ -83,23 +83,17 @@ pub fn run(quiet: bool) {
             .unwrap_or(WIN_SCORE);
     }
 
-    // --- net receive: joins, leaves, input, acks, events (prio 15) ----
-    pm.task_add("net_recv", 15.0, {
+    // --- lobby: joins, leaves, reliable events (prio 10, after net) ----
+    pm.task_add("lobby", 10.0, {
         let game = game.clone();
         let player = player.clone();
         let player_srv = player_srv.clone();
         let roster = roster.clone();
         let monster = monster.clone();
         let bullet = bullet.clone();
-        let quic = quic.clone();
-        let net = net.clone();
         move |pm| {
-            let mut quic = quic.borrow_mut();
-            let mut net = net.borrow_mut();
-            quic.pump();
             let mut g = game.borrow_mut();
-            for p in quic.joined_drain() {
-                net.peer_add(p);
+            for &p in &peers.borrow().joined {
                 let rid = pm.id_add();
                 roster.borrow_mut().add(rid, Roster::new(p, &format!("P{p}")));
                 g.rosters.insert(p, rid);
@@ -122,9 +116,7 @@ pub fn run(quiet: bool) {
                     eprintln!("[server] peer {p} joined");
                 }
             }
-            for p in quic.left_drain() {
-                net.peer_remove(p);
-                g.axes.remove(&p);
+            for &p in &peers.borrow().left {
                 if let Some(id) = g.players.remove(&p) {
                     pm.id_remove(id);
                 }
@@ -135,22 +127,13 @@ pub fn run(quiet: bool) {
                     eprintln!("[server] peer {p} left");
                 }
             }
-            for (p, seq, bytes) in quic.inputs_drain() {
-                if bytes.len() == size_of::<InputCmd>() {
-                    g.axes.insert(p, bytemuck::pod_read_unaligned(&bytes));
-                    net.input_processed(p, seq);
-                }
-            }
-            for (p, tick) in quic.acks_drain() {
-                net.ack(p, tick);
-            }
-            for (p, ty, payload) in quic.events_drain() {
-                match ty {
+            for (p, ty, payload) in &events.borrow().0 {
+                match *ty {
                     EV_NAME => {
                         if let (Some(&rid), Ok(name)) =
-                            (g.rosters.get(&p), std::str::from_utf8(&payload))
+                            (g.rosters.get(p), std::str::from_utf8(payload))
                         {
-                            roster.borrow_mut().add(rid, Roster::new(p, name));
+                            roster.borrow_mut().add(rid, Roster::new(*p, name));
                         }
                     }
                     EV_START if !g.started => {
@@ -195,12 +178,15 @@ pub fn run(quiet: bool) {
             {
                 let mut players = player.borrow_mut();
                 let mut srv = player_srv.borrow_mut();
+                let mut cmds = cmds.borrow_mut();
                 for (&peer, &pid) in &g.players {
                     let Some(mut p) = players.get_mut(pid) else { continue };
                     if p.alive == 0 {
                         continue;
                     }
-                    let cmd = g.axes.get(&peer).copied().unwrap_or_default();
+                    // Newest-wins: hellfire input is continuous held
+                    // state, not per-tick command frames.
+                    let cmd = cmds.latest(peer);
                     let mv = vec2(cmd.dx, cmd.dy).norm();
                     if mv != Vec2::ZERO {
                         let hs = PLAYER_SIZE * 0.5;
@@ -349,24 +335,16 @@ pub fn run(quiet: bool) {
                 return;
             }
             let dt = pm.loop_dt();
-            let mut dead = Vec::new();
-            {
-                let mut bullets = bullet.borrow_mut();
-                let mut srv = bullet_srv.borrow_mut();
-                for (id, mut b) in bullets.iter_mut() {
-                    let next = Bullet { pos: b.pos + b.vel * dt, ..*b };
-                    *b = next;
-                    if let Some(mut s) = srv.get_mut(id) {
-                        s.life -= dt;
-                        if s.life <= 0.0 {
-                            dead.push(id);
-                        }
-                    }
+            // id_remove is deferred (flushed at end of tick), so expiry
+            // can despawn right inside the join.
+            bullet.borrow_mut().each_with(&mut bullet_srv.borrow_mut(), |id, mut b, mut s| {
+                let next = Bullet { pos: b.pos + b.vel * dt, ..*b };
+                *b = next;
+                s.life -= dt;
+                if s.life <= 0.0 {
+                    pm.id_remove(id);
                 }
-            }
-            for id in dead {
-                pm.id_remove(id);
-            }
+            });
         }
     });
 
@@ -392,35 +370,29 @@ pub fn run(quiet: bool) {
                 .map(|p| p.pos)
                 .collect();
             let mut shots = Vec::new();
-            {
-                let mut monsters = monster.borrow_mut();
-                let mut srv = monster_srv.borrow_mut();
-                for (id, mut m) in monsters.iter_mut() {
-                    let (mut tgt, mut best) = (m.pos, f32::MAX);
-                    for &p in &alive {
-                        let d = m.pos.dist(p);
-                        if d < best {
-                            best = d;
-                            tgt = p;
-                        }
-                    }
-                    let desired = (tgt - m.pos).norm() * m.vel.len();
-                    let vel = m.vel + (desired - m.vel) * (0.5 * dt);
-                    let next = Monster { vel, pos: m.pos + vel * dt, ..*m };
-                    *m = next;
-                    if let Some(mut s) = srv.get_mut(id) {
-                        s.shoot_timer -= dt;
-                        if s.shoot_timer <= 0.0 && best < 500.0 {
-                            s.shoot_timer = g.rng.rfr(2.0, 5.0);
-                            let dir = (tgt - m.pos).norm();
-                            let sp = g.rng.rfr(-0.15, 0.15);
-                            let (cs, sn) = (sp.cos(), sp.sin());
-                            let aim = vec2(dir.x * cs - dir.y * sn, dir.x * sn + dir.y * cs);
-                            shots.push((m.pos, aim));
-                        }
+            monster.borrow_mut().each_with(&mut monster_srv.borrow_mut(), |_, mut m, mut s| {
+                let (mut tgt, mut best) = (m.pos, f32::MAX);
+                for &p in &alive {
+                    let d = m.pos.dist(p);
+                    if d < best {
+                        best = d;
+                        tgt = p;
                     }
                 }
-            }
+                let desired = (tgt - m.pos).norm() * m.vel.len();
+                let vel = m.vel + (desired - m.vel) * (0.5 * dt);
+                let next = Monster { vel, pos: m.pos + vel * dt, ..*m };
+                *m = next;
+                s.shoot_timer -= dt;
+                if s.shoot_timer <= 0.0 && best < 500.0 {
+                    s.shoot_timer = g.rng.rfr(2.0, 5.0);
+                    let dir = (tgt - m.pos).norm();
+                    let sp = g.rng.rfr(-0.15, 0.15);
+                    let (cs, sn) = (sp.cos(), sp.sin());
+                    let aim = vec2(dir.x * cs - dir.y * sn, dir.x * sn + dir.y * cs);
+                    shots.push((m.pos, aim));
+                }
+            });
             for (pos, aim) in shots {
                 let id = pm.id_add();
                 bullet.borrow_mut().add(
@@ -537,20 +509,17 @@ pub fn run(quiet: bool) {
             if !game.borrow().started {
                 return;
             }
-            let mut dead = Vec::new();
+            // Deferred id_remove: safe to call mid-iteration.
             for (id, m) in monster.borrow().iter() {
                 if m.pos.x < -100.0 || m.pos.x > W + 100.0 || m.pos.y < -100.0 || m.pos.y > H + 100.0
                 {
-                    dead.push(id);
+                    pm.id_remove(id);
                 }
             }
             for (id, b) in bullet.borrow().iter() {
                 if b.pos.x < -50.0 || b.pos.x > W + 50.0 || b.pos.y < -50.0 || b.pos.y > H + 50.0 {
-                    dead.push(id);
+                    pm.id_remove(id);
                 }
-            }
-            for id in dead {
-                pm.id_remove(id);
             }
         }
     });
@@ -632,24 +601,6 @@ pub fn run(quiet: bool) {
                 );
                 g.samples.push(sample);
             }
-        }
-    });
-
-    // --- snapshots out (prio 95) -------------------------------------------
-    pm.task_add("net_send", 95.0, {
-        let quic = quic.clone();
-        let net = net.clone();
-        move |pm| {
-            let mut quic = quic.borrow_mut();
-            let mut net = net.borrow_mut();
-            let peers: Vec<u8> = net.peers().collect();
-            for p in peers {
-                let budget = quic.snapshot_budget(p);
-                if let Some(snap) = net.snapshot_budgeted(pm, p, budget) {
-                    quic.snapshot_send(p, &snap);
-                }
-            }
-            net.prune(pm);
         }
     });
 
