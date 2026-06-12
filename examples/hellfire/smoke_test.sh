@@ -3,7 +3,7 @@
 # score; pass = server + every bot wrote a valid JSON diag report and
 # the server reported a win. PROFILE=debug for quicker iteration.
 set -u
-cd "$(dirname "$0")/../.."   # -> repo root
+cd "$(dirname "$0")/../.."   # examples/hellfire -> repo root
 
 PROFILE=${PROFILE:-release}
 BOTS=${BOTS:-4}

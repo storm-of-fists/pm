@@ -7,5 +7,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-hellfire_core = { path = "../hellfire_core" }
-pm = { path = "../../crates/pm" }
+hellfire_core = { path = "../core" }
+pm = { path = "../../../crates/pm" }
