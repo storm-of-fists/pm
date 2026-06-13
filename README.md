@@ -226,19 +226,27 @@ descriptor set 1 (`@group(1)` in WGSL); binding = the slot passed to
 
 **Camera**: cameras are ENTITIES attached to other entities — a
 `CamRig` component whose `target` field names the entity it's mounted
-on (the flecs-style relationship). The game-facing surface is three
-calls: `camera_follow(pm, car, sampler)` (feed the car's anchor each
-tick from smoothed DRAW state — registers the task for you),
-`camera_attach(pm, car, CamRig::chase()/hood()/backup()/side())` →
-camera id (any number per entity, each with its own mount offsets,
-FOV, and spring stiffness; 0 = welded), and `camera_use(pm, cam)` to
-point the screen. No install ceremony: the first call bootstraps the
-module's one-time machinery (pools, the `"cam.view"` single, the
-spring task), latched by the `"cam.manager"` single and owned by
+on (the flecs-style relationship). Setup goes through `camera_track(pm,
+car, sampler)`, which fixes the tracked entity once (feeding its anchor
+each tick from smoothed DRAW state — the task is registered for you)
+and hands back a `CameraRack`. Mount cameras on it —
+`rack.mount(CamRig::chase()/rear()/side())` → camera id, any number per
+entity, each with its own offsets, FOV, and spring stiffness (0 =
+welded) — and `rack.show(cam)` to pick the first one. Everything
+*after* setup goes through the `CamManager` single, captured with
+`camera_manager(pm)` and used with no `pm` at all:
+`mgr.show_index(i)` (mount order — number keys) and
+`mgr.toggle_panini()`. That split is the rule pm reaches for — **`pm`
+is for lifecycle (ids, tasks, modules); pools and singles are for
+state and behavior** — so the per-frame path is all handles, no kernel
+(the manager caches a handle to `"cam.view"` and switches through it).
+No install ceremony: the first camera call bootstraps the module's
+one-time machinery (pools, the `"cam.view"`/`"cam.manager"` singles,
+the spring task), latched by the manager and owned by
 `module_add("camera")` for one-call teardown. Renderers read
-`"cam.view"` — eye/target matrix plus the active rig's `fov_deg`
-(drive applies it to `Renderer3d` per frame, so swapping cameras
-swaps FOV too).
+`"cam.view"` — eye/target matrix, the active rig's `fov_deg`, and a
+`panini` flag (drive applies all three to `Renderer3d` per frame, so
+swapping cameras swaps FOV and the live P toggle flips the look).
 
 Pacing gotchas (WSLg): the swapchain is created vsync but WSLg does not
 honor it — an uncapped loop free-runs (~700 fps). Windowed examples pace

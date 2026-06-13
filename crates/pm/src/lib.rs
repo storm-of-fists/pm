@@ -20,8 +20,8 @@ mod transport;
 mod util;
 
 pub use camera::{
-    CAMERA_PRIO, CamAnchor, CamRig, CamView, camera_attach, camera_follow, camera_install,
-    camera_use,
+    CAMERA_PRIO, CamAnchor, CamManager, CamRig, CamView, CameraRack, camera_install,
+    camera_manager, camera_track,
 };
 pub use id::Id;
 pub use kernel::{AccessError, Handle, IntoTaskResult, Pm, Single, TaskError, TaskFault, TaskStat};

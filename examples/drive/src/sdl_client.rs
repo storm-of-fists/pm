@@ -2,10 +2,15 @@
 //! entity (cameras are entities related to the car by `CamRig.target`),
 //! the whole field rendered through pm_sdl::gpu3d's panini projection.
 //!
-//! WASD drives; 1-4 switch cameras (chase / hood / backup / side, each
-//! with its own FOV); P toggles panini; Esc quits.
+//! WASD drives; 1/2/3 switch cameras (chase / rear / side, each with its
+//! own FOV); P toggles panini; Esc quits. Camera switching and the
+//! panini toggle go through the `CamManager` single — no `pm` in the
+//! per-frame path.
 
-use pm::{CamAnchor, CamRig, CamView, Id, Mat4, Pm, Predictor, Vec3, camera_attach, camera_follow, camera_use, vec3};
+use pm::{
+    CamAnchor, CamRig, CamView, Mat4, Pm, Predictor, Vec3, camera_install, camera_manager,
+    camera_track, vec3,
+};
 use pm_sdl::gpu3d::{Renderer3d, bake, box_tris, checker_ground, panini_for_fov};
 use pm_sdl::sdl3;
 use sdl3::event::Event;
@@ -25,21 +30,7 @@ fn car_model(c: &Car) -> Mat4 {
 
 #[allow(dead_code)] // pause-menu stub, not wired up yet
 pub struct InGameMenu {
-    pub paused: bool
-}
-
-/// Single `"camctl"`: the car's camera rack (ids from `camera_attach`,
-/// C cycles through them) plus the panini toggle.
-struct CamCtl {
-    cams: Vec<Id>,
-    active: usize,
-    panini: bool,
-}
-
-impl Default for CamCtl {
-    fn default() -> Self {
-        Self { cams: Vec::new(), active: 0, panini: true }
-    }
+    pub paused: bool,
 }
 
 pub fn run() {
@@ -56,11 +47,15 @@ pub fn run() {
     let status = pm.single::<NetStatus>("net.status");
     let stats = pm.single::<Stats>("stats");
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
-    let ctl = pm.single::<CamCtl>("camctl");
+    // Install the camera module now so we can capture its manager single
+    // for the input task; the rig is mounted later, once we know our car.
+    camera_install(&mut pm);
+    let cam_mgr = camera_manager(&mut pm);
+    let cam_view = pm.single::<CamView>("cam.view");
     let draw_pool = draw.clone();
 
     let (mut window, mut pump, refresh) =
-        pm_sdl::window("pm drive — wasd, c cam, p panini, esc quits", W, H);
+        pm_sdl::window("pm drive — wasd, 1-3 cams, p panini, esc quits", W, H);
     let mut r3d = Renderer3d::new(&window).expect("renderer");
     r3d.fog_distance = 160.0;
     let ground = r3d
@@ -90,29 +85,24 @@ pub fn run() {
 
     pm.task_add("input", 4.0, 0.0, {
         let cmd = cmd.clone();
-        let ctl = ctl.clone();
+        let cam_mgr = cam_mgr.clone();
         move |pm| {
             for ev in pump.poll_iter() {
                 match ev {
                     Event::Quit { .. }
                     | Event::KeyDown { scancode: Some(Scancode::Escape), .. } => pm.loop_quit(),
+                    // Camera controls go straight through the manager
+                    // single — no pm.
                     Event::KeyDown { scancode: Some(Scancode::P), repeat: false, .. } => {
-                        let mut c = ctl.borrow_mut();
-                        c.panini = !c.panini;
+                        cam_mgr.borrow().toggle_panini();
                     }
-                    Event::KeyDown { scancode: Some(Scancode::C), repeat: false, .. } => {
-                        let next = {
-                            let mut c = ctl.borrow_mut();
-                            if c.cams.is_empty() {
-                                None
-                            } else {
-                                c.active = (c.active + 1) % c.cams.len();
-                                Some(c.cams[c.active])
-                            }
-                        };
-                        if let Some(cam) = next {
-                            camera_use(pm, cam);
-                        }
+                    Event::KeyDown {
+                        scancode:
+                            Some(sc @ (Scancode::_1 | Scancode::_2 | Scancode::_3)),
+                        repeat: false,
+                        ..
+                    } => {
+                        cam_mgr.borrow().show_index(sc as usize - Scancode::_1 as usize);
                     }
                     _ => {}
                 }
@@ -127,51 +117,48 @@ pub fn run() {
     });
 
     // The moment the server tells us which car is ours, rig the ENTITY:
-    // one camera_follow feeding its anchor from the smooth-predicted
-    // draw state, four camera_attach mounts (chase/hood/backup/side),
-    // then this task retires itself. The first camera_* call bootstraps
-    // the whole pm::camera module — no install ceremony.
+    // camera_track registers the anchor sampler (fed from the smooth-
+    // predicted draw state) and hands back a rack; we mount three cameras
+    // on it and show the chase. Then this task retires itself.
     pm.task_add("rig_cams", 32.0, 0.0, {
         let stats = stats.clone();
         let draw = draw.clone();
-        let ctl = ctl.clone();
         move |pm| {
             let Some(id) = stats.borrow().mine else { return };
             let draw = draw.clone();
-            camera_follow(pm, id, move |_pm| {
-                draw.borrow().get(id).copied().map(|c| CamAnchor {
-                    pos: vec3(c.x, 0.0, c.z),
-                    fwd: vec3(c.heading.sin(), 0.0, c.heading.cos()),
-                })
-            });
-            let cams = [CamRig::chase(), CamRig::hood(), CamRig::backup(), CamRig::side()]
-                .map(|rig| camera_attach(pm, id, rig));
-            camera_use(pm, cams[0]);
-            ctl.borrow_mut().cams = cams.to_vec();
+            {
+                let mut rack = camera_track(pm, id, move |_pm| {
+                    draw.borrow().get(id).copied().map(|c| CamAnchor {
+                        pos: vec3(c.x, 0.0, c.z),
+                        fwd: vec3(c.heading.sin(), 0.0, c.heading.cos()),
+                    })
+                });
+                let chase = rack.mount(CamRig::chase());
+                rack.mount(CamRig::rear());
+                rack.mount(CamRig::side());
+                rack.show(chase);
+            }
             pm.task_stop("rig_cams");
         }
     });
 
     pm.task_add("render", 70.0, 0.0, {
         let stats = stats.clone();
-        let ctl = ctl.clone();
+        let view = cam_view.clone();
         move |pm| {
-            // Fetched through pm each frame (not hoisted): the camera
-            // module doesn't exist until rig_cams bootstraps it, and a
-            // once-per-frame name lookup costs nothing.
-            let view = pm.single::<CamView>("cam.view");
-            let v = view.borrow();
-            let (view_mat, fov) = if v.ready() {
-                (v.matrix(), v.fov_deg)
-            } else {
-                (Mat4::look_at(vec3(0.0, 6.0, -ARENA), Vec3::ZERO, Vec3::UP), 100.0)
+            let (view_mat, fov, panini_on) = {
+                let v = view.borrow();
+                if v.ready() {
+                    (v.matrix(), v.fov_deg, v.panini)
+                } else {
+                    (Mat4::look_at(vec3(0.0, 6.0, -ARENA), Vec3::ZERO, Vec3::UP), 100.0, v.panini)
+                }
             };
-            drop(v);
-            // The active rig drives the FOV; P flips the house panini
-            // look off and back (both are plain renderer fields, read
-            // per frame — `set_fov` is just the coupled-curve setter).
+            // The active rig drives the FOV; the panini flag rides the
+            // house fov→distance curve, or 0 (rectilinear) when toggled
+            // off. Both are plain renderer fields, read per frame.
             r3d.fov_deg = fov;
-            r3d.panini = if ctl.borrow().panini { panini_for_fov(fov) } else { 0.0 };
+            r3d.panini = if panini_on { panini_for_fov(fov) } else { 0.0 };
             if let Some(mut frame) = r3d.frame(&window, view_mat, vec3(0.45, 1.0, 0.35)) {
                 let white = (1.0, 1.0, 1.0);
                 frame.draw(&ground, Mat4::IDENTITY, white, true);
@@ -192,7 +179,10 @@ pub fn run() {
                     pred.borrow().state().map(|c| c.speed * 3.6 / 1.6).unwrap_or(0.0); // ~mph, for flavor
                 let title = format!(
                     "pm drive — peer {}  {:.0} mph  rtt {:.0} ms  corrections {}  (wasd, esc)",
-                    st.peer, speed.abs(), st.rtt_ms, stats.borrow().corrections,
+                    st.peer,
+                    speed.abs(),
+                    st.rtt_ms,
+                    stats.borrow().corrections,
                 );
                 let _ = window.set_title(&title);
             }
