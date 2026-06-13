@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use pm::{
-    AppliedLog, ClientEvents, Id, NetClient, NetInput, Pm, Predictor, QuicClient, SentLog,
-    coast_blend, pool_mirror, vec2,
+    AppliedLog, ClientEvents, Id, NetClient, NetInput, NetStatus, Pm, Predictor, QuicClient,
+    SentLog, coast_blend, pool_mirror, vec2,
 };
 
 use crate::common::*;
@@ -88,7 +88,14 @@ pub fn add_client_tasks(
         }
     });
 
-    // Remote cars dead-reckon between budget-rotated refreshes.
+    // Remote cars dead-reckon between budget-rotated refreshes; the own
+    // car draws SMOOTH-PREDICTED: the predictor advances in fixed 60 Hz
+    // steps, and at render rates not phase-locked to that, drawing the
+    // raw state hitches (a frame advances 0 steps, the next 2 — the
+    // "camera jitter"). Extrapolate by the accumulator remainder with
+    // the current input: exactly where the next predict will land.
+    let status = pm.single::<NetStatus>("net.status");
+    let input = pm.single::<NetInput<Drive>>("net.input");
     pm.task_add("smooth", 30.0, 0.0, {
         let stats = stats.clone();
         move |pm| {
@@ -102,7 +109,9 @@ pub fn add_client_tasks(
                 let p = coast_blend(vec2(d.x, d.z), vel, vec2(a.x, a.z), dt, 0.15);
                 Car { x: p.x, z: p.y, ..*a }
             });
-            if let (Some(id), Some(p)) = (mine, pred.borrow().state()) {
+            if let (Some(id), Some(mut p)) = (mine, pred.borrow().state()) {
+                let alpha = status.borrow().input_alpha.min(1.0);
+                drive_step(&mut p, input.borrow().0, alpha * FIXED_DT);
                 draw.borrow_mut().add(id, p);
             }
         }

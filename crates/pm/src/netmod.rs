@@ -145,6 +145,14 @@ pub struct NetStatus {
     pub rtt_ms: f32,
     pub snapshots: u32,
     pub connected: bool,
+    /// Fraction (0..1) of the next fixed input step already accumulated
+    /// this tick. The predictor advances in whole `1/input_hz` steps; at
+    /// render rates not phase-locked to that, draw the local avatar at
+    /// `step(pred.state(), current_cmd, alpha / input_hz)` — the render-
+    /// clock interpolation that removes fixed-step beat ("smooth
+    /// predict"). Extrapolating with the current command is exact: it is
+    /// precisely where the next predict will land.
+    pub input_alpha: f32,
 }
 
 /// The command the input layer wants sent (client, `"net.input"`) —
@@ -304,6 +312,7 @@ impl NetClient {
                         let seq = quic.input_send(bytemuck::bytes_of(&cmd));
                         sent.borrow_mut().0.push((seq, cmd));
                     }
+                    status.borrow_mut().input_alpha = accum * input_hz;
                 }
                 status.borrow_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
             });

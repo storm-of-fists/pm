@@ -28,11 +28,13 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
 
 fn decode_png(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut decoder = png::Decoder::new(file);
+    // png 0.18 wants buffered input (it reads the stream in small sips).
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     // Normalize exotic PNGs (palette, 16-bit, no alpha) toward RGBA8.
     decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let size = reader.output_buffer_size().ok_or("png dimensions overflow")?;
+    let mut buf = vec![0u8; size];
     let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     buf.truncate(info.buffer_size());
     let rgba = match info.color_type {

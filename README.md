@@ -8,14 +8,14 @@ built in, not bolted on.
 ## Workspace layout
 
 ```
-crates/pm             the kernel: scheduler, pools, ids, math, net, transport, mods
-crates/pm_sdl         SDL3 companions: Sprite (png + hot-reload), Font (fontdue), gpu3d; re-exports sdl3
-examples/demo         8-car networked prediction reference (terminal renderer — works over ssh)
-examples/drive        networked 3D driving: predicted local car, chase camera, gpu3d
-examples/solids       3D solids + fly camera; gpu3d playground
-examples/hellfire     the flagship game: wave shooter, sprites, lobby, HUD, mods
-examples/hellfire_core  hellfire's shared/replicated types (a crate so mods can link them)
-examples/meteor       example dylib mod that hot-reloads into a running hellfire server
+crates/pm                the kernel: scheduler, pools, ids, math, net, transport, camera, mods
+crates/pm_sdl            SDL3 companions: window helper, Sprite (png + hot-reload), Font, gpu3d; re-exports sdl3
+examples/demo            8-car networked prediction reference (terminal renderer — works over ssh)
+examples/drive           networked 3D driving: predicted local car, chase camera, gpu3d panini
+examples/solids          3D solids + fly camera; gpu3d playground
+examples/hellfire/game   the flagship game: wave shooter, sprites, lobby, HUD, mods
+examples/hellfire/core   hellfire's shared/replicated types (a crate so mods can link them)
+examples/hellfire/meteor example dylib mod that hot-reloads into a running hellfire server
 ```
 
 `pm` has **zero cargo features, by design**: a mod dylib must link the
@@ -34,8 +34,9 @@ cargo run --release -p drive               # networked 3D driving (SDL window)
 cargo run --release -p solids              # 3D solids + fly camera
 cargo run --release -p hellfire            # wave shooter: server + 3 bots + you
 
-cargo run --release -p pm --example sim    # perf sanity check
-cargo run --release -p pm --example taskbench  # pool-access micro-bench
+cargo run --release -p pm --example sim    # perf sanity check (the README number)
+cargo run --release -p pm --example bench  # ns/op for every kernel hot path
+cargo run --release -p pm --example taskbench  # task dispatch + pool-access patterns
 examples/hellfire/smoke_test.sh            # headless end-to-end gate
 ```
 
@@ -47,8 +48,10 @@ on the player's connection with `PM_LAG_MS=80 PM_LOSS=0.05`.
   client prediction with rewind+replay reconciliation, dead reckoning.
   WASD-ish keys (latched throttle — terminals only report presses),
   `p` profiling panel, `q` quits.
-- **drive** — the same netcode shape in 3D: predicted local car, sprung
-  chase camera, budget-rotated snapshots, gpu3d rendering. WASD, Esc.
+- **drive** — the same netcode shape in 3D: predicted local car, four
+  camera rigs mounted on it (chase/hood/backup/side, each its own FOV),
+  budget-rotated snapshots, gpu3d rendering. WASD, C cycles cameras,
+  P toggles panini, Esc.
 - **hellfire** — the flagship: up to 8 players, 5 score-gated waves to
   8000 points, mouse aim, sprite hot-reload (edit
   `examples/hellfire/resources/*.png` while it runs), lobby, F1 debug
@@ -67,11 +70,11 @@ let id = pm.id_add();                  // generational id [peer|gen|index]
 car.borrow_mut().add(id, Car::default());
 pm.id_remove(id);                      // deferred: flushed end-of-tick, logged for sync
 
-pm.task_add("drive", 30.0, move |pm| { // flat priority order, lowest first
+pm.task_add("drive", 30.0, 0.0, move |pm| { // prio (lowest first), interval (0 = every tick)
     let dt = pm.loop_dt();
     for (id, mut c) in car.borrow_mut().iter_mut() { /* ... */ }
 });
-pm.task_add_every("status", 90.0, 5.0, move |pm| { /* every 5 s */ });
+pm.task_add("status", 90.0, 5.0, move |pm| { /* every 5 s */ });
 
 pm.loop_rate = 60;                     // absolute-deadline pacing (0 = uncapped)
 pm.loop_run();
@@ -188,21 +191,65 @@ work; u32 ticks last ~2.2 years.
 `pm_sdl::gpu3d`: `Renderer3d` (device, flat-shaded pipeline in a
 cull/no-cull pair, depth texture, `upload_mesh`,
 `frame().draw(mesh, model, tint, cull)`), `bake`/`box_tris`/
-`checker_ground` helpers, WGSL shader compiled to SPIR-V at build time
-by naga (a build-dependency — no global toolchain, nothing committed).
+`checker_ground`/`subdivide` helpers, WGSL shader compiled to SPIR-V at
+build time by naga (a build-dependency — no global toolchain, nothing
+committed).
 
-Conventions in one breath: +y up, +z forward, depth 0..1, the projection
-bakes the Vulkan y-flip, so front faces are CLOCKWISE on screen — author
-meshes CCW-from-outside and gpu3d handles the rest. SDL_gpu SPIR-V
-quirk: vertex-stage uniforms live in descriptor set 1 (`@group(1)` in
-WGSL); binding = the slot passed to `push_vertex_uniform_data`.
+**The house projection is Panini**, not rectilinear: a cylindrical
+projection that keeps the center rectilinear and verticals straight
+while compressing the periphery — wide FOVs without edge smearing, and
+calmer motion/rotation (no peripheral stretching racing past). The
+panini distance rides the FOV (`panini_for_fov`: d = 0.3 at 60° up to
+0.9 at 125°); `set_fov` keeps them coupled, `panini = 0.0` renders
+rectilinear straight to the swapchain. Implemented as a post pass —
+the scene renders rectilinear (wider source FOV, sized so center pixel
+density matches; edges come out supersampled) into an offscreen
+texture, then a compute pass inverts the mapping per pixel and a blit
+presents. Exact for all geometry; per-vertex warping was tried first
+and smears every triangle that crosses the camera plane.
 
-Pacing gotcha (WSLg): the swapchain is created vsync but WSLg does not
+SDL_gpu binding lore (the segfault tax, so nobody pays it twice): a
+"read-only storage texture" slot is a SAMPLED-IMAGE descriptor in
+SDL's Vulkan backend — in WGSL declare it `texture_2d<f32>` and
+`textureLoad` it; a real `texture_storage_2d<.., read>` declaration
+mismatches the descriptor type and crashes the driver at dispatch.
+Read-write slots are true storage images. (Sampled-with-sampler
+textures want combined image-samplers, which naga can't emit — avoid;
+textureLoad needs no sampler.)
+
+Conventions in one breath: +y up, +z forward, depth 0..1, `fov_deg` is
+HORIZONTAL, the projection bakes the Vulkan y-flip, so front faces are
+CLOCKWISE on screen — author meshes CCW-from-outside and gpu3d handles
+the rest. SDL_gpu SPIR-V quirk: vertex-stage uniforms live in
+descriptor set 1 (`@group(1)` in WGSL); binding = the slot passed to
+`push_vertex_uniform_data`.
+
+**Camera**: cameras are ENTITIES attached to other entities — a
+`CamRig` component whose `target` field names the entity it's mounted
+on (the flecs-style relationship). The game-facing surface is three
+calls: `camera_follow(pm, car, sampler)` (feed the car's anchor each
+tick from smoothed DRAW state — registers the task for you),
+`camera_attach(pm, car, CamRig::chase()/hood()/backup()/side())` →
+camera id (any number per entity, each with its own mount offsets,
+FOV, and spring stiffness; 0 = welded), and `camera_use(pm, cam)` to
+point the screen. No install ceremony: the first call bootstraps the
+module's one-time machinery (pools, the `"cam.view"` single, the
+spring task), latched by the `"cam.manager"` single and owned by
+`module_add("camera")` for one-call teardown. Renderers read
+`"cam.view"` — eye/target matrix plus the active rig's `fov_deg`
+(drive applies it to `Renderer3d` per frame, so swapping cameras
+swaps FOV too).
+
+Pacing gotchas (WSLg): the swapchain is created vsync but WSLg does not
 honor it — an uncapped loop free-runs (~700 fps). Windowed examples pace
 `pm.loop_rate` to the display's measured refresh rate; where vsync does
 block, the absolute-deadline loop absorbs the wait. Client input/
-prediction runs at a FIXED 60 Hz cadence via a dt accumulator regardless
-of render rate (drive's client is the reference).
+prediction runs at a FIXED 60 Hz cadence inside the net module
+regardless of render rate — so draw the LOCAL avatar smooth-predicted:
+extrapolate `pred.state()` by `NetStatus::input_alpha` of one fixed step
+with the current command (drive's smooth task is the reference).
+Drawing the raw fixed-step state at an unlocked render rate hitches
+(0 steps one frame, 2 the next).
 
 ## Mods (dylib hot-reload)
 

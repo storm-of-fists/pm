@@ -263,7 +263,7 @@ impl QuicServer {
         let cert = rcgen::generate_simple_self_signed(vec!["pm".into()])
             .map_err(io::Error::other)?;
         let cert_der = cert.cert.der().clone();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
         let mut crypto = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key.into())

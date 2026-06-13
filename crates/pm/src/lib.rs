@@ -3,6 +3,7 @@
 //! Flat task scheduler + sparse-set ECS with networking built into the
 //! core. See the repo README for the API tour and design decisions.
 
+mod camera;
 mod id;
 mod kernel;
 mod math;
@@ -18,6 +19,10 @@ mod spatial;
 mod transport;
 mod util;
 
+pub use camera::{
+    CAMERA_PRIO, CamAnchor, CamRig, CamView, camera_attach, camera_follow, camera_install,
+    camera_use,
+};
 pub use id::Id;
 pub use kernel::{AccessError, Handle, IntoTaskResult, Pm, Single, TaskError, TaskFault, TaskStat};
 pub use math::{Mat4, Rng, Vec2, Vec3, vec2, vec3};

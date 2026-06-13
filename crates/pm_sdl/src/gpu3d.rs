@@ -15,20 +15,30 @@
 //! } // drop submits
 //! ```
 //!
-//! Conventions: +y up, +z forward, depth 0..1. `projection()` bakes the
+//! Conventions: +y up, +z forward, depth 0..1. The projection bakes the
 //! y-flip the Vulkan backend needs, which mirrors screen winding — the
 //! culling pipeline therefore treats CLOCKWISE as front. Author meshes
 //! CCW-from-outside and it all works out.
+//!
+//! Projection is (General) Panini by default — pm's house look: wide
+//! FOV with a rectilinear center, straight verticals, compressed
+//! periphery (`panini_for_fov` couples the distance to the FOV). Done
+//! the right way: the scene renders RECTILINEAR (wider source FOV)
+//! into an offscreen texture, then a fullscreen pass inverts the
+//! panini mapping per pixel (post3d.wgsl) — exact for all geometry.
+//! Set `panini = 0.0` to skip the pass entirely and render rectilinear
+//! straight to the swapchain.
 
 use pm::{Mat4, Vec3, vec3};
 use sdl3::gpu::{
-    Buffer, BufferBinding, BufferRegion, BufferUsageFlags, ColorTargetDescription,
-    ColorTargetInfo, CommandBuffer, CompareOp, CullMode, DepthStencilState,
-    DepthStencilTargetInfo, Device, FillMode, FrontFace, GraphicsPipeline,
+    BlitInfo, Buffer, BufferBinding, BufferRegion, BufferUsageFlags, ColorTargetDescription,
+    ColorTargetInfo, CommandBuffer, CompareOp, ComputePipeline, CullMode, DepthStencilState,
+    DepthStencilTargetInfo, Device, FillMode, Filter, FrontFace, GraphicsPipeline,
     GraphicsPipelineTargetInfo, LoadOp, PrimitiveType, RasterizerState, RenderPass, SampleCount,
-    ShaderFormat, ShaderStage, StoreOp, Texture, TextureCreateInfo, TextureFormat, TextureType,
-    TextureUsage, TransferBufferLocation, TransferBufferUsage, VertexAttribute,
-    VertexBufferDescription, VertexElementFormat, VertexInputRate, VertexInputState,
+    ShaderFormat, ShaderStage, StorageTextureReadWriteBinding, StoreOp, Texture,
+    TextureCreateInfo, TextureFormat, TextureType, TextureUsage, TransferBufferLocation,
+    TransferBufferUsage, VertexAttribute, VertexBufferDescription, VertexElementFormat,
+    VertexInputRate, VertexInputState,
 };
 use sdl3::pixels::Color;
 use sdl3::video::Window;
@@ -46,11 +56,33 @@ pub struct Vertex3 {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Uniforms {
-    mvp: [f32; 16],
     mv: [f32; 16],
+    proj: [f32; 4],  // sx, sy (negative: y-flip), depth A, depth B
     light: [f32; 4], // xyz dir (view space), w = fog distance
     tint: [f32; 4],
     fog_color: [f32; 4],
+}
+
+/// Post-pass uniform block — must match `PostU` in post3d.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PostU {
+    out_scale: [f32; 4], // panini x/y at the screen edges, d, squeeze s
+    src_scale: [f32; 4], // source half-tans, output pixel dims
+}
+
+/// Offscreen targets for the panini path: the scene renders into
+/// `color`, the compute pass warps into `warped`, the blit presents.
+struct SceneTarget {
+    color: Texture<'static>,
+    depth: Texture<'static>,
+    warped: Texture<'static>,
+    /// Rectilinear half-tangents the source covers (h, v).
+    src_tan: (f32, f32),
+    /// Panini coords at the output screen edges (h, v).
+    out_edge: (f32, f32),
+    /// (fov, panini) this target was built for.
+    key: (u32, u32),
 }
 
 /// An uploaded static mesh: GPU buffer + vertex count.
@@ -63,15 +95,48 @@ pub struct Renderer3d {
     device: Device,
     pipe_cull: GraphicsPipeline,
     pipe_nocull: GraphicsPipeline,
+    pipe_post: ComputePipeline,
     depth: Texture<'static>,
+    scene: Option<SceneTarget>,
     width: u32,
     height: u32,
-    /// Projection used by `frame` (rebuild with `set_projection`).
-    proj: Mat4,
+    /// HORIZONTAL field of view, degrees. Set via `set_fov` to keep the
+    /// panini distance coupled, or write directly to decouple them.
+    pub fov_deg: f32,
+    /// Panini distance `d`: 0 = rectilinear, ~0.3 mild at 60° FOV up to
+    /// ~0.9 at 125°. `set_fov` keeps it on that curve — pm's house
+    /// look. Wide FOV without peripheral smearing; verticals stay
+    /// straight; helps motion/rotation comfort in vehicle games.
+    pub panini: f32,
+    /// Vertical squeeze `s` (1 = full panini vertical, 0 = rectilinear
+    /// vertical). Leave at 1 unless you know why.
+    pub panini_squeeze: f32,
     /// Fog cutoff distance in world units; 0 disables. Default 80.
     pub fog_distance: f32,
     /// Clear / fog color (rgb 0..1).
     pub clear_color: (f32, f32, f32),
+}
+
+/// The house fov→panini coupling: d = 0.3 at 60° FOV rising to 0.9 at
+/// 125° (clamped outside). Wider view, more cylinder.
+pub fn panini_for_fov(fov_deg: f32) -> f32 {
+    (0.3 + (fov_deg - 60.0) / 65.0 * 0.6).clamp(0.0, 1.0)
+}
+
+/// Panini-x at azimuth `phi` for distance `d`.
+fn panini_x(phi: f32, d: f32) -> f32 {
+    phi.sin() * (d + 1.0) / (d + phi.cos())
+}
+
+/// Inverse panini: panini coords -> rectilinear tangents (the same math
+/// the post shader runs per pixel; used here to plan source coverage).
+fn panini_inverse(xp: f32, yp: f32, d: f32, s: f32) -> (f32, f32) {
+    let k = xp / (d + 1.0);
+    let phi = k.atan() + (d * k / (1.0 + k * k).sqrt()).asin();
+    let c = phi.cos().max(1e-3);
+    let m = (d + 1.0) / (d + c);
+    let vert = (1.0 / c) * (1.0 - s) + m * s;
+    (phi.tan(), yp / (vert * c))
 }
 
 impl Renderer3d {
@@ -164,6 +229,26 @@ impl Renderer3d {
         drop(vert);
         drop(frag);
 
+        // The panini post pass is a COMPUTE pipeline: read the scene
+        // texture, write the warped one, then blit to the swapchain.
+        // (A fragment-shader version needs either sampled textures —
+        // SDL_gpu wants combined image-samplers naga can't emit — or
+        // fragment storage reads, an optional Vulkan feature that
+        // segfaults WSLg's Dozen driver. Compute storage is core.)
+        let pipe_post = device
+            .create_compute_pipeline()
+            .with_code(
+                ShaderFormat::SPIRV,
+                include_bytes!(concat!(env!("OUT_DIR"), "/cs_post.spv")),
+            )
+            .with_entrypoint(c"cs_post")
+            .with_readonly_storage_textures(1)
+            .with_readwrite_storage_textures(1)
+            .with_uniform_buffers(1)
+            .with_thread_count(8, 8, 1)
+            .build()
+            .map_err(|e| e.to_string())?;
+
         let depth = device
             .create_texture(
                 TextureCreateInfo::new()
@@ -178,37 +263,113 @@ impl Renderer3d {
             )
             .map_err(|e| e.to_string())?;
 
-        let proj = Self::projection(70.0_f32.to_radians(), width as f32 / height as f32);
+        let fov_deg = 100.0;
         Ok(Renderer3d {
             device,
             pipe_cull,
             pipe_nocull,
+            pipe_post,
             depth,
+            scene: None,
             width,
             height,
-            proj,
+            fov_deg,
+            panini: panini_for_fov(fov_deg),
+            panini_squeeze: 1.0,
             fog_distance: 80.0,
             clear_color: (0.051, 0.059, 0.078),
         })
     }
 
-    /// Perspective for SDL GPU's clip space: +z forward, depth 0..1,
-    /// y NEGATED (the Vulkan backend renders y-down otherwise — this is
-    /// also why the cull pipeline's front face is clockwise).
-    pub fn projection(fov_y: f32, aspect: f32) -> Mat4 {
-        let (near, far) = (0.1, 300.0);
-        let f = 1.0 / (fov_y / 2.0).tan();
-        let mut m = Mat4([0.0; 16]);
-        m.0[0] = f / aspect;
-        m.0[5] = -f;
-        m.0[10] = far / (far - near);
-        m.0[11] = 1.0;
-        m.0[14] = -near * far / (far - near);
-        m
+    /// (Re)build the offscreen scene target for the current fov/panini.
+    /// The source is rectilinear and must cover every angle the panini
+    /// output shows (corners need the most); it is sized so its CENTER
+    /// pixel density matches the output — panini compresses the
+    /// periphery, so edges come out supersampled for free.
+    fn ensure_scene(&mut self) -> Option<()> {
+        let key = ((self.fov_deg * 16.0) as u32, (self.panini * 1024.0) as u32);
+        if self.scene.as_ref().is_some_and(|sc| sc.key == key) {
+            return Some(());
+        }
+        let (d, s) = (self.panini, self.panini_squeeze);
+        let half = (self.fov_deg.to_radians() / 2.0).clamp(0.1, 1.45);
+        let x_edge = panini_x(half, d);
+        let y_edge = x_edge * self.height as f32 / self.width as f32;
+        let (mut th, mut tv) = (0.0f32, 0.0f32);
+        for i in 0..=32 {
+            let t = i as f32 / 32.0;
+            for (xp, yp) in [(x_edge, y_edge * t), (x_edge * t, y_edge)] {
+                let (xr, yr) = panini_inverse(xp, yp, d, s);
+                th = th.max(xr.abs());
+                tv = tv.max(yr.abs());
+            }
+        }
+        let (th, tv) = (th * 1.02, tv * 1.02);
+        let w = ((self.width as f32 * th / x_edge).ceil() as u32).clamp(self.width, self.width * 2);
+        let h =
+            ((self.height as f32 * tv / y_edge).ceil() as u32).clamp(self.height, self.height * 2);
+        let tex = |w, h, format, usage| {
+            self.device
+                .create_texture(
+                    TextureCreateInfo::new()
+                        .with_type(TextureType::_2D)
+                        .with_width(w)
+                        .with_height(h)
+                        .with_layer_count_or_depth(1)
+                        .with_num_levels(1)
+                        .with_sample_count(SampleCount::NoMultiSampling)
+                        .with_format(format)
+                        .with_usage(usage),
+                )
+                .ok()
+        };
+        let color = tex(
+            w,
+            h,
+            TextureFormat::R8g8b8a8Unorm,
+            TextureUsage::COLOR_TARGET | TextureUsage::COMPUTE_STORAGE_READ,
+        )?;
+        let depth = tex(w, h, TextureFormat::D16Unorm, TextureUsage::DEPTH_STENCIL_TARGET)?;
+        // Warped output: written by compute, blitted to the swapchain
+        // (blit sources must carry SAMPLER usage).
+        let warped = tex(
+            self.width,
+            self.height,
+            TextureFormat::R8g8b8a8Unorm,
+            TextureUsage::COMPUTE_STORAGE_WRITE | TextureUsage::SAMPLER,
+        )?;
+        self.scene = Some(SceneTarget {
+            color,
+            depth,
+            warped,
+            src_tan: (th, tv),
+            out_edge: (x_edge, y_edge),
+            key,
+        });
+        Some(())
     }
 
-    pub fn set_fov(&mut self, fov_y: f32) {
-        self.proj = Self::projection(fov_y, self.width as f32 / self.height as f32);
+    /// Set the horizontal FOV and ride the house fov→panini curve
+    /// (`panini_for_fov`). Write the fields directly to decouple.
+    pub fn set_fov(&mut self, fov_deg: f32) {
+        self.fov_deg = fov_deg;
+        self.panini = panini_for_fov(fov_deg);
+    }
+
+    /// Projection params for the shader: screen scales chosen so the
+    /// horizontal screen edge lands exactly at fov/2 THROUGH the panini
+    /// mapping (center pixels stay square: sy = sx * aspect), plus the
+    /// 0..1 depth mapping. sy is negated — the Vulkan backend renders
+    /// y-down otherwise; this is also why the cull pipeline's front
+    /// face is clockwise.
+    fn proj_params(&self) -> [f32; 4] {
+        let d = self.panini;
+        let half = self.fov_deg.to_radians() / 2.0;
+        let edge = half.sin() * (d + 1.0) / (d + half.cos());
+        let sx = 1.0 / edge;
+        let sy = -(sx * self.width as f32 / self.height as f32);
+        let (near, far) = (0.1_f32, 300.0_f32);
+        [sx, sy, far / (far - near), -near * far / (far - near)]
     }
 
     /// Upload a static mesh (transfer buffer + copy pass).
@@ -243,38 +404,99 @@ impl Renderer3d {
         Ok(Mesh3 { buffer, count: vertices.len() as u32 })
     }
 
-    /// Begin a frame: acquire swapchain (blocks on vsync — let it pace
-    /// the loop: `pm.loop_rate = 0`), clear color + depth. Returns None
-    /// when the swapchain isn't available (minimized etc). The frame
-    /// submits on drop.
-    pub fn frame(&mut self, window: &Window, view: Mat4, light_world: Vec3) -> Option<Frame3<'_>> {
+    /// Begin a frame: clear color + depth, ready to draw. Returns None
+    /// when a target isn't available (minimized etc). The frame submits
+    /// on drop — including the panini post pass when active (the
+    /// swapchain is acquired only then, after the scene is recorded).
+    pub fn frame<'a>(
+        &'a mut self,
+        window: &'a Window,
+        view: Mat4,
+        light_world: Vec3,
+    ) -> Option<Frame3<'a>> {
+        let use_post = self.panini > 1e-3;
+        if use_post {
+            self.ensure_scene()?;
+        }
         let mut commands = self.device.acquire_command_buffer().ok()?;
-        let Ok(swapchain) = commands.wait_and_acquire_swapchain_texture(window) else {
-            commands.cancel();
-            return None;
-        };
         let (r, g, b) = self.clear_color;
-        let color_targets = [ColorTargetInfo::default()
-            .with_texture(&swapchain)
-            .with_load_op(LoadOp::CLEAR)
-            .with_store_op(StoreOp::STORE)
-            .with_clear_color(Color::RGB(
-                (r * 255.0) as u8,
-                (g * 255.0) as u8,
-                (b * 255.0) as u8,
-            ))];
-        let depth_target = DepthStencilTargetInfo::new()
-            .with_texture(&mut self.depth)
-            .with_cycle(true)
-            .with_clear_depth(1.0)
-            .with_load_op(LoadOp::CLEAR)
-            .with_store_op(StoreOp::STORE)
-            .with_stencil_load_op(LoadOp::DONT_CARE)
-            .with_stencil_store_op(StoreOp::DONT_CARE);
-        let pass = self
-            .device
-            .begin_render_pass(&commands, &color_targets, Some(&depth_target))
-            .ok()?;
+        let clear =
+            Color::RGB((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+        let depth_part = |t: DepthStencilTargetInfo| {
+            t.with_cycle(true)
+                .with_clear_depth(1.0)
+                .with_load_op(LoadOp::CLEAR)
+                .with_store_op(StoreOp::STORE)
+                .with_stencil_load_op(LoadOp::DONT_CARE)
+                .with_stencil_store_op(StoreOp::DONT_CARE)
+        };
+        let (pass, proj) = if use_post {
+            let scene = self.scene.as_mut().unwrap();
+            let color_targets = [ColorTargetInfo::default()
+                .with_texture(&scene.color)
+                .with_load_op(LoadOp::CLEAR)
+                .with_store_op(StoreOp::STORE)
+                .with_clear_color(clear)];
+            let depth_target = depth_part(DepthStencilTargetInfo::new())
+                .with_texture(&mut scene.depth);
+            let pass = self
+                .device
+                .begin_render_pass(&commands, &color_targets, Some(&depth_target))
+                .ok()?;
+            // Rectilinear source projection covering the panini output.
+            let (near, far) = (0.1_f32, 300.0_f32);
+            let proj = [
+                1.0 / scene.src_tan.0,
+                -(1.0 / scene.src_tan.1),
+                far / (far - near),
+                -near * far / (far - near),
+            ];
+            (pass, proj)
+        } else {
+            let Ok(swapchain) = commands.wait_and_acquire_swapchain_texture(window) else {
+                commands.cancel();
+                return None;
+            };
+            let color_targets = [ColorTargetInfo::default()
+                .with_texture(&swapchain)
+                .with_load_op(LoadOp::CLEAR)
+                .with_store_op(StoreOp::STORE)
+                .with_clear_color(clear)];
+            let depth_target =
+                depth_part(DepthStencilTargetInfo::new()).with_texture(&mut self.depth);
+            let pass = self
+                .device
+                .begin_render_pass(&commands, &color_targets, Some(&depth_target))
+                .ok()?;
+            (pass, self.proj_params())
+        };
+        let post = if use_post {
+            let scene = self.scene.as_ref().unwrap();
+            Some(PostPass {
+                window,
+                pipe: &self.pipe_post,
+                scene_color: &scene.color,
+                warped: &scene.warped,
+                out_w: self.width,
+                out_h: self.height,
+                u: PostU {
+                    out_scale: [
+                        scene.out_edge.0,
+                        scene.out_edge.1,
+                        self.panini,
+                        self.panini_squeeze,
+                    ],
+                    src_scale: [
+                        scene.src_tan.0,
+                        scene.src_tan.1,
+                        self.width as f32,
+                        self.height as f32,
+                    ],
+                },
+            })
+        } else {
+            None
+        };
         let light_view = view.transform_dir(light_world.norm());
         Some(Frame3 {
             device: &self.device,
@@ -283,10 +505,11 @@ impl Renderer3d {
             commands: Some(commands),
             pass: Some(pass),
             view,
-            proj: self.proj,
+            proj,
             light: [light_view.x, light_view.y, light_view.z, self.fog_distance],
             fog_color: [r, g, b, 1.0],
             bound_cull: None,
+            post,
         })
     }
 }
@@ -299,10 +522,22 @@ pub struct Frame3<'a> {
     commands: Option<CommandBuffer>,
     pass: Option<RenderPass>,
     view: Mat4,
-    proj: Mat4,
+    proj: [f32; 4],
     light: [f32; 4],
     fog_color: [f32; 4],
     bound_cull: Option<bool>,
+    post: Option<PostPass<'a>>,
+}
+
+/// Everything the drop-time panini pass needs.
+struct PostPass<'a> {
+    window: &'a Window,
+    pipe: &'a ComputePipeline,
+    scene_color: &'a Texture<'static>,
+    warped: &'a Texture<'static>,
+    out_w: u32,
+    out_h: u32,
+    u: PostU,
 }
 
 impl Frame3<'_> {
@@ -317,8 +552,8 @@ impl Frame3<'_> {
         }
         let mv = self.view * model;
         let u = Uniforms {
-            mvp: (self.proj * mv).0,
             mv: mv.0,
+            proj: self.proj,
             light: self.light,
             tint: [tint.0, tint.1, tint.2, 1.0],
             fog_color: self.fog_color,
@@ -334,10 +569,42 @@ impl Frame3<'_> {
 
 impl Drop for Frame3<'_> {
     fn drop(&mut self) {
-        if let (Some(pass), Some(commands)) = (self.pass.take(), self.commands.take()) {
-            self.device.end_render_pass(pass);
-            let _ = commands.submit();
+        let (Some(pass), Some(mut commands)) = (self.pass.take(), self.commands.take()) else {
+            return;
+        };
+        self.device.end_render_pass(pass);
+        if let Some(post) = self.post.take() {
+            // Warp scene -> warped in compute...
+            let rw = [StorageTextureReadWriteBinding::new().with_texture(post.warped)];
+            if let Ok(cp) = self.device.begin_compute_pass(&commands, &rw, &[]) {
+                cp.bind_compute_pipeline(post.pipe);
+                cp.bind_compute_storage_textures(0, std::slice::from_ref(post.scene_color));
+                commands.push_compute_uniform_data(0, &post.u);
+                cp.dispatch(post.out_w.div_ceil(8), post.out_h.div_ceil(8), 1);
+                self.device.end_compute_pass(cp);
+            }
+            // ...then blit to the swapchain, acquired only now that the
+            // frame's work is recorded (the one point that can block on
+            // the compositor; if it fails — minimized — drop the frame).
+            // BlitInfo holds raw handles, so the swapchain borrow can
+            // end before the blit call needs `commands` again.
+            let blit = match commands.wait_and_acquire_swapchain_texture(post.window) {
+                Ok(swapchain) => Some(
+                    BlitInfo::default()
+                        .with_source_texture(post.warped)
+                        .with_source_region(0, 0, 0, post.out_w, post.out_h)
+                        .with_destination_texture(&swapchain)
+                        .with_destination_region(0, 0, 0, swapchain.width(), swapchain.height())
+                        .with_load_op(LoadOp::DONT_CARE)
+                        .with_filter(Filter::Nearest),
+                ),
+                Err(_) => None,
+            };
+            if let Some(blit) = blit {
+                commands.blit_texture(blit);
+            }
         }
+        let _ = commands.submit();
     }
 }
 

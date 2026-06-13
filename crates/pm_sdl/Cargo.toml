@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 pm = { path = "../pm" }
-sdl3 = { version = "0.14", features = ["build-from-source", "static-link", "unsafe_textures"] }
-png = "0.17"
+sdl3 = { version = "0.18", features = ["build-from-source", "static-link", "unsafe_textures"] }
+png = "0.18"
 fontdue = "0.9"
 
 [build-dependencies]
