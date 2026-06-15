@@ -134,6 +134,24 @@ pub fn drive_step(c: &mut Car, cmd: Drive, dt: f32) {
     }
 }
 
+/// Interpolate between two replicated car samples for snapshot
+/// interpolation (`pm::pool_interp`). Linear on the scalar fields;
+/// heading takes the SHORTEST arc so a car crossing the +z wrap (pi to
+/// -pi) eases across instead of spinning the long way round.
+pub fn car_lerp(a: &Car, b: &Car, t: f32) -> Car {
+    let l = |x: f32, y: f32| x + (y - x) * t;
+    let dh = (b.heading - a.heading + std::f32::consts::PI)
+        .rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    Car {
+        x: l(a.x, b.x),
+        z: l(a.z, b.z),
+        heading: a.heading + dh * t,
+        speed: l(a.speed, b.speed),
+        steer: l(a.steer, b.steer),
+    }
+}
+
 /// Center-to-center distance between two cars on the ground plane.
 pub fn car_dist(a: &Car, b: &Car) -> f32 {
     let (dx, dz) = (a.x - b.x, a.z - b.z);

@@ -36,7 +36,7 @@ pub use netmod::{
 };
 pub use pool::{Mut, Pool};
 pub use predict::Predictor;
-pub use smooth::{coast_blend, pool_mirror};
+pub use smooth::{InterpBuffer, coast_blend, pool_interp, pool_mirror};
 pub use spatial::SpatialGrid;
 pub use transport::{EVENT_USER_BASE, QuicClient, QuicServer};
 pub use util::{Cooldown, Counter, DelayTimer, FallingEdge, Hysteresis, Latch, RisingEdge};

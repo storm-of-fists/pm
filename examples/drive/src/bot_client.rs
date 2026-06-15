@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use pm::{
-    AppliedLog, ClientEvents, Id, NetInput, NetStatus, Pm, Predictor, QuicClient, SentLog,
-    coast_blend, pool_mirror, vec2,
+    AppliedLog, ClientEvents, Id, InterpBuffer, NetInput, NetStatus, Pm, Predictor, QuicClient,
+    SentLog, pool_interp,
 };
 
 use crate::common::*;
@@ -99,31 +99,40 @@ pub fn add_client_tasks(
         }
     });
 
-    // Remote cars dead-reckon between budget-rotated refreshes; the own
-    // car draws SMOOTH-PREDICTED: the predictor advances in fixed 60 Hz
-    // steps, and at render rates not phase-locked to that, drawing the
-    // raw state hitches (a frame advances 0 steps, the next 2 — the
-    // "camera jitter"). Extrapolate by the accumulator remainder with
-    // the current input: exactly where the next predict will land.
+    // Remote cars draw by SNAPSHOT INTERPOLATION: `pool_interp` renders
+    // them ~100 ms behind the newest authoritative sample, easing between
+    // two known-true points instead of dead-reckoning past the latest one
+    // — so a juke or a dropped snapshot widens the bracket it spans rather
+    // than snapping when the guess was wrong (the old `coast_blend`).
+    //
+    // The OWN car ignores all that and draws SMOOTH-PREDICTED: the
+    // predictor advances in fixed 60 Hz steps, and at render rates not
+    // phase-locked to that, drawing the raw state hitches (a frame
+    // advances 0 steps, the next 2 — the "camera jitter"). Extrapolate by
+    // the accumulator remainder with the current input — exactly where
+    // the next predict lands — and overwrite the interpolated local car.
     let status = pm.single::<NetStatus>("net.status");
     let input = pm.single::<NetInput<Drive>>("net.input");
+    // Interp delay/extrapolation are env-tunable so feel can be A/B'd live
+    // without a rebuild. 50 ms behind newest is plenty at 60 Hz snapshots
+    // (3 intervals) and keeps other cars near their true server positions
+    // so collisions line up with what you see; the 50 ms capped
+    // extrapolation only kicks in on an actual loss burst.
+    let env_ms = |k: &str, d: f64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(d, |ms| ms / 1000.0)
+    };
     pm.task_add("smooth", 30.0, 0.0, {
         let stats = stats.clone();
+        let mut interp = InterpBuffer::<Car>::new(env_ms("PM_INTERP_MS", 0.05));
+        interp.extrap_max = env_ms("PM_EXTRAP_MS", 0.05);
+        let mut clock = 0.0f64;
         move |pm| {
-            let dt = pm.loop_dt();
+            clock += pm.loop_dt() as f64;
             let mine = stats.get().mine;
-            pool_mirror(&car, &draw, |id, d, a: &Car| {
-                if Some(id) == mine {
-                    return *a; // overwritten below from the predictor
-                }
-                let vel = vec2(a.heading.sin(), a.heading.cos()) * a.speed;
-                let p = coast_blend(vec2(d.x, d.z), vel, vec2(a.x, a.z), dt, 0.15);
-                Car {
-                    x: p.x,
-                    z: p.y,
-                    ..*a
-                }
-            });
+            pool_interp(&car, &draw, &mut interp, clock, car_lerp);
             if let (Some(id), Some(mut p)) = (mine, pred.get().state()) {
                 let alpha = status.get().input_alpha.min(1.0);
                 drive_step(&mut p, input.get().0, alpha * FIXED_DT);
