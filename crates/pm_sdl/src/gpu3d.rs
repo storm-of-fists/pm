@@ -29,19 +29,23 @@
 //! Set `panini = 0.0` to skip the pass entirely and render rectilinear
 //! straight to the swapchain.
 
+use std::collections::HashMap;
+
 use pm::{Mat4, Vec3, vec3};
 use sdl3::gpu::{
     BlitInfo, Buffer, BufferBinding, BufferRegion, BufferUsageFlags, ColorTargetDescription,
     ColorTargetInfo, CommandBuffer, CompareOp, ComputePipeline, CullMode, DepthStencilState,
     DepthStencilTargetInfo, Device, FillMode, Filter, FrontFace, GraphicsPipeline,
     GraphicsPipelineTargetInfo, LoadOp, PrimitiveType, RasterizerState, RenderPass, SampleCount,
-    ShaderFormat, ShaderStage, StorageTextureReadWriteBinding, StoreOp, Texture,
-    TextureCreateInfo, TextureFormat, TextureType, TextureUsage, TransferBufferLocation,
-    TransferBufferUsage, VertexAttribute, VertexBufferDescription, VertexElementFormat,
-    VertexInputRate, VertexInputState,
+    ShaderFormat, ShaderStage, StorageTextureReadWriteBinding, StoreOp, Texture, TextureCreateInfo,
+    TextureFormat, TextureRegion, TextureTransferInfo, TextureType, TextureUsage,
+    TransferBufferLocation, TransferBufferUsage, VertexAttribute, VertexBufferDescription,
+    VertexElementFormat, VertexInputRate, VertexInputState,
 };
 use sdl3::pixels::Color;
 use sdl3::video::Window;
+
+use crate::font::Font;
 
 /// Vertex of the standard pipeline: position, per-face normal, color.
 #[repr(C)]
@@ -71,12 +75,20 @@ struct PostU {
     src_scale: [f32; 4], // source half-tans, output pixel dims
 }
 
-/// Offscreen targets for the panini path: the scene renders into
-/// `color`, the compute pass warps into `warped`, the blit presents.
+/// Text-pass uniform block — must match `TextU` in text.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TextU {
+    rect: [f32; 4],  // dest top-left x, y in pixels (zw unused)
+    color: [f32; 4], // rgb tint, a = coverage scale
+}
+
+/// Offscreen scene target for the panini path: the scene renders into
+/// `color` (oversized, rectilinear), the compute pass warps it into the
+/// screen-sized `present`. Rebuilt when fov/panini change.
 struct SceneTarget {
     color: Texture<'static>,
     depth: Texture<'static>,
-    warped: Texture<'static>,
     /// Rectilinear half-tangents the source covers (h, v).
     src_tan: (f32, f32),
     /// Panini coords at the output screen edges (h, v).
@@ -91,13 +103,111 @@ pub struct Mesh3 {
     count: u32,
 }
 
+/// A cached glyph: its GPU coverage texture (None for whitespace) and
+/// the metrics needed to place it. Mirrors `font::Raster`, with the
+/// coverage living on the GPU.
+struct GpuGlyph {
+    tex: Option<Texture<'static>>,
+    w: u32,
+    h: u32,
+    xmin: f32,
+    top: f32,
+    advance: f32,
+}
+
+/// A glyph texture awaiting its copy-pass upload (deferred so all uploads
+/// ride the frame's command buffer, before the compute passes).
+struct PendingGlyph {
+    tex: Texture<'static>,
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+/// The GPU text subsystem: a fontdue face plus a per-(glyph, px) texture
+/// cache. Glyphs rasterize on demand (`ensure_glyph`); new ones queue an
+/// upload that the next frame's `drop` flushes.
+struct TextCache {
+    font: Font,
+    glyphs: HashMap<(char, u32), GpuGlyph>,
+    pending: Vec<PendingGlyph>,
+}
+
+/// One laid-out glyph to composite this frame: its texture and where.
+struct TextCmd {
+    tex: Texture<'static>,
+    rect: [f32; 4],
+    color: [f32; 4],
+    w: u32,
+    h: u32,
+}
+
+impl TextCache {
+    /// Rasterize + cache `ch` at `px` if needed; return its metrics. New
+    /// non-empty glyphs create a GPU texture and queue its upload.
+    fn ensure_glyph(&mut self, device: &Device, ch: char, px: f32) -> &GpuGlyph {
+        let key = (ch, px.round() as u32);
+        if !self.glyphs.contains_key(&key) {
+            let r = self.font.raster(ch, key.1 as f32);
+            let tex = if r.w == 0 || r.h == 0 {
+                None
+            } else {
+                // Coverage replicated across rgba; the shader reads .r.
+                let mut rgba = Vec::with_capacity(r.coverage.len() * 4);
+                for a in &r.coverage {
+                    rgba.extend_from_slice(&[*a, *a, *a, *a]);
+                }
+                device
+                    .create_texture(
+                        TextureCreateInfo::new()
+                            .with_type(TextureType::_2D)
+                            .with_width(r.w)
+                            .with_height(r.h)
+                            .with_layer_count_or_depth(1)
+                            .with_num_levels(1)
+                            .with_sample_count(SampleCount::NoMultiSampling)
+                            .with_format(TextureFormat::R8g8b8a8Unorm)
+                            .with_usage(TextureUsage::COMPUTE_STORAGE_READ),
+                    )
+                    .ok()
+                    .inspect(|tex| {
+                        self.pending.push(PendingGlyph {
+                            tex: (*tex).clone(),
+                            rgba,
+                            w: r.w,
+                            h: r.h,
+                        });
+                    })
+            };
+            self.glyphs.insert(
+                key,
+                GpuGlyph {
+                    tex,
+                    w: r.w,
+                    h: r.h,
+                    xmin: r.xmin,
+                    top: r.top,
+                    advance: r.advance,
+                },
+            );
+        }
+        self.glyphs.get(&key).unwrap()
+    }
+}
+
 pub struct Renderer3d {
     device: Device,
     pipe_cull: GraphicsPipeline,
     pipe_nocull: GraphicsPipeline,
     pipe_post: ComputePipeline,
+    pipe_text: ComputePipeline,
     depth: Texture<'static>,
     scene: Option<SceneTarget>,
+    /// Screen-sized final image: every frame resolves here (the panini
+    /// warp's target, or the scene's direct target when panini is off),
+    /// the text pass composites onto it, then it blits to the swapchain.
+    present: Option<Texture<'static>>,
+    text: TextCache,
     width: u32,
     height: u32,
     /// HORIZONTAL field of view, degrees. Set via `set_fov` to keep the
@@ -249,6 +359,22 @@ impl Renderer3d {
             .build()
             .map_err(|e| e.to_string())?;
 
+        // The HUD/text pass: same compute shape as the panini pass — one
+        // read-only glyph texture in, the screen image read-write out.
+        let pipe_text = device
+            .create_compute_pipeline()
+            .with_code(
+                ShaderFormat::SPIRV,
+                include_bytes!(concat!(env!("OUT_DIR"), "/cs_text.spv")),
+            )
+            .with_entrypoint(c"cs_text")
+            .with_readonly_storage_textures(1)
+            .with_readwrite_storage_textures(1)
+            .with_uniform_buffers(1)
+            .with_thread_count(8, 8, 1)
+            .build()
+            .map_err(|e| e.to_string())?;
+
         let depth = device
             .create_texture(
                 TextureCreateInfo::new()
@@ -263,14 +389,26 @@ impl Renderer3d {
             )
             .map_err(|e| e.to_string())?;
 
+        // A missing font isn't fatal — the renderer still draws, text is
+        // simply skipped (each draw checks `text.font`-less paths via the
+        // empty cache producing no glyphs). We try the system fonts.
+        let font = Font::load_default()?;
+
         let fov_deg = 100.0;
         Ok(Renderer3d {
             device,
             pipe_cull,
             pipe_nocull,
             pipe_post,
+            pipe_text,
             depth,
             scene: None,
+            present: None,
+            text: TextCache {
+                font,
+                glyphs: HashMap::new(),
+                pending: Vec::new(),
+            },
             width,
             height,
             fov_deg,
@@ -279,6 +417,37 @@ impl Renderer3d {
             fog_distance: 80.0,
             clear_color: (0.051, 0.059, 0.078),
         })
+    }
+
+    /// Allocate the screen-sized `present` image once. It is a color
+    /// target (the panini-off scene renders straight into it), a
+    /// simultaneous read/write compute storage image (the warp writes it,
+    /// the text pass blends onto it), and a sampler source (blit reads
+    /// it).
+    fn ensure_present(&mut self) -> Option<()> {
+        if self.present.is_some() {
+            return Some(());
+        }
+        let tex = self
+            .device
+            .create_texture(
+                TextureCreateInfo::new()
+                    .with_type(TextureType::_2D)
+                    .with_width(self.width)
+                    .with_height(self.height)
+                    .with_layer_count_or_depth(1)
+                    .with_num_levels(1)
+                    .with_sample_count(SampleCount::NoMultiSampling)
+                    .with_format(TextureFormat::R8g8b8a8Unorm)
+                    .with_usage(
+                        TextureUsage::COLOR_TARGET
+                            | TextureUsage::COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE
+                            | TextureUsage::SAMPLER,
+                    ),
+            )
+            .ok()?;
+        self.present = Some(tex);
+        Some(())
     }
 
     /// (Re)build the offscreen scene target for the current fov/panini.
@@ -329,19 +498,15 @@ impl Renderer3d {
             TextureFormat::R8g8b8a8Unorm,
             TextureUsage::COLOR_TARGET | TextureUsage::COMPUTE_STORAGE_READ,
         )?;
-        let depth = tex(w, h, TextureFormat::D16Unorm, TextureUsage::DEPTH_STENCIL_TARGET)?;
-        // Warped output: written by compute, blitted to the swapchain
-        // (blit sources must carry SAMPLER usage).
-        let warped = tex(
-            self.width,
-            self.height,
-            TextureFormat::R8g8b8a8Unorm,
-            TextureUsage::COMPUTE_STORAGE_WRITE | TextureUsage::SAMPLER,
+        let depth = tex(
+            w,
+            h,
+            TextureFormat::D16Unorm,
+            TextureUsage::DEPTH_STENCIL_TARGET,
         )?;
         self.scene = Some(SceneTarget {
             color,
             depth,
-            warped,
             src_tan: (th, tv),
             out_edge: (x_edge, y_edge),
             key,
@@ -392,22 +557,40 @@ impl Renderer3d {
         let mut map = transfer.map::<Vertex3>(&self.device, true);
         map.mem_mut()[..vertices.len()].copy_from_slice(vertices);
         map.unmap();
-        let commands = self.device.acquire_command_buffer().map_err(|e| e.to_string())?;
-        let copy = self.device.begin_copy_pass(&commands).map_err(|e| e.to_string())?;
+        let commands = self
+            .device
+            .acquire_command_buffer()
+            .map_err(|e| e.to_string())?;
+        let copy = self
+            .device
+            .begin_copy_pass(&commands)
+            .map_err(|e| e.to_string())?;
         copy.upload_to_gpu_buffer(
-            TransferBufferLocation::new().with_offset(0).with_transfer_buffer(&transfer),
-            BufferRegion::new().with_offset(0).with_size(bytes as u32).with_buffer(&buffer),
+            TransferBufferLocation::new()
+                .with_offset(0)
+                .with_transfer_buffer(&transfer),
+            BufferRegion::new()
+                .with_offset(0)
+                .with_size(bytes as u32)
+                .with_buffer(&buffer),
             true,
         );
         self.device.end_copy_pass(copy);
         commands.submit().map_err(|e| e.to_string())?;
-        Ok(Mesh3 { buffer, count: vertices.len() as u32 })
+        Ok(Mesh3 {
+            buffer,
+            count: vertices.len() as u32,
+        })
     }
 
     /// Begin a frame: clear color + depth, ready to draw. Returns None
-    /// when a target isn't available (minimized etc). The frame submits
-    /// on drop — including the panini post pass when active (the
-    /// swapchain is acquired only then, after the scene is recorded).
+    /// when a target isn't available (minimized etc). Every frame resolves
+    /// into the screen-sized `present` image — the scene renders there
+    /// directly (panini off) or into the oversized scene target that the
+    /// warp resolves there (panini on) — then the text pass composites the
+    /// HUD and the result blits to the swapchain. The frame submits on
+    /// drop (the swapchain is acquired only then, after all work is
+    /// recorded).
     pub fn frame<'a>(
         &'a mut self,
         window: &'a Window,
@@ -415,13 +598,13 @@ impl Renderer3d {
         light_world: Vec3,
     ) -> Option<Frame3<'a>> {
         let use_post = self.panini > 1e-3;
+        self.ensure_present()?;
         if use_post {
             self.ensure_scene()?;
         }
-        let mut commands = self.device.acquire_command_buffer().ok()?;
+        let commands = self.device.acquire_command_buffer().ok()?;
         let (r, g, b) = self.clear_color;
-        let clear =
-            Color::RGB((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+        let clear = Color::RGB((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
         let depth_part = |t: DepthStencilTargetInfo| {
             t.with_cycle(true)
                 .with_clear_depth(1.0)
@@ -437,8 +620,8 @@ impl Renderer3d {
                 .with_load_op(LoadOp::CLEAR)
                 .with_store_op(StoreOp::STORE)
                 .with_clear_color(clear)];
-            let depth_target = depth_part(DepthStencilTargetInfo::new())
-                .with_texture(&mut scene.depth);
+            let depth_target =
+                depth_part(DepthStencilTargetInfo::new()).with_texture(&mut scene.depth);
             let pass = self
                 .device
                 .begin_render_pass(&commands, &color_targets, Some(&depth_target))
@@ -453,12 +636,10 @@ impl Renderer3d {
             ];
             (pass, proj)
         } else {
-            let Ok(swapchain) = commands.wait_and_acquire_swapchain_texture(window) else {
-                commands.cancel();
-                return None;
-            };
+            // No panini: render straight into `present` (screen-sized).
+            let present = self.present.as_ref().unwrap();
             let color_targets = [ColorTargetInfo::default()
-                .with_texture(&swapchain)
+                .with_texture(present)
                 .with_load_op(LoadOp::CLEAR)
                 .with_store_op(StoreOp::STORE)
                 .with_clear_color(clear)];
@@ -470,15 +651,11 @@ impl Renderer3d {
                 .ok()?;
             (pass, self.proj_params())
         };
-        let post = if use_post {
+        let warp = if use_post {
             let scene = self.scene.as_ref().unwrap();
-            Some(PostPass {
-                window,
+            Some(WarpInfo {
                 pipe: &self.pipe_post,
                 scene_color: &scene.color,
-                warped: &scene.warped,
-                out_w: self.width,
-                out_h: self.height,
                 u: PostU {
                     out_scale: [
                         scene.out_edge.0,
@@ -509,12 +686,19 @@ impl Renderer3d {
             light: [light_view.x, light_view.y, light_view.z, self.fog_distance],
             fog_color: [r, g, b, 1.0],
             bound_cull: None,
-            post,
+            present: self.present.as_ref().unwrap(),
+            warp,
+            text_pipe: &self.pipe_text,
+            text: &mut self.text,
+            window,
+            out_w: self.width,
+            out_h: self.height,
+            cmds: Vec::new(),
         })
     }
 }
 
-/// One frame in flight: draw meshes, then drop to submit.
+/// One frame in flight: draw meshes and HUD text, then drop to submit.
 pub struct Frame3<'a> {
     device: &'a Device,
     pipe_cull: &'a GraphicsPipeline,
@@ -526,17 +710,23 @@ pub struct Frame3<'a> {
     light: [f32; 4],
     fog_color: [f32; 4],
     bound_cull: Option<bool>,
-    post: Option<PostPass<'a>>,
-}
-
-/// Everything the drop-time panini pass needs.
-struct PostPass<'a> {
+    /// The screen-sized image everything resolves into before the blit.
+    present: &'a Texture<'static>,
+    /// The panini warp inputs, present only when panini is on.
+    warp: Option<WarpInfo<'a>>,
+    text_pipe: &'a ComputePipeline,
+    text: &'a mut TextCache,
     window: &'a Window,
-    pipe: &'a ComputePipeline,
-    scene_color: &'a Texture<'static>,
-    warped: &'a Texture<'static>,
     out_w: u32,
     out_h: u32,
+    /// HUD glyphs queued this frame, composited at drop.
+    cmds: Vec<TextCmd>,
+}
+
+/// The drop-time panini warp inputs (`scene_color` -> `present`).
+struct WarpInfo<'a> {
+    pipe: &'a ComputePipeline,
+    scene_color: &'a Texture<'static>,
     u: PostU,
 }
 
@@ -545,9 +735,15 @@ impl Frame3<'_> {
     /// (rgb; pass white for none). `cull = false` for open surfaces
     /// that must be visible from both sides.
     pub fn draw(&mut self, mesh: &Mesh3, model: Mat4, tint: (f32, f32, f32), cull: bool) {
-        let (Some(commands), Some(pass)) = (&self.commands, &self.pass) else { return };
+        let (Some(commands), Some(pass)) = (&self.commands, &self.pass) else {
+            return;
+        };
         if self.bound_cull != Some(cull) {
-            pass.bind_graphics_pipeline(if cull { self.pipe_cull } else { self.pipe_nocull });
+            pass.bind_graphics_pipeline(if cull {
+                self.pipe_cull
+            } else {
+                self.pipe_nocull
+            });
             self.bound_cull = Some(cull);
         }
         let mv = self.view * model;
@@ -561,9 +757,46 @@ impl Frame3<'_> {
         commands.push_vertex_uniform_data(0, &u);
         pass.bind_vertex_buffers(
             0,
-            &[BufferBinding::new().with_buffer(&mesh.buffer).with_offset(0)],
+            &[BufferBinding::new()
+                .with_buffer(&mesh.buffer)
+                .with_offset(0)],
         );
         pass.draw_primitives(mesh.count as usize, 1, 0, 0);
+    }
+
+    /// Queue a line of screen-space HUD text with its top-left at (x, y),
+    /// `px` tall, in `color`. Composited over the final image at drop.
+    /// Returns the advance width (so callers can lay out following text).
+    /// Glyphs rasterize once and cache; whitespace costs nothing.
+    pub fn text(&mut self, s: &str, x: f32, y: f32, px: f32, color: (u8, u8, u8)) -> f32 {
+        let col = [
+            color.0 as f32 / 255.0,
+            color.1 as f32 / 255.0,
+            color.2 as f32 / 255.0,
+            1.0,
+        ];
+        let baseline = y + self.text.font.ascent(px);
+        let mut pen = x;
+        for ch in s.chars() {
+            let g = self.text.ensure_glyph(self.device, ch, px);
+            if let Some(tex) = &g.tex {
+                self.cmds.push(TextCmd {
+                    tex: tex.clone(),
+                    rect: [pen + g.xmin, baseline + g.top, 0.0, 0.0],
+                    color: col,
+                    w: g.w,
+                    h: g.h,
+                });
+            }
+            pen += g.advance;
+        }
+        pen - x
+    }
+
+    /// Width `s` would occupy at `px` without drawing — for centering and
+    /// right-alignment (e.g. the score number at top-middle).
+    pub fn text_width(&self, s: &str, px: f32) -> f32 {
+        self.text.font.measure(s, px)
     }
 }
 
@@ -573,38 +806,102 @@ impl Drop for Frame3<'_> {
             return;
         };
         self.device.end_render_pass(pass);
-        if let Some(post) = self.post.take() {
-            // Warp scene -> warped in compute...
-            let rw = [StorageTextureReadWriteBinding::new().with_texture(post.warped)];
+
+        // 1. Upload glyphs rasterized this frame, before the compute
+        // passes that sample them. The transfer buffers must outlive the
+        // submit, so they live in `transfers` until the end.
+        let pending = std::mem::take(&mut self.text.pending);
+        let mut transfers = Vec::new();
+        let copy = if pending.is_empty() {
+            None
+        } else {
+            self.device.begin_copy_pass(&commands).ok()
+        };
+        if let Some(copy) = copy {
+            for gph in &pending {
+                let Ok(tb) = self
+                    .device
+                    .create_transfer_buffer()
+                    .with_size(gph.rgba.len() as u32)
+                    .with_usage(TransferBufferUsage::UPLOAD)
+                    .build()
+                else {
+                    continue;
+                };
+                let mut map = tb.map::<u8>(self.device, false);
+                map.mem_mut()[..gph.rgba.len()].copy_from_slice(&gph.rgba);
+                map.unmap();
+                copy.upload_to_gpu_texture(
+                    TextureTransferInfo::new()
+                        .with_transfer_buffer(&tb)
+                        .with_offset(0)
+                        .with_pixels_per_row(gph.w)
+                        .with_rows_per_layer(gph.h),
+                    TextureRegion::new()
+                        .with_texture(&gph.tex)
+                        .with_width(gph.w)
+                        .with_height(gph.h)
+                        .with_depth(1),
+                    false,
+                );
+                transfers.push(tb);
+            }
+            self.device.end_copy_pass(copy);
+        }
+
+        // 2. Panini warp: scene.color -> present (skipped when off).
+        if let Some(warp) = self.warp.take() {
+            let rw = [StorageTextureReadWriteBinding::new().with_texture(self.present)];
             if let Ok(cp) = self.device.begin_compute_pass(&commands, &rw, &[]) {
-                cp.bind_compute_pipeline(post.pipe);
-                cp.bind_compute_storage_textures(0, std::slice::from_ref(post.scene_color));
-                commands.push_compute_uniform_data(0, &post.u);
-                cp.dispatch(post.out_w.div_ceil(8), post.out_h.div_ceil(8), 1);
+                cp.bind_compute_pipeline(warp.pipe);
+                cp.bind_compute_storage_textures(0, std::slice::from_ref(warp.scene_color));
+                commands.push_compute_uniform_data(0, &warp.u);
+                cp.dispatch(self.out_w.div_ceil(8), self.out_h.div_ceil(8), 1);
                 self.device.end_compute_pass(cp);
             }
-            // ...then blit to the swapchain, acquired only now that the
-            // frame's work is recorded (the one point that can block on
-            // the compositor; if it fails — minimized — drop the frame).
-            // BlitInfo holds raw handles, so the swapchain borrow can
-            // end before the blit call needs `commands` again.
-            let blit = match commands.wait_and_acquire_swapchain_texture(post.window) {
-                Ok(swapchain) => Some(
-                    BlitInfo::default()
-                        .with_source_texture(post.warped)
-                        .with_source_region(0, 0, 0, post.out_w, post.out_h)
-                        .with_destination_texture(&swapchain)
-                        .with_destination_region(0, 0, 0, swapchain.width(), swapchain.height())
-                        .with_load_op(LoadOp::DONT_CARE)
-                        .with_filter(Filter::Nearest),
-                ),
-                Err(_) => None,
-            };
-            if let Some(blit) = blit {
-                commands.blit_texture(blit);
+        }
+
+        // 3. HUD: alpha-blend each queued glyph onto present. One compute
+        // pass, one dispatch per glyph (rebinding the glyph texture).
+        if !self.cmds.is_empty() {
+            let rw = [StorageTextureReadWriteBinding::new().with_texture(self.present)];
+            if let Ok(cp) = self.device.begin_compute_pass(&commands, &rw, &[]) {
+                cp.bind_compute_pipeline(self.text_pipe);
+                for cmd in &self.cmds {
+                    cp.bind_compute_storage_textures(0, std::slice::from_ref(&cmd.tex));
+                    commands.push_compute_uniform_data(
+                        0,
+                        &TextU {
+                            rect: cmd.rect,
+                            color: cmd.color,
+                        },
+                    );
+                    cp.dispatch(cmd.w.div_ceil(8), cmd.h.div_ceil(8), 1);
+                }
+                self.device.end_compute_pass(cp);
             }
         }
+
+        // 4. Blit present -> swapchain, acquired only now that the frame's
+        // work is recorded (the one point that can block on the
+        // compositor; if it fails — minimized — drop the frame).
+        let blit = match commands.wait_and_acquire_swapchain_texture(self.window) {
+            Ok(swapchain) => Some(
+                BlitInfo::default()
+                    .with_source_texture(self.present)
+                    .with_source_region(0, 0, 0, self.out_w, self.out_h)
+                    .with_destination_texture(&swapchain)
+                    .with_destination_region(0, 0, 0, swapchain.width(), swapchain.height())
+                    .with_load_op(LoadOp::DONT_CARE)
+                    .with_filter(Filter::Nearest),
+            ),
+            Err(_) => None,
+        };
+        if let Some(blit) = blit {
+            commands.blit_texture(blit);
+        }
         let _ = commands.submit();
+        drop(transfers);
     }
 }
 
@@ -643,12 +940,20 @@ pub fn box_tris(min: Vec3, max: Vec3) -> Vec<[Vec3; 3]> {
         [v(0, 0, 1), v(0, 0, 0), v(1, 0, 0), v(1, 0, 1)], // -y
         [v(0, 1, 0), v(0, 1, 1), v(1, 1, 1), v(1, 1, 0)], // +y
     ];
-    quads.iter().flat_map(|q| [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]).collect()
+    quads
+        .iter()
+        .flat_map(|q| [[q[0], q[1], q[2]], [q[0], q[2], q[3]]])
+        .collect()
 }
 
 /// Checkerboard ground on y=0, `half` cells in each direction from the
 /// origin, `cell` units per cell, alternating the two colors.
-pub fn checker_ground(half: i32, cell: f32, a: (f32, f32, f32), b: (f32, f32, f32)) -> Vec<Vertex3> {
+pub fn checker_ground(
+    half: i32,
+    cell: f32,
+    a: (f32, f32, f32),
+    b: (f32, f32, f32),
+) -> Vec<Vertex3> {
     let mut out = Vec::new();
     for gx in -half..half {
         for gz in -half..half {

@@ -7,13 +7,13 @@ mod camera;
 mod id;
 mod kernel;
 mod math;
+pub mod modload;
 mod net;
 mod netmod;
 mod paged;
-pub mod probe;
 mod pool;
 mod predict;
-pub mod modload;
+pub mod probe;
 mod smooth;
 mod spatial;
 mod transport;
@@ -24,8 +24,11 @@ pub use camera::{
     camera_manager, camera_track,
 };
 pub use id::Id;
-pub use kernel::{AccessError, Handle, IntoTaskResult, Pm, Single, TaskError, TaskFault, TaskStat};
+pub use kernel::{
+    IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
+};
 pub use math::{Mat4, Rng, Vec2, Vec3, vec2, vec3};
+pub use modload::{MOD_ABI, ModLoader, mod_abi};
 pub use net::{Applied, NetClient, NetError, NetServer, Outbox};
 pub use netmod::{
     AppliedLog, ClientEvents, Commands, NET_PRIO, NetInput, NetStatus, PeerEvents, SentLog,
@@ -33,7 +36,6 @@ pub use netmod::{
 };
 pub use pool::{Mut, Pool};
 pub use predict::Predictor;
-pub use modload::{MOD_ABI, ModLoader, mod_abi};
 pub use smooth::{coast_blend, pool_mirror};
 pub use spatial::SpatialGrid;
 pub use transport::{EVENT_USER_BASE, QuicClient, QuicServer};

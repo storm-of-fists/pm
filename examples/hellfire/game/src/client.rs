@@ -3,7 +3,7 @@
 //! plus the bot's input task. The transport is pm's net module; the SDL
 //! window/input/render live in sdl_client.rs.
 
-use pm::{NetClient, NetInput, NetStatus, Outbox, Pm, QuicClient, Rng, coast_blend, pool_mirror, vec2};
+use pm::{NetInput, NetStatus, Outbox, Pm, QuicClient, Rng, coast_blend, pool_mirror, vec2};
 
 use crate::common::*;
 
@@ -19,7 +19,11 @@ pub struct Camera {
 
 impl Default for Camera {
     fn default() -> Self {
-        Self { center: vec2(W * 0.5, H * 0.5), zoom: 1.0, target_zoom: 1.0 }
+        Self {
+            center: vec2(W * 0.5, H * 0.5),
+            zoom: 1.0,
+            target_zoom: 1.0,
+        }
     }
 }
 
@@ -32,7 +36,10 @@ impl Camera {
     }
 
     pub fn to_world(self, sx: f32, sy: f32) -> pm::Vec2 {
-        vec2((sx - W * 0.5) / self.zoom + self.center.x, (sy - H * 0.5) / self.zoom + self.center.y)
+        vec2(
+            (sx - W * 0.5) / self.zoom + self.center.x,
+            (sy - H * 0.5) / self.zoom + self.center.y,
+        )
     }
 }
 
@@ -43,18 +50,18 @@ pub struct Ui {
 }
 
 pub struct Pools {
-    pub player: pm::Handle<Player>,
-    pub monster: pm::Handle<Monster>,
-    pub bullet: pm::Handle<Bullet>,
-    pub status: pm::Handle<Status>,
-    pub dbg: pm::Handle<Dbg>,
-    pub roster: pm::Handle<Roster>,
-    pub monster_draw: pm::Handle<Monster>,
-    pub bullet_draw: pm::Handle<Bullet>,
-    pub player_draw: pm::Handle<Player>,
+    pub player: pm::PoolHandle<Player>,
+    pub monster: pm::PoolHandle<Monster>,
+    pub bullet: pm::PoolHandle<Bullet>,
+    pub status: pm::PoolHandle<Status>,
+    pub dbg: pm::PoolHandle<Dbg>,
+    pub roster: pm::PoolHandle<Roster>,
+    pub monster_draw: pm::PoolHandle<Monster>,
+    pub bullet_draw: pm::PoolHandle<Bullet>,
+    pub player_draw: pm::PoolHandle<Player>,
 }
 
-pub fn client_pools(pm: &mut Pm) -> (Pools, NetClient) {
+pub fn client_pools(pm: &mut Pm) -> Pools {
     let pools = Pools {
         player: pm.pool("player"),
         monster: pm.pool("monster"),
@@ -66,30 +73,36 @@ pub fn client_pools(pm: &mut Pm) -> (Pools, NetClient) {
         bullet_draw: pm.pool("bullet_draw"),
         player_draw: pm.pool("player_draw"),
     };
-    let mut net = NetClient::new();
-    net.pool_sync("player", &pools.player);
-    net.pool_sync("monster", &pools.monster);
-    net.pool_sync("bullet", &pools.bullet);
-    net.pool_sync("status", &pools.status);
-    net.pool_sync("dbg", &pools.dbg);
-    net.pool_sync("roster", &pools.roster);
-    (pools, net)
+    pm.sync(&pools.player);
+    pm.sync(&pools.monster);
+    pm.sync(&pools.bullet);
+    pm.sync(&pools.status);
+    pm.sync(&pools.dbg);
+    pm.sync(&pools.roster);
+    pools
 }
 
-pub fn current_status(status: &pm::Handle<Status>) -> Status {
-    status.borrow().values().first().copied().unwrap_or_default()
+pub fn current_status(status: &pm::PoolHandle<Status>) -> Status {
+    status
+        .get()
+        .values()
+        .first()
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Smoothing + diag tasks shared by player and bot clients; the
 /// transport is the net module. The input layer (SDL or bot) writes the
 /// `"net.input"` single; rendering reads the draw pools.
-pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, net: NetClient, pools: &Pools, name: String) {
-    net.connect::<InputCmd>(pm, quic, 60.0);
+pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, pools: &Pools, name: String) {
+    pm.connect::<InputCmd>(quic, 60.0);
     let stats = pm.single::<NetStatus>("net.status");
 
     // Queued before the handshake even exists — the module holds
     // reliable events until connected.
-    pm.single::<Outbox>("net.out").borrow_mut().send(EV_NAME, name.as_bytes());
+    pm.single::<Outbox>("net.out")
+        .get_mut()
+        .send(EV_NAME, name.as_bytes());
 
     let report_name = name;
 
@@ -108,7 +121,7 @@ pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, net: NetClient, pools: &P
             let dir =
                 std::env::var("HELLFIRE_REPORT_DIR").unwrap_or_else(|_| "target/work/reports".into());
             let _ = std::fs::create_dir_all(&dir);
-            let s = stats.borrow();
+            let s = stats.get();
             let json = format!(
                 "{{\n  \"role\": \"client\",\n  \"name\": \"{name}\",\n  \"peer\": {},\n  \"snapshots\": {},\n  \"rtt_ms\": {:.1},\n  \"score\": {},\n  \"win\": {}\n}}\n",
                 s.peer,
@@ -143,7 +156,11 @@ pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, net: NetClient, pools: &P
             });
             pool_mirror(&pools_p, &draw_p, |_, d, a: &Player| {
                 let snap = d.pos.dist(a.pos) > 120.0; // respawn/level jump
-                let pos = if snap { a.pos } else { d.pos + (a.pos - d.pos) * 0.35 };
+                let pos = if snap {
+                    a.pos
+                } else {
+                    d.pos + (a.pos - d.pos) * 0.35
+                };
                 Player { pos, ..*a }
             });
         }
@@ -154,9 +171,9 @@ pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, net: NetClient, pools: &P
 /// own replicated state, restarts the game when it ends.
 pub fn run_bot(n: u32) {
     let mut pm = Pm::new();
-    let (pools, net) = client_pools(&mut pm);
-    let quic = QuicClient::connect(ADDR, &net.schema()).expect("bot connect");
-    add_client_tasks(&mut pm, quic, net, &pools, format!("bot{n}"));
+    let pools = client_pools(&mut pm);
+    let quic = QuicClient::connect(ADDR, &pm.net_schema()).expect("bot connect");
+    add_client_tasks(&mut pm, quic, &pools, format!("bot{n}"));
 
     let cmd = pm.single::<NetInput<InputCmd>>("net.input");
     let outbox = pm.single::<Outbox>("net.out");
@@ -173,10 +190,14 @@ pub fn run_bot(n: u32) {
             let dt = pm.loop_dt();
             let my_peer = pm.local_peer as u32;
             if me.is_none() {
-                me = player.borrow().iter().find(|(_, p)| p.peer == my_peer).map(|(id, _)| id);
+                me = player
+                    .get()
+                    .iter()
+                    .find(|(_, p)| p.peer == my_peer)
+                    .map(|(id, _)| id);
             }
             let pos = me
-                .and_then(|id| player.borrow().get(id).map(|p| p.pos))
+                .and_then(|id| player.get().get(id).map(|p| p.pos))
                 .unwrap_or(vec2(W * 0.5, H * 0.5));
             if turn.ready(dt) {
                 turn.interval = rng.rfr(0.6, 1.6);
@@ -188,7 +209,7 @@ pub fn run_bot(n: u32) {
             }
             // Aim at the nearest monster in replicated state.
             let (mut aim, mut best) = (pos + dir * 100.0, f32::MAX);
-            for (_, m) in monster.borrow().iter() {
+            for (_, m) in monster.get().iter() {
                 let d = m.pos.dist(pos);
                 if d < best {
                     best = d;
@@ -196,14 +217,20 @@ pub fn run_bot(n: u32) {
                 }
             }
             let st = current_status(&status);
-            let mut c = cmd.borrow_mut();
-            c.0 = InputCmd { dx: dir.x, dy: dir.y, ax: aim.x, ay: aim.y, buttons: BTN_SHOOT };
+            let mut c = cmd.get_mut();
+            c.0 = InputCmd {
+                dx: dir.x,
+                dy: dir.y,
+                ax: aim.x,
+                ay: aim.y,
+                buttons: BTN_SHOOT,
+            };
             if st.flags & FLAG_GAME_OVER != 0 && rng.rf() < 0.005 {
-                outbox.borrow_mut().send(EV_RESTART, &[]);
+                outbox.get_mut().send(EV_RESTART, &[]);
             }
             // Nobody to press ENTER in a bot lobby: start after a beat.
             if st.flags & FLAG_STARTED == 0 && rng.rf() < 0.02 {
-                outbox.borrow_mut().send(EV_START, &[]);
+                outbox.get_mut().send(EV_START, &[]);
             }
         }
     });

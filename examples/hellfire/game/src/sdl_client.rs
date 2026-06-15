@@ -3,16 +3,16 @@
 //! TTF HUD, lobby screen, and an F1 debug overlay.
 
 use pm::{Cooldown, Hysteresis, Pm, QuicClient, vec2};
-use pm_sdl::{Font, Sprite};
 use pm_sdl::sdl3::event::Event;
 use pm_sdl::sdl3::keyboard::Scancode;
 use pm_sdl::sdl3::mouse::MouseButton;
 use pm_sdl::sdl3::pixels::Color;
 use pm_sdl::sdl3::render::FRect;
+use pm_sdl::{Font, Sprite};
 
 use crate::client::{Camera, Ui, add_client_tasks, client_pools, current_status};
-use pm::{NetInput, NetStatus, Outbox};
 use crate::common::*;
+use pm::{NetInput, NetStatus, Outbox};
 
 fn resource(name: &str) -> String {
     format!("{}/resources/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -25,11 +25,11 @@ fn roster_name(r: &Roster) -> String {
 
 pub fn run() {
     let mut pm = Pm::new();
-    let (pools, net) = client_pools(&mut pm);
-    let quic = QuicClient::connect(ADDR, &net.schema()).expect("connect");
+    let pools = client_pools(&mut pm);
+    let quic = QuicClient::connect(ADDR, &pm.net_schema()).expect("connect");
     eprintln!("connecting to {ADDR} ...");
     let name = std::env::var("HELLFIRE_NAME").unwrap_or_else(|_| "player".into());
-    add_client_tasks(&mut pm, quic, net, &pools, name);
+    add_client_tasks(&mut pm, quic, &pools, name);
 
     let (window, mut pump, refresh) = pm_sdl::window("hellfire", W as u32, H as u32);
     let mut canvas = window.into_canvas();
@@ -56,19 +56,31 @@ pub fn run() {
             for ev in pump.poll_iter() {
                 match ev {
                     Event::Quit { .. }
-                    | Event::KeyDown { scancode: Some(Scancode::Escape), .. } => pm.loop_quit(),
-                    Event::KeyDown { scancode: Some(Scancode::R), .. } => {
-                        outbox.borrow_mut().send(EV_RESTART, &[]);
+                    | Event::KeyDown {
+                        scancode: Some(Scancode::Escape),
+                        ..
+                    } => pm.loop_quit(),
+                    Event::KeyDown {
+                        scancode: Some(Scancode::R),
+                        ..
+                    } => {
+                        outbox.get_mut().send(EV_RESTART, &[]);
                     }
-                    Event::KeyDown { scancode: Some(Scancode::Return), .. } if in_lobby => {
-                        outbox.borrow_mut().send(EV_START, &[]);
+                    Event::KeyDown {
+                        scancode: Some(Scancode::Return),
+                        ..
+                    } if in_lobby => {
+                        outbox.get_mut().send(EV_START, &[]);
                     }
-                    Event::KeyDown { scancode: Some(Scancode::F1), .. } => {
-                        let mut u = ui.borrow_mut();
+                    Event::KeyDown {
+                        scancode: Some(Scancode::F1),
+                        ..
+                    } => {
+                        let mut u = ui.get_mut();
                         u.show_debug = !u.show_debug;
                     }
                     Event::MouseWheel { y, .. } => {
-                        let mut cam = cam.borrow_mut();
+                        let mut cam = cam.get_mut();
                         cam.target_zoom = (cam.target_zoom * 1.15f32.powf(y)).clamp(0.5, 3.0);
                     }
                     _ => {}
@@ -77,14 +89,14 @@ pub fn run() {
 
             // Camera dynamics: ease zoom, follow own player.
             let dt = pm.loop_dt();
-            let my_peer = stats.borrow().peer as u32;
+            let my_peer = stats.get().peer as u32;
             let me = player_draw
-                .borrow()
+                .get()
                 .iter()
                 .find(|(_, p)| p.peer == my_peer)
                 .map(|(_, p)| p.pos);
             {
-                let mut cam = cam.borrow_mut();
+                let mut cam = cam.get_mut();
                 let dz = cam.target_zoom - cam.zoom;
                 cam.zoom += dz * (10.0 * dt).min(1.0);
                 let target = me.unwrap_or(vec2(W * 0.5, H * 0.5));
@@ -95,8 +107,8 @@ pub fn run() {
             let k = pump.keyboard_state();
             let held = |sc: Scancode| k.is_scancode_pressed(sc);
             let m = pump.mouse_state();
-            let aim = cam.borrow().to_world(m.x(), m.y());
-            let mut c = cmd.borrow_mut();
+            let aim = cam.get().to_world(m.x(), m.y());
+            let mut c = cmd.get_mut();
             c.0 = InputCmd {
                 dx: (held(Scancode::D) as i32 - held(Scancode::A) as i32) as f32,
                 dy: (held(Scancode::S) as i32 - held(Scancode::W) as i32) as f32,
@@ -146,7 +158,7 @@ pub fn run() {
             let st = current_status(&pools.status);
             let started = st.flags & FLAG_STARTED != 0;
             let over = st.flags & FLAG_GAME_OVER != 0;
-            let cam = *cam.borrow();
+            let cam = *cam.get();
             let z = cam.zoom;
 
             let c = &mut canvas;
@@ -156,13 +168,13 @@ pub fn run() {
             let (bx, by) = cam.to_screen(vec2(0.0, 0.0));
             let _ = c.draw_rect(FRect::new(bx, by, W * z, H * z));
 
-            for (_, m) in pools.monster_draw.borrow().iter() {
+            for (_, m) in pools.monster_draw.get().iter() {
                 c.set_draw_color(Color::RGB(m.color[0], m.color[1], m.color[2]));
                 let s = m.size * z;
                 let (x, y) = cam.to_screen(m.pos);
                 let _ = c.fill_rect(FRect::new(x - s * 0.5, y - s * 0.5, s, s));
             }
-            for (_, b) in pools.bullet_draw.borrow().iter() {
+            for (_, b) in pools.bullet_draw.get().iter() {
                 c.set_draw_color(if b.player_owned == 1 {
                     Color::RGB(255, 255, 160)
                 } else {
@@ -173,8 +185,8 @@ pub fn run() {
                 let _ = c.fill_rect(FRect::new(x - s * 0.5, y - s * 0.5, s, s));
             }
 
-            let my_peer = stats.borrow().peer as u32;
-            for (_, p) in pools.player_draw.borrow().iter() {
+            let my_peer = stats.get().peer as u32;
+            for (_, p) in pools.player_draw.get().iter() {
                 if p.alive == 0 {
                     continue;
                 }
@@ -220,7 +232,7 @@ pub fn run() {
                 if started {
                     let me_hp = pools
                         .player
-                        .borrow()
+                        .get()
                         .iter()
                         .find(|(_, p)| p.peer == my_peer)
                         .map(|(_, p)| p.hp)
@@ -248,7 +260,7 @@ pub fn run() {
                     let mut y = 240.0;
                     f.draw(c, "pilots:", W * 0.5 - 120.0, y, 20.0, (160, 160, 170));
                     y += 30.0;
-                    for (_, r) in pools.roster.borrow().iter() {
+                    for (_, r) in pools.roster.get().iter() {
                         let mut label = roster_name(r);
                         if r.peer == my_peer {
                             label.push_str("  (you)");
@@ -264,28 +276,45 @@ pub fn run() {
                 if over {
                     c.set_draw_color(Color::RGBA(0, 0, 0, 140));
                     let _ = c.fill_rect(FRect::new(0.0, 0.0, W, H));
-                    let text = if st.flags & FLAG_WIN != 0 { "YOU WIN" } else { "GAME OVER" };
+                    let text = if st.flags & FLAG_WIN != 0 {
+                        "YOU WIN"
+                    } else {
+                        "GAME OVER"
+                    };
                     let w = f.measure(text, 56.0);
                     f.draw(c, text, (W - w) * 0.5, H * 0.36, 56.0, (255, 90, 90));
                     let sub = format!("score {}   R to restart", st.score);
                     let sw = f.measure(&sub, 22.0);
-                    f.draw(c, &sub, (W - sw) * 0.5, H * 0.36 + 70.0, 22.0, (220, 220, 225));
+                    f.draw(
+                        c,
+                        &sub,
+                        (W - sw) * 0.5,
+                        H * 0.36 + 70.0,
+                        22.0,
+                        (220, 220, 225),
+                    );
                 }
 
                 // F1 debug overlay: client loop + net + server dbg + tasks.
-                if ui.borrow().show_debug {
+                if ui.get().show_debug {
                     c.set_draw_color(Color::RGBA(0, 0, 0, 170));
                     let _ = c.fill_rect(FRect::new(8.0, 34.0, 360.0, 250.0));
-                    let s = stats.borrow();
-                    let dbg = pools.dbg.borrow().values().first().copied().unwrap_or_default();
+                    let s = stats.get();
+                    let dbg = pools
+                        .dbg
+                        .get()
+                        .values()
+                        .first()
+                        .copied()
+                        .unwrap_or_default();
                     let mut lines = vec![
                         format!("fps {fps:.0}   frame {:.2} ms", dt * 1000.0),
                         format!("rtt {:.0} ms   snapshots {}", s.rtt_ms, s.snapshots),
                         format!(
                             "draw: {} monsters  {} bullets  {} players",
-                            pools.monster_draw.borrow().len(),
-                            pools.bullet_draw.borrow().len(),
-                            pools.player_draw.borrow().len(),
+                            pools.monster_draw.get().len(),
+                            pools.bullet_draw.get().len(),
+                            pools.player_draw.get().len(),
                         ),
                         format!(
                             "server: {} monsters  {} bullets  tick {:.2} ms",

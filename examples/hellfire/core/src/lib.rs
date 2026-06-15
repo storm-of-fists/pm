@@ -62,11 +62,41 @@ pub struct LevelDef {
 }
 
 pub const LEVELS: [LevelDef; 5] = [
-    LevelDef { threshold: 0, speed_mult: 0.6, spawn_mult: 0.4, max_monsters: 60, size_mult: 0.8 },
-    LevelDef { threshold: 500, speed_mult: 0.8, spawn_mult: 0.7, max_monsters: 120, size_mult: 0.9 },
-    LevelDef { threshold: 1500, speed_mult: 1.0, spawn_mult: 1.2, max_monsters: 200, size_mult: 1.0 },
-    LevelDef { threshold: 3000, speed_mult: 1.3, spawn_mult: 2.0, max_monsters: 300, size_mult: 1.1 },
-    LevelDef { threshold: 5500, speed_mult: 1.6, spawn_mult: 3.0, max_monsters: 400, size_mult: 1.2 },
+    LevelDef {
+        threshold: 0,
+        speed_mult: 0.6,
+        spawn_mult: 0.4,
+        max_monsters: 60,
+        size_mult: 0.8,
+    },
+    LevelDef {
+        threshold: 500,
+        speed_mult: 0.8,
+        spawn_mult: 0.7,
+        max_monsters: 120,
+        size_mult: 0.9,
+    },
+    LevelDef {
+        threshold: 1500,
+        speed_mult: 1.0,
+        spawn_mult: 1.2,
+        max_monsters: 200,
+        size_mult: 1.0,
+    },
+    LevelDef {
+        threshold: 3000,
+        speed_mult: 1.3,
+        spawn_mult: 2.0,
+        max_monsters: 300,
+        size_mult: 1.1,
+    },
+    LevelDef {
+        threshold: 5500,
+        speed_mult: 1.6,
+        spawn_mult: 3.0,
+        max_monsters: 400,
+        size_mult: 1.2,
+    },
 ];
 
 // --- replicated components (Pod = wire format) --------------------------
@@ -126,7 +156,10 @@ pub struct Roster {
 
 impl Roster {
     pub fn new(peer: u8, name: &str) -> Self {
-        let mut r = Roster { peer: peer as u32, name: [0; 12] };
+        let mut r = Roster {
+            peer: peer as u32,
+            name: [0; 12],
+        };
         let bytes = name.as_bytes();
         let n = bytes.len().min(12);
         r.name[..n].copy_from_slice(&bytes[..n]);

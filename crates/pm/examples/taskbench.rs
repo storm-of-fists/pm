@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use pm::{Pm, TaskError};
+use pm::Pm;
 
 #[derive(Clone, Copy, PartialEq, Default)]
 struct P {
@@ -30,28 +30,29 @@ fn main() {
     let mut pm = Pm::new();
     let pool = pm.pool::<P>("p");
     let id = pm.id_add();
-    pool.borrow_mut().add(id, P::default());
+    pool.get_mut().add(id, P::default());
     pm.task_add("borrow", 1.0, 0.0, {
         let pool = pool.clone();
         move |_| {
-            pool.borrow_mut().get_mut(id).unwrap().x += 1.0;
+            pool.get_mut().get_mut(id).unwrap().x += 1.0;
         }
     });
     bench("borrow_mut + get_mut", pm);
 
-    // Fallible per-entity access (`?` into the fault system).
+    // Per-entity access via the Option-returning shortcut.
     let mut pm = Pm::new();
     let pool = pm.pool::<P>("p");
     let id = pm.id_add();
-    pool.borrow_mut().add(id, P::default());
-    pm.task_add("try", 1.0, 0.0, {
+    pool.get_mut().add(id, P::default());
+    pm.task_add("get_id", 1.0, 0.0, {
         let pool = pool.clone();
-        move |_| -> Result<(), TaskError> {
-            pool.try_mut(id)?.x += 1.0;
-            Ok(())
+        move |_| {
+            if let Some(mut e) = pool.get_id_mut(id) {
+                e.x += 1.0;
+            }
         }
     });
-    bench("try_mut (fallible)", pm);
+    bench("get_id_mut (per-entity)", pm);
 
     // Singleton access.
     let mut pm = Pm::new();
@@ -59,7 +60,7 @@ fn main() {
     pm.task_add("single", 1.0, 0.0, {
         let single = single.clone();
         move |_| {
-            single.borrow_mut().x += 1.0;
+            single.get_mut().x += 1.0;
         }
     });
     bench("Single::borrow_mut", pm);

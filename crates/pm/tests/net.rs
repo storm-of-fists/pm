@@ -39,7 +39,13 @@ fn snapshot_delta_replicates_state() {
     let ids: Vec<_> = (0..3)
         .map(|i| {
             let id = server.id_add();
-            s_pos.borrow_mut().add(id, Pos { x: i as f32, y: 0.0 });
+            s_pos.get_mut().add(
+                id,
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+            );
             id
         })
         .collect();
@@ -49,27 +55,27 @@ fn snapshot_delta_replicates_state() {
     let snap = snet.snapshot(&server, 1).unwrap();
     let ack = cnet.apply(&mut client, &snap).unwrap().tick;
     client.loop_once(DT);
-    assert_eq!(c_pos.borrow().len(), 3);
-    assert_eq!(c_pos.borrow().get(ids[1]), Some(&Pos { x: 1.0, y: 0.0 }));
+    assert_eq!(c_pos.get().len(), 3);
+    assert_eq!(c_pos.get().get(ids[1]), Some(&Pos { x: 1.0, y: 0.0 }));
     assert!(client.id_alive(ids[1]));
     snet.ack(1, ack);
 
     // After the ack, only the mutated entity rides the next delta.
-    *s_pos.borrow_mut().get_mut(ids[0]).unwrap() = Pos { x: 10.0, y: 0.0 };
+    *s_pos.get_mut().get_mut(ids[0]).unwrap() = Pos { x: 10.0, y: 0.0 };
     server.loop_once(DT);
     let snap = snet.snapshot(&server, 1).unwrap();
-    let header_entities = c_pos.borrow().len();
+    let header_entities = c_pos.get().len();
     let ack = cnet.apply(&mut client, &snap).unwrap().tick;
     snet.ack(1, ack);
-    assert_eq!(c_pos.borrow().len(), header_entities); // upsert, no dup
-    assert_eq!(c_pos.borrow().get(ids[0]), Some(&Pos { x: 10.0, y: 0.0 }));
+    assert_eq!(c_pos.get().len(), header_entities); // upsert, no dup
+    assert_eq!(c_pos.get().get(ids[0]), Some(&Pos { x: 10.0, y: 0.0 }));
 
     // Fully acked: the delta is empty (label only).
     server.loop_once(DT);
     let snap = snet.snapshot(&server, 1).unwrap();
-    let before = c_pos.borrow().get(ids[0]).copied();
+    let before = c_pos.get().get(ids[0]).copied();
     cnet.apply(&mut client, &snap).unwrap();
-    assert_eq!(c_pos.borrow().get(ids[0]).copied(), before);
+    assert_eq!(c_pos.get().get(ids[0]).copied(), before);
 }
 
 #[test]
@@ -79,7 +85,7 @@ fn lost_state_resends_once_a_later_ack_reveals_the_loss() {
     let c_pos = client.pool::<Pos>("pos");
 
     let id = server.id_add();
-    s_pos.borrow_mut().add(id, Pos { x: 5.0, y: 5.0 });
+    s_pos.get_mut().add(id, Pos { x: 5.0, y: 5.0 });
     server.loop_once(DT);
 
     let lost = snet.snapshot(&server, 1).unwrap();
@@ -91,7 +97,7 @@ fn lost_state_resends_once_a_later_ack_reveals_the_loss() {
     server.loop_once(DT);
     let empty = snet.snapshot(&server, 1).unwrap();
     let applied = cnet.apply(&mut client, &empty).unwrap();
-    assert_eq!(c_pos.borrow().get(id), None);
+    assert_eq!(c_pos.get().get(id), None);
 
     // Acking a *later* label than the lost snapshot's proves the loss;
     // the entry becomes resendable and the next snapshot converges.
@@ -99,7 +105,7 @@ fn lost_state_resends_once_a_later_ack_reveals_the_loss() {
     server.loop_once(DT);
     let retry = snet.snapshot(&server, 1).unwrap();
     cnet.apply(&mut client, &retry).unwrap();
-    assert_eq!(c_pos.borrow().get(id), Some(&Pos { x: 5.0, y: 5.0 }));
+    assert_eq!(c_pos.get().get(id), Some(&Pos { x: 5.0, y: 5.0 }));
 }
 
 #[test]
@@ -109,7 +115,7 @@ fn silent_ack_gap_expires_in_flight_state_and_resends() {
     let c_pos = client.pool::<Pos>("pos");
 
     let id = server.id_add();
-    s_pos.borrow_mut().add(id, Pos { x: 5.0, y: 5.0 });
+    s_pos.get_mut().add(id, Pos { x: 5.0, y: 5.0 });
     server.loop_once(DT);
     let lost = snet.snapshot(&server, 1).unwrap();
     drop(lost);
@@ -121,7 +127,7 @@ fn silent_ack_gap_expires_in_flight_state_and_resends() {
     }
     let retry = snet.snapshot(&server, 1).unwrap();
     cnet.apply(&mut client, &retry).unwrap();
-    assert_eq!(c_pos.borrow().get(id), Some(&Pos { x: 5.0, y: 5.0 }));
+    assert_eq!(c_pos.get().get(id), Some(&Pos { x: 5.0, y: 5.0 }));
 }
 
 #[test]
@@ -131,7 +137,7 @@ fn removal_replicates_and_recycling_waits_for_ack() {
     let c_pos = client.pool::<Pos>("pos");
 
     let a = server.id_add();
-    s_pos.borrow_mut().add(a, Pos { x: 1.0, y: 0.0 });
+    s_pos.get_mut().add(a, Pos { x: 1.0, y: 0.0 });
     server.loop_once(DT);
     let snap = snet.snapshot(&server, 1).unwrap();
     snet.ack(1, cnet.apply(&mut client, &snap).unwrap().tick);
@@ -144,7 +150,11 @@ fn removal_replicates_and_recycling_waits_for_ack() {
     server.loop_once(DT);
     snet.prune(&mut server);
     let b = server.id_add();
-    assert_ne!(b.index(), a.index(), "recycle before ack would race the wire");
+    assert_ne!(
+        b.index(),
+        a.index(),
+        "recycle before ack would race the wire"
+    );
 
     // Removal rides the delta; client applies it through the normal
     // deferred path.
@@ -153,7 +163,7 @@ fn removal_replicates_and_recycling_waits_for_ack() {
     snet.ack(1, cnet.apply(&mut client, &snap).unwrap().tick);
     client.loop_once(DT);
     assert!(!client.id_alive(a));
-    assert!(!c_pos.borrow().contains(a));
+    assert!(!c_pos.get().contains(a));
 
     // Acked by every peer: now the index recycles, with a bumped gen.
     snet.prune(&mut server);
@@ -171,17 +181,17 @@ fn client_local_entities_coexist_with_replicated_ones() {
     // Client spawns a local-only entity (e.g. a predicted cosmetic).
     let local = client.id_add();
     assert_eq!(local.peer(), 1, "client allocates in its own peer space");
-    c_pos.borrow_mut().add(local, Pos { x: -1.0, y: -1.0 });
+    c_pos.get_mut().add(local, Pos { x: -1.0, y: -1.0 });
 
     let remote = server.id_add();
-    s_pos.borrow_mut().add(remote, Pos { x: 1.0, y: 1.0 });
+    s_pos.get_mut().add(remote, Pos { x: 1.0, y: 1.0 });
     server.loop_once(DT);
     let snap = snet.snapshot(&server, 1).unwrap();
     cnet.apply(&mut client, &snap).unwrap();
 
-    assert_eq!(c_pos.borrow().len(), 2);
-    assert_eq!(c_pos.borrow().get(local), Some(&Pos { x: -1.0, y: -1.0 }));
-    assert_eq!(c_pos.borrow().get(remote), Some(&Pos { x: 1.0, y: 1.0 }));
+    assert_eq!(c_pos.get().len(), 2);
+    assert_eq!(c_pos.get().get(local), Some(&Pos { x: -1.0, y: -1.0 }));
+    assert_eq!(c_pos.get().get(remote), Some(&Pos { x: 1.0, y: 1.0 }));
 }
 
 #[test]
@@ -189,12 +199,18 @@ fn malformed_snapshots_error_instead_of_panicking() {
     let (mut server, mut snet, mut client, cnet) = server_client_pair();
     let s_pos = server.pool::<Pos>("pos");
     let id = server.id_add();
-    s_pos.borrow_mut().add(id, Pos { x: 1.0, y: 2.0 });
+    s_pos.get_mut().add(id, Pos { x: 1.0, y: 2.0 });
     server.loop_once(DT);
 
     let snap = snet.snapshot(&server, 1).unwrap();
-    assert_eq!(cnet.apply(&mut client, &snap[..3]), Err(NetError::Truncated));
-    assert_eq!(cnet.apply(&mut client, &snap[..snap.len() - 1]), Err(NetError::Truncated));
+    assert_eq!(
+        cnet.apply(&mut client, &snap[..3]),
+        Err(NetError::Truncated)
+    );
+    assert_eq!(
+        cnet.apply(&mut client, &snap[..snap.len() - 1]),
+        Err(NetError::Truncated)
+    );
 }
 
 /// The milestone test: two live kernels, net logic running as ordinary pm
@@ -214,7 +230,13 @@ fn two_pms_converge_through_tasked_net_loop() {
     let ids: Vec<_> = (0..50)
         .map(|i| {
             let id = server.id_add();
-            s_pos.borrow_mut().add(id, Pos { x: i as f32, y: 0.0 });
+            s_pos.get_mut().add(
+                id,
+                Pos {
+                    x: i as f32,
+                    y: 0.0,
+                },
+            );
             id
         })
         .collect();
@@ -224,7 +246,7 @@ fn two_pms_converge_through_tasked_net_loop() {
         let pos = s_pos.clone();
         move |pm| {
             if pm.tick() <= 30 {
-                for (_, mut p) in pos.borrow_mut().iter_mut() {
+                for (_, mut p) in pos.get_mut().iter_mut() {
                     p.x += 1.0;
                     p.y += 0.5;
                 }
@@ -275,12 +297,16 @@ fn two_pms_converge_through_tasked_net_loop() {
 
     // Physics stopped at tick 30 and later rounds flushed the queues:
     // the client must hold the exact server state.
-    assert_eq!(c_pos.borrow().len(), 50);
+    assert_eq!(c_pos.get().len(), 50);
     for &id in &ids {
-        assert_eq!(c_pos.borrow().get(id), s_pos.borrow().get(id), "entity {id:?} diverged");
+        assert_eq!(
+            c_pos.get().get(id),
+            s_pos.get().get(id),
+            "entity {id:?} diverged"
+        );
     }
     // Kernel ticks start at 1, so "tick <= 30" fires on ticks 2..=30.
-    assert_eq!(s_pos.borrow().get(ids[0]), Some(&Pos { x: 29.0, y: 14.5 }));
+    assert_eq!(s_pos.get().get(ids[0]), Some(&Pos { x: 29.0, y: 14.5 }));
 }
 
 #[test]
@@ -296,18 +322,24 @@ fn dense_pool_streams_through_a_byte_budget() {
     let mut ids = Vec::new();
     for i in 0..300 {
         let id = server.id_add();
-        s_pos.borrow_mut().add(id, Pos { x: i as f32, y: 0.0 });
+        s_pos.get_mut().add(
+            id,
+            Pos {
+                x: i as f32,
+                y: 0.0,
+            },
+        );
         ids.push(id);
     }
 
     const BUDGET: usize = 500; // ~40 entries of 12 bytes
     let mut rounds = 0;
-    while c_pos.borrow().len() < 300 {
+    while c_pos.get().len() < 300 {
         rounds += 1;
         assert!(rounds <= 12, "rotation failed to cover all entities");
         server.loop_once(DT);
         // Everything moves every tick — worst case for delta models.
-        for (_, mut p) in s_pos.borrow_mut().iter_mut() {
+        for (_, mut p) in s_pos.get_mut().iter_mut() {
             p.y += 1.0;
         }
         let snap = snet.snapshot_budgeted(&server, 1, BUDGET).unwrap();

@@ -1,12 +1,10 @@
 //! Installable net modules: the transport-pumping loop every game wrote
 //! by hand, hoisted into core. `NetServer::serve` / `NetClient::connect`
-//! move the QUIC endpoint into a single net task (priority
-//! [`NET_PRIO`], registered under `module_add` so
-//! `module_remove("net_server" | "net_client")` is a clean shutdown)
+//! move the QUIC endpoint into a single net task (priority [`NET_PRIO`])
 //! that trades exclusively in plain data — games read and write singles
 //! and never touch the transport.
 //!
-//! Server (`net.serve::<C>(pm, quic)`), where `C` is the input pod:
+//! Server (`pm.sync(&pool)…` then `pm.serve::<C>(quic)`), `C` the input pod:
 //! - `"net.peers"`  [`PeerEvents`] — who joined/left this tick
 //! - `"net.cmds"`   [`Commands<C>`] — per-peer input queues. `pop` is
 //!   the command-frame model (one per tick, bounded skip-ahead),
@@ -15,7 +13,7 @@
 //! - `"net.events"` [`ServerEvents`] — reliable events received this tick
 //! - `"net.out"`    [`ServerOutbox`] — queue reliable events to a peer
 //!
-//! Client (`net.connect::<C>(pm, quic, input_hz)`):
+//! Client (`pm.sync(&pool)…` then `pm.connect::<C>(quic, input_hz)`):
 //! - `"net.status"`  [`NetStatus`] — peer / rtt / snapshot count / connected
 //! - `"net.input"`   [`NetInput<C>`] — the game writes its current
 //!   command; the module sends it at a fixed `input_hz` cadence,
@@ -38,14 +36,51 @@ use std::collections::{HashMap, VecDeque};
 
 use bytemuck::Pod;
 
-use crate::kernel::Pm;
-use crate::net::{Applied, NetClient, NetServer, Outbox};
+use crate::kernel::{PoolHandle, Pm};
+use crate::net::{Applied, NetClient, NetServer, Outbox, SyncSet};
 use crate::transport::{QuicClient, QuicServer};
 
 /// Priority of the net task both modules register. It runs first in the
 /// tick (per net.rs: sending before the sim avoids relabeling freshly
 /// stamped entries); register game tasks above it.
 pub const NET_PRIO: f32 = 5.0;
+
+/// Networking is part of the kernel: register pools with [`Pm::sync`],
+/// then pick a role with [`Pm::serve`] / [`Pm::connect`]. The transport
+/// pumps in a single task; games only ever touch the `"net.*"` singles.
+impl Pm {
+    /// Register `pool` for replication. The pool's name is its wire
+    /// identity — server and client must register the same pools in the
+    /// same order. Call before `serve`/`connect`.
+    pub fn sync<T: Pod + 'static>(&mut self, pool: &PoolHandle<T>) {
+        let name = pool.name().to_string();
+        self.single::<SyncSet>("net.sync")
+            .get_mut()
+            .pool_sync(&name, pool);
+    }
+
+    /// Schema (pool name + value size, registration order) of everything
+    /// registered with `sync` — hand to `QuicServer::bind` /
+    /// `QuicClient::connect` so the transport can verify both ends match.
+    pub fn net_schema(&mut self) -> Vec<(String, usize)> {
+        self.single::<SyncSet>("net.sync").get().schema()
+    }
+
+    /// Become the authoritative server over `quic`, replicating every
+    /// pool registered with `sync`. `C` is the input pod clients send.
+    pub fn serve<C: Pod + 'static>(&mut self, quic: QuicServer) {
+        let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
+        self.removal_hold_set(true);
+        NetServer::with_sync(sync).serve::<C>(self, quic);
+    }
+
+    /// Become a client over `quic`, applying snapshots into every pool
+    /// registered with `sync`. `C` is the input pod, sent at `input_hz`.
+    pub fn connect<C: Pod + 'static>(&mut self, quic: QuicClient, input_hz: f32) {
+        let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
+        NetClient::with_sync(sync).connect::<C>(self, quic, input_hz);
+    }
+}
 
 /// Peers that joined or left this tick (server, `"net.peers"`).
 #[derive(Default)]
@@ -64,7 +99,10 @@ pub struct Commands<C: Pod> {
 
 impl<C: Pod> Default for Commands<C> {
     fn default() -> Self {
-        Self { queues: HashMap::new(), applied: HashMap::new() }
+        Self {
+            queues: HashMap::new(),
+            applied: HashMap::new(),
+        }
     }
 }
 
@@ -95,7 +133,10 @@ impl<C: Pod> Commands<C> {
         if let Some(next) = q.pop_front() {
             self.applied.insert(peer, next);
         }
-        self.applied.get(&peer).map(|&(_, c)| c).unwrap_or_else(C::zeroed)
+        self.applied
+            .get(&peer)
+            .map(|&(_, c)| c)
+            .unwrap_or_else(C::zeroed)
     }
 
     /// Newest-wins consumption: drain to the latest command and hold it.
@@ -106,7 +147,10 @@ impl<C: Pod> Commands<C> {
         if let Some(last) = q.drain(..).last() {
             self.applied.insert(peer, last);
         }
-        self.applied.get(&peer).map(|&(_, c)| c).unwrap_or_else(C::zeroed)
+        self.applied
+            .get(&peer)
+            .map(|&(_, c)| c)
+            .unwrap_or_else(C::zeroed)
     }
 
     /// Last consumed (peer, seq) pairs — echoed by the module so clients
@@ -193,59 +237,57 @@ impl NetServer {
     /// `C` is the input pod clients send.
     pub fn serve<C: Pod + 'static>(self, pm: &mut Pm, mut quic: QuicServer) {
         let mut net = self;
-        let _ = pm.module_add("net_server", |pm| {
-            let peers = pm.single::<PeerEvents>("net.peers");
-            let cmds = pm.single::<Commands<C>>("net.cmds");
-            let events = pm.single::<ServerEvents>("net.events");
-            let out = pm.single::<ServerOutbox>("net.out");
-            pm.task_add("net", NET_PRIO, 0.0, move |pm| {
-                quic.pump();
-                {
-                    let mut pe = peers.borrow_mut();
-                    pe.joined.clear();
-                    pe.left.clear();
-                    let mut cs = cmds.borrow_mut();
-                    for p in quic.joined_drain() {
-                        net.peer_add(p);
-                        cs.peer_add(p);
-                        pe.joined.push(p);
-                    }
-                    for p in quic.left_drain() {
-                        net.peer_remove(p);
-                        cs.peer_remove(p);
-                        pe.left.push(p);
-                    }
-                    for (p, seq, bytes) in quic.inputs_drain() {
-                        if bytes.len() == size_of::<C>() {
-                            cs.push(p, seq, bytemuck::pod_read_unaligned(&bytes));
-                        }
-                    }
-                    // Echo what the sim consumed (last tick — it runs
-                    // after this task); clients reconcile against this.
-                    for (p, seq) in cs.applied_seqs() {
-                        net.input_processed(p, seq);
+        let peers = pm.single::<PeerEvents>("net.peers");
+        let cmds = pm.single::<Commands<C>>("net.cmds");
+        let events = pm.single::<ServerEvents>("net.events");
+        let out = pm.single::<ServerOutbox>("net.out");
+        pm.task_add("net", NET_PRIO, 0.0, move |pm| {
+            quic.pump();
+            {
+                let mut pe = peers.get_mut();
+                pe.joined.clear();
+                pe.left.clear();
+                let mut cs = cmds.get_mut();
+                for p in quic.joined_drain() {
+                    net.peer_add(p);
+                    cs.peer_add(p);
+                    pe.joined.push(p);
+                }
+                for p in quic.left_drain() {
+                    net.peer_remove(p);
+                    cs.peer_remove(p);
+                    pe.left.push(p);
+                }
+                for (p, seq, bytes) in quic.inputs_drain() {
+                    if bytes.len() == size_of::<C>() {
+                        cs.push(p, seq, bytemuck::pod_read_unaligned(&bytes));
                     }
                 }
-                for (p, tick) in quic.acks_drain() {
-                    net.ack(p, tick);
+                // Echo what the sim consumed (last tick — it runs
+                // after this task); clients reconcile against this.
+                for (p, seq) in cs.applied_seqs() {
+                    net.input_processed(p, seq);
                 }
-                {
-                    let ev = &mut events.borrow_mut().0;
-                    ev.clear();
-                    ev.extend(quic.events_drain());
+            }
+            for (p, tick) in quic.acks_drain() {
+                net.ack(p, tick);
+            }
+            {
+                let ev = &mut events.get_mut().0;
+                ev.clear();
+                ev.extend(quic.events_drain());
+            }
+            for (p, ty, payload) in out.get_mut().drain() {
+                quic.event_send(p, ty, &payload);
+            }
+            let plist: Vec<u8> = net.peers().collect();
+            for p in plist {
+                let budget = quic.snapshot_budget(p);
+                if let Some(snap) = net.snapshot_budgeted(pm, p, budget) {
+                    quic.snapshot_send(p, &snap);
                 }
-                for (p, ty, payload) in out.borrow_mut().drain() {
-                    quic.event_send(p, ty, &payload);
-                }
-                let plist: Vec<u8> = net.peers().collect();
-                for p in plist {
-                    let budget = quic.snapshot_budget(p);
-                    if let Some(snap) = net.snapshot_budgeted(pm, p, budget) {
-                        quic.snapshot_send(p, &snap);
-                    }
-                }
-                net.prune(pm);
-            });
+            }
+            net.prune(pm);
         });
     }
 }
@@ -258,64 +300,64 @@ impl NetClient {
     /// a 60 Hz server). Connection errors quit the loop.
     pub fn connect<C: Pod + 'static>(self, pm: &mut Pm, mut quic: QuicClient, input_hz: f32) {
         let net = self;
-        let _ = pm.module_add("net_client", |pm| {
-            let status = pm.single::<NetStatus>("net.status");
-            let input = pm.single::<NetInput<C>>("net.input");
-            let sent = pm.single::<SentLog<C>>("net.sent");
-            let applied = pm.single::<AppliedLog>("net.applied");
-            let events = pm.single::<ClientEvents>("net.events");
-            let out = pm.single::<Outbox>("net.out");
-            let mut accum = 0.0f32;
-            pm.task_add("net", NET_PRIO, 0.0, move |pm| {
-                quic.pump();
-                if let Some(err) = quic.error() {
-                    eprintln!("[net] disconnected: {err}");
-                    pm.loop_quit();
-                    return;
-                }
-                if quic.is_gone() {
-                    eprintln!("[net] server closed the connection");
-                    pm.loop_quit();
-                    return;
-                }
-                sent.borrow_mut().0.clear();
-                applied.borrow_mut().0.clear();
+        let status = pm.single::<NetStatus>("net.status");
+        let input = pm.single::<NetInput<C>>("net.input");
+        let sent = pm.single::<SentLog<C>>("net.sent");
+        let applied = pm.single::<AppliedLog>("net.applied");
+        let events = pm.single::<ClientEvents>("net.events");
+        let out = pm.single::<Outbox>("net.out");
+        let mut accum = 0.0f32;
+        pm.task_add("net", NET_PRIO, 0.0, move |pm| {
+            quic.pump();
+            if let Some(err) = quic.error() {
+                eprintln!("[net] disconnected: {err}");
+                pm.loop_quit();
+                return;
+            }
+            if quic.is_gone() {
+                eprintln!("[net] server closed the connection");
+                pm.loop_quit();
+                return;
+            }
+            sent.get_mut().0.clear();
+            applied.get_mut().0.clear();
+            {
+                let ev = &mut events.get_mut().0;
+                ev.clear();
+                ev.extend(quic.events_drain());
+            }
+            for snap in quic.snapshots_drain() {
+                let Ok(a) = net.apply(pm, &snap) else {
+                    continue;
+                };
+                quic.ack_send(a.tick);
+                applied.get_mut().0.push(a);
+                status.get_mut().snapshots += 1;
+            }
+            if let Some(peer) = quic.handshake_done() {
+                pm.local_peer = peer;
                 {
-                    let ev = &mut events.borrow_mut().0;
-                    ev.clear();
-                    ev.extend(quic.events_drain());
+                    let mut st = status.get_mut();
+                    st.peer = peer;
+                    st.connected = true;
                 }
-                for snap in quic.snapshots_drain() {
-                    let Ok(a) = net.apply(pm, &snap) else { continue };
-                    quic.ack_send(a.tick);
-                    applied.borrow_mut().0.push(a);
-                    status.borrow_mut().snapshots += 1;
+                for (ty, payload) in out.get_mut().drain() {
+                    quic.event_send(ty, &payload);
                 }
-                if let Some(peer) = quic.handshake_done() {
-                    pm.local_peer = peer;
-                    {
-                        let mut st = status.borrow_mut();
-                        st.peer = peer;
-                        st.connected = true;
-                    }
-                    for (ty, payload) in out.borrow_mut().drain() {
-                        quic.event_send(ty, &payload);
-                    }
-                    // Fixed-cadence input: the server consumes one per
-                    // sim tick, and prediction must step the same fixed
-                    // dt — regardless of what rate this loop runs at.
-                    accum += pm.loop_dt();
-                    let step = 1.0 / input_hz;
-                    while accum >= step {
-                        accum -= step;
-                        let cmd = input.borrow().0;
-                        let seq = quic.input_send(bytemuck::bytes_of(&cmd));
-                        sent.borrow_mut().0.push((seq, cmd));
-                    }
-                    status.borrow_mut().input_alpha = accum * input_hz;
+                // Fixed-cadence input: the server consumes one per
+                // sim tick, and prediction must step the same fixed
+                // dt — regardless of what rate this loop runs at.
+                accum += pm.loop_dt();
+                let step = 1.0 / input_hz;
+                while accum >= step {
+                    accum -= step;
+                    let cmd = input.get().0;
+                    let seq = quic.input_send(bytemuck::bytes_of(&cmd));
+                    sent.get_mut().0.push((seq, cmd));
                 }
-                status.borrow_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
-            });
+                status.get_mut().input_alpha = accum * input_hz;
+            }
+            status.get_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
         });
     }
 }

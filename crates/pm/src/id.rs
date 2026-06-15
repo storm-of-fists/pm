@@ -20,8 +20,15 @@ pub struct Id(pub u32);
 impl Id {
     #[inline]
     pub fn new(peer: u8, generation: u8, index: u32) -> Self {
-        debug_assert!(index <= INDEX_MASK, "index {index} exceeds {INDEX_BITS} bits");
-        Self(((peer as u32) << (GEN_BITS + INDEX_BITS)) | ((generation as u32) << INDEX_BITS) | index)
+        debug_assert!(
+            index <= INDEX_MASK,
+            "index {index} exceeds {INDEX_BITS} bits"
+        );
+        Self(
+            ((peer as u32) << (GEN_BITS + INDEX_BITS))
+                | ((generation as u32) << INDEX_BITS)
+                | index,
+        )
     }
 
     #[inline]
@@ -80,7 +87,11 @@ impl IdAllocator {
             Some(i) => u32::from(i),
             None => {
                 let i = slots.next_index;
-                assert!(i <= INDEX_MASK, "peer {peer} exceeded {} concurrent entities", INDEX_MASK + 1);
+                assert!(
+                    i <= INDEX_MASK,
+                    "peer {peer} exceeded {} concurrent entities",
+                    INDEX_MASK + 1
+                );
                 slots.next_index = i + 1;
                 i
             }
@@ -116,7 +127,9 @@ impl IdAllocator {
     /// Return the index to the free list for reuse. Called by the kernel
     /// when the removal log prunes (i.e. all peers acked the removal).
     pub(crate) fn release(&mut self, id: Id) {
-        self.peers[id.peer() as usize].free.push_back(id.index() as u16);
+        self.peers[id.peer() as usize]
+            .free
+            .push_back(id.index() as u16);
     }
 }
 

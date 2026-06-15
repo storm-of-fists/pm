@@ -4,7 +4,8 @@
       "Read",
       "Grep",
       "Glob",
-      "Bash"
+      "Bash",
+      "WebSearch"
     ]
   }
 }

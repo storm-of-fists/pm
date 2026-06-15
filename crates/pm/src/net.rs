@@ -28,7 +28,7 @@ use std::rc::Rc;
 use bytemuck::Pod;
 
 use crate::id::Id;
-use crate::kernel::{Handle, Pm};
+use crate::kernel::{PoolHandle, Pm};
 use crate::paged::PagedArray;
 use crate::pool::Pool;
 
@@ -217,21 +217,26 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
 }
 
 #[derive(Default)]
-struct SyncSet {
+pub(crate) struct SyncSet {
     adapters: Vec<Box<dyn SyncAdapter>>,
 }
 
 impl SyncSet {
-    fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &Handle<T>) {
-        self.adapters
-            .push(Box::new(PoolAdapter { name: name.to_string(), pool: pool.rc().clone() }));
+    pub(crate) fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
+        self.adapters.push(Box::new(PoolAdapter {
+            name: name.to_string(),
+            pool: pool.rc().clone(),
+        }));
     }
 
     /// (pool name, value size) per registered pool, in registration order.
     /// Server and client schemas must match; the QUIC handshake will
     /// verify this — until then, tests assert it.
-    fn schema(&self) -> Vec<(String, usize)> {
-        self.adapters.iter().map(|a| (a.name().to_string(), a.value_size())).collect()
+    pub(crate) fn schema(&self) -> Vec<(String, usize)> {
+        self.adapters
+            .iter()
+            .map(|a| (a.name().to_string(), a.value_size()))
+            .collect()
     }
 }
 
@@ -281,10 +286,22 @@ impl NetServer {
     /// indices aren't recycled before every peer has acked the removal.
     pub fn new(pm: &mut Pm) -> Self {
         pm.removal_hold_set(true);
-        Self { sync: SyncSet::default(), peers: Vec::new() }
+        Self {
+            sync: SyncSet::default(),
+            peers: Vec::new(),
+        }
     }
 
-    pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &Handle<T>) {
+    /// Build a server around an already-populated sync set (what
+    /// `Pm::serve` hands over from the `"net.sync"` registration).
+    pub(crate) fn with_sync(sync: SyncSet) -> Self {
+        Self {
+            sync,
+            peers: Vec::new(),
+        }
+    }
+
+    pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
     }
 
@@ -298,7 +315,9 @@ impl NetServer {
                 peer,
                 acked_tick: 0,
                 input_seq: 0,
-                pools: (0..self.sync.adapters.len()).map(|_| PeerPool::new()).collect(),
+                pools: (0..self.sync.adapters.len())
+                    .map(|_| PeerPool::new())
+                    .collect(),
                 sent: VecDeque::new(),
             });
         }
@@ -396,8 +415,12 @@ impl NetServer {
         out.extend_from_slice(&label.to_le_bytes());
         out.extend_from_slice(&state.input_seq.to_le_bytes());
 
-        let removals: Vec<u32> =
-            pm.removal_log().iter().filter(|&&(_, t)| t > acked).map(|&(id, _)| id.0).collect();
+        let removals: Vec<u32> = pm
+            .removal_log()
+            .iter()
+            .filter(|&&(_, t)| t > acked)
+            .map(|&(id, _)| id.0)
+            .collect();
         out.extend_from_slice(&(removals.len() as u32).to_le_bytes());
         for id in removals {
             out.extend_from_slice(&id.to_le_bytes());
@@ -406,8 +429,7 @@ impl NetServer {
         out.extend_from_slice(&(self.sync.adapters.len() as u16).to_le_bytes());
         let mut sent = Vec::new();
         // 6 bytes of section header (index + count) per pool.
-        let mut remaining =
-            budget.saturating_sub(out.len() + 6 * self.sync.adapters.len());
+        let mut remaining = budget.saturating_sub(out.len() + 6 * self.sync.adapters.len());
         for (i, adapter) in self.sync.adapters.iter().enumerate() {
             out.extend_from_slice(&(i as u16).to_le_bytes());
             let count_at = out.len();
@@ -431,7 +453,12 @@ impl NetServer {
     /// Recycle removal-log entries every peer has acked. Call once per net
     /// tick, after processing acks.
     pub fn prune(&self, pm: &mut Pm) {
-        let min = self.peers.iter().map(|p| p.acked_tick).min().unwrap_or(pm.tick());
+        let min = self
+            .peers
+            .iter()
+            .map(|p| p.acked_tick)
+            .min()
+            .unwrap_or(pm.tick());
         pm.removal_release_upto(min);
     }
 }
@@ -449,7 +476,13 @@ impl NetClient {
         Self::default()
     }
 
-    pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &Handle<T>) {
+    /// Build a client around an already-populated sync set (what
+    /// `Pm::connect` hands over from the `"net.sync"` registration).
+    pub(crate) fn with_sync(sync: SyncSet) -> Self {
+        Self { sync }
+    }
+
+    pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
     }
 
@@ -476,8 +509,11 @@ impl NetClient {
         for _ in 0..section_count {
             let index = r.u16()?;
             let count = r.u32()?;
-            let adapter =
-                self.sync.adapters.get(index as usize).ok_or(NetError::UnknownPool(index))?;
+            let adapter = self
+                .sync
+                .adapters
+                .get(index as usize)
+                .ok_or(NetError::UnknownPool(index))?;
             adapter.apply(pm, count, &mut r)?;
         }
         Ok(Applied { tick, input_seq })

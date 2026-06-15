@@ -46,7 +46,12 @@ struct Cam {
 
 impl Default for Cam {
     fn default() -> Self {
-        Self { pos: vec3(0.0, 2.0, -10.0), yaw: 0.0, pitch: -0.1, speed: 6.0 }
+        Self {
+            pos: vec3(0.0, 2.0, -10.0),
+            yaw: 0.0,
+            pitch: -0.1,
+            speed: 6.0,
+        }
     }
 }
 
@@ -105,7 +110,7 @@ fn spawn_scene(pm: &mut Pm) {
     let solids = pm.pool::<Solid>("solids");
     let mut add = |s: Solid| {
         let id = pm.id_add();
-        solids.borrow_mut().add(id, s);
+        solids.get_mut().add(id, s);
     };
     for i in 0..8 {
         let a = i as f32 / 8.0 * std::f32::consts::TAU;
@@ -146,11 +151,19 @@ fn main() {
     let cam = pm.single::<Cam>("cam");
     let cull = pm.single::<Cull>("cull");
 
-    let (mut window, mut pump, refresh) =
-        pm_sdl::window("pm solids (gpu) — wasd+eq fly, hold RMB to look, wheel = speed", W, H);
+    let (mut window, mut pump, refresh) = pm_sdl::window(
+        "pm solids (gpu) — wasd+eq fly, hold RMB to look, wheel = speed",
+        W,
+        H,
+    );
     let mut r3d = Renderer3d::new(&window).expect("renderer");
     let ground = r3d
-        .upload_mesh(&checker_ground(14, 1.0, (0.24, 0.27, 0.33), (0.16, 0.18, 0.22)))
+        .upload_mesh(&checker_ground(
+            14,
+            1.0,
+            (0.24, 0.27, 0.33),
+            (0.16, 0.18, 0.22),
+        ))
         .expect("ground");
     let cube = r3d
         .upload_mesh(&bake(
@@ -158,26 +171,40 @@ fn main() {
             (0.36, 0.55, 0.86),
         ))
         .expect("cube");
-    let tetra = r3d.upload_mesh(&bake(&tetra_tris(), (0.95, 0.78, 0.25))).expect("tetra");
-    let octa = r3d.upload_mesh(&bake(&octa_tris(), (0.85, 0.35, 0.42))).expect("octa");
+    let tetra = r3d
+        .upload_mesh(&bake(&tetra_tris(), (0.95, 0.78, 0.25)))
+        .expect("tetra");
+    let octa = r3d
+        .upload_mesh(&bake(&octa_tris(), (0.85, 0.35, 0.42)))
+        .expect("octa");
 
     pm.task_add("input", 4.0, 0.0, {
         let cam = cam.clone();
         let cull = cull.clone();
         move |pm| {
             let dt = pm.loop_dt();
-            let mut c = cam.borrow_mut();
+            let mut c = cam.get_mut();
             for ev in pump.poll_iter() {
                 match ev {
                     Event::Quit { .. }
-                    | Event::KeyDown { scancode: Some(Scancode::Escape), .. } => pm.loop_quit(),
-                    Event::KeyDown { scancode: Some(Scancode::C), repeat: false, .. } => {
-                        let now = !cull.borrow().0;
-                        cull.borrow_mut().0 = now;
+                    | Event::KeyDown {
+                        scancode: Some(Scancode::Escape),
+                        ..
+                    } => pm.loop_quit(),
+                    Event::KeyDown {
+                        scancode: Some(Scancode::C),
+                        repeat: false,
+                        ..
+                    } => {
+                        let now = !cull.get().0;
+                        cull.get_mut().0 = now;
                     }
-                    Event::MouseMotion { xrel, yrel, mousestate, .. }
-                        if mousestate.is_mouse_button_pressed(MouseButton::Right) =>
-                    {
+                    Event::MouseMotion {
+                        xrel,
+                        yrel,
+                        mousestate,
+                        ..
+                    } if mousestate.is_mouse_button_pressed(MouseButton::Right) => {
                         c.yaw += xrel * 0.004;
                         c.pitch = (c.pitch - yrel * 0.004).clamp(-1.5, 1.5);
                     }
@@ -206,7 +233,7 @@ fn main() {
         let solids = solids.clone();
         move |pm| {
             let dt = pm.loop_dt();
-            for (_, mut s) in solids.borrow_mut().iter_mut() {
+            for (_, mut s) in solids.get_mut().iter_mut() {
                 let spin = s.spin;
                 s.angle += spin * dt;
             }
@@ -218,12 +245,12 @@ fn main() {
         let cam = cam.clone();
         let cull = cull.clone();
         move |pm| {
-            let c = *cam.borrow();
-            let culling = cull.borrow().0;
+            let c = *cam.get();
+            let culling = cull.get().0;
             let white = (1.0, 1.0, 1.0);
             if let Some(mut frame) = r3d.frame(&window, c.view(), vec3(0.45, 1.0, 0.35)) {
                 frame.draw(&ground, Mat4::IDENTITY, white, culling);
-                for (_, s) in solids.borrow().iter() {
+                for (_, s) in solids.get().iter() {
                     let model = Mat4::translate(s.pos)
                         * Mat4::rot_axis(s.axis, s.angle)
                         * Mat4::scale(s.scale);
@@ -239,7 +266,7 @@ fn main() {
             if pm.tick() % 30 == 0 {
                 let title = format!(
                     "pm solids (gpu) — {} solids, {:.0} fps, cull {} (C toggles; wasd+eq fly, RMB look)",
-                    solids.borrow().len(),
+                    solids.get().len(),
                     1.0 / pm.loop_dt().max(1e-6),
                     if culling { "ON" } else { "off" },
                 );

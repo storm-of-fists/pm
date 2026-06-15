@@ -3,13 +3,12 @@
 //! end-of-tick deferred removal.
 //!
 //! Usage pattern: fetch pool/singleton handles during init, clone them
-//! into the task closure, and access inside the task. Tasks are plain closures; a task's "state" is its
-//! captures. Closures may return `Result` — an `Err` benches the task
-//! (recorded in `task_faults`) and the loop survives, so fallible data
-//! access (`try_get`/`try_mut` + `?`) turns bad-access bugs into
-//! captured faults instead of crashes. The panicking `borrow` forms
-//! remain for hot paths where a conflict is a programming error you
-//! want loud.
+//! into the task closure, and access inside the task. Tasks are plain
+//! closures; a task's "state" is its captures. A closure may return
+//! `Result` — an `Err` benches the task (recorded in `task_faults`) and
+//! the loop survives — but that's for the task's own errors; per-entity
+//! data access is just `Option` (there or not), since single-threaded
+//! pm has no cross-pool contention to model.
 
 use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
@@ -48,7 +47,6 @@ type TaskFn = Box<dyn FnMut(&mut Pm) -> Result<(), TaskError>>;
 
 struct TaskEntry {
     name: String,
-    module: Option<Rc<str>>,
     priority: f32,
     interval: f32, // 0 = every tick
     accum: f32,
@@ -61,58 +59,34 @@ struct TaskEntry {
 #[derive(Clone, Debug)]
 pub struct TaskFault {
     pub task: String,
-    pub module: Option<String>,
     pub tick: u32,
     pub error: String,
 }
 
-/// Why a fallible data access failed. Implements `Error`, so inside a
-/// fallible task `?` converts it straight into a `TaskFault`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccessError {
-    /// The pool is already mutably borrowed — two tasks colliding on the
-    /// same data, or one task borrowing it twice.
-    Busy { pool: String },
-    /// The entity isn't in the pool (never added, or removed).
-    Missing { pool: String, id: Id },
-}
-
-impl std::fmt::Display for AccessError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AccessError::Busy { pool } => write!(f, "pool '{pool}' is busy (borrowed elsewhere)"),
-            AccessError::Missing { pool, id } => {
-                write!(f, "entity {:?} not in pool '{pool}'", id)
-            }
-        }
-    }
-}
-
-impl std::error::Error for AccessError {}
-
 /// Handle to a named pool. This is what `pm.pool()` returns and what
 /// task closures capture; it hides the `Rc<RefCell<..>>` plumbing.
 ///
-/// Two access styles:
-/// - `borrow`/`borrow_mut` lock the whole pool for iteration. They
-///   panic on a borrow conflict — that's two tasks holding the same
-///   pool mutably at once, a real bug worth a loud stop.
-/// - `try_get`/`try_mut`/`try_borrow`/`try_borrow_mut` return
-///   `Result<_, AccessError>`, so per-entity access in a fallible task
-///   propagates with `?` and a bad access benches the task instead of
-///   crashing the loop.
-pub struct Handle<T> {
+/// - `get`/`get_mut` lock the whole pool for iteration. They panic on a
+///   borrow conflict — single-threaded, that only happens if one task
+///   borrows the same pool twice, a real bug worth a loud stop.
+/// - `get_id`/`get_id_mut` reach one entity, returning `Option` — there
+///   or not. (No cross-pool contention to model: a single-threaded task
+///   can't hold two pools at once.)
+pub struct PoolHandle<T> {
     name: Rc<str>,
     rc: Rc<RefCell<Pool<T>>>,
 }
 
-impl<T> Clone for Handle<T> {
+impl<T> Clone for PoolHandle<T> {
     fn clone(&self) -> Self {
-        Self { name: self.name.clone(), rc: self.rc.clone() }
+        Self {
+            name: self.name.clone(),
+            rc: self.rc.clone(),
+        }
     }
 }
 
-impl<T: 'static> Handle<T> {
+impl<T: 'static> PoolHandle<T> {
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -122,79 +96,69 @@ impl<T: 'static> Handle<T> {
     }
 
     /// Whole-pool read lock (iteration). Panics if mutably borrowed.
-    pub fn borrow(&self) -> Ref<'_, Pool<T>> {
+    pub fn get(&self) -> Ref<'_, Pool<T>> {
         self.rc.borrow()
     }
 
     /// Whole-pool write lock (iteration/insert/remove). Panics if borrowed.
-    pub fn borrow_mut(&self) -> RefMut<'_, Pool<T>> {
+    pub fn get_mut(&self) -> RefMut<'_, Pool<T>> {
         self.rc.borrow_mut()
     }
 
-    pub fn try_borrow(&self) -> Result<Ref<'_, Pool<T>>, AccessError> {
-        self.rc.try_borrow().map_err(|_| AccessError::Busy { pool: self.name.to_string() })
+    /// Reach one entity for reading — `None` if it isn't in the pool.
+    /// Panics if the pool is already mutably borrowed (a double-borrow
+    /// bug, same as `get`).
+    pub fn get_id(&self, id: Id) -> Option<Ref<'_, T>> {
+        Ref::filter_map(self.rc.borrow(), |p| p.get(id)).ok()
     }
 
-    pub fn try_borrow_mut(&self) -> Result<RefMut<'_, Pool<T>>, AccessError> {
-        self.rc.try_borrow_mut().map_err(|_| AccessError::Busy { pool: self.name.to_string() })
-    }
-
-    /// Read one entity, fallibly.
-    pub fn try_get(&self, id: Id) -> Result<Ref<'_, T>, AccessError> {
-        let pool = self.try_borrow()?;
-        Ref::filter_map(pool, |p| p.get(id))
-            .map_err(|_| AccessError::Missing { pool: self.name.to_string(), id })
-    }
-
-    /// Write one entity, fallibly. Stamps the changed-tick immediately,
-    /// so a synced entity replicates after this.
-    pub fn try_mut(&self, id: Id) -> Result<RefMut<'_, T>, AccessError> {
-        let pool = self.try_borrow_mut()?;
-        RefMut::filter_map(pool, |p| p.get_mut_stamped(id))
-            .map_err(|_| AccessError::Missing { pool: self.name.to_string(), id })
+    /// Reach one entity for writing — `None` if it isn't in the pool.
+    /// Stamps the changed-tick immediately, so a synced entity replicates
+    /// after this.
+    pub fn get_id_mut(&self, id: Id) -> Option<RefMut<'_, T>> {
+        RefMut::filter_map(self.rc.borrow_mut(), |p| p.get_mut_stamped(id)).ok()
     }
 }
 
 /// Handle to a named singleton: one entity in an ordinary pool (there is
-/// no separate "state" concept). `borrow_mut`/`try_mut` stamp the
+/// no separate "state" concept). Its one entity always exists (created
+/// with the handle and protected by a pool lock), so `get`/`get_mut`
+/// hand back the value directly — no `Option`. `get_mut` stamps the
 /// changed-tick, so a synced singleton replicates on write.
-pub struct Single<T> {
-    handle: Handle<T>,
+pub struct SingleHandle<T> {
+    handle: PoolHandle<T>,
     id: Id,
 }
 
-impl<T> Clone for Single<T> {
+impl<T> Clone for SingleHandle<T> {
     fn clone(&self) -> Self {
-        Self { handle: self.handle.clone(), id: self.id }
+        Self {
+            handle: self.handle.clone(),
+            id: self.id,
+        }
     }
 }
 
-impl<T: 'static> Single<T> {
+impl<T: 'static> SingleHandle<T> {
     pub fn id(&self) -> Id {
         self.id
     }
 
     /// The underlying pool handle (e.g. to register it for sync).
-    pub fn pool(&self) -> &Handle<T> {
+    pub fn pool(&self) -> &PoolHandle<T> {
         &self.handle
     }
 
-    /// Read access; panics on borrow conflict (bug-loud form).
-    pub fn borrow(&self) -> Ref<'_, T> {
-        self.try_get().expect("singleton access failed")
+    /// Read the singleton's value. Panics only on a double-borrow bug.
+    pub fn get(&self) -> Ref<'_, T> {
+        Ref::filter_map(self.handle.get(), |p| p.get(self.id))
+            .unwrap_or_else(|_| panic!("singleton '{}' entity missing", self.handle.name()))
     }
 
-    /// Write access; panics on borrow conflict (bug-loud form).
-    pub fn borrow_mut(&self) -> RefMut<'_, T> {
-        self.try_mut().expect("singleton access failed")
-    }
-
-    pub fn try_get(&self) -> Result<Ref<'_, T>, AccessError> {
-        self.handle.try_get(self.id)
-    }
-
-    pub fn try_mut(&self) -> Result<RefMut<'_, T>, AccessError> {
-        self.handle.try_mut(self.id)
+    /// Mutate the singleton's value (stamps the changed-tick).
+    pub fn get_mut(&self) -> RefMut<'_, T> {
+        RefMut::filter_map(self.handle.get_mut(), |p| p.get_mut_stamped(self.id))
+            .unwrap_or_else(|_| panic!("singleton '{}' entity missing", self.handle.name()))
     }
 }
 
@@ -233,11 +197,9 @@ pub struct Pm {
     tasks: Vec<TaskEntry>,
     tasks_dirty: bool,
     stop_requests: Vec<String>,
-    module_stops: Vec<String>,
-    /// Set while a module's init or one of its tasks runs, so anything
-    /// registered during that window is tagged as the module's.
-    current_module: Option<Rc<str>>,
-    pool_owners: HashMap<String, Rc<str>>,
+    /// Names whose currently-running task should be dropped at end of
+    /// tick because `task_add_or_replace` superseded it this tick.
+    replace_requests: Vec<String>,
     faults: Vec<TaskFault>,
     stats: HashMap<String, TaskStat>,
     ids: IdAllocator,
@@ -268,9 +230,7 @@ impl Default for Pm {
             tasks: Vec::new(),
             tasks_dirty: false,
             stop_requests: Vec::new(),
-            module_stops: Vec::new(),
-            current_module: None,
-            pool_owners: HashMap::new(),
+            replace_requests: Vec::new(),
             faults: Vec::new(),
             stats: HashMap::new(),
             ids: IdAllocator::new(),
@@ -296,23 +256,25 @@ impl Pm {
 
     // --- pools & singletons ---------------------------------------------
 
-    /// Named sparse-set component pool. Created on first fetch. A pool
-    /// first created while a module is active belongs to that module.
-    pub fn pool<T: 'static>(&mut self, name: &str) -> Handle<T> {
+    /// Named sparse-set component pool. Created on first fetch.
+    pub fn pool<T: 'static>(&mut self, name: &str) -> PoolHandle<T> {
         if let Some(rc) = self.pools.get(name) {
             let typed = downcast_pool::<T>(rc).unwrap_or_else(|| {
                 panic!("pool '{name}' already registered with a different type")
             });
-            return Handle { name: Rc::from(name), rc: typed };
-        }
-        if let Some(m) = &self.current_module {
-            self.pool_owners.insert(name.to_string(), m.clone());
+            return PoolHandle {
+                name: Rc::from(name),
+                rc: typed,
+            };
         }
         let rc = Rc::new(RefCell::new(Pool::<T>::new()));
         rc.borrow_mut().tick_set(self.tick);
         let erased: Rc<RefCell<dyn ErasedPool>> = rc.clone();
         self.pools.insert(name.to_string(), erased);
-        Handle { name: Rc::from(name), rc }
+        PoolHandle {
+            name: Rc::from(name),
+            rc,
+        }
     }
 
     /// Named singleton: a single-entity pool. Created (with one
@@ -323,18 +285,31 @@ impl Pm {
     /// Authority rule: only the side that owns a replicated singleton
     /// may `single()` it (creation adds an entity). A replica fetches
     /// the pool with `pool()` and reads the synced entity instead.
-    pub fn single<T: Default + 'static>(&mut self, name: &str) -> Single<T> {
+    pub fn single<T: Default + 'static>(&mut self, name: &str) -> SingleHandle<T> {
         let handle = self.pool::<T>(name);
-        let existing = handle.borrow().ids().first().copied();
+        let existing = handle.get().ids().first().copied();
         let id = match existing {
             Some(id) => id,
             None => {
                 let id = self.id_add();
-                handle.borrow_mut().add(id, T::default());
+                let mut pool = handle.get_mut();
+                pool.add(id, T::default());
+                // A singleton's entity is permanent: lock the pool so the
+                // id-removal flush can never drop it from under the handle.
+                pool.lock();
                 id
             }
         };
-        Single { handle, id }
+        SingleHandle { handle, id }
+    }
+
+    /// Protect a pool from the end-of-tick id-removal flush (see
+    /// [`Pool::lock`]). `single` does this automatically; call it
+    /// explicitly to pin a regular pool's entities.
+    pub fn pool_lock(&mut self, name: &str) {
+        if let Some(rc) = self.pools.get(name) {
+            rc.borrow_mut().lock();
+        }
     }
 
     // --- tasks ----------------------------------------------------------
@@ -354,7 +329,6 @@ impl Pm {
     ) {
         self.tasks.push(TaskEntry {
             name: name.to_string(),
-            module: self.current_module.clone(),
             priority,
             interval,
             accum: 0.0,
@@ -362,6 +336,27 @@ impl Pm {
             func: Box::new(move |pm| func(pm).into_task_result()),
         });
         self.tasks_dirty = true;
+    }
+
+    /// Register a task, replacing any existing task with the same name
+    /// (its old closure is dropped). The dev-hot-reload primitive: a
+    /// reloaded module re-runs its init with this, swapping each task's
+    /// body in place — no teardown bookkeeping, and pools keep their
+    /// data across the reload. If the old task is mid-run this tick, it's
+    /// dropped at end of tick and the new one starts next tick.
+    pub fn task_add_or_replace<R: IntoTaskResult>(
+        &mut self,
+        name: &str,
+        priority: f32,
+        interval: f32,
+        func: impl FnMut(&mut Pm) -> R + 'static,
+    ) {
+        self.tasks.retain(|t| t.name != name);
+        // Covers the case where the old task is in this tick's running
+        // set (taken out of self.tasks): drop it during the end-of-tick
+        // merge so it doesn't come back alongside the replacement.
+        self.replace_requests.push(name.to_string());
+        self.task_add(name, priority, interval, func);
     }
 
     /// Tasks benched after returning `Err`, oldest first.
@@ -376,7 +371,11 @@ impl Pm {
     /// Per-task cumulative timings since start (or last reset), heaviest
     /// first. Callable from inside a task.
     pub fn task_stats(&self) -> Vec<(String, TaskStat)> {
-        let mut v: Vec<_> = self.stats.iter().map(|(n, s)| (n.clone(), s.clone())).collect();
+        let mut v: Vec<_> = self
+            .stats
+            .iter()
+            .map(|(n, s)| (n.clone(), s.clone()))
+            .collect();
         v.sort_by_key(|(_, s)| std::cmp::Reverse(s.ns_total));
         v
     }
@@ -392,51 +391,12 @@ impl Pm {
         self.stop_requests.push(name.to_string());
     }
 
-    // --- modules ----------------------------------------------------------
-
-    /// Install a named module: a bundle of tasks, pools, and singletons
-    /// that can be torn down as a unit with `module_remove`.
-    ///
-    /// `init` receives `&mut Pm` and registers things exactly the way
-    /// `main` does — `task_add`, `pool`, `single`. While it runs (and
-    /// later, while any of the module's tasks run), everything
-    /// first-created is tagged as belonging to the module, so runtime
-    /// additions by module tasks are owned too. If `init` returns `Err`,
-    /// whatever it registered is rolled back and the error is returned.
-    pub fn module_add<R: IntoTaskResult>(
-        &mut self,
-        name: &str,
-        init: impl FnOnce(&mut Pm) -> R,
-    ) -> Result<(), TaskError> {
-        let prev = self.current_module.replace(Rc::from(name));
-        let result = init(self).into_task_result();
-        self.current_module = prev;
-        if result.is_err() {
-            self.module_remove(name);
-        }
-        result
-    }
-
-    /// Tear down a module: stop its tasks and drop its pools from the
-    /// store. Tasks from other modules that hold handles to a removed
-    /// pool keep a working (now orphaned) pool until they drop the
-    /// handle; a fresh `pool()` of the same name creates a new, empty
-    /// pool. If called from inside a task, the module's tasks stop at
-    /// the end of the current tick.
-    pub fn module_remove(&mut self, name: &str) {
-        self.tasks.retain(|t| t.module.as_deref() != Some(name));
-        self.module_stops.push(name.to_string());
-
-        let owned: Vec<String> = self
-            .pool_owners
-            .iter()
-            .filter(|(_, owner)| &***owner == name)
-            .map(|(n, _)| n.clone())
-            .collect();
-        for pool_name in owned {
-            self.pool_owners.remove(&pool_name);
-            self.pools.remove(&pool_name);
-        }
+    /// Drop a pool from the store by name (e.g. a hot-reloaded mod
+    /// clearing its own private pools). Tasks still holding a handle to
+    /// it keep a working, now-orphaned pool until they drop it; a fresh
+    /// `pool()` of the same name makes a new empty one.
+    pub fn pool_remove(&mut self, name: &str) {
+        self.pools.remove(name);
     }
 
     // --- ids --------------------------------------------------------------
@@ -461,8 +421,8 @@ impl Pm {
     /// Queue removal of every entity currently in `pool` (deferred, like
     /// `id_remove`). The "clear this part of the world" primitive — e.g.
     /// despawn all monsters and bullets on game restart.
-    pub fn id_remove_all<T: 'static>(&mut self, pool: &Handle<T>) {
-        for &id in pool.borrow().ids() {
+    pub fn id_remove_all<T: 'static>(&mut self, pool: &PoolHandle<T>) {
+        for &id in pool.get().ids() {
             self.pending_removes.push(id);
         }
     }
@@ -559,18 +519,17 @@ impl Pm {
                 }
                 entry.accum -= entry.interval;
             }
-            // Anything the task registers at runtime inherits its module.
-            self.current_module = entry.module.clone();
             let started_at = Instant::now();
             let result = (entry.func)(self);
             let ns = started_at.elapsed().as_nanos() as u64;
-            self.current_module = None;
             if let Err(err) = result {
-                eprintln!("pm: task '{}' faulted at tick {}: {err}", entry.name, self.tick);
+                eprintln!(
+                    "pm: task '{}' faulted at tick {}: {err}",
+                    entry.name, self.tick
+                );
                 entry.faulted = true;
                 self.faults.push(TaskFault {
                     task: entry.name.clone(),
-                    module: entry.module.as_deref().map(str::to_string),
                     tick: self.tick,
                     error: err.to_string(),
                 });
@@ -582,19 +541,36 @@ impl Pm {
                     s.ns_max = s.ns_max.max(ns);
                 }
                 None => {
-                    self.stats
-                        .insert(entry.name.clone(), TaskStat { calls: 1, ns_total: ns, ns_max: ns });
+                    self.stats.insert(
+                        entry.name.clone(),
+                        TaskStat {
+                            calls: 1,
+                            ns_total: ns,
+                            ns_max: ns,
+                        },
+                    );
                 }
             }
         }
         running.retain(|t| !t.faulted);
         running.append(&mut self.tasks);
         self.tasks = running;
+        // For each task_add_or_replace this tick, keep only the most
+        // recent task of that name (appended last) and drop any older
+        // copy — including one still in this tick's running set. Both
+        // share the name, so we dedup by position, not by name-inequality.
+        for name in std::mem::take(&mut self.replace_requests) {
+            if let Some(last) = self.tasks.iter().rposition(|t| t.name == name) {
+                let mut i = 0;
+                self.tasks.retain(|t| {
+                    let keep = t.name != name || i == last;
+                    i += 1;
+                    keep
+                });
+            }
+        }
         for name in std::mem::take(&mut self.stop_requests) {
             self.tasks.retain(|t| t.name != name);
-        }
-        for name in std::mem::take(&mut self.module_stops) {
-            self.tasks.retain(|t| t.module.as_deref() != Some(name.as_str()));
         }
 
         self.id_process_removes();

@@ -61,7 +61,9 @@ fn frame_write(out: &mut Vec<u8>, ty: u16, payload: &[u8]) {
 /// peer's last seen sequence are redundant copies — skipped — so the
 /// output is in-order and gap-tolerant without retransmits.
 fn inputs_parse(data: &[u8], peer: u8, last: &mut u32, out: &mut Vec<(u8, u32, Vec<u8>)>) {
-    let Some((&count, mut rest)) = data.split_first() else { return };
+    let Some((&count, mut rest)) = data.split_first() else {
+        return;
+    };
     for _ in 0..count {
         if rest.len() < 6 {
             return;
@@ -98,7 +100,9 @@ fn frames_parse(buf: &mut Vec<u8>) -> Vec<(u16, Vec<u8>)> {
 
 fn stream_read(conn: &mut Connection, id: StreamId, into: &mut Vec<u8>) {
     let mut recv = conn.recv_stream(id);
-    let Ok(mut chunks) = recv.read(true) else { return };
+    let Ok(mut chunks) = recv.read(true) else {
+        return;
+    };
     while let Ok(Some(chunk)) = chunks.next(64 * 1024) {
         into.extend_from_slice(&chunk.bytes);
     }
@@ -203,7 +207,8 @@ impl LagSocket {
             match self.socket.recv_from(&mut tmp) {
                 Ok((len, from)) => {
                     if !self.drop_roll() {
-                        self.in_q.push_back((now + self.delay, from, tmp[..len].to_vec()));
+                        self.in_q
+                            .push_back((now + self.delay, from, tmp[..len].to_vec()));
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -260,8 +265,8 @@ impl QuicServer {
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
 
-        let cert = rcgen::generate_simple_self_signed(vec!["pm".into()])
-            .map_err(io::Error::other)?;
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["pm".into()]).map_err(io::Error::other)?;
         let cert_der = cert.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
         let mut crypto = rustls::ServerConfig::builder()
@@ -362,7 +367,8 @@ impl QuicServer {
                             }
                         }
                         Some(DatagramEvent::Response(response)) => {
-                            self.socket.send_to(now, &out[..response.size], response.destination);
+                            self.socket
+                                .send_to(now, &out[..response.size], response.destination);
                         }
                         None => {}
                     }
@@ -375,9 +381,10 @@ impl QuicServer {
         let mut drained = Vec::new();
         for (&ch, st) in self.conns.iter_mut() {
             if let Some(deadline) = st.conn.poll_timeout()
-                && now >= deadline {
-                    st.conn.handle_timeout(now);
-                }
+                && now >= deadline
+            {
+                st.conn.handle_timeout(now);
+            }
             while let Some(ev) = st.conn.poll() {
                 match ev {
                     Event::Connected => {
@@ -405,7 +412,8 @@ impl QuicServer {
             while let Some(d) = st.conn.datagrams().recv() {
                 match d.first() {
                     Some(&DGRAM_ACK) if d.len() >= 5 => {
-                        self.acks.push((st.peer, u32::from_le_bytes(d[1..5].try_into().unwrap())));
+                        self.acks
+                            .push((st.peer, u32::from_le_bytes(d[1..5].try_into().unwrap())));
                     }
                     Some(&DGRAM_INPUT) => {
                         inputs_parse(&d[1..], st.peer, &mut st.last_input_seq, &mut self.inputs);
@@ -481,7 +489,11 @@ impl QuicServer {
     /// dropped and counted — keep synced state per snapshot under the
     /// datagram limit (~1200 bytes until MTU discovery raises it).
     pub fn snapshot_send(&mut self, peer: u8, snapshot: &[u8]) {
-        let Some(st) = self.peer_conns.get(&peer).and_then(|ch| self.conns.get_mut(ch)) else {
+        let Some(st) = self
+            .peer_conns
+            .get(&peer)
+            .and_then(|ch| self.conns.get_mut(ch))
+        else {
             return;
         };
         if !st.connected || st.gone {
@@ -502,7 +514,11 @@ impl QuicServer {
     /// >= EVENT_USER_BASE).
     pub fn event_send(&mut self, peer: u8, ty: u16, payload: &[u8]) {
         debug_assert!(ty >= EVENT_USER_BASE);
-        if let Some(st) = self.peer_conns.get(&peer).and_then(|ch| self.conns.get_mut(ch)) {
+        if let Some(st) = self
+            .peer_conns
+            .get(&peer)
+            .and_then(|ch| self.conns.get_mut(ch))
+        {
             frame_write(&mut st.stream_out, ty, payload);
         }
     }
@@ -572,7 +588,11 @@ pub struct QuicClient {
 impl QuicClient {
     pub fn connect(addr: &str, schema: &[(String, usize)]) -> io::Result<Self> {
         let server: SocketAddr = addr.parse().map_err(io::Error::other)?;
-        let bind = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let bind = if server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         let socket = UdpSocket::bind(bind)?;
         socket.set_nonblocking(true)?;
 
@@ -631,7 +651,8 @@ impl QuicClient {
                     ) {
                         Some(DatagramEvent::ConnectionEvent(_, ev)) => self.conn.handle_event(ev),
                         Some(DatagramEvent::Response(response)) => {
-                            self.socket.send_to(now, &out[..response.size], response.destination);
+                            self.socket
+                                .send_to(now, &out[..response.size], response.destination);
                         }
                         _ => {}
                     }
@@ -642,9 +663,10 @@ impl QuicClient {
         }
 
         if let Some(deadline) = self.conn.poll_timeout()
-            && now >= deadline {
-                self.conn.handle_timeout(now);
-            }
+            && now >= deadline
+        {
+            self.conn.handle_timeout(now);
+        }
         while let Some(ev) = self.conn.poll() {
             match ev {
                 Event::Connected => self.connected = true,
@@ -652,16 +674,15 @@ impl QuicClient {
                     self.gone = true;
                     self.error.get_or_insert(reason.to_string());
                 }
-                Event::Stream(StreamEvent::Opened { dir: Dir::Bi })
-                    if self.stream.is_none() => {
-                        self.stream = self.conn.streams().accept(Dir::Bi);
-                        // Data that arrived together with the stream-open
-                        // emits no Readable event — read it now or the
-                        // hello sits buffered until more traffic arrives.
-                        if let Some(id) = self.stream {
-                            stream_read(&mut self.conn, id, &mut self.stream_in);
-                        }
+                Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) if self.stream.is_none() => {
+                    self.stream = self.conn.streams().accept(Dir::Bi);
+                    // Data that arrived together with the stream-open
+                    // emits no Readable event — read it now or the
+                    // hello sits buffered until more traffic arrives.
+                    if let Some(id) = self.stream {
+                        stream_read(&mut self.conn, id, &mut self.stream_in);
                     }
+                }
                 Event::Stream(StreamEvent::Readable { id }) => {
                     stream_read(&mut self.conn, id, &mut self.stream_in);
                 }
@@ -677,7 +698,8 @@ impl QuicClient {
             if ty == FRAME_HELLO {
                 if payload.len() < 1 + self.schema.len() || payload[1..] != self.schema[..] {
                     self.error = Some("schema mismatch with server".into());
-                    self.conn.close(now, 1u32.into(), b"schema mismatch"[..].into());
+                    self.conn
+                        .close(now, 1u32.into(), b"schema mismatch"[..].into());
                     continue;
                 }
                 self.peer = Some(payload[0]);

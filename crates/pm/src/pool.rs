@@ -18,6 +18,7 @@ pub struct Pool<T> {
     values: Vec<T>,
     changed: Vec<u32>, // kernel tick of last insert/mutation, for sync diffing
     tick: u32,         // current kernel tick, pushed in each loop_once
+    locked: bool,      // if set, the kernel's id-removal flush skips this pool
 }
 
 /// Mutable handle to a pool entry. Derefs like `&mut T`, but stamps the
@@ -50,6 +51,7 @@ impl<T> Default for Pool<T> {
             values: Vec::new(),
             changed: Vec::new(),
             tick: 0,
+            locked: false,
         }
     }
 }
@@ -57,6 +59,19 @@ impl<T> Default for Pool<T> {
 impl<T> Pool<T> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Protect this pool from the kernel's end-of-tick id-removal flush:
+    /// once locked, `id_remove`/`id_remove_all` can't drop its entities.
+    /// Used by `single` so a singleton's one entity can't be removed out
+    /// from under the handles holding it. Direct `remove`/`clear`/`retain`
+    /// by the owner still work — the lock only blocks the automatic flush.
+    pub fn lock(&mut self) {
+        self.locked = true;
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked
     }
 
     fn dense_index(&self, id: Id) -> Option<usize> {
@@ -176,7 +191,16 @@ impl<T> Pool<T> {
             .iter()
             .copied()
             .zip(self.values.iter_mut().zip(self.changed.iter_mut()))
-            .map(move |(id, (value, changed))| (id, Mut { value, changed, tick }))
+            .map(move |(id, (value, changed))| {
+                (
+                    id,
+                    Mut {
+                        value,
+                        changed,
+                        tick,
+                    },
+                )
+            })
     }
 
     pub fn clear(&mut self) {
@@ -214,15 +238,23 @@ impl<T> Pool<T> {
 
     /// Read-only join: (id, &A, &B) for every entity in BOTH pools,
     /// iterating this (drive it with the smaller/denser pool).
-    pub fn iter_with<'a, U>(&'a self, other: &'a Pool<U>) -> impl Iterator<Item = (Id, &'a T, &'a U)> {
-        self.iter().filter_map(|(id, t)| other.get(id).map(|u| (id, t, u)))
+    pub fn iter_with<'a, U>(
+        &'a self,
+        other: &'a Pool<U>,
+    ) -> impl Iterator<Item = (Id, &'a T, &'a U)> {
+        self.iter()
+            .filter_map(|(id, t)| other.get(id).map(|u| (id, t, u)))
     }
 
     /// Mutable join: call `f(id, Mut<A>, Mut<B>)` for every entity in
     /// both pools. Callback style because a streaming iterator of two
     /// `Mut` borrows can't be expressed safely; each pair is disjoint,
     /// so the callback is.
-    pub fn each_with<U>(&mut self, other: &mut Pool<U>, mut f: impl FnMut(Id, Mut<'_, T>, Mut<'_, U>)) {
+    pub fn each_with<U>(
+        &mut self,
+        other: &mut Pool<U>,
+        mut f: impl FnMut(Id, Mut<'_, T>, Mut<'_, U>),
+    ) {
         for i in 0..self.ids.len() {
             let id = self.ids[i];
             if let Some(u) = other.get_mut(id) {
@@ -244,15 +276,22 @@ impl<T> Pool<T> {
 pub(crate) trait ErasedPool: std::any::Any {
     fn erased_remove(&mut self, id: Id);
     fn tick_set(&mut self, tick: u32);
+    fn lock(&mut self);
 }
 
 impl<T: 'static> ErasedPool for Pool<T> {
     fn erased_remove(&mut self, id: Id) {
-        self.remove(id);
+        if !self.locked {
+            self.remove(id);
+        }
     }
 
     fn tick_set(&mut self, tick: u32) {
         self.tick = tick;
+    }
+
+    fn lock(&mut self) {
+        self.locked = true;
     }
 }
 

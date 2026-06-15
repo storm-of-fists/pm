@@ -35,7 +35,7 @@ pub extern "C-unwind" fn pm_mod_init(pm: &mut Pm) -> bool {
             let pos = center + vec2(angle.cos(), angle.sin()) * radius;
             let speed = rng.rfr(130.0, 190.0);
             let id = pm.id_add();
-            monster.borrow_mut().add(
+            monster.get_mut().add(
                 id,
                 Monster {
                     pos,
@@ -44,7 +44,12 @@ pub extern "C-unwind" fn pm_mod_init(pm: &mut Pm) -> bool {
                     color: [255, rng.rfr(40.0, 90.0) as u8, 30, 255],
                 },
             );
-            monster_srv.borrow_mut().add(id, MonsterSrv { shoot_timer: rng.rfr(1.0, 3.0) });
+            monster_srv.get_mut().add(
+                id,
+                MonsterSrv {
+                    shoot_timer: rng.rfr(1.0, 3.0),
+                },
+            );
         }
         eprintln!("[meteor] shower of {count} at tick {}", pm.tick());
     });

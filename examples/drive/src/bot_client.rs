@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use pm::{
-    AppliedLog, ClientEvents, Id, NetClient, NetInput, NetStatus, Pm, Predictor, QuicClient,
-    SentLog, coast_blend, pool_mirror, vec2,
+    AppliedLog, ClientEvents, Id, NetInput, NetStatus, Pm, Predictor, QuicClient, SentLog,
+    coast_blend, pool_mirror, vec2,
 };
 
 use crate::common::*;
@@ -20,13 +20,23 @@ pub struct Stats {
 }
 
 fn err_metric(a: &Car, b: &Car) -> f32 {
-    (a.x - b.x).abs() + (a.z - b.z).abs() + (a.heading - b.heading).abs() + (a.speed - b.speed).abs()
+    (a.x - b.x).abs()
+        + (a.z - b.z).abs()
+        + (a.heading - b.heading).abs()
+        + (a.speed - b.speed).abs()
+        + (a.steer - b.steer).abs()
 }
 
-pub fn connect(net: &NetClient) -> QuicClient {
-    let mut quic = QuicClient::connect(ADDR, &net.schema()).expect("connect");
-    let lag_ms: f32 = std::env::var("PM_LAG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    let loss: f32 = std::env::var("PM_LOSS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+pub fn quic_connect(schema: &[(String, usize)]) -> QuicClient {
+    let mut quic = QuicClient::connect(ADDR, schema).expect("connect");
+    let lag_ms: f32 = std::env::var("PM_LAG_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let loss: f32 = std::env::var("PM_LOSS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
     if lag_ms > 0.0 || loss > 0.0 {
         quic.link_lag_set(Duration::from_secs_f32(lag_ms / 1000.0), loss);
     }
@@ -39,11 +49,10 @@ pub fn connect(net: &NetClient) -> QuicClient {
 pub fn add_client_tasks(
     pm: &mut Pm,
     quic: QuicClient,
-    net: NetClient,
-    car: &pm::Handle<Car>,
-    draw: &pm::Handle<Car>,
+    car: &pm::PoolHandle<Car>,
+    draw: &pm::PoolHandle<Car>,
 ) {
-    net.connect::<Drive>(pm, quic, 1.0 / FIXED_DT);
+    pm.connect::<Drive>(quic, 1.0 / FIXED_DT);
 
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
     let stats = pm.single::<Stats>("stats");
@@ -61,17 +70,18 @@ pub fn add_client_tasks(
         let car = car.clone();
         let stats = stats.clone();
         move |_pm| {
-            for (ty, payload) in &events.borrow().0 {
+            for (ty, payload) in &events.get().0 {
                 if *ty == EV_VEHICLE && payload.len() == 4 {
-                    stats.borrow_mut().mine =
-                        Some(Id(u32::from_le_bytes(payload.as_slice().try_into().unwrap())));
+                    stats.get_mut().mine = Some(Id(u32::from_le_bytes(
+                        payload.as_slice().try_into().unwrap(),
+                    )));
                 }
             }
-            let mine = stats.borrow().mine;
-            for a in &applied.borrow().0 {
-                let auth = mine.and_then(|id| car.borrow().get(id).copied());
+            let mine = stats.get().mine;
+            for a in &applied.get().0 {
+                let auth = mine.and_then(|id| car.get().get(id).copied());
                 let Some(auth) = auth else { continue };
-                let corrected = pred.borrow_mut().reconcile(
+                let corrected = pred.get_mut().reconcile(
                     auth,
                     a.input_seq,
                     |s, c| drive_step(s, c, FIXED_DT),
@@ -79,11 +89,12 @@ pub fn add_client_tasks(
                     1e-4,
                 );
                 if corrected {
-                    stats.borrow_mut().corrections += 1;
+                    stats.get_mut().corrections += 1;
                 }
             }
-            for &(seq, cmd) in &sent.borrow().0 {
-                pred.borrow_mut().predict(seq, cmd, |s, c| drive_step(s, c, FIXED_DT));
+            for &(seq, cmd) in &sent.get().0 {
+                pred.get_mut()
+                    .predict(seq, cmd, |s, c| drive_step(s, c, FIXED_DT));
             }
         }
     });
@@ -100,19 +111,23 @@ pub fn add_client_tasks(
         let stats = stats.clone();
         move |pm| {
             let dt = pm.loop_dt();
-            let mine = stats.borrow().mine;
+            let mine = stats.get().mine;
             pool_mirror(&car, &draw, |id, d, a: &Car| {
                 if Some(id) == mine {
                     return *a; // overwritten below from the predictor
                 }
                 let vel = vec2(a.heading.sin(), a.heading.cos()) * a.speed;
                 let p = coast_blend(vec2(d.x, d.z), vel, vec2(a.x, a.z), dt, 0.15);
-                Car { x: p.x, z: p.y, ..*a }
+                Car {
+                    x: p.x,
+                    z: p.y,
+                    ..*a
+                }
             });
-            if let (Some(id), Some(mut p)) = (mine, pred.borrow().state()) {
-                let alpha = status.borrow().input_alpha.min(1.0);
-                drive_step(&mut p, input.borrow().0, alpha * FIXED_DT);
-                draw.borrow_mut().add(id, p);
+            if let (Some(id), Some(mut p)) = (mine, pred.get().state()) {
+                let alpha = status.get().input_alpha.min(1.0);
+                drive_step(&mut p, input.get().0, alpha * FIXED_DT);
+                draw.get_mut().add(id, p);
             }
         }
     });
@@ -122,11 +137,13 @@ pub fn add_client_tasks(
 pub fn run_bot(n: u32) {
     let mut pm = Pm::new();
     let car = pm.pool::<Car>("car");
+    let score = pm.pool::<Score>("score");
     let draw = pm.pool::<Car>("car_draw");
-    let mut net = NetClient::new();
-    net.pool_sync("car", &car);
-    let quic = connect(&net);
-    add_client_tasks(&mut pm, quic, net, &car, &draw);
+    // Same synced pools in the same order as the server (motion, then score).
+    pm.sync(&car);
+    pm.sync(&score);
+    let quic = quic_connect(&pm.net_schema());
+    add_client_tasks(&mut pm, quic, &car, &draw);
 
     let cmd = pm.single::<NetInput<Drive>>("net.input");
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
@@ -135,7 +152,9 @@ pub fn run_bot(n: u32) {
         // Wander on a sine, but steer home before grinding a wall —
         // the original pure-sine bot looped into the back wall and sat
         // there at 0.1 speed forever.
-        let Some(c) = pred.borrow().state() else { return };
+        let Some(c) = pred.get().state() else {
+            return;
+        };
         let r = (c.x * c.x + c.z * c.z).sqrt();
         let turn = if r > ARENA - 14.0 {
             let desired = (-c.x).atan2(-c.z); // heading toward the center
@@ -146,7 +165,12 @@ pub fn run_bot(n: u32) {
         } else {
             (t * 0.43).sin() * 0.8
         };
-        cmd.borrow_mut().0 = Drive { thrust: 0.75 + 0.25 * (t * 0.31).sin(), turn };
+        cmd.get_mut().0 = Drive {
+            thrust: 0.75 + 0.25 * (t * 0.31).sin(),
+            turn,
+            drift: 0.0,
+            bot: 1.0, // AI: steering lags, arrow leads
+        };
     });
 
     pm.loop_rate = 60;

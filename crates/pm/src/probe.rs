@@ -33,7 +33,10 @@ pub struct Scope {
 
 /// Start timing; records into the thread's registry when dropped.
 pub fn scope(name: &'static str) -> Scope {
-    Scope { name, start: Instant::now() }
+    Scope {
+        name,
+        start: Instant::now(),
+    }
 }
 
 impl Drop for Scope {

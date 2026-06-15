@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use pm::{Commands, Id, NetServer, PeerEvents, Pm, QuicServer, Rng, ServerEvents, SpatialGrid, Vec2, vec2};
+use pm::{Commands, Id, PeerEvents, Pm, QuicServer, Rng, ServerEvents, SpatialGrid, Vec2, vec2};
 
 use crate::common::*;
 
@@ -49,15 +49,14 @@ pub fn run(quiet: bool) {
     let monster_srv = pm.pool::<MonsterSrv>("monster_srv");
     let bullet_srv = pm.pool::<BulletSrv>("bullet_srv");
 
-    let mut net = NetServer::new(&mut pm);
-    net.pool_sync("player", &player);
-    net.pool_sync("monster", &monster);
-    net.pool_sync("bullet", &bullet);
-    net.pool_sync("status", status.pool());
-    net.pool_sync("dbg", dbg.pool());
-    net.pool_sync("roster", &roster);
+    pm.sync(&player);
+    pm.sync(&monster);
+    pm.sync(&bullet);
+    pm.sync(status.pool());
+    pm.sync(dbg.pool());
+    pm.sync(&roster);
 
-    let quic = QuicServer::bind(ADDR, &net.schema()).unwrap_or_else(|e| {
+    let quic = QuicServer::bind(ADDR, &pm.net_schema()).unwrap_or_else(|e| {
         eprintln!("cannot bind {ADDR}: {e}");
         eprintln!("(a previous hellfire may still be running: pkill -x hellfire)");
         std::process::exit(1);
@@ -67,14 +66,14 @@ pub fn run(quiet: bool) {
     }
     // The pump/ack/echo/snapshot loop is pm's net module; gameplay reads
     // the "net.*" singles it publishes.
-    net.serve::<InputCmd>(&mut pm, quic);
+    pm.serve::<InputCmd>(quic);
     let peers = pm.single::<PeerEvents>("net.peers");
     let cmds = pm.single::<Commands<InputCmd>>("net.cmds");
     let events = pm.single::<ServerEvents>("net.events");
 
     let game = pm.single::<Game>("game");
     {
-        let mut g = game.borrow_mut();
+        let mut g = game.get_mut();
         g.grid = SpatialGrid::new(W, H, 64.0);
         g.rng = Rng::new(42);
         g.win_score = std::env::var("HELLFIRE_WIN_SCORE")
@@ -92,15 +91,17 @@ pub fn run(quiet: bool) {
         let monster = monster.clone();
         let bullet = bullet.clone();
         move |pm| {
-            let mut g = game.borrow_mut();
-            for &p in &peers.borrow().joined {
+            let mut g = game.get_mut();
+            for &p in &peers.get().joined {
                 let rid = pm.id_add();
-                roster.borrow_mut().add(rid, Roster::new(p, &format!("P{p}")));
+                roster
+                    .get_mut()
+                    .add(rid, Roster::new(p, &format!("P{p}")));
                 g.rosters.insert(p, rid);
                 let i = spawn_index(p);
                 let pid = pm.id_add();
                 let c = PCOL[i];
-                player.borrow_mut().add(
+                player.get_mut().add(
                     pid,
                     Player {
                         pos: vec2(SPAWN_X[i], SPAWN_Y[i]),
@@ -110,13 +111,19 @@ pub fn run(quiet: bool) {
                         color: [c[0], c[1], c[2], 255],
                     },
                 );
-                player_srv.borrow_mut().add(pid, PlayerSrv { cooldown: 0.0, invuln: 2.0 });
+                player_srv.get_mut().add(
+                    pid,
+                    PlayerSrv {
+                        cooldown: 0.0,
+                        invuln: 2.0,
+                    },
+                );
                 g.players.insert(p, pid);
                 if !quiet {
                     eprintln!("[server] peer {p} joined");
                 }
             }
-            for &p in &peers.borrow().left {
+            for &p in &peers.get().left {
                 if let Some(id) = g.players.remove(&p) {
                     pm.id_remove(id);
                 }
@@ -127,13 +134,13 @@ pub fn run(quiet: bool) {
                     eprintln!("[server] peer {p} left");
                 }
             }
-            for (p, ty, payload) in &events.borrow().0 {
+            for (p, ty, payload) in &events.get().0 {
                 match *ty {
                     EV_NAME => {
                         if let (Some(&rid), Ok(name)) =
                             (g.rosters.get(p), std::str::from_utf8(payload))
                         {
-                            roster.borrow_mut().add(rid, Roster::new(*p, name));
+                            roster.get_mut().add(rid, Roster::new(*p, name));
                         }
                     }
                     EV_START if !g.started => {
@@ -142,8 +149,7 @@ pub fn run(quiet: bool) {
                         let len: usize = g.players.len();
                         g.events.push(format!(
                             "{{\"t\": {:.1}, \"event\": \"started with {} players\"}}",
-                            time,
-                            len
+                            time, len
                         ));
                         if !quiet {
                             eprintln!("[server] game started ({} players)", g.players.len());
@@ -169,18 +175,20 @@ pub fn run(quiet: bool) {
         let bullet = bullet.clone();
         let bullet_srv = bullet_srv.clone();
         move |pm| {
-            let g = game.borrow();
+            let g = game.get();
             if !g.started || g.game_over {
                 return;
             }
             let dt = pm.loop_dt();
             let mut spawned = Vec::new();
             {
-                let mut players = player.borrow_mut();
-                let mut srv = player_srv.borrow_mut();
-                let mut cmds = cmds.borrow_mut();
+                let mut players = player.get_mut();
+                let mut srv = player_srv.get_mut();
+                let mut cmds = cmds.get_mut();
                 for (&peer, &pid) in &g.players {
-                    let Some(mut p) = players.get_mut(pid) else { continue };
+                    let Some(mut p) = players.get_mut(pid) else {
+                        continue;
+                    };
                     if p.alive == 0 {
                         continue;
                     }
@@ -194,7 +202,9 @@ pub fn run(quiet: bool) {
                         p.pos = vec2(next.x.clamp(hs, W - hs), next.y.clamp(hs, H - hs));
                     }
                     let pos = p.pos;
-                    let Some(mut s) = srv.get_mut(pid) else { continue };
+                    let Some(mut s) = srv.get_mut(pid) else {
+                        continue;
+                    };
                     s.cooldown -= dt;
                     s.invuln -= dt;
                     if cmd.buttons & BTN_SHOOT != 0 && s.cooldown <= 0.0 {
@@ -209,11 +219,18 @@ pub fn run(quiet: bool) {
             }
             for (pos, aim) in spawned {
                 let id = pm.id_add();
-                bullet.borrow_mut().add(
+                bullet.get_mut().add(
                     id,
-                    Bullet { pos, vel: aim * PBULLET_SPEED, size: PBULLET_SIZE, player_owned: 1 },
+                    Bullet {
+                        pos,
+                        vel: aim * PBULLET_SPEED,
+                        size: PBULLET_SIZE,
+                        player_owned: 1,
+                    },
                 );
-                bullet_srv.borrow_mut().add(id, BulletSrv { life: PBULLET_LIFE });
+                bullet_srv
+                    .get_mut()
+                    .add(id, BulletSrv { life: PBULLET_LIFE });
             }
         }
     });
@@ -227,7 +244,7 @@ pub fn run(quiet: bool) {
         let monster_srv = monster_srv.clone();
         let bullet = bullet.clone();
         move |pm| {
-            let mut g = game.borrow_mut();
+            let mut g = game.get_mut();
             if !g.started || g.game_over {
                 return;
             }
@@ -249,8 +266,8 @@ pub fn run(quiet: bool) {
                 pm.id_remove_all(&monster);
                 pm.id_remove_all(&bullet);
                 let entries: Vec<(u8, Id)> = g.players.iter().map(|(&p, &id)| (p, id)).collect();
-                let mut players = player.borrow_mut();
-                let mut srv = player_srv.borrow_mut();
+                let mut players = player.get_mut();
+                let mut srv = player_srv.get_mut();
                 for (peer, pid) in entries {
                     let (jx, jy) = (g.rng.rfr(-80.0, 80.0), g.rng.rfr(-60.0, 60.0));
                     if let Some(mut p) = players.get_mut(pid)
@@ -276,26 +293,32 @@ pub fn run(quiet: bool) {
                 return;
             }
             let lvl = &LEVELS[g.level];
-            if monster.borrow().len() >= lvl.max_monsters {
+            if monster.get().len() >= lvl.max_monsters {
                 return;
             }
             let intensity = ((g.time * 0.4).sin() * 0.5 + 0.5) * 0.6
                 + ((g.time * 0.08).sin() * 0.5 + 0.5) * 0.4;
             g.spawn_accum += (1.0 + 8.0 * intensity) * lvl.spawn_mult * dt;
-            while g.spawn_accum >= 1.0 && monster.borrow().len() < lvl.max_monsters {
+            while g.spawn_accum >= 1.0 && monster.get().len() < lvl.max_monsters {
                 g.spawn_accum -= 1.0;
                 let lvl = &LEVELS[g.level];
                 let speed = MONSTER_SPEED
                     * (0.8 + intensity * 0.6)
                     * (lvl.speed_mult * lvl.size_mult).min(3.0);
-                let size = g.rng.rfr(MONSTER_MIN_SZ * lvl.size_mult, MONSTER_MAX_SZ * lvl.size_mult);
+                let size = g.rng.rfr(
+                    MONSTER_MIN_SZ * lvl.size_mult,
+                    MONSTER_MAX_SZ * lvl.size_mult,
+                );
                 let pos = match g.rng.next_u32() % 4 {
                     0 => vec2(g.rng.rfr(0.0, W), -30.0),
                     1 => vec2(g.rng.rfr(0.0, W), H + 30.0),
                     2 => vec2(-30.0, g.rng.rfr(0.0, H)),
                     _ => vec2(W + 30.0, g.rng.rfr(0.0, H)),
                 };
-                let tgt = vec2(W * 0.5 + g.rng.rfr(-200.0, 200.0), H * 0.5 + g.rng.rfr(-200.0, 200.0));
+                let tgt = vec2(
+                    W * 0.5 + g.rng.rfr(-200.0, 200.0),
+                    H * 0.5 + g.rng.rfr(-200.0, 200.0),
+                );
                 let hue = g.rng.rf();
                 let c: [u8; 3] = if hue < 0.3 {
                     [255, 80, 60]
@@ -310,7 +333,7 @@ pub fn run(quiet: bool) {
                 };
                 let shoot_timer = g.rng.rfr(1.5, 4.0);
                 let id = pm.id_add();
-                monster.borrow_mut().add(
+                monster.get_mut().add(
                     id,
                     Monster {
                         pos,
@@ -319,7 +342,7 @@ pub fn run(quiet: bool) {
                         color: [c[0], c[1], c[2], 255],
                     },
                 );
-                monster_srv.borrow_mut().add(id, MonsterSrv { shoot_timer });
+                monster_srv.get_mut().add(id, MonsterSrv { shoot_timer });
             }
         }
     });
@@ -330,21 +353,26 @@ pub fn run(quiet: bool) {
         let bullet = bullet.clone();
         let bullet_srv = bullet_srv.clone();
         move |pm| {
-            let g = game.borrow();
+            let g = game.get();
             if !g.started || g.game_over {
                 return;
             }
             let dt = pm.loop_dt();
             // id_remove is deferred (flushed at end of tick), so expiry
             // can despawn right inside the join.
-            bullet.borrow_mut().each_with(&mut bullet_srv.borrow_mut(), |id, mut b, mut s| {
-                let next = Bullet { pos: b.pos + b.vel * dt, ..*b };
-                *b = next;
-                s.life -= dt;
-                if s.life <= 0.0 {
-                    pm.id_remove(id);
-                }
-            });
+            bullet
+                .get_mut()
+                .each_with(&mut bullet_srv.get_mut(), |id, mut b, mut s| {
+                    let next = Bullet {
+                        pos: b.pos + b.vel * dt,
+                        ..*b
+                    };
+                    *b = next;
+                    s.life -= dt;
+                    if s.life <= 0.0 {
+                        pm.id_remove(id);
+                    }
+                });
         }
     });
 
@@ -357,49 +385,62 @@ pub fn run(quiet: bool) {
         let bullet = bullet.clone();
         let bullet_srv = bullet_srv.clone();
         move |pm| {
-            let mut g = game.borrow_mut();
+            let mut g = game.get_mut();
             if !g.started || g.game_over {
                 return;
             }
             let dt = pm.loop_dt();
             let alive: Vec<Vec2> = player
-                .borrow()
+                .get()
                 .values()
                 .iter()
                 .filter(|p| p.alive == 1)
                 .map(|p| p.pos)
                 .collect();
             let mut shots = Vec::new();
-            monster.borrow_mut().each_with(&mut monster_srv.borrow_mut(), |_, mut m, mut s| {
-                let (mut tgt, mut best) = (m.pos, f32::MAX);
-                for &p in &alive {
-                    let d = m.pos.dist(p);
-                    if d < best {
-                        best = d;
-                        tgt = p;
+            monster
+                .get_mut()
+                .each_with(&mut monster_srv.get_mut(), |_, mut m, mut s| {
+                    let (mut tgt, mut best) = (m.pos, f32::MAX);
+                    for &p in &alive {
+                        let d = m.pos.dist(p);
+                        if d < best {
+                            best = d;
+                            tgt = p;
+                        }
                     }
-                }
-                let desired = (tgt - m.pos).norm() * m.vel.len();
-                let vel = m.vel + (desired - m.vel) * (0.5 * dt);
-                let next = Monster { vel, pos: m.pos + vel * dt, ..*m };
-                *m = next;
-                s.shoot_timer -= dt;
-                if s.shoot_timer <= 0.0 && best < 500.0 {
-                    s.shoot_timer = g.rng.rfr(2.0, 5.0);
-                    let dir = (tgt - m.pos).norm();
-                    let sp = g.rng.rfr(-0.15, 0.15);
-                    let (cs, sn) = (sp.cos(), sp.sin());
-                    let aim = vec2(dir.x * cs - dir.y * sn, dir.x * sn + dir.y * cs);
-                    shots.push((m.pos, aim));
-                }
-            });
+                    let desired = (tgt - m.pos).norm() * m.vel.len();
+                    let vel = m.vel + (desired - m.vel) * (0.5 * dt);
+                    let next = Monster {
+                        vel,
+                        pos: m.pos + vel * dt,
+                        ..*m
+                    };
+                    *m = next;
+                    s.shoot_timer -= dt;
+                    if s.shoot_timer <= 0.0 && best < 500.0 {
+                        s.shoot_timer = g.rng.rfr(2.0, 5.0);
+                        let dir = (tgt - m.pos).norm();
+                        let sp = g.rng.rfr(-0.15, 0.15);
+                        let (cs, sn) = (sp.cos(), sp.sin());
+                        let aim = vec2(dir.x * cs - dir.y * sn, dir.x * sn + dir.y * cs);
+                        shots.push((m.pos, aim));
+                    }
+                });
             for (pos, aim) in shots {
                 let id = pm.id_add();
-                bullet.borrow_mut().add(
+                bullet.get_mut().add(
                     id,
-                    Bullet { pos, vel: aim * MBULLET_SPEED, size: MBULLET_SIZE, player_owned: 0 },
+                    Bullet {
+                        pos,
+                        vel: aim * MBULLET_SPEED,
+                        size: MBULLET_SIZE,
+                        player_owned: 0,
+                    },
                 );
-                bullet_srv.borrow_mut().add(id, BulletSrv { life: MBULLET_LIFE });
+                bullet_srv
+                    .get_mut()
+                    .add(id, BulletSrv { life: MBULLET_LIFE });
             }
         }
     });
@@ -412,7 +453,7 @@ pub fn run(quiet: bool) {
         let monster = monster.clone();
         let bullet = bullet.clone();
         move |pm| {
-            let mut g = game.borrow_mut();
+            let mut g = game.get_mut();
             if !g.started || g.game_over {
                 return;
             }
@@ -421,15 +462,15 @@ pub fn run(quiet: bool) {
 
             let g = &mut *g; // split-borrow grid vs rng/score
             g.grid.clear();
-            for (id, m) in monster.borrow().iter() {
+            for (id, m) in monster.get().iter() {
                 g.grid.insert(id, m.pos);
             }
 
             // Player bullets vs monsters (broad phase via grid).
             let mut dead = Vec::new();
             {
-                let monsters = monster.borrow();
-                for (bid, b) in bullet.borrow().iter() {
+                let monsters = monster.get();
+                for (bid, b) in bullet.get().iter() {
                     if b.player_owned == 0 {
                         continue;
                     }
@@ -453,16 +494,20 @@ pub fn run(quiet: bool) {
 
             // Players vs enemy bullets and monster contact.
             {
-                let mut players = player.borrow_mut();
-                let mut srv = player_srv.borrow_mut();
-                let bullets = bullet.borrow();
-                let monsters = monster.borrow();
+                let mut players = player.get_mut();
+                let mut srv = player_srv.get_mut();
+                let bullets = bullet.get();
+                let monsters = monster.get();
                 for &pid in g.players.values() {
-                    let Some(mut p) = players.get_mut(pid) else { continue };
+                    let Some(mut p) = players.get_mut(pid) else {
+                        continue;
+                    };
                     if p.alive == 0 {
                         continue;
                     }
-                    let Some(mut s) = srv.get_mut(pid) else { continue };
+                    let Some(mut s) = srv.get_mut(pid) else {
+                        continue;
+                    };
                     if s.invuln > 0.0 {
                         continue;
                     }
@@ -489,7 +534,7 @@ pub fn run(quiet: bool) {
                 pm.id_remove(id);
             }
 
-            let players = player.borrow();
+            let players = player.get();
             let any_alive = players.values().iter().any(|p| p.alive == 1);
             if !any_alive && !players.is_empty() {
                 g.game_over = true;
@@ -506,17 +551,20 @@ pub fn run(quiet: bool) {
         let monster = monster.clone();
         let bullet = bullet.clone();
         move |pm| {
-            if !game.borrow().started {
+            if !game.get().started {
                 return;
             }
             // Deferred id_remove: safe to call mid-iteration.
-            for (id, m) in monster.borrow().iter() {
-                if m.pos.x < -100.0 || m.pos.x > W + 100.0 || m.pos.y < -100.0 || m.pos.y > H + 100.0
+            for (id, m) in monster.get().iter() {
+                if m.pos.x < -100.0
+                    || m.pos.x > W + 100.0
+                    || m.pos.y < -100.0
+                    || m.pos.y > H + 100.0
                 {
                     pm.id_remove(id);
                 }
             }
-            for (id, b) in bullet.borrow().iter() {
+            for (id, b) in bullet.get().iter() {
                 if b.pos.x < -50.0 || b.pos.x > W + 50.0 || b.pos.y < -50.0 || b.pos.y > H + 50.0 {
                     pm.id_remove(id);
                 }
@@ -529,7 +577,7 @@ pub fn run(quiet: bool) {
         let game = game.clone();
         let status = status.clone();
         move |_pm| {
-            let mut g = game.borrow_mut();
+            let mut g = game.get_mut();
             let mut flags = 0;
             if g.started {
                 flags |= FLAG_STARTED;
@@ -549,8 +597,8 @@ pub fn run(quiet: bool) {
                 flags,
                 level_flash: (g.level_flash * 4.0).round() / 4.0,
             };
-            if *status.borrow() != next {
-                *status.borrow_mut() = next;
+            if *status.get() != next {
+                *status.get_mut() = next;
             }
             if g.game_over && !g.report_written {
                 g.report_written = true;
@@ -586,10 +634,10 @@ pub fn run(quiet: bool) {
         let monster = monster.clone();
         let bullet = bullet.clone();
         move |pm| {
-            let (m, b) = (monster.borrow().len(), bullet.borrow().len());
-            *dbg.borrow_mut() =
+            let (m, b) = (monster.get().len(), bullet.get().len());
+            *dbg.get_mut() =
                 Dbg { monsters: m as u32, bullets: b as u32, tick_ms: pm.loop_dt() * 1000.0 };
-            let mut g = game.borrow_mut();
+            let mut g = game.get_mut();
             g.peak_monsters = g.peak_monsters.max(m);
             g.peak_bullets = g.peak_bullets.max(b);
             if g.started && !g.game_over {
@@ -610,17 +658,21 @@ pub fn run(quiet: bool) {
             let monster = monster.clone();
             let bullet = bullet.clone();
             move |_pm| {
-                let g = game.borrow();
+                let g = game.get();
                 if g.started {
                     eprintln!(
                         "[server] t={:.0} score={} lvl={} m={} b={} players={} {}",
                         g.time,
                         g.score,
                         g.level + 1,
-                        monster.borrow().len(),
-                        bullet.borrow().len(),
+                        monster.get().len(),
+                        bullet.get().len(),
                         g.players.len(),
-                        if g.game_over { if g.win { "WIN" } else { "GAME OVER" } } else { "" },
+                        if g.game_over {
+                            if g.win { "WIN" } else { "GAME OVER" }
+                        } else {
+                            ""
+                        },
                     );
                 }
             }
@@ -636,7 +688,11 @@ pub fn run(quiet: bool) {
         && let Some(dir) = exe.parent()
     {
         // Bins sit in target/<profile>/, examples one level deeper.
-        let dir = if dir.ends_with("examples") { dir.parent().unwrap_or(dir) } else { dir };
+        let dir = if dir.ends_with("examples") {
+            dir.parent().unwrap_or(dir)
+        } else {
+            dir
+        };
         // The mod must come from the same cargo resolution as the game:
         // a bare `-p meteor` build resolves features over a smaller graph
         // and can produce a different pm unit (different TypeIds). Joint
@@ -660,10 +716,10 @@ pub fn run(quiet: bool) {
 fn restart(
     pm: &mut Pm,
     g: &mut Game,
-    player: &pm::Handle<Player>,
-    player_srv: &pm::Handle<PlayerSrv>,
-    monster: &pm::Handle<Monster>,
-    bullet: &pm::Handle<Bullet>,
+    player: &pm::PoolHandle<Player>,
+    player_srv: &pm::PoolHandle<PlayerSrv>,
+    monster: &pm::PoolHandle<Monster>,
+    bullet: &pm::PoolHandle<Bullet>,
 ) {
     pm.id_remove_all(monster);
     pm.id_remove_all(bullet);
@@ -677,8 +733,8 @@ fn restart(
     g.round += 1;
     g.game_over = false;
     g.win = false;
-    let mut players = player.borrow_mut();
-    let mut srv = player_srv.borrow_mut();
+    let mut players = player.get_mut();
+    let mut srv = player_srv.get_mut();
     for (&peer, &pid) in &g.players {
         if let Some(mut p) = players.get_mut(pid) {
             let i = spawn_index(peer);
@@ -692,4 +748,3 @@ fn restart(
         }
     }
 }
-

@@ -11,7 +11,10 @@ pub(crate) struct PagedArray<T> {
 
 impl<T: Copy + PartialEq> PagedArray<T> {
     pub fn new(fill: T) -> Self {
-        Self { pages: Vec::new(), fill }
+        Self {
+            pages: Vec::new(),
+            fill,
+        }
     }
 
     pub fn get(&self, idx: u32) -> T {

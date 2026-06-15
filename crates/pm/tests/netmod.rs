@@ -60,30 +60,33 @@ fn net_modules_loopback() {
         let sseen = sseen.clone();
         let s_pos = s_pos.clone();
         spm.task_add("game", 30.0, 0.0, move |pm| {
-            for &p in &peers.borrow().joined {
+            for &p in &peers.get().joined {
                 let id = pm.id_add();
-                s_pos.borrow_mut().add(id, Pos::default());
-                garage.borrow_mut().0.insert(p, id);
-                sout.borrow_mut().send(p, 16, b"welcome");
-                sseen.borrow_mut().joined = true;
+                s_pos.get_mut().add(id, Pos::default());
+                garage.get_mut().0.insert(p, id);
+                sout.get_mut().send(p, 16, b"welcome");
+                sseen.get_mut().joined = true;
             }
-            for &p in &peers.borrow().left {
-                if let Some(id) = garage.borrow_mut().0.remove(&p) {
+            for &p in &peers.get().left {
+                if let Some(id) = garage.get_mut().0.remove(&p) {
                     pm.id_remove(id);
                 }
             }
-            let mut cs = cmds.borrow_mut();
-            let mut pool = s_pos.borrow_mut();
-            for (&p, &id) in &garage.borrow().0 {
+            let mut cs = cmds.get_mut();
+            let mut pool = s_pos.get_mut();
+            for (&p, &id) in &garage.get().0 {
                 let c = cs.pop(p);
                 if let Some(mut e) = pool.get_mut(id) {
-                    let next = Pos { x: e.x + c.dx, ..*e };
+                    let next = Pos {
+                        x: e.x + c.dx,
+                        ..*e
+                    };
                     *e = next;
                 }
             }
-            for (_, ty, payload) in &sevents.borrow().0 {
+            for (_, ty, payload) in &sevents.get().0 {
                 if *ty == 17 && payload == b"hi" {
-                    sseen.borrow_mut().event = true;
+                    sseen.get_mut().event = true;
                 }
             }
         });
@@ -99,8 +102,10 @@ fn net_modules_loopback() {
 
     // Queue a reliable event BEFORE the handshake exists — the module
     // holds it until connected.
-    cpm.single::<pm::Outbox>("net.out").borrow_mut().send(17, b"hi");
-    cpm.single::<pm::NetInput<Cmd>>("net.input").borrow_mut().0 = Cmd { dx: 1.0 };
+    cpm.single::<pm::Outbox>("net.out")
+        .get_mut()
+        .send(17, b"hi");
+    cpm.single::<pm::NetInput<Cmd>>("net.input").get_mut().0 = Cmd { dx: 1.0 };
 
     let cseen = cpm.single::<ClientSeen>("seen");
     {
@@ -108,13 +113,13 @@ fn net_modules_loopback() {
         let applied = cpm.single::<pm::AppliedLog>("net.applied");
         let cseen = cseen.clone();
         cpm.task_add("game", 30.0, 0.0, move |_pm| {
-            for (ty, payload) in &events.borrow().0 {
+            for (ty, payload) in &events.get().0 {
                 if *ty == 16 && payload == b"welcome" {
-                    cseen.borrow_mut().event = true;
+                    cseen.get_mut().event = true;
                 }
             }
-            let mut s = cseen.borrow_mut();
-            for a in &applied.borrow().0 {
+            let mut s = cseen.get_mut();
+            for a in &applied.get().0 {
                 s.echo = s.echo.max(a.input_seq);
             }
         });
@@ -129,22 +134,32 @@ fn net_modules_loopback() {
         cpm.loop_once(DT);
         std::thread::sleep(Duration::from_millis(1));
 
-        let replicated = c_pos.borrow().values().iter().any(|p| p.x > 5.0);
-        let s = sseen.borrow();
-        let c = cseen.borrow();
-        if status.borrow().connected && s.joined && s.event && c.event && c.echo > 0 && replicated
-        {
+        let replicated = c_pos.get().values().iter().any(|p| p.x > 5.0);
+        let s = sseen.get();
+        let c = cseen.get();
+        if status.get().connected && s.joined && s.event && c.event && c.echo > 0 && replicated {
             done = true;
             break;
         }
     }
 
-    assert!(sseen.borrow().joined, "server never observed the join");
-    assert!(status.borrow().connected, "client never connected");
-    assert!(sseen.borrow().event, "client->server reliable event lost");
-    assert!(cseen.borrow().event, "server->client reliable event lost");
-    assert!(cseen.borrow().echo > 0, "applied input-seq echo never arrived");
+    assert!(sseen.get().joined, "server never observed the join");
+    assert!(status.get().connected, "client never connected");
+    assert!(sseen.get().event, "client->server reliable event lost");
+    assert!(cseen.get().event, "server->client reliable event lost");
+    assert!(
+        cseen.get().echo > 0,
+        "applied input-seq echo never arrived"
+    );
     assert!(done, "replication never converged (cmd-driven pos.x > 5)");
-    assert!(spm.task_faults().is_empty(), "server task faults: {:?}", spm.task_faults());
-    assert!(cpm.task_faults().is_empty(), "client task faults: {:?}", cpm.task_faults());
+    assert!(
+        spm.task_faults().is_empty(),
+        "server task faults: {:?}",
+        spm.task_faults()
+    );
+    assert!(
+        cpm.task_faults().is_empty(),
+        "client task faults: {:?}",
+        cpm.task_faults()
+    );
 }

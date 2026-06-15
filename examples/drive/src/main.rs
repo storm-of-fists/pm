@@ -9,9 +9,9 @@
 //!
 //! Feel a real link: PM_LAG_MS=80 PM_LOSS=0.03 cargo run --release -p drive client
 
-mod client;
+mod bot_client;
 mod common;
-mod sdl_client;
+mod player_client;
 mod server;
 
 fn main() {
@@ -20,16 +20,16 @@ fn main() {
         Some("server") => server::run(false),
         Some("bot") => {
             let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-            client::run_bot(n);
+            bot_client::run_bot(n);
         }
-        Some("client") => sdl_client::run(),
+        Some("client") => player_client::run(),
         None => {
             let server = std::thread::spawn(|| server::run(true));
             std::thread::sleep(std::time::Duration::from_millis(300));
             for n in 0..3 {
-                std::thread::spawn(move || client::run_bot(n));
+                std::thread::spawn(move || bot_client::run_bot(n));
             }
-            sdl_client::run();
+            player_client::run();
             drop(server); // window closed: process exit tears the rest down
         }
         Some(other) => {

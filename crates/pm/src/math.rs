@@ -8,7 +8,6 @@
 
 use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 
-
 use bytemuck::{Pod, Zeroable};
 
 #[derive(Clone, Copy, PartialEq, Default, Debug, Pod, Zeroable)]
@@ -36,7 +35,11 @@ impl Vec2 {
     /// Unit vector, or zero when too short to normalize safely.
     pub fn norm(self) -> Vec2 {
         let l = self.len();
-        if l > 1e-4 { self * (1.0 / l) } else { Vec2::ZERO }
+        if l > 1e-4 {
+            self * (1.0 / l)
+        } else {
+            Vec2::ZERO
+        }
     }
 }
 
@@ -114,7 +117,9 @@ impl Default for Rng {
 
 impl Rng {
     pub fn new(seed: u32) -> Self {
-        Self { state: if seed == 0 { 1 } else { seed } }
+        Self {
+            state: if seed == 0 { 1 } else { seed },
+        }
     }
 
     pub fn next_u32(&mut self) -> u32 {
@@ -210,7 +215,11 @@ impl Vec3 {
     /// Unit vector, or zero when too short to normalize safely.
     pub fn norm(self) -> Vec3 {
         let l = self.len();
-        if l > 1e-6 { self * (1.0 / l) } else { Vec3::ZERO }
+        if l > 1e-6 {
+            self * (1.0 / l)
+        } else {
+            Vec3::ZERO
+        }
     }
 }
 
@@ -296,8 +305,9 @@ impl Mul for Mat4 {
 }
 
 impl Mat4 {
-    pub const IDENTITY: Mat4 =
-        Mat4([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    pub const IDENTITY: Mat4 = Mat4([
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
 
     /// Transform a point (w = 1, includes translation).
     pub fn transform_point(self, v: Vec3) -> Vec3 {
@@ -414,7 +424,10 @@ mod tests3d {
     fn mat4_identity_and_transform() {
         let p = vec3(1.0, 2.0, 3.0);
         assert_eq!(Mat4::IDENTITY.transform_point(p), p);
-        assert_eq!(Mat4::translate(vec3(1.0, 0.0, 0.0)).transform_point(p), vec3(2.0, 2.0, 3.0));
+        assert_eq!(
+            Mat4::translate(vec3(1.0, 0.0, 0.0)).transform_point(p),
+            vec3(2.0, 2.0, 3.0)
+        );
         assert_eq!(Mat4::translate(vec3(1.0, 0.0, 0.0)).transform_dir(p), p);
         let r = Mat4::rot_y(std::f32::consts::FRAC_PI_2).transform_dir(vec3(0.0, 0.0, 1.0));
         assert!(r.dist(vec3(1.0, 0.0, 0.0)) < 1e-6);

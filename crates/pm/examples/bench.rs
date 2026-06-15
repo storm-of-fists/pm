@@ -51,19 +51,25 @@ fn pools() {
     let ids: Vec<_> = (0..N).map(|i| pm.id_add_for((i / 60_000) as u8)).collect();
 
     time("add", N as u64, || {
-        let mut p = pos.borrow_mut();
+        let mut p = pos.get_mut();
         for &id in &ids {
             p.add(id, P::default());
         }
     });
     {
-        let mut v = vel.borrow_mut();
+        let mut v = vel.get_mut();
         for (i, &id) in ids.iter().enumerate() {
-            v.add(id, V { x: (i % 7) as f32, y: (i % 3) as f32 });
+            v.add(
+                id,
+                V {
+                    x: (i % 7) as f32,
+                    y: (i % 3) as f32,
+                },
+            );
         }
     }
     time("get (sparse lookup + gen check)", N as u64, || {
-        let p = pos.borrow();
+        let p = pos.get();
         let mut acc = 0.0f32;
         for &id in &ids {
             acc += p.get(id).unwrap().x;
@@ -71,7 +77,7 @@ fn pools() {
         black_box(acc);
     });
     time("iter (dense read)", N as u64, || {
-        let p = pos.borrow();
+        let p = pos.get();
         let mut acc = 0.0f32;
         for (_, v) in p.iter() {
             acc += v.x;
@@ -79,19 +85,20 @@ fn pools() {
         black_box(acc);
     });
     time("iter_mut (write + change stamp)", N as u64, || {
-        for (_, mut v) in pos.borrow_mut().iter_mut() {
+        for (_, mut v) in pos.get_mut().iter_mut() {
             v.x += 1.0;
         }
     });
     time("each_with join (vel -> pos, write)", N as u64, || {
-        vel.borrow_mut().each_with(&mut pos.borrow_mut(), |_, v, mut p| {
-            p.x += v.x;
-            p.y += v.y;
-        });
+        vel.get_mut()
+            .each_with(&mut pos.get_mut(), |_, v, mut p| {
+                p.x += v.x;
+                p.y += v.y;
+            });
     });
     time("iter_with join (read)", N as u64, || {
-        let p = pos.borrow();
-        let v = vel.borrow();
+        let p = pos.get();
+        let v = vel.get();
         let mut acc = 0.0f32;
         for (_, a, b) in p.iter_with(&v) {
             acc += a.x + b.x;
@@ -101,7 +108,7 @@ fn pools() {
     // Data-dependent predicate (always true here, but the optimizer
     // can't know that) so the scan + loads actually happen.
     time("retain (keep all — scan cost)", N as u64, || {
-        pos.borrow_mut().retain(|_, v| v.x > -1.0);
+        pos.get_mut().retain(|_, v| v.x > -1.0);
     });
 }
 
@@ -114,7 +121,7 @@ fn id_lifecycle() {
         let ids: Vec<_> = (0..M)
             .map(|_| {
                 let id = pm.id_add();
-                pool.borrow_mut().add(id, P::default());
+                pool.get_mut().add(id, P::default());
                 id
             })
             .collect();
@@ -159,7 +166,13 @@ fn net_sync() {
     net.peer_add(1);
     for i in 0..M {
         let id = spm.id_add();
-        s_pos.borrow_mut().add(id, P { x: i as f32, y: 0.0 });
+        s_pos.get_mut().add(
+            id,
+            P {
+                x: i as f32,
+                y: 0.0,
+            },
+        );
     }
     spm.loop_once(1.0 / 60.0);
 
@@ -211,7 +224,10 @@ fn predictor() {
                 seq += 1;
                 pred.predict(seq, Cmd { dx: 1.0 }, step);
             }
-            let auth = P { x: i as f32 * -10.0, y: 0.0 };
+            let auth = P {
+                x: i as f32 * -10.0,
+                y: 0.0,
+            };
             black_box(pred.reconcile(auth, seq - 120, step, err, 1e-6));
         }
         black_box(pred.state());
@@ -225,11 +241,20 @@ fn mirror() {
     let draw = pm.pool::<P>("draw");
     for i in 0..10_000 {
         let id = pm.id_add();
-        auth.borrow_mut().add(id, P { x: i as f32, y: 0.0 });
+        auth.get_mut().add(
+            id,
+            P {
+                x: i as f32,
+                y: 0.0,
+            },
+        );
     }
     time("mirror + blend", 10_000 * 100, || {
         for _ in 0..100 {
-            pool_mirror(&auth, &draw, |_, d, a: &P| P { x: d.x + (a.x - d.x) * 0.15, y: a.y });
+            pool_mirror(&auth, &draw, |_, d, a: &P| P {
+                x: d.x + (a.x - d.x) * 0.15,
+                y: a.y,
+            });
         }
     });
 }

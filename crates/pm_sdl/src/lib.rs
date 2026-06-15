@@ -12,7 +12,7 @@ mod font;
 pub mod gpu3d;
 mod sprite;
 
-pub use font::Font;
+pub use font::{Font, Raster};
 pub use sprite::Sprite;
 
 /// The windowed-client opening ceremony, in one call: SDL init, a
@@ -28,8 +28,11 @@ pub use sprite::Sprite;
 pub fn window(title: &str, w: u32, h: u32) -> (sdl3::video::Window, sdl3::EventPump, u32) {
     let sdl = sdl3::init().expect("sdl init");
     let video = sdl.video().expect("sdl video");
-    let window =
-        video.window(title, w, h).position_centered().build().expect("window");
+    let window = video
+        .window(title, w, h)
+        .position_centered()
+        .build()
+        .expect("window");
     let pump = sdl.event_pump().expect("event pump");
     let refresh = window
         .get_display()

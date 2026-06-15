@@ -35,13 +35,19 @@ fn main() {
     let pos = pm.pool::<Pos>("pos");
     let vel = pm.pool::<Vel>("vel");
     let sim = pm.single::<Sim>("sim");
-    sim.borrow_mut().ticks_left = TICKS;
+    sim.get_mut().ticks_left = TICKS;
 
     for i in 0..ENTITIES {
         // 100k exceeds the 65k-per-peer index budget; spread across two.
         let id = pm.id_add_for((i / 60_000) as u8);
-        pos.borrow_mut().add(id, Pos::default());
-        vel.borrow_mut().add(id, Vel { x: (i % 7) as f32, y: (i % 3) as f32 });
+        pos.get_mut().add(id, Pos::default());
+        vel.get_mut().add(
+            id,
+            Vel {
+                x: (i % 7) as f32,
+                y: (i % 3) as f32,
+            },
+        );
     }
 
     // The join: iterate one pool densely, look the other up by id —
@@ -52,17 +58,18 @@ fn main() {
         let vel = vel.clone();
         move |pm| {
             let dt = pm.loop_dt();
-            vel.borrow_mut().each_with(&mut pos.borrow_mut(), |_, v, mut p| {
-                p.x += v.x * dt;
-                p.y += v.y * dt;
-            });
+            vel.get_mut()
+                .each_with(&mut pos.get_mut(), |_, v, mut p| {
+                    p.x += v.x * dt;
+                    p.y += v.y * dt;
+                });
         }
     });
 
     pm.task_add("control", 100.0, 0.0, {
         let sim = sim.clone();
         move |pm| {
-            let mut sim = sim.borrow_mut();
+            let mut sim = sim.get_mut();
             sim.ticks_left -= 1;
             if sim.ticks_left == 0 {
                 pm.loop_quit();
@@ -82,7 +89,7 @@ fn main() {
         elapsed.as_secs_f64() * 1e3,
         elapsed.as_secs_f64() * 1e9 / ops as f64,
     );
-    let p = pos.borrow();
+    let p = pos.get();
     let sample = p.values()[1];
     println!("sample pos[1] = ({:.1}, {:.1})", sample.x, sample.y);
 }

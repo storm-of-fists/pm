@@ -28,7 +28,13 @@ fn quic_loopback_full_stack() {
     let ids: Vec<_> = (0..20)
         .map(|i| {
             let id = spm.id_add();
-            s_pos.borrow_mut().add(id, Pos { x: i as f32, y: 2.0 * i as f32 });
+            s_pos.get_mut().add(
+                id,
+                Pos {
+                    x: i as f32,
+                    y: 2.0 * i as f32,
+                },
+            );
             id
         })
         .collect();
@@ -103,15 +109,15 @@ fn quic_loopback_full_stack() {
         cpm.loop_once(DT);
 
         // once converged, remove an entity server-side (exactly once)
-        let synced = c_pos.borrow().len() == 20
-            && c_pos.borrow().get(ids[7]) == Some(&Pos { x: 7.0, y: 14.0 });
+        let synced = c_pos.get().len() == 20
+            && c_pos.get().get(ids[7]) == Some(&Pos { x: 7.0, y: 14.0 });
         if synced && !removed {
             spm.id_remove(ids[3]);
             removed = true;
         }
         if removed
             && !cpm.id_alive(ids[3])
-            && c_pos.borrow().len() == 19
+            && c_pos.get().len() == 19
             && event_echoed
             && input_echo > 0
         {
@@ -121,8 +127,14 @@ fn quic_loopback_full_stack() {
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    assert!(converged_then_removed, "did not converge over QUIC within deadline");
-    assert!(input_sent > 0 && input_echo <= input_sent, "input echo out of range");
+    assert!(
+        converged_then_removed,
+        "did not converge over QUIC within deadline"
+    );
+    assert!(
+        input_sent > 0 && input_echo <= input_sent,
+        "input echo out of range"
+    );
     assert!(cpm.local_peer >= 1, "handshake should assign a peer id");
     assert_eq!(squic.oversize_drops, 0);
 }
@@ -160,7 +172,6 @@ fn schema_mismatch_is_rejected() {
     assert_eq!(cquic.error(), Some("schema mismatch with server"));
 }
 
-
 #[test]
 fn converges_under_lag_and_loss() {
     let mut spm = Pm::new();
@@ -173,7 +184,13 @@ fn converges_under_lag_and_loss() {
     let ids: Vec<_> = (0..15)
         .map(|i| {
             let id = spm.id_add();
-            s_pos.borrow_mut().add(id, Pos { x: i as f32, y: -(i as f32) });
+            s_pos.get_mut().add(
+                id,
+                Pos {
+                    x: i as f32,
+                    y: -(i as f32),
+                },
+            );
             id
         })
         .collect();
@@ -215,8 +232,10 @@ fn converges_under_lag_and_loss() {
         }
         cpm.loop_once(DT);
 
-        if c_pos.borrow().len() == 15
-            && ids.iter().all(|&id| c_pos.borrow().get(id) == s_pos.borrow().get(id))
+        if c_pos.get().len() == 15
+            && ids
+                .iter()
+                .all(|&id| c_pos.get().get(id) == s_pos.get().get(id))
         {
             converged = true;
             break;
@@ -224,7 +243,10 @@ fn converges_under_lag_and_loss() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(converged, "did not converge under 15ms lag + 15% loss");
-    assert!(cquic.rtt() >= Duration::from_millis(25), "RTT should reflect the simulated lag");
+    assert!(
+        cquic.rtt() >= Duration::from_millis(25),
+        "RTT should reflect the simulated lag"
+    );
 }
 
 #[test]

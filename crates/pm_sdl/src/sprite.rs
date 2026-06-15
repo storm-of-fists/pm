@@ -31,17 +31,22 @@ fn decode_png(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
     // png 0.18 wants buffered input (it reads the stream in small sips).
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     // Normalize exotic PNGs (palette, 16-bit, no alpha) toward RGBA8.
-    decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let size = reader.output_buffer_size().ok_or("png dimensions overflow")?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or("png dimensions overflow")?;
     let mut buf = vec![0u8; size];
     let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     buf.truncate(info.buffer_size());
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf,
-        png::ColorType::GrayscaleAlpha => {
-            buf.chunks_exact(2).flat_map(|ga| [ga[0], ga[0], ga[0], ga[1]]).collect()
-        }
+        png::ColorType::GrayscaleAlpha => buf
+            .chunks_exact(2)
+            .flat_map(|ga| [ga[0], ga[0], ga[0], ga[1]])
+            .collect(),
         other => return Err(format!("unsupported decoded color type {other:?}")),
     };
     Ok((info.width, info.height, rgba))
@@ -61,8 +66,13 @@ impl Sprite {
     /// Load from `path`. On failure the sprite is empty (draws nothing)
     /// and a later `reload` retries.
     pub fn load(canvas: &Canvas<Window>, path: impl Into<PathBuf>) -> Sprite {
-        let mut s =
-            Sprite { tex: None, w: 0.0, h: 0.0, path: path.into(), mtime: None };
+        let mut s = Sprite {
+            tex: None,
+            w: 0.0,
+            h: 0.0,
+            path: path.into(),
+            mtime: None,
+        };
         s.reload(canvas);
         s
     }
@@ -118,8 +128,17 @@ impl Sprite {
     /// proportional height.
     pub fn draw_centered(&self, canvas: &mut Canvas<Window>, cx: f32, cy: f32, display_w: f32) {
         let Some(tex) = &self.tex else { return };
-        let display_h = if self.w > 0.0 { display_w * (self.h / self.w) } else { display_w };
-        let dst = FRect::new(cx - display_w * 0.5, cy - display_h * 0.5, display_w, display_h);
+        let display_h = if self.w > 0.0 {
+            display_w * (self.h / self.w)
+        } else {
+            display_w
+        };
+        let dst = FRect::new(
+            cx - display_w * 0.5,
+            cy - display_h * 0.5,
+            display_w,
+            display_h,
+        );
         let _ = canvas.copy(tex, None, dst);
     }
 }
@@ -133,9 +152,10 @@ mod tests {
     // so only the decode path is covered headless).
     #[test]
     fn decodes_hellfire_sprites() {
-        for (name, w, h) in
-            [("connor-front.png", 148, 272), ("connor-back.png", 147, 270)]
-        {
+        for (name, w, h) in [
+            ("connor-front.png", 148, 272),
+            ("connor-back.png", 147, 270),
+        ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../examples/hellfire/game/resources")
                 .join(name);

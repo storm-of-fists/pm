@@ -32,13 +32,12 @@
 //! ```
 //!
 //! That split is the rule pm reaches for: **`pm` is for lifecycle —
-//! ids, tasks, modules; pools and singles are for state and behavior.**
-//! The per-frame system is all handles, no kernel.
+//! ids, tasks; pools and singles are for state and behavior.**
 //!
-//! The module installs itself the first time any of these touch a `Pm`
-//! (guarded by the `"cam.manager"` single); everything is owned by
-//! `module_add("camera")`, so `module_remove("camera")` is the one-call
-//! teardown and the next `track` reinstalls clean.
+//! Installation is just a function — [`camera_install`] registers the
+//! pools, singles, and spring task directly on the `Pm`. It's idempotent
+//! (guarded by the `"cam.manager"` single) and called for you the first
+//! time any camera function touches a `Pm`.
 //!
 //! Per tick, in priority order: the anchor sampler writes `"cam.anchor"`
 //! (CAMERA_PRIO - 1) → the spring task moves every rig toward its mount
@@ -46,7 +45,7 @@
 //! rendering reads [`CamView`] for the matrix, FOV and panini flag.
 
 use crate::Id;
-use crate::kernel::{Pm, Single};
+use crate::kernel::{Pm, SingleHandle};
 use crate::math::{Mat4, Vec3, vec3};
 
 /// Priority of the camera module's spring task. The anchor sampler runs
@@ -140,7 +139,13 @@ pub struct CamView {
 
 impl Default for CamView {
     fn default() -> Self {
-        Self { active: None, eye: Vec3::ZERO, target: Vec3::ZERO, fov_deg: 100.0, panini: true }
+        Self {
+            active: None,
+            eye: Vec3::ZERO,
+            target: Vec3::ZERO,
+            fov_deg: 100.0,
+            panini: true,
+        }
     }
 }
 
@@ -162,7 +167,7 @@ impl CamView {
 /// first camera call; its `view` being `Some` is the install latch.
 #[derive(Default)]
 pub struct CamManager {
-    view: Option<Single<CamView>>,
+    view: Option<SingleHandle<CamView>>,
     cams: Vec<Id>,
 }
 
@@ -197,13 +202,16 @@ impl CamManager {
     }
 
     fn view(&self) -> std::cell::RefMut<'_, CamView> {
-        self.view.as_ref().expect("camera module not installed").borrow_mut()
+        self.view
+            .as_ref()
+            .expect("camera module not installed")
+            .get_mut()
     }
 }
 
 /// Fetch the camera manager single (installing the module if needed),
 /// to capture into a task for live camera switching / panini toggling.
-pub fn camera_manager(pm: &mut Pm) -> Single<CamManager> {
+pub fn camera_manager(pm: &mut Pm) -> SingleHandle<CamManager> {
     camera_install(pm);
     pm.single::<CamManager>("cam.manager")
 }
@@ -214,46 +222,46 @@ pub fn camera_manager(pm: &mut Pm) -> Single<CamManager> {
 /// [`camera_manager`] — games only need it explicitly to control
 /// install timing.
 pub fn camera_install(pm: &mut Pm) {
-    let _ = pm.module_add("camera", |pm| {
-        let mgr = pm.single::<CamManager>("cam.manager");
-        if mgr.borrow().view.is_some() {
-            return; // already installed
-        }
-        let anchors = pm.pool::<CamAnchor>("cam.anchor");
-        let rigs = pm.pool::<CamRig>("cam.rig");
-        let view = pm.single::<CamView>("cam.view");
-        mgr.borrow_mut().view = Some(view.clone());
+    let mgr = pm.single::<CamManager>("cam.manager");
+    if mgr.get().view.is_some() {
+        return; // already installed
+    }
+    let anchors = pm.pool::<CamAnchor>("cam.anchor");
+    let rigs = pm.pool::<CamRig>("cam.rig");
+    let view = pm.single::<CamView>("cam.view");
+    mgr.get_mut().view = Some(view.clone());
 
-        pm.task_add("camera", CAMERA_PRIO, 0.0, move |pm| {
-            let dt = pm.loop_dt();
-            let mut v = view.borrow_mut();
-            let anchors = anchors.borrow();
-            for (cam_id, mut r) in rigs.borrow_mut().iter_mut() {
-                let Some(a) = anchors.get(r.target) else { continue };
-                let fwd = a.fwd.norm();
-                let right = Vec3::UP.cross(fwd).norm();
-                let mount = |o: Vec3| a.pos + right * o.x + Vec3::UP * o.y + fwd * o.z;
-                let want_eye = mount(r.eye);
-                let want_look = mount(r.look);
-                if r.seeded && r.stiffness > 0.0 {
-                    // Frame-rate independent spring: same convergence
-                    // per second whatever the loop rate.
-                    let k = 1.0 - (-r.stiffness * dt).exp();
-                    let (e, l) = (r.eye_w, r.look_w);
-                    r.eye_w = e + (want_eye - e) * k;
-                    r.look_w = l + (want_look - l) * k;
-                } else {
-                    r.eye_w = want_eye;
-                    r.look_w = want_look;
-                    r.seeded = true;
-                }
-                if v.active == Some(cam_id) {
-                    v.eye = r.eye_w;
-                    v.target = r.look_w;
-                    v.fov_deg = r.fov_deg;
-                }
+    pm.task_add("camera", CAMERA_PRIO, 0.0, move |pm| {
+        let dt = pm.loop_dt();
+        let mut v = view.get_mut();
+        let anchors = anchors.get();
+        for (cam_id, mut r) in rigs.get_mut().iter_mut() {
+            let Some(a) = anchors.get(r.target) else {
+                continue;
+            };
+            let fwd = a.fwd.norm();
+            let right = Vec3::UP.cross(fwd).norm();
+            let mount = |o: Vec3| a.pos + right * o.x + Vec3::UP * o.y + fwd * o.z;
+            let want_eye = mount(r.eye);
+            let want_look = mount(r.look);
+            if r.seeded && r.stiffness > 0.0 {
+                // Frame-rate independent spring: same convergence
+                // per second whatever the loop rate.
+                let k = 1.0 - (-r.stiffness * dt).exp();
+                let (e, l) = (r.eye_w, r.look_w);
+                r.eye_w = e + (want_eye - e) * k;
+                r.look_w = l + (want_look - l) * k;
+            } else {
+                r.eye_w = want_eye;
+                r.look_w = want_look;
+                r.seeded = true;
             }
-        });
+            if v.active == Some(cam_id) {
+                v.eye = r.eye_w;
+                v.target = r.look_w;
+                v.fov_deg = r.fov_deg;
+            }
+        }
     });
 }
 
@@ -269,14 +277,17 @@ pub fn camera_track<'a>(
     mut sample: impl FnMut(&mut Pm) -> Option<CamAnchor> + 'static,
 ) -> CameraRack<'a> {
     camera_install(pm);
-    let _ = pm.module_add("camera", |pm| {
-        let anchors = pm.pool::<CamAnchor>("cam.anchor");
-        pm.task_add(&format!("cam.follow.{}", target.0), CAMERA_PRIO - 1.0, 0.0, move |pm| {
+    let anchors = pm.pool::<CamAnchor>("cam.anchor");
+    pm.task_add(
+        &format!("cam.follow.{}", target.0),
+        CAMERA_PRIO - 1.0,
+        0.0,
+        move |pm| {
             if let Some(a) = sample(pm) {
-                anchors.borrow_mut().add(target, a);
+                anchors.get_mut().add(target, a);
             }
-        });
-    });
+        },
+    );
     CameraRack { pm, target }
 }
 
@@ -294,14 +305,21 @@ impl CameraRack<'_> {
     pub fn mount(&mut self, mut rig: CamRig) -> Id {
         let cam = self.pm.id_add();
         rig.target = self.target;
-        self.pm.pool::<CamRig>("cam.rig").borrow_mut().add(cam, rig);
-        self.pm.single::<CamManager>("cam.manager").borrow_mut().cams.push(cam);
+        self.pm.pool::<CamRig>("cam.rig").get_mut().add(cam, rig);
+        self.pm
+            .single::<CamManager>("cam.manager")
+            .get_mut()
+            .cams
+            .push(cam);
         cam
     }
 
     /// Make `cam` drive the screen now.
     pub fn show(&mut self, cam: Id) {
-        self.pm.single::<CamManager>("cam.manager").borrow().show(cam);
+        self.pm
+            .single::<CamManager>("cam.manager")
+            .get()
+            .show(cam);
     }
 }
 
@@ -311,7 +329,10 @@ mod tests {
 
     fn track_static(pm: &mut Pm, id: Id) -> CameraRack<'_> {
         camera_track(pm, id, move |_pm| {
-            Some(CamAnchor { pos: vec3(10.0, 0.0, 5.0), fwd: vec3(0.0, 0.0, 1.0) })
+            Some(CamAnchor {
+                pos: vec3(10.0, 0.0, 5.0),
+                fwd: vec3(0.0, 0.0, 1.0),
+            })
         })
     }
 
@@ -327,17 +348,25 @@ mod tests {
             rack.show(cam);
             cam
         };
-        assert_eq!(camera_manager(&mut pm).borrow().active(), Some(cam));
+        assert_eq!(camera_manager(&mut pm).get().active(), Some(cam));
 
         for _ in 0..240 {
             pm.loop_once(1.0 / 60.0);
         }
         let view = pm.single::<CamView>("cam.view");
-        let v = view.borrow();
+        let v = view.get();
         assert!(v.ready());
         // Eye should settle at anchor - fwd*9 + up*3.6: (10, 3.6, -4).
-        assert!((v.eye - vec3(10.0, 3.6, -4.0)).len() < 0.05, "eye = {:?}", v.eye);
-        assert!((v.target - vec3(10.0, 1.0, 9.0)).len() < 0.05, "target = {:?}", v.target);
+        assert!(
+            (v.eye - vec3(10.0, 3.6, -4.0)).len() < 0.05,
+            "eye = {:?}",
+            v.eye
+        );
+        assert!(
+            (v.target - vec3(10.0, 1.0, 9.0)).len() < 0.05,
+            "target = {:?}",
+            v.target
+        );
         assert!((v.fov_deg - 100.0).abs() < 1e-6);
     }
 
@@ -356,11 +385,19 @@ mod tests {
         // Rigid (stiffness 0): exact after a single tick, no settling.
         pm.loop_once(1.0 / 60.0);
         let view = pm.single::<CamView>("cam.view");
-        let v = view.borrow();
+        let v = view.get();
         assert_eq!(v.active, Some(rear));
         // fwd = +z, right = UP×fwd = +x; rear eye (0, 1.5, -1.9).
-        assert!((v.eye - vec3(10.0, 1.5, 3.1)).len() < 1e-4, "eye = {:?}", v.eye);
-        assert!((v.target - vec3(10.0, 0.4, -7.0)).len() < 1e-4, "target = {:?}", v.target);
+        assert!(
+            (v.eye - vec3(10.0, 1.5, 3.1)).len() < 1e-4,
+            "eye = {:?}",
+            v.eye
+        );
+        assert!(
+            (v.target - vec3(10.0, 0.4, -7.0)).len() < 1e-4,
+            "target = {:?}",
+            v.target
+        );
         assert!((v.fov_deg - 120.0).abs() < 1e-6);
     }
 
@@ -376,12 +413,12 @@ mod tests {
             (chase, side)
         };
         let mgr = camera_manager(&mut pm);
-        mgr.borrow().show_index(0);
-        assert_eq!(mgr.borrow().active(), Some(chase));
-        mgr.borrow().show_index(2);
-        assert_eq!(mgr.borrow().active(), Some(side));
-        mgr.borrow().show_index(9); // out of range: no-op
-        assert_eq!(mgr.borrow().active(), Some(side));
+        mgr.get().show_index(0);
+        assert_eq!(mgr.get().active(), Some(chase));
+        mgr.get().show_index(2);
+        assert_eq!(mgr.get().active(), Some(side));
+        mgr.get().show_index(9); // out of range: no-op
+        assert_eq!(mgr.get().active(), Some(side));
     }
 
     #[test]
@@ -389,38 +426,10 @@ mod tests {
         let mut pm = Pm::new();
         let mgr = camera_manager(&mut pm);
         let view = pm.single::<CamView>("cam.view");
-        assert!(view.borrow().panini); // house default
-        mgr.borrow().toggle_panini();
-        assert!(!view.borrow().panini);
-        mgr.borrow().toggle_panini();
-        assert!(view.borrow().panini);
-    }
-
-    #[test]
-    fn module_remove_tears_the_camera_down() {
-        let mut pm = Pm::new();
-        let car = pm.id_add();
-        {
-            let mut rack = track_static(&mut pm, car);
-            let cam = rack.mount(CamRig::chase());
-            rack.show(cam);
-        }
-        pm.module_remove("camera");
-        pm.loop_once(1.0 / 60.0);
-        // Everything the module owned is gone — including the manager
-        // latch, so the next track reinstalls a working module.
-        assert_eq!(pm.pool::<CamRig>("cam.rig").borrow().len(), 0);
-        assert_eq!(pm.pool::<CamAnchor>("cam.anchor").borrow().len(), 0);
-        let cam = {
-            let mut rack = track_static(&mut pm, car);
-            let cam = rack.mount(CamRig::rear());
-            rack.show(cam);
-            cam
-        };
-        assert_eq!(pm.pool::<CamRig>("cam.rig").borrow().len(), 1);
-        pm.loop_once(1.0 / 60.0);
-        let view = pm.single::<CamView>("cam.view");
-        assert!(view.borrow().ready());
-        assert_eq!(view.borrow().active, Some(cam));
+        assert!(view.get().panini); // house default
+        mgr.get().toggle_panini();
+        assert!(!view.get().panini);
+        mgr.get().toggle_panini();
+        assert!(view.get().panini);
     }
 }

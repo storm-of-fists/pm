@@ -1,5 +1,7 @@
-//! Dylib mod loading with mtime hot-reload, built on the module system:
-//! a mod IS a module whose init lives in a shared library.
+//! Dylib mod loading with mtime hot-reload. A mod is just a function
+//! (`pm_mod_init`) living in a shared library — there is no "module"
+//! concept in the kernel anymore; a mod registers tasks and pools
+//! exactly like `main` does.
 //!
 //! Contract (pinned-toolchain, like game-version-pinned mods): the mod
 //! must link the exact `pm` compilation the host links — same rustc,
@@ -21,16 +23,22 @@
 //!
 //! #[unsafe(no_mangle)]
 //! pub extern "C-unwind" fn pm_mod_init(pm: &mut Pm) -> bool {
-//!     // register tasks/pools exactly like any module init; return false to fail
+//!     // Register with task_add_or_replace so a reload swaps each task's
+//!     // body in place instead of stacking duplicates. Pools persist
+//!     // across reloads, so entity state survives a code change.
+//!     pm.task_add_or_replace("my_mod", 30.0, 0.0, move |pm| { /* ... */ });
 //!     true
 //! }
 //! ```
 //!
-//! On file change the loader does `module_remove` (stopping the mod's
-//! tasks — running their `end` hooks — and dropping its pools, so no
-//! code or vtable from the old library survives), unloads, reloads, and
-//! re-runs init. Drop the loader only after `module_remove`-ing or at
-//! process exit.
+//! Hot-reload model: on file change the loader loads the NEW library and
+//! runs its init (which re-registers tasks via `task_add_or_replace`),
+//! then **leaks the previous library** — keeps its code mapped rather
+//! than `dlclose`-ing it. That's deliberate: a task the new init didn't
+//! replace (renamed, removed) still holds a closure pointing into the
+//! old code, and unmapping code a live task calls is UB. Leaking a few
+//! MB per reload is the right trade for a dev-only feature; restart to
+//! reclaim. Pools are never dropped, so state carries across reloads.
 
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -88,12 +96,20 @@ impl ModLoader {
             .file_stem()
             .map(|s| s.to_string_lossy().trim_start_matches("lib").to_string())
             .unwrap_or_else(|| "mod".into());
-        self.mods.push(ModEntry { path, name, lib: None, loaded_mtime: None });
+        self.mods.push(ModEntry {
+            path,
+            name,
+            lib: None,
+            loaded_mtime: None,
+        });
     }
 
     /// Names of currently loaded mods.
     pub fn loaded(&self) -> impl Iterator<Item = &str> {
-        self.mods.iter().filter(|m| m.lib.is_some()).map(|m| m.name.as_str())
+        self.mods
+            .iter()
+            .filter(|m| m.lib.is_some())
+            .map(|m| m.name.as_str())
     }
 
     /// Check every watched path; (re)load the ones whose file changed.
@@ -105,14 +121,6 @@ impl ModLoader {
                 continue;
             }
             entry.loaded_mtime = now;
-
-            // Tear down the previous incarnation completely before
-            // dlclose: every closure, Task vtable, and pool the mod
-            // registered must die while its code is still mapped.
-            if entry.lib.take().is_some() {
-                pm.module_remove(&entry.name);
-                eprintln!("pm: mod '{}' unloaded for reload", entry.name);
-            }
 
             let lib = match unsafe { Library::new(&entry.path) } {
                 Ok(l) => l,
@@ -147,23 +155,30 @@ impl ModLoader {
                 }
             };
             // catch_unwind at the mod boundary (and only here — tasks
-            // stay panic-loud): foreign init code must not take the
-            // host down. module_add rolls back partial registration.
-            let result = pm.module_add(&entry.name, |pm| -> Result<(), crate::TaskError> {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                    init(pm)
-                })) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err("pm_mod_init returned false".into()),
-                    Err(_) => Err("pm_mod_init panicked (see message above)".into()),
-                }
-            });
-            match result {
-                Ok(()) => {
-                    entry.lib = Some(lib);
+            // stay panic-loud): foreign init code must not take the host
+            // down. There's no rollback now, so a failed init may leave
+            // partial registration; the dev sees the message and fixes
+            // the mod. Either way the just-loaded library is leaked, not
+            // dropped — on failure it may already hold closures the host
+            // now runs (UB to unmap); on success it replaces the old one.
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { init(pm) }));
+            match ok {
+                Ok(true) => {
+                    // New code is live; keep the old library mapped for
+                    // any task the new init didn't replace.
+                    if let Some(old) = entry.lib.replace(lib) {
+                        std::mem::forget(old);
+                    }
                     eprintln!("pm: mod '{}' loaded", entry.name);
                 }
-                Err(e) => eprintln!("pm: mod '{}' init failed: {e}", entry.name),
+                Ok(false) => {
+                    std::mem::forget(lib);
+                    eprintln!("pm: mod '{}' init returned false", entry.name);
+                }
+                Err(_) => {
+                    std::mem::forget(lib);
+                    eprintln!("pm: mod '{}' init panicked (see message above)", entry.name);
+                }
             }
         }
     }

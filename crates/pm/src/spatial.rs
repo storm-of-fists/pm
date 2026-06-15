@@ -30,7 +30,12 @@ impl SpatialGrid {
     pub fn new(world_w: f32, world_h: f32, cell_sz: f32) -> Self {
         let cols = (world_w / cell_sz).ceil().max(1.0) as i32;
         let rows = (world_h / cell_sz).ceil().max(1.0) as i32;
-        Self { cell_sz, cols, rows, cells: vec![Vec::new(); (cols * rows) as usize] }
+        Self {
+            cell_sz,
+            cols,
+            rows,
+            cells: vec![Vec::new(); (cols * rows) as usize],
+        }
     }
 
     /// Clear all cells for this frame (retains capacity).

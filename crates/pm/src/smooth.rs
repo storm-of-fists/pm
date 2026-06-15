@@ -3,7 +3,7 @@
 //! the standard coast+blend math for dead reckoning. Both games (demo,
 //! hellfire) wrote this by hand before it was hoisted here.
 
-use crate::kernel::Handle;
+use crate::kernel::PoolHandle;
 use crate::math::Vec2;
 
 /// Mirror `auth` into `draw`: new entities copy in, existing ones go
@@ -11,12 +11,12 @@ use crate::math::Vec2;
 /// from `auth` drop out. Call once per tick from a smoothing task; the
 /// draw pool is what rendering should read.
 pub fn pool_mirror<T: Copy + 'static>(
-    auth: &Handle<T>,
-    draw: &Handle<T>,
+    auth: &PoolHandle<T>,
+    draw: &PoolHandle<T>,
     mut blend: impl FnMut(crate::Id, T, &T) -> T,
 ) {
-    let auth = auth.borrow();
-    let mut draw = draw.borrow_mut();
+    let auth = auth.get();
+    let mut draw = draw.get_mut();
     for (id, a) in auth.iter() {
         match draw.get_mut(id) {
             Some(mut d) => *d = blend(id, *d, a),

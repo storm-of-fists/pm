@@ -16,7 +16,11 @@ pub struct Hysteresis<T: Copy + PartialEq> {
 
 impl<T: Copy + PartialEq> Hysteresis<T> {
     pub fn new(initial: T, hold_sec: f32) -> Self {
-        Self { value: initial, hold: hold_sec, cooldown: 0.0 }
+        Self {
+            value: initial,
+            hold: hold_sec,
+            cooldown: 0.0,
+        }
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -50,7 +54,10 @@ pub struct Cooldown {
 
 impl Cooldown {
     pub fn new(sec: f32) -> Self {
-        Self { interval: sec, elapsed: 0.0 }
+        Self {
+            interval: sec,
+            elapsed: 0.0,
+        }
     }
 
     /// Accumulates `dt`; returns true once per interval.
@@ -85,13 +92,22 @@ pub struct DelayTimer {
 
 impl DelayTimer {
     pub fn new(on_sec: f32, off_sec: f32) -> Self {
-        Self { on_delay: on_sec, off_delay: off_sec, elapsed: 0.0, output: false }
+        Self {
+            on_delay: on_sec,
+            off_delay: off_sec,
+            elapsed: 0.0,
+            output: false,
+        }
     }
 
     pub fn update(&mut self, input: bool, dt: f32) {
         if self.output != input {
             self.elapsed += dt;
-            let delay = if self.output { self.off_delay } else { self.on_delay };
+            let delay = if self.output {
+                self.off_delay
+            } else {
+                self.on_delay
+            };
             if self.elapsed >= delay {
                 self.output = input;
                 self.elapsed = 0.0;
@@ -149,13 +165,19 @@ pub struct Latch {
 
 impl Default for Latch {
     fn default() -> Self {
-        Self { output: false, reset_dominant: true }
+        Self {
+            output: false,
+            reset_dominant: true,
+        }
     }
 }
 
 impl Latch {
     pub fn new(reset_dominant: bool) -> Self {
-        Self { output: false, reset_dominant }
+        Self {
+            output: false,
+            reset_dominant,
+        }
     }
 
     pub fn update(&mut self, set: bool, reset: bool) {
@@ -184,7 +206,11 @@ pub struct Counter {
 
 impl Counter {
     pub fn new(preset: i32) -> Self {
-        Self { count: 0, preset, done: false }
+        Self {
+            count: 0,
+            preset,
+            done: false,
+        }
     }
 
     pub fn increment(&mut self) {

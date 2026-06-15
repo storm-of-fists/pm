@@ -31,6 +31,17 @@ struct Glyph {
     advance: f32,
 }
 
+/// A CPU-rasterized glyph: 8-bit coverage (`w * h`, row-major) plus
+/// placement metrics. The backend-agnostic output of [`Font::raster`].
+pub struct Raster {
+    pub w: u32,
+    pub h: u32,
+    pub xmin: f32,
+    pub top: f32,
+    pub advance: f32,
+    pub coverage: Vec<u8>,
+}
+
 pub struct Font {
     font: fontdue::Font,
     cache: HashMap<(char, u32), Glyph>,
@@ -41,7 +52,10 @@ impl Font {
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
         let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .map_err(|e| format!("{path}: {e}"))?;
-        Ok(Font { font, cache: HashMap::new() })
+        Ok(Font {
+            font,
+            cache: HashMap::new(),
+        })
     }
 
     /// First system font that loads. Errors only if none exist.
@@ -59,6 +73,31 @@ impl Font {
             .horizontal_line_metrics(px)
             .map(|m| m.new_line_size)
             .unwrap_or(px * 1.2)
+    }
+
+    /// Distance from the line top down to the baseline at `px`.
+    pub fn ascent(&self, px: f32) -> f32 {
+        self.font
+            .horizontal_line_metrics(px)
+            .map(|m| m.ascent)
+            .unwrap_or(px)
+    }
+
+    /// Rasterize one glyph to an 8-bit coverage bitmap plus the metrics a
+    /// renderer needs to place it. Backend-agnostic (no SDL): the GPU text
+    /// path uploads `coverage` into a texture; the canvas path uses
+    /// `draw`. `top` is the offset from the baseline DOWN to the glyph top
+    /// in screen (y-down) space, matching `draw`'s placement.
+    pub fn raster(&self, ch: char, px: f32) -> Raster {
+        let (m, coverage) = self.font.rasterize(ch, px);
+        Raster {
+            w: m.width as u32,
+            h: m.height as u32,
+            xmin: m.xmin as f32,
+            top: -(m.ymin as f32 + m.height as f32),
+            advance: m.advance_width,
+            coverage,
+        }
     }
 
     fn glyph_cache(&mut self, canvas: &Canvas<Window>, ch: char, px: f32) -> (char, u32) {
@@ -110,7 +149,11 @@ impl Font {
         px: f32,
         color: (u8, u8, u8),
     ) -> f32 {
-        let ascent = self.font.horizontal_line_metrics(px).map(|m| m.ascent).unwrap_or(px);
+        let ascent = self
+            .font
+            .horizontal_line_metrics(px)
+            .map(|m| m.ascent)
+            .unwrap_or(px);
         let baseline = y + ascent;
         let mut pen = x;
         for ch in text.chars() {
@@ -127,8 +170,10 @@ impl Font {
     }
 
     /// Width `text` would occupy at `px` (no draw).
-    pub fn measure(&mut self, text: &str, px: f32) -> f32 {
+    pub fn measure(&self, text: &str, px: f32) -> f32 {
         let size = px.round() as u32 as f32;
-        text.chars().map(|ch| self.font.metrics(ch, size).advance_width).sum()
+        text.chars()
+            .map(|ch| self.font.metrics(ch, size).advance_width)
+            .sum()
     }
 }

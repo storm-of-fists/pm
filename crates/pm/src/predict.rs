@@ -26,13 +26,21 @@ pub struct Predictor<S, C> {
 impl<S, C> Default for Predictor<S, C> {
     fn default() -> Self {
         // ~4 s of unacked input at 60 Hz before the ring caps.
-        Self { state: None, ring: VecDeque::new(), cap: 240, corrections: 0 }
+        Self {
+            state: None,
+            ring: VecDeque::new(),
+            cap: 240,
+            corrections: 0,
+        }
     }
 }
 
 impl<S: Copy, C: Copy> Predictor<S, C> {
     pub fn with_cap(cap: usize) -> Self {
-        Self { cap, ..Self::default() }
+        Self {
+            cap,
+            ..Self::default()
+        }
     }
 
     /// Current predicted state — what rendering should show for the

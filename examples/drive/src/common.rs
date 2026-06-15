@@ -13,7 +13,12 @@ pub const ARENA: f32 = 38.0;
 
 /// Replicated car state. Ground-plane physics: heading 0 faces +z,
 /// forward = (sin h, cos h) on (x, z). y stays 0 — the presentation is
-/// 3D, the simulation deliberately isn't (yet).
+/// 3D, the simulation deliberately isn't (yet). This is the PREDICTED
+/// substate only — every field is something `drive_step` evolves and the
+/// client predicts then reconciles. Server-owned state the client must NOT
+/// predict (scoring) lives in a separate `Score` pool joined by id, so an
+/// un-stepped field can never freeze inside the predictor between
+/// corrections — the bug that motivated the split.
 #[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
 #[repr(C)]
 pub struct Car {
@@ -21,6 +26,29 @@ pub struct Car {
     pub z: f32,
     pub heading: f32,
     pub speed: f32,
+    /// Filtered steering: the wheel lags the commanded turn (control
+    /// weight). Because it's part of the replicated/predicted state, the
+    /// next ~0.5s of motion is determined — that's what makes the
+    /// projected path a real prediction, not a dead-reckoned guess.
+    pub steer: f32,
+}
+
+/// Server-owned scoring for a car, in its OWN replicated pool keyed by the
+/// SAME id as the motion `Car`. Split out on purpose: `Car` is predicted,
+/// this is authoritative-only — the server computes it from global
+/// proximity and collisions, and it mirrors straight down to the HUD, read
+/// raw. Folding it into `Car` let the un-stepped points freeze inside the
+/// predictor between corrections (it only refreshed on a position rewind);
+/// a separate pool — exactly what pools are for — makes that impossible.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Score {
+    pub points: f32,
+    /// Live rate (points/sec) the HUD shows green/red; `-HIT_COST` while
+    /// the post-collision lockout runs so the bite reads as a number.
+    pub rate: f32,
+    /// Seconds left on the post-collision charge lockout (`HIT_COOLDOWN`).
+    pub hit_cd: f32,
 }
 
 /// Command-frame input payload.
@@ -29,18 +57,71 @@ pub struct Car {
 pub struct Drive {
     pub thrust: f32, // -1..1
     pub turn: f32,   // -1..1 (positive = left)
+    pub drift: f32,  // 0/1: shift held — sharper steering, less drag
+    pub bot: f32,    // 0/1: AI controller — its steering lags (see drive_step)
 }
 
 /// Server event: your car's id (sent once at join).
 pub const EV_VEHICLE: u16 = 16;
 
-/// THE step. Speed-scaled steering so the car doesn't spin in place,
-/// quadratic-ish drag, hard arena walls that scrub speed.
+/// Top speed (forward); the `drive_step` clamp and the speed-match scale.
+pub const VMAX: f32 = 18.0;
+/// Car collision capsule: a segment of half-length `CAR_HL` along the
+/// car's forward axis, radius `CAR_R`. Total footprint 2*(HL+R) long by
+/// 2*R wide — a car shape, NOT a fat circle, so side-by-side cars don't
+/// falsely register as touching.
+pub const CAR_HL: f32 = 0.8;
+pub const CAR_R: f32 = 0.9;
+/// Beyond this center-to-center distance a car contributes no score.
+pub const SCORE_RANGE: f32 = 14.0;
+/// Points per second per rival at point-blank (before the speed-match
+/// bonus). The dominant payoff: just being near a moving car earns.
+pub const SCORE_BASE: f32 = 40.0;
+/// Points a collision costs outright. A flat bite, NOT a continuous rate:
+/// the collision push flicks cars in and out of overlap every few ticks,
+/// so a per-second drain barely accrued — a hit you can feel needs to be
+/// an impulse, debounced (see `HIT_COOLDOWN`).
+pub const HIT_COST: f32 = 25.0;
+/// Seconds after a charged hit before another can land — debounces the
+/// push bouncing you across the overlap boundary into repeat billing.
+pub const HIT_COOLDOWN: f32 = 1.0;
+/// Surface gap (capsule clearance) below which a rival grants NO proximity
+/// reward — the contact dead-zone. Without it, point-blank pays the most,
+/// so leaning on someone farms the reward back between hits. With it, the
+/// scrape band earns nothing (the hit impulse owns contact) while near-miss
+/// passes just outside it still pay the peak.
+pub const CONTACT_DEADZONE: f32 = 0.6;
+/// Below this speed a car neither earns nor grants score (no farming a
+/// parked car; no points while stuck).
+pub const MOVE_MIN: f32 = 1.5;
+/// Steering control-lag time constant (seconds): the wheel reaches ~63%
+/// of the commanded turn after this long. ~200-300ms of perceived lag.
+pub const STEER_TAU: f32 = 0.18;
+
+/// THE step. For BOT controllers (`cmd.bot`) steering LAGS the input (a
+/// first-order filter on `c.steer`), giving the AI weight and a
+/// meaningful lead — so its projected arrow is a real prediction. Human
+/// players steer crisply (no lag); their arrow just traces the live turn.
+/// Drift (shift) tightens the turn rate (and the bot lag). Speed-scaled
+/// steering, quadratic-ish drag, hard arena walls that scrub speed.
 pub fn drive_step(c: &mut Car, cmd: Drive, dt: f32) {
-    c.speed = (c.speed + cmd.thrust * 14.0 * dt) * (1.0 - 1.2 * dt);
-    c.speed = c.speed.clamp(-7.0, 18.0);
-    let steer = (c.speed.abs() / 6.0).min(1.0);
-    c.heading += cmd.turn * 2.2 * steer * dt * c.speed.signum();
+    let drifting = cmd.drift > 0.5;
+    if cmd.bot > 0.5 {
+        // Bot steering catches up to the commanded turn over STEER_TAU
+        // (snappier while drifting) — the control lag behind the arrow.
+        let tau = if drifting { 0.10 } else { STEER_TAU };
+        let k = 1.0 - (-dt / tau).exp();
+        c.steer += (cmd.turn - c.steer) * k;
+    } else {
+        c.steer = cmd.turn; // human: instant, crisp
+    }
+
+    let drag = if drifting { 0.6 } else { 1.2 };
+    c.speed = (c.speed + cmd.thrust * 14.0 * dt) * (1.0 - drag * dt);
+    c.speed = c.speed.clamp(-7.0, VMAX);
+    let authority = (c.speed.abs() / 6.0).min(1.0);
+    let turn_rate = if drifting { 3.4 } else { 2.2 };
+    c.heading += c.steer * turn_rate * authority * dt * c.speed.signum();
     c.x += c.heading.sin() * c.speed * dt;
     c.z += c.heading.cos() * c.speed * dt;
     if c.x.abs() > ARENA {
@@ -51,6 +132,155 @@ pub fn drive_step(c: &mut Car, cmd: Drive, dt: f32) {
         c.z = c.z.clamp(-ARENA, ARENA);
         c.speed *= 0.4;
     }
+}
+
+/// Center-to-center distance between two cars on the ground plane.
+pub fn car_dist(a: &Car, b: &Car) -> f32 {
+    let (dx, dz) = (a.x - b.x, a.z - b.z);
+    (dx * dx + dz * dz).sqrt()
+}
+
+/// A car's collision capsule as its two segment endpoints (front, back).
+fn car_seg(c: &Car) -> ((f32, f32), (f32, f32)) {
+    let (fx, fz) = (c.heading.sin() * CAR_HL, c.heading.cos() * CAR_HL);
+    ((c.x - fx, c.z - fz), (c.x + fx, c.z + fz))
+}
+
+/// Closest distance between two 2D segments (Ericson, RTCD) and the unit
+/// axis from segment 2's closest point toward segment 1's: `(nx, nz, d)`.
+fn seg_seg(
+    p1: (f32, f32),
+    q1: (f32, f32),
+    p2: (f32, f32),
+    q2: (f32, f32),
+) -> (f32, f32, f32) {
+    let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
+    let sub = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0, a.1 - b.1);
+    let (d1, d2, r) = (sub(q1, p1), sub(q2, p2), sub(p1, p2));
+    let (a, e, f) = (dot(d1, d1), dot(d2, d2), dot(d2, r));
+    let eps = 1e-8;
+    let (mut s, mut t) = (0.0f32, 0.0f32);
+    if a <= eps && e <= eps {
+        // both degenerate
+    } else if a <= eps {
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = dot(d1, r);
+        if e <= eps {
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = dot(d1, d2);
+            let denom = a * e - b * b;
+            s = if denom.abs() > eps {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+        }
+    }
+    let c1 = (p1.0 + d1.0 * s, p1.1 + d1.1 * s);
+    let c2 = (p2.0 + d2.0 * t, p2.1 + d2.1 * t);
+    let (dx, dz) = (c1.0 - c2.0, c1.1 - c2.1);
+    let d = (dx * dx + dz * dz).sqrt();
+    if d > 1e-4 {
+        (dx / d, dz / d, d)
+    } else {
+        (1.0, 0.0, 0.0)
+    }
+}
+
+/// Capsule overlap between two cars: `Some((nx, nz, penetration))` with a
+/// unit push axis (from `b` toward `a`) when they intersect.
+pub fn capsule_overlap(a: &Car, b: &Car) -> Option<(f32, f32, f32)> {
+    let (p1, q1) = car_seg(a);
+    let (p2, q2) = car_seg(b);
+    let (nx, nz, d) = seg_seg(p1, q1, p2, q2);
+    let min = 2.0 * CAR_R;
+    (d < min).then_some((nx, nz, min - d))
+}
+
+/// Surface gap between two cars' capsules along the closest axis: 0 at
+/// touching, NEGATIVE while overlapping. `capsule_overlap(..).is_some()`
+/// is exactly `capsule_clearance(..) < 0.0`; this gives scoring the same
+/// orientation-correct contact metric the collision push uses.
+pub fn capsule_clearance(a: &Car, b: &Car) -> f32 {
+    let (p1, q1) = car_seg(a);
+    let (p2, q2) = car_seg(b);
+    let (_, _, d) = seg_seg(p1, q1, p2, q2);
+    d - 2.0 * CAR_R
+}
+
+/// The scoring RATE (points/sec) for `me`: an exponential proximity
+/// reward that spikes on a close pass, weighted per rival by a SPEED
+/// MATCH — both cars must be moving and at similar speed (a paced
+/// near-miss, not buzzing a parked car). This is the POSITIVE earning rate
+/// only; contact is owned by the flat hit impulse (`HIT_COST`), not a
+/// per-second drain. Pays NOTHING inside the contact dead-zone so a scrape
+/// can't farm the point-blank reward back between hits. Pure +
+/// deterministic, but the server is the sole caller — the HUD reads the
+/// banked `Score.rate`, it does not recompute this.
+pub fn score_rate(me: &Car, others: &[Car]) -> f32 {
+    let a = me.speed.abs();
+    let mut gain = 0.0;
+    for o in others {
+        let clr = capsule_clearance(me, o); // surface gap; < 0 == overlap
+        let d = car_dist(me, o);
+        let b = o.speed.abs();
+        if d > SCORE_RANGE || a < MOVE_MIN || b < MOVE_MIN {
+            continue;
+        }
+        // Contact dead-zone: a rival you're scraping (or a hair off it)
+        // earns nothing — the hit impulse, not the reward curve, is what
+        // contact pays out.
+        if clr < CONTACT_DEADZONE {
+            continue;
+        }
+        let prox = (-d / 5.0).exp(); // 0..1, sharp when really close
+        // Speed match is a BONUS, not a gate: half the reward for just
+        // being near a moving car, the other half for pacing its speed.
+        let speed_match = (1.0 - (a - b).abs() / VMAX).clamp(0.0, 1.0);
+        gain += prox * (0.5 + 0.5 * speed_match);
+    }
+    SCORE_BASE * gain
+}
+
+/// Positional-push collision resolution (capsule): separate every
+/// overlapping pair along the contact normal — half the penetration each
+/// plus a small bias so resting contacts break instead of sticking.
+pub fn collide_push(cars: &[Car]) -> Vec<(f32, f32)> {
+    let mut push = vec![(0.0f32, 0.0f32); cars.len()];
+    for i in 0..cars.len() {
+        for j in (i + 1)..cars.len() {
+            if let Some((nx, nz, pen)) = capsule_overlap(&cars[i], &cars[j]) {
+                let s = pen * 0.5 + 0.04; // split + un-stick bias
+                push[i].0 += nx * s;
+                push[i].1 += nz * s;
+                push[j].0 -= nx * s;
+                push[j].1 -= nz * s;
+            }
+        }
+    }
+    push
+}
+
+/// Replay `drive_step` forward from `c` holding `cmd`, collecting the
+/// ground positions each step — the projected path (a real prediction
+/// because steering lag makes the near future deterministic).
+pub fn predict_path(mut c: Car, cmd: Drive, steps: u32, dt: f32) -> Vec<(f32, f32)> {
+    let mut pts = Vec::with_capacity(steps as usize);
+    for _ in 0..steps {
+        drive_step(&mut c, cmd, dt);
+        pts.push((c.x, c.z));
+    }
+    pts
 }
 
 /// Per-peer body tints.
@@ -71,5 +301,11 @@ pub fn peer_color(peer: u8) -> (f32, f32, f32) {
 
 /// Spawn slot for a peer: spread along the back wall, facing +z.
 pub fn spawn_car(peer: u8) -> Car {
-    Car { x: (peer as f32 - 4.5) * 5.0, z: -ARENA + 6.0, heading: 0.0, speed: 0.0 }
+    Car {
+        x: (peer as f32 - 4.5) * 5.0,
+        z: -ARENA + 6.0,
+        heading: 0.0,
+        speed: 0.0,
+        steer: 0.0,
+    }
 }

@@ -4,12 +4,22 @@
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let files: [(&str, &[(&str, naga::ShaderStage)]); 2] = [
+    let files: [(&str, &[(&str, naga::ShaderStage)]); 3] = [
         (
             "shaders/basic3d.wgsl",
-            &[("vs_main", naga::ShaderStage::Vertex), ("fs_main", naga::ShaderStage::Fragment)],
+            &[
+                ("vs_main", naga::ShaderStage::Vertex),
+                ("fs_main", naga::ShaderStage::Fragment),
+            ],
         ),
-        ("shaders/post3d.wgsl", &[("cs_post", naga::ShaderStage::Compute)]),
+        (
+            "shaders/post3d.wgsl",
+            &[("cs_post", naga::ShaderStage::Compute)],
+        ),
+        (
+            "shaders/text.wgsl",
+            &[("cs_text", naga::ShaderStage::Compute)],
+        ),
     ];
     for (file, entries) in files {
         println!("cargo:rerun-if-changed={file}");

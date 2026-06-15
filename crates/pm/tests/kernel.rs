@@ -16,12 +16,12 @@ struct Hits(u32);
 fn single_is_one_entity_shared_by_name() {
     let mut pm = Pm::new();
     let a = pm.single::<Hits>("hits");
-    a.borrow_mut().0 = 7;
+    a.get_mut().0 = 7;
     let b = pm.single::<Hits>("hits");
-    assert_eq!(b.borrow().0, 7);
+    assert_eq!(b.get().0, 7);
     assert_eq!(a.id(), b.id());
     // It's an ordinary pool entity underneath.
-    assert_eq!(pm.pool::<Hits>("hits").borrow().len(), 1);
+    assert_eq!(pm.pool::<Hits>("hits").get().len(), 1);
 }
 
 #[test]
@@ -51,13 +51,13 @@ fn the_canonical_pattern_works() {
     let pos = pm.pool::<Pos>("pos");
 
     let id = pm.id_add();
-    pos.borrow_mut().add(id, Pos { x: 0.0, y: 0.0 });
+    pos.get_mut().add(id, Pos { x: 0.0, y: 0.0 });
 
     pm.task_add("physics", 30.0, 0.0, {
         let pos = pos.clone();
         move |pm| {
             let dt = pm.loop_dt();
-            for (_, mut p) in pos.borrow_mut().iter_mut() {
+            for (_, mut p) in pos.get_mut().iter_mut() {
                 p.x += 10.0 * dt;
             }
         }
@@ -65,7 +65,7 @@ fn the_canonical_pattern_works() {
 
     pm.loop_once(0.5);
     pm.loop_once(0.5);
-    assert_eq!(pos.borrow().get(id), Some(&Pos { x: 10.0, y: 0.0 }));
+    assert_eq!(pos.get().get(id), Some(&Pos { x: 10.0, y: 0.0 }));
 }
 
 #[test]
@@ -75,8 +75,8 @@ fn id_remove_is_deferred_and_flushes_all_pools() {
     let hp = pm.pool::<u32>("hp");
 
     let id = pm.id_add();
-    pos.borrow_mut().add(id, Pos::default());
-    hp.borrow_mut().add(id, 100);
+    pos.get_mut().add(id, Pos::default());
+    hp.get_mut().add(id, 100);
 
     let seen_alive_after_remove = Rc::new(RefCell::new(false));
     pm.task_add("reaper", 10.0, 0.0, {
@@ -91,8 +91,8 @@ fn id_remove_is_deferred_and_flushes_all_pools() {
     pm.loop_once(1.0 / 60.0);
     assert!(*seen_alive_after_remove.borrow());
     assert!(!pm.id_alive(id));
-    assert!(!pos.borrow().contains(id));
-    assert!(!hp.borrow().contains(id));
+    assert!(!pos.get().contains(id));
+    assert!(!hp.get().contains(id));
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn removed_ids_recycle_with_bumped_generation() {
     let pos = pm.pool::<Pos>("pos");
 
     let a = pm.id_add();
-    pos.borrow_mut().add(a, Pos { x: 1.0, y: 0.0 });
+    pos.get_mut().add(a, Pos { x: 1.0, y: 0.0 });
     pm.id_remove(a);
     pm.loop_once(1.0 / 60.0); // flush: kill + (no peers) release
 
@@ -110,9 +110,9 @@ fn removed_ids_recycle_with_bumped_generation() {
     assert_eq!(b.generation(), a.generation() + 1, "generation should bump");
     assert!(!pm.id_alive(a) && pm.id_alive(b));
 
-    pos.borrow_mut().add(b, Pos { x: 2.0, y: 0.0 });
-    assert_eq!(pos.borrow().get(a), None, "stale handle must miss");
-    assert_eq!(pos.borrow().get(b), Some(&Pos { x: 2.0, y: 0.0 }));
+    pos.get_mut().add(b, Pos { x: 2.0, y: 0.0 });
+    assert_eq!(pos.get().get(a), None, "stale handle must miss");
+    assert_eq!(pos.get().get(b), Some(&Pos { x: 2.0, y: 0.0 }));
 }
 
 #[test]
@@ -120,13 +120,13 @@ fn tick_advances_and_stamps_changes() {
     let mut pm = Pm::new();
     let hp = pm.pool::<u32>("hp");
     let id = pm.id_add();
-    hp.borrow_mut().add(id, 100); // init-time add, stamped tick 1
+    hp.get_mut().add(id, 100); // init-time add, stamped tick 1
     let init_tick = pm.tick();
 
     pm.task_add("damage", 10.0, 0.0, {
         let hp = hp.clone();
         move |_| {
-            if let Some(mut h) = hp.borrow_mut().get_mut(id) {
+            if let Some(mut h) = hp.get_mut().get_mut(id) {
                 *h -= 1;
             }
         }
@@ -135,10 +135,10 @@ fn tick_advances_and_stamps_changes() {
     pm.loop_once(1.0 / 60.0);
 
     assert_eq!(pm.tick(), init_tick + 2);
-    assert_eq!(hp.borrow().changed_tick(id), Some(pm.tick()));
+    assert_eq!(hp.get().changed_tick(id), Some(pm.tick()));
     // A peer that acked the first tick still sees the later change.
-    assert_eq!(hp.borrow().changed_since(init_tick + 1).count(), 1);
-    assert_eq!(hp.borrow().changed_since(pm.tick()).count(), 0);
+    assert_eq!(hp.get().changed_since(init_tick + 1).count(), 1);
+    assert_eq!(hp.get().changed_since(pm.tick()).count(), 0);
 }
 
 #[test]
@@ -165,7 +165,9 @@ fn task_add_and_stop_from_inside_a_task() {
         move |pm| {
             log.borrow_mut().push("spawner");
             let log = log.clone();
-            pm.task_add("spawned", 5.0, 0.0, move |_| log.borrow_mut().push("spawned"));
+            pm.task_add("spawned", 5.0, 0.0, move |_| {
+                log.borrow_mut().push("spawned")
+            });
             pm.task_stop("spawner");
         }
     });
@@ -226,14 +228,20 @@ fn loop_rate_is_accurate_on_average() {
     // Relative sleeps accumulate ~0.5-1 ms oversleep per tick (~570+ ms);
     // absolute deadlines must hold the average. Generous upper bound for
     // loaded machines, tight enough to catch the accumulation bug.
-    assert!((0.46..0.56).contains(&elapsed), "120 ticks at 240Hz took {elapsed:.3}s");
+    assert!(
+        (0.46..0.56).contains(&elapsed),
+        "120 ticks at 240Hz took {elapsed:.3}s"
+    );
 }
 
 /// Manual probe: `cargo test --release jitter_probe -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn jitter_probe() {
-    for (label, spin_us) in [("plain sleep (spin=0)", 0u32), ("sleep+spin (default)", 2000)] {
+    for (label, spin_us) in [
+        ("plain sleep (spin=0)", 0u32),
+        ("sleep+spin (default)", 2000),
+    ] {
         let mut pm = Pm::new();
         pm.loop_rate = 60;
         pm.loop_spin_us = spin_us;
@@ -293,7 +301,6 @@ fn faulting_task_is_benched_and_the_loop_survives() {
     let fault = &pm.task_faults()[0];
     assert_eq!(fault.task, "flaky");
     assert_eq!(fault.error, "disk on fire");
-    assert_eq!(fault.module, None);
     pm.task_faults_clear();
     assert!(pm.task_faults().is_empty());
 }
@@ -301,158 +308,120 @@ fn faulting_task_is_benched_and_the_loop_survives() {
 #[test]
 fn tasks_can_use_question_mark() {
     let mut pm = Pm::new();
-    pm.task_add("parse", 10.0, 0.0, |_| -> Result<(), Box<dyn std::error::Error>> {
-        let n: i32 = "not a number".parse()?;
-        let _ = n;
-        Ok(())
-    });
+    pm.task_add(
+        "parse",
+        10.0,
+        0.0,
+        |_| -> Result<(), Box<dyn std::error::Error>> {
+            let n: i32 = "not a number".parse()?;
+            let _ = n;
+            Ok(())
+        },
+    );
     pm.loop_once(1.0 / 60.0);
     assert_eq!(pm.task_faults().len(), 1);
     assert!(pm.task_faults()[0].error.contains("invalid digit"));
 }
 
 #[test]
-fn module_add_and_remove_tear_down_as_a_unit() {
+fn task_add_or_replace_swaps_a_task_in_place() {
     let mut pm = Pm::new();
-    let outside = pm.pool::<Pos>("outside");
-    let runs = Rc::new(RefCell::new(0u32));
+    let log = Rc::new(RefCell::new(Vec::new()));
 
-    pm.module_add("physics", |pm| {
-        let pos = pm.pool::<Pos>("mod_pos");
-        let _hits = pm.single::<Hits>("mod_hits");
-        let runs = runs.clone();
-        pm.task_add("mod_task", 10.0, 0.0, move |_| {
-            *runs.borrow_mut() += 1;
-            let _ = &pos;
-        });
-    })
-    .unwrap();
-
-    pm.loop_once(1.0 / 60.0);
-    assert_eq!(*runs.borrow(), 1);
-
-    pm.module_remove("physics");
-    pm.loop_once(1.0 / 60.0);
-    // Task stopped; the pool registry forgot the module's pool, so a
-    // re-fetch creates a fresh one, while unowned pools are untouched.
-    assert_eq!(*runs.borrow(), 1);
-    let fresh = pm.pool::<Pos>("mod_pos");
-    assert_eq!(fresh.borrow().len(), 0);
-    // The unowned pool is untouched: a re-fetch sees the same data.
-    let outside_id = pm.id_add();
-    outside.borrow_mut().add(outside_id, Pos { x: 9.0, y: 9.0 });
-    assert_eq!(pm.pool::<Pos>("outside").borrow().get(outside_id), Some(&Pos { x: 9.0, y: 9.0 }));
-}
-
-#[test]
-fn module_init_error_rolls_back_registration() {
-    let mut pm = Pm::new();
-    let result = pm.module_add("broken", |pm| -> Result<(), String> {
-        let _pool = pm.pool::<Pos>("broken_pool");
-        pm.task_add("broken_task", 10.0, 0.0, |_| {});
-        Err("init failed".to_string())
+    pm.task_add("worker", 10.0, 0.0, {
+        let log = log.clone();
+        move |_| log.borrow_mut().push("v1")
     });
-    assert!(result.is_err());
+    pm.loop_once(1.0 / 60.0); // v1
 
-    // Nothing of the module survives: fresh pool on re-fetch, task gone.
-    let pool = pm.pool::<Pos>("broken_pool");
+    // Replace between ticks: the new body takes over, no duplicate.
+    pm.task_add_or_replace("worker", 10.0, 0.0, {
+        let log = log.clone();
+        move |_| log.borrow_mut().push("v2")
+    });
+    pm.loop_once(1.0 / 60.0);
+    pm.loop_once(1.0 / 60.0);
+    assert_eq!(*log.borrow(), vec!["v1", "v2", "v2"]);
+}
+
+#[test]
+fn task_add_or_replace_drops_the_old_body_mid_tick() {
+    // The hot-reload shape: a lower-priority "reloader" replaces a task
+    // that is *also scheduled this tick*. The old body must not survive
+    // alongside the new one — they share a name, so the merge keeps the
+    // most recent and drops the in-flight copy.
+    let mut pm = Pm::new();
+    let log = Rc::new(RefCell::new(Vec::new()));
+
+    pm.task_add("worker", 10.0, 0.0, {
+        let log = log.clone();
+        move |_| log.borrow_mut().push("v1")
+    });
+    pm.task_add("reload", 5.0, 0.0, {
+        let log = log.clone();
+        move |pm| {
+            let log = log.clone();
+            pm.task_add_or_replace("worker", 10.0, 0.0, move |_| log.borrow_mut().push("v2"));
+            pm.task_stop("reload");
+        }
+    });
+
+    pm.loop_once(1.0 / 60.0); // reload swaps worker; v1 still runs this tick, then is dropped
+    pm.loop_once(1.0 / 60.0);
+    pm.loop_once(1.0 / 60.0);
+    assert_eq!(*log.borrow(), vec!["v1", "v2", "v2"]);
+}
+
+#[test]
+fn pool_remove_drops_the_pool() {
+    let mut pm = Pm::new();
+    let pool = pm.pool::<Pos>("p");
     let id = pm.id_add();
-    pool.borrow_mut().add(id, Pos { x: 1.0, y: 0.0 });
-    pm.loop_once(1.0 / 60.0);
-    assert!(pm.task_stats().iter().all(|(name, _)| name != "broken_task"));
+    pool.get_mut().add(id, Pos { x: 1.0, y: 0.0 });
+    pm.pool_remove("p");
+    // A fresh fetch makes a new empty pool.
+    assert_eq!(pm.pool::<Pos>("p").get().len(), 0);
 }
 
-#[test]
-fn runtime_additions_by_module_tasks_belong_to_the_module() {
-    let mut pm = Pm::new();
-    let spawned_runs = Rc::new(RefCell::new(0u32));
-
-    pm.module_add("spawner_mod", |pm| {
-        let spawned_runs = spawned_runs.clone();
-        pm.task_add("spawner", 10.0, 0.0, move |pm| {
-            let spawned_runs = spawned_runs.clone();
-            pm.task_add("late_task", 5.0, 0.0, move |_| *spawned_runs.borrow_mut() += 1);
-            pm.task_stop("spawner");
-        });
-    })
-    .unwrap();
-
-    pm.loop_once(1.0 / 60.0); // spawner registers late_task
-    pm.loop_once(1.0 / 60.0); // late_task runs
-    assert_eq!(*spawned_runs.borrow(), 1);
-
-    pm.module_remove("spawner_mod");
-    pm.loop_once(1.0 / 60.0);
-    // late_task was added at runtime by a module task — still owned, still removed.
-    assert_eq!(*spawned_runs.borrow(), 1);
-}
+// --- per-entity access (Option) and pool locking -----------------------
 
 #[test]
-fn faulting_module_task_records_its_module() {
-    let mut pm = Pm::new();
-    pm.module_add("m", |pm| {
-        pm.task_add("doomed", 10.0, 0.0, |_| -> Result<(), String> { Err("oops".into()) });
-    })
-    .unwrap();
-    pm.loop_once(1.0 / 60.0);
-    assert_eq!(pm.task_faults()[0].module.as_deref(), Some("m"));
-}
-
-// --- fallible data access (try_* -> task faults) -----------------------
-
-#[test]
-fn bad_entity_access_faults_the_task_instead_of_crashing() {
+fn get_id_is_none_for_a_missing_entity() {
     let mut pm = Pm::new();
     let pos = pm.pool::<Pos>("pos");
     let ghost = pm.id_add(); // never added to the pool
+    assert!(pos.get_id(ghost).is_none());
+    assert!(pos.get_id_mut(ghost).is_none());
 
-    let healthy_runs = Rc::new(RefCell::new(0u32));
-    pm.task_add("reader", 10.0, 0.0, {
-        let pos = pos.clone();
-        move |_| -> Result<(), pm::TaskError> {
-            let p = pos.try_get(ghost)?; // Missing -> AccessError -> fault
-            let _ = *p;
-            Ok(())
-        }
-    });
-    pm.task_add("healthy", 20.0, 0.0, {
-        let healthy_runs = healthy_runs.clone();
-        move |_| *healthy_runs.borrow_mut() += 1
-    });
-
-    for _ in 0..3 {
-        pm.loop_once(1.0 / 60.0);
-    }
-    assert_eq!(*healthy_runs.borrow(), 3);
-    assert_eq!(pm.task_faults().len(), 1);
-    assert!(pm.task_faults()[0].error.contains("not in pool 'pos'"));
+    let id = pm.id_add();
+    pos.get_mut().add(id, Pos { x: 1.0, y: 1.0 });
+    assert_eq!(*pos.get_id(id).unwrap(), Pos { x: 1.0, y: 1.0 });
 }
 
 #[test]
-fn busy_pool_is_an_error_not_a_panic_via_try() {
+fn get_id_mut_stamps_the_changed_tick() {
     let mut pm = Pm::new();
     let pos = pm.pool::<Pos>("pos");
     let id = pm.id_add();
-    pos.borrow_mut().add(id, Pos { x: 1.0, y: 1.0 });
+    pos.get_mut().add(id, Pos::default());
+    pm.loop_once(1.0 / 60.0);
+    pm.loop_once(1.0 / 60.0);
 
-    let held = pos.borrow_mut(); // simulate another task holding the pool
-    assert!(matches!(pos.try_get(id), Err(pm::AccessError::Busy { .. })));
-    assert!(matches!(pos.try_mut(id), Err(pm::AccessError::Busy { .. })));
-    drop(held);
-    assert_eq!(*pos.try_get(id).unwrap(), Pos { x: 1.0, y: 1.0 });
+    let before = pos.get().changed_tick(id).unwrap();
+    pos.get_id_mut(id).unwrap().x = 5.0;
+    let after = pos.get().changed_tick(id).unwrap();
+    assert!(after > before, "get_id_mut must stamp for the sync layer");
 }
 
 #[test]
-fn try_mut_stamps_the_changed_tick() {
+fn a_singleton_survives_id_remove_of_its_entity() {
     let mut pm = Pm::new();
-    let pos = pm.pool::<Pos>("pos");
-    let id = pm.id_add();
-    pos.borrow_mut().add(id, Pos::default());
+    let hits = pm.single::<Hits>("hits");
+    hits.get_mut().0 = 9;
+    // Even if the singleton's id is fed to the removal flush, the pool
+    // lock keeps its entity (and the value) intact.
+    pm.id_remove(hits.id());
     pm.loop_once(1.0 / 60.0);
-    pm.loop_once(1.0 / 60.0);
-
-    let before = pos.borrow().changed_tick(id).unwrap();
-    pos.try_mut(id).unwrap().x = 5.0;
-    let after = pos.borrow().changed_tick(id).unwrap();
-    assert!(after > before, "try_mut must stamp for the sync layer");
+    assert_eq!(hits.get().0, 9);
+    assert_eq!(pm.pool::<Hits>("hits").get().len(), 1);
 }
