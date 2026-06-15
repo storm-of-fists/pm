@@ -5,6 +5,19 @@
 //! `std::ops` traits — `Add` gives you `a + b`, `Mul<f32>` gives
 //! `v * s`. The vector types are `Pod` so they can sit directly inside
 //! replicated components.
+//!
+//! ```
+//! use pm::{vec2, Vec2};
+//!
+//! let a = vec2(3.0, 4.0);
+//! assert_eq!(a.len(), 5.0);
+//! assert_eq!(a.norm().len(), 1.0);
+//!
+//! // Operator overloads (commutative scalar mul, component add/sub):
+//! let b = a + vec2(1.0, 0.0) - vec2(0.0, 4.0);
+//! assert_eq!(b, vec2(4.0, 0.0));
+//! assert_eq!(2.0 * vec2(1.0, 1.0), vec2(2.0, 2.0));
+//! ```
 
 use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 

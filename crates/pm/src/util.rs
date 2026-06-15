@@ -4,6 +4,27 @@
 //! Rust note: Rust has no implicit conversions, so these expose
 //! explicit `get()` / `is_on()` accessors rather than converting to
 //! their value.
+//!
+//! ```
+//! use pm::{Cooldown, RisingEdge};
+//!
+//! // Fire once per interval, accumulating dt across ticks.
+//! let mut fire = Cooldown::new(0.25);
+//! let mut shots = 0;
+//! for _ in 0..60 {
+//!     if fire.ready(1.0 / 60.0) {
+//!         shots += 1;
+//!     }
+//! }
+//! assert_eq!(shots, 4); // one second / 0.25 s
+//!
+//! // One-tick pulse on a false -> true transition (debounced intent).
+//! let mut jump = RisingEdge::default();
+//! assert!(jump.update(true)); // pressed this tick
+//! assert!(!jump.update(true)); // still held: no repeat
+//! assert!(!jump.update(false));
+//! assert!(jump.update(true)); // pressed again
+//! ```
 
 /// Value with dead-zone persistence: changes are blocked for `hold`
 /// seconds after each transition (anti-flicker).

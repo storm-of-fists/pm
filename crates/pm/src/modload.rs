@@ -74,6 +74,12 @@ struct ModEntry {
     loaded_mtime: Option<SystemTime>,
 }
 
+// TODO(roadmap): store mods (Tier 1) — a mod as its own `Pm` + thread,
+// handed only an `Arc<Store>` (see the threaded-stores note in kernel):
+// crash isolation and safe unload, because nothing of the mod's is
+// mapped into the host's address space the way today's dlopen'd cdylibs
+// are. Today's injected mods stay as the sharp-knife tier; wasm is a
+// maybe-later third tier.
 #[derive(Default)]
 pub struct ModLoader {
     mods: Vec<ModEntry>,

@@ -7,6 +7,9 @@
 //! `sim` (the end-to-end 100k-entity loop). These are the numbers to
 //! eyeball after kernel changes; threshold-gated regression checks can
 //! grow out of them later.
+//!
+//! TODO(roadmap): benchmarks — turn this suite into threshold-based
+//! regression gates (fail CI when a hot path regresses past a margin).
 
 use std::hint::black_box;
 use std::time::Instant;

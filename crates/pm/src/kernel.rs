@@ -193,6 +193,14 @@ pub struct Pm {
     /// The one store: every pool, type-erased. Typed access goes through
     /// `pool()` (downcast); the kernel's own bookkeeping (tick stamps,
     /// entity removal) goes through the `ErasedPool` vtable.
+    //
+    // TODO(roadmap): threaded stores — parallelism as an explicit door,
+    // not ambient scheduler magic. A `Pm` stays a thread (its own pools
+    // `Rc<RefCell>`); a *Store* is a frozen registry of
+    // `Arc<Mutex<Pool<T>>>` shared before threads spawn, so the type
+    // names the locking cost at the call site. Unlocks "store mods"
+    // (see modload): a mod as its own Pm + thread handed only an
+    // `Arc<Store>`, for crash isolation and safe unload.
     pools: HashMap<String, Rc<RefCell<dyn ErasedPool>>>,
     tasks: Vec<TaskEntry>,
     tasks_dirty: bool,

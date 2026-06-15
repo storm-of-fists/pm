@@ -27,7 +27,21 @@
 //! into an offscreen texture, then a fullscreen pass inverts the
 //! panini mapping per pixel (post3d.wgsl) — exact for all geometry.
 //! Set `panini = 0.0` to skip the pass entirely and render rectilinear
-//! straight to the swapchain.
+//! straight to the swapchain. Also note `fov_deg` is HORIZONTAL, and
+//! SDL_gpu's SPIR-V wants vertex-stage uniforms in descriptor set 1
+//! (`@group(1)` in WGSL; binding = the slot passed to
+//! `push_vertex_uniform_data`).
+//!
+//! SDL_gpu binding lore (the segfault tax, documented so nobody pays it
+//! twice): a "read-only storage texture" slot is a SAMPLED-IMAGE
+//! descriptor in SDL's Vulkan backend — declare it `texture_2d<f32>` in
+//! WGSL and `textureLoad` it; a real `texture_storage_2d<.., read>`
+//! mismatches the descriptor type and crashes the driver at dispatch.
+//! Read-write slots are true storage images. Sampled-with-sampler
+//! textures want combined image-samplers, which naga can't emit — avoid
+//! (`textureLoad` needs no sampler). The practical fallout: anything
+//! that would sample a texture in a fragment shader — HUD, sprites,
+//! decals — must instead be a compute pass that `textureLoad`s.
 
 use std::collections::HashMap;
 

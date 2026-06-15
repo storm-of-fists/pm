@@ -3,14 +3,22 @@
 //! position; queries scan the cells overlapping the query circle's
 //! bounding box and filter by exact distance.
 //!
-//! Intended usage — rebuild every frame:
-//! ```ignore
-//! grid.clear();
-//! for (id, m) in monsters.iter() { grid.insert(id, m.pos); }
-//! grid.query(centre, radius, |id, pos| { /* narrow-phase */ });
-//! ```
+//! Intended usage — rebuild every frame: `clear`, re-`insert` every
+//! entity by position, then `query` the neighborhood of each.
 //! Per-cell vectors keep their capacity across `clear`, so steady-state
 //! frames allocate nothing.
+//!
+//! ```
+//! use pm::{Id, SpatialGrid, vec2};
+//!
+//! let mut grid = SpatialGrid::new(100.0, 100.0, 10.0);
+//! grid.insert(Id::new(0, 0, 1), vec2(5.0, 5.0));
+//! grid.insert(Id::new(0, 0, 2), vec2(50.0, 50.0)); // far away
+//!
+//! let mut neighbors = 0;
+//! grid.query(vec2(6.0, 6.0), 4.0, |_id, _pos| neighbors += 1);
+//! assert_eq!(neighbors, 1); // exact distance — no false positives
+//! ```
 
 use crate::id::Id;
 use crate::math::Vec2;

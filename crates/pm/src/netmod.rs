@@ -162,6 +162,11 @@ impl<C: Pod> Commands<C> {
 
 /// Reliable events received this tick (server, `"net.events"`):
 /// (peer, type, payload).
+// TODO(roadmap): typed event queues — sugar over these raw
+// (type, payload) event singles so games push/pop concrete event enums
+// instead of hand-encoding bytes. Reliable events stay for true
+// must-see instants; everything a late joiner must know stays pool
+// state (TTL'd if it's a fact that fades).
 #[derive(Default)]
 pub struct ServerEvents(pub Vec<(u8, u16, Vec<u8>)>);
 

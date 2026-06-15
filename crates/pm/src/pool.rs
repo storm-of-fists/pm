@@ -185,6 +185,8 @@ impl<T> Pool<T> {
 
     /// Mutable iteration in dense order. Entries are stamped changed only
     /// when actually written through the `Mut` handle.
+    // TODO(roadmap): parallel iteration — rayon over the dense `values`
+    // slice as an explicit opt-in (`par_iter_mut`), never ambient.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Id, Mut<'_, T>)> {
         let tick = self.tick;
         self.ids
@@ -249,7 +251,22 @@ impl<T> Pool<T> {
     /// Mutable join: call `f(id, Mut<A>, Mut<B>)` for every entity in
     /// both pools. Callback style because a streaming iterator of two
     /// `Mut` borrows can't be expressed safely; each pair is disjoint,
-    /// so the callback is.
+    /// so the callback is. Entities in only one pool are skipped.
+    ///
+    /// ```
+    /// use pm::{Id, Pool};
+    ///
+    /// let mut pos: Pool<f32> = Pool::new();
+    /// let mut vel: Pool<f32> = Pool::new();
+    /// let car = Id::new(0, 0, 1);
+    /// pos.add(car, 0.0);
+    /// vel.add(car, 3.0);
+    /// pos.add(Id::new(0, 0, 2), 99.0); // no velocity -> skipped by the join
+    ///
+    /// pos.each_with(&mut vel, |_id, mut p, v| *p += *v);
+    /// assert_eq!(pos.get(car), Some(&3.0));
+    /// assert_eq!(pos.get(Id::new(0, 0, 2)), Some(&99.0)); // untouched
+    /// ```
     pub fn each_with<U>(
         &mut self,
         other: &mut Pool<U>,

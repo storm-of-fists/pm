@@ -21,6 +21,16 @@
 //! again next time, never lost. Run the net-send task at low priority
 //! (first in the tick) to avoid the duplicate sends entirely.
 
+// TODO(roadmap): known limits, deliberate until a workload demands
+// otherwise — per-peer pack scan is O(entities) per net tick (interest
+// management is future work); lag-compensation history and
+// reconnect/peer-id reassignment are unbuilt; u32 ticks last ~2.2 years.
+// TODO(roadmap): per-pool sync modifiers — `sync_with(&pool,
+// SyncMode::interp())` to formalize the presentation-side interpolation
+// (see smooth), and a `duration` modifier (TTL on transient entries +
+// a server-side past-tick ring). That ring is what unlocks
+// lag-compensated contact resolution: rewind other entities to the view
+// the acting peer actually saw.
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;

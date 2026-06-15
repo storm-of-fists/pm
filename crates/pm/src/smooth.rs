@@ -52,6 +52,20 @@ pub fn coast_blend(pos: Vec2, vel: Vec2, auth_pos: Vec2, dt: f32, blend: f32) ->
 /// Drive against `pool_interp` once per smoothing tick; tune `delay` to a
 /// snapshot interval or two (long enough to ride the worst loss burst,
 /// short enough that other entities don't feel laggy).
+///
+/// ```
+/// use pm::{Id, InterpBuffer};
+///
+/// let mut buf = InterpBuffer::new(0.1); // render 100 ms behind newest
+/// let id = Id::new(0, 0, 1);
+/// buf.push(id, 0.0, 0.0); // sample at t=0.0
+/// buf.push(id, 0.1, 10.0); // sample at t=0.1 (moved 0 -> 10)
+///
+/// // At now=0.15 we render now-delay=0.05 — halfway *between* the two
+/// // known-true samples, never extrapolated past the newest.
+/// let lerp = |a: &f32, b: &f32, t: f32| a + (b - a) * t;
+/// assert_eq!(buf.sample(id, 0.15, lerp), Some(5.0));
+/// ```
 pub struct InterpBuffer<T> {
     /// Per entity, `(sample_time, value)` oldest-first. Only genuinely new
     /// values append — a held/stationary entity adds nothing and reads its
@@ -152,6 +166,10 @@ impl<T: Copy + PartialEq> InterpBuffer<T> {
 /// interpolated value out (via the game's angle-/field-aware `lerp`).
 /// Entities gone from `auth` drop from both the buffer and `draw`. The
 /// snapshot-interpolation counterpart to `pool_mirror` + `coast_blend`.
+// TODO(roadmap): promote this to a per-pool sync modifier —
+// `sync_with(&pool, SyncMode::interp())` — so a synced pool smooths
+// itself instead of every game wiring up a draw pool by hand (see the
+// sync-modifiers note in net).
 pub fn pool_interp<T: Copy + PartialEq + 'static>(
     auth: &PoolHandle<T>,
     draw: &PoolHandle<T>,
