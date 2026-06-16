@@ -20,6 +20,11 @@ pub extern "C-unwind" fn pm_mod_abi() -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C-unwind" fn pm_mod_manifest() -> *const std::os::raw::c_char {
+    pm::mod_manifest_ptr()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C-unwind" fn pm_mod_init(pm: &mut Pm) -> bool {
     let monster = pm.pool::<Monster>("monster");
     let monster_srv = pm.pool::<MonsterSrv>("monster_srv");

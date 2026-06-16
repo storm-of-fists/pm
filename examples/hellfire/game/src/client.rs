@@ -3,7 +3,7 @@
 //! plus the bot's input task. The transport is pm's net module; the SDL
 //! window/input/render live in sdl_client.rs.
 
-use pm::{NetInput, NetStatus, Outbox, Pm, QuicClient, Rng, coast_blend, pool_mirror, vec2};
+use pm::{NetInput, NetStatus, Outbox, Pm, Rng, coast_blend, pool_mirror, vec2};
 
 use crate::common::*;
 
@@ -62,24 +62,20 @@ pub struct Pools {
 }
 
 pub fn client_pools(pm: &mut Pm) -> Pools {
-    let pools = Pools {
-        player: pm.pool("player"),
-        monster: pm.pool("monster"),
-        bullet: pm.pool("bullet"),
-        status: pm.pool("status"),
-        dbg: pm.pool("dbg"),
-        roster: pm.pool("roster"),
+    Pools {
+        // Replicated (registered for sync; a replica reads synced singletons
+        // as plain pools, so status/dbg come through `sync_pool` here too).
+        player: pm.sync_pool("player"),
+        monster: pm.sync_pool("monster"),
+        bullet: pm.sync_pool("bullet"),
+        status: pm.sync_pool("status"),
+        dbg: pm.sync_pool("dbg"),
+        roster: pm.sync_pool("roster"),
+        // Local draw pools (smoothing targets, never networked).
         monster_draw: pm.pool("monster_draw"),
         bullet_draw: pm.pool("bullet_draw"),
         player_draw: pm.pool("player_draw"),
-    };
-    pm.sync(&pools.player);
-    pm.sync(&pools.monster);
-    pm.sync(&pools.bullet);
-    pm.sync(&pools.status);
-    pm.sync(&pools.dbg);
-    pm.sync(&pools.roster);
-    pools
+    }
 }
 
 pub fn current_status(status: &pm::PoolHandle<Status>) -> Status {
@@ -94,8 +90,8 @@ pub fn current_status(status: &pm::PoolHandle<Status>) -> Status {
 /// Smoothing + diag tasks shared by player and bot clients; the
 /// transport is the net module. The input layer (SDL or bot) writes the
 /// `"net.input"` single; rendering reads the draw pools.
-pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, pools: &Pools, name: String) {
-    pm.connect::<InputCmd>(quic, 60.0);
+pub fn add_client_tasks(pm: &mut Pm, pools: &Pools, name: String) {
+    // No connect here — `Pm::run` does that once the schema is complete.
     let stats = pm.single::<NetStatus>("net.status");
 
     // Queued before the handshake even exists — the module holds
@@ -170,10 +166,9 @@ pub fn add_client_tasks(pm: &mut Pm, quic: QuicClient, pools: &Pools, name: Stri
 /// Headless bot: wanders, hunts the nearest monster it can see in its
 /// own replicated state, restarts the game when it ends.
 pub fn run_bot(n: u32) {
-    let mut pm = Pm::new();
+    let mut pm = Pm::client(ADDR, 60.0);
     let pools = client_pools(&mut pm);
-    let quic = QuicClient::connect(ADDR, &pm.net_schema()).expect("bot connect");
-    add_client_tasks(&mut pm, quic, &pools, format!("bot{n}"));
+    add_client_tasks(&mut pm, &pools, format!("bot{n}"));
 
     let cmd = pm.single::<NetInput<InputCmd>>("net.input");
     let outbox = pm.single::<Outbox>("net.out");
@@ -236,5 +231,5 @@ pub fn run_bot(n: u32) {
     });
 
     pm.loop_rate = 60;
-    pm.loop_run();
+    let _ = pm.run::<InputCmd>(); // a bot with no server to reach just exits
 }

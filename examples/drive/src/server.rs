@@ -2,58 +2,47 @@
 //! layer (`pm.sync` + `pm.serve`) — this file is pure gameplay: spawn a
 //! car per peer, step each car with its command-frame input.
 
-use std::collections::HashMap;
-
-use pm::{Commands, Id, PeerEvents, Pm, QuicServer, ServerOutbox};
+use pm::{Commands, Id, PeerEvents, Pm, ServerOwn};
 
 use crate::common::*;
 
-#[derive(Default)]
-struct Garage(HashMap<u8, Id>);
-
 pub fn run(quiet: bool) {
-    let mut pm = Pm::new();
-    let car = pm.pool::<Car>("car");
-    let score = pm.pool::<Score>("score");
-    let garage = pm.single::<Garage>("garage");
-
+    let mut pm = Pm::server(ADDR);
     // Two replicated pools joined by id: motion (predicted client-side) and
-    // score (authoritative-only). Order must match the clients' sync calls.
-    pm.sync(&car);
-    pm.sync(&score);
-    let quic = QuicServer::bind(ADDR, &pm.net_schema()).unwrap_or_else(|e| {
-        eprintln!("cannot bind {ADDR}: {e}");
-        eprintln!("(a previous drive may still be running: pkill -x drive)");
-        std::process::exit(1);
-    });
+    // score (authoritative-only). Registration order is irrelevant — pools
+    // are keyed by name on the wire.
+    let car = pm.sync_pool::<Car>("car");
+    let score = pm.sync_pool::<Score>("score");
     if !quiet {
         eprintln!("drive server on {ADDR}");
     }
-    pm.serve::<Drive>(quic);
     let peers = pm.single::<PeerEvents>("net.peers");
     let cmds = pm.single::<Commands<Drive>>("net.cmds");
-    let out = pm.single::<ServerOutbox>("net.out");
+    // `ServerOwn` is the built-in peer→entity channel: recording a peer's
+    // car here both ships its id down (so the client knows which car is
+    // its own — no bespoke handshake) and serves as our garage lookup.
+    let own = pm.single::<ServerOwn>("net.own");
 
     // Joins and leaves: a car per peer (prio 10 — after the net task).
     pm.task_add("roster", 10.0, 0.0, {
         let car = car.clone();
         let score = score.clone();
-        let garage = garage.clone();
+        let own = own.clone();
         move |pm| {
             for &p in &peers.get().joined {
                 let id = pm.id_add();
                 car.get_mut().add(id, spawn_car(p));
                 score.get_mut().add(id, Score::default());
-                garage.get_mut().0.insert(p, id);
-                out.get_mut().send(p, EV_VEHICLE, &id.0.to_le_bytes());
+                own.get_mut().set(p, id);
                 if !quiet {
                     eprintln!("[server] peer {p} joined");
                 }
             }
             for &p in &peers.get().left {
-                if let Some(id) = garage.get_mut().0.remove(&p) {
+                if let Some(id) = own.get().get(p) {
                     pm.id_remove(id);
                 }
+                own.get_mut().clear(p);
                 if !quiet {
                     eprintln!("[server] peer {p} left");
                 }
@@ -63,11 +52,11 @@ pub fn run(quiet: bool) {
 
     pm.task_add("drive", 30.0, 0.0, {
         let car = car.clone();
-        let garage = garage.clone();
+        let own = own.clone();
         move |_pm| {
             let mut cmds = cmds.get_mut();
             let mut car = car.get_mut();
-            for (&peer, &id) in &garage.get().0 {
+            for (&peer, &id) in &own.get().0 {
                 // pop = command-frame consumption: one input per tick,
                 // hold-when-dry, bounded skip-ahead. The consumed seq is
                 // echoed automatically for prediction reconciliation.
@@ -156,5 +145,9 @@ pub fn run(quiet: bool) {
     }
 
     pm.loop_rate = 60;
-    pm.loop_run();
+    pm.run::<Drive>().unwrap_or_else(|e| {
+        eprintln!("cannot serve {ADDR}: {e}");
+        eprintln!("(a previous drive may still be running: pkill -x drive)");
+        std::process::exit(1);
+    });
 }

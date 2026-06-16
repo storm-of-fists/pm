@@ -8,8 +8,7 @@
 //! per-frame path.
 
 use pm::{
-    CamAnchor, CamRig, CamView, Mat4, Pm, Predictor, Vec3, camera_install, camera_manager,
-    camera_track, vec3,
+    CamAnchor, CamRig, CamView, Mat4, Pm, Vec3, camera_install, camera_manager, camera_track, vec3,
 };
 use pm_sdl::gpu3d::{Frame3, Renderer3d, bake, box_tris, checker_ground, panini_for_fov};
 use pm_sdl::sdl3;
@@ -18,7 +17,7 @@ use sdl3::keyboard::Scancode;
 
 use pm::{NetInput, NetStatus};
 
-use crate::bot_client::{Stats, add_client_tasks, quic_connect};
+use crate::bot_client::add_client_tasks;
 use crate::common::*;
 
 const W: u32 = 1280;
@@ -42,21 +41,17 @@ pub struct InGameMenu {
 }
 
 pub fn run() {
-    let mut pm = Pm::new();
-    let car = pm.pool::<Car>("car");
-    let score = pm.pool::<Score>("score");
-    let draw = pm.pool::<Car>("car_draw");
-    // Same synced pools in the same order as the server (motion, then score).
-    pm.sync(&car);
-    pm.sync(&score);
-    let quic = quic_connect(&pm.net_schema());
+    let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
+    // Same synced pools as the server (order doesn't matter — keyed by name).
+    let car = pm.sync_pool::<Car>("car");
+    let score = pm.sync_pool::<Score>("score");
     eprintln!("connecting to {ADDR} ...");
-    add_client_tasks(&mut pm, quic, &car, &draw);
+    // `draw` is the smoothed view to render: predicted local car,
+    // interpolated remotes, maintained by the net module.
+    let (pred, draw) = add_client_tasks(&mut pm, &car);
 
     let cmd = pm.single::<NetInput<Drive>>("net.input");
     let status = pm.single::<NetStatus>("net.status");
-    let stats = pm.single::<Stats>("stats");
-    let pred = pm.single::<Predictor<Car, Drive>>("pred");
     // Install the camera module now so we can capture its manager single
     // for the input task; the rig is mounted later, once we know our car.
     camera_install(&mut pm);
@@ -161,10 +156,9 @@ pub fn run() {
     // predicted draw state) and hands back a rack; we mount three cameras
     // on it and show the chase. Then this task retires itself.
     pm.task_add("rig_cams", 32.0, 0.0, {
-        let stats = stats.clone();
         let draw = draw.clone();
         move |pm| {
-            let Some(id) = stats.get().mine else {
+            let Some(id) = pm.mine() else {
                 return;
             };
             let draw = draw.clone();
@@ -185,7 +179,6 @@ pub fn run() {
     });
 
     pm.task_add("render", 70.0, 0.0, {
-        let stats = stats.clone();
         let view = cam_view.clone();
         let score = score.clone();
         move |pm| {
@@ -273,7 +266,7 @@ pub fn run() {
                 // Read RAW from the authoritative `score` pool — server-owned,
                 // never predicted — so the number and its rate can't disagree
                 // with each other or lag the truth.
-                let mine = stats.get().mine;
+                let mine = pm.mine();
                 let (points, rate) = match mine.and_then(|id| score.get().get(id).copied()) {
                     Some(s) => (s.points, s.rate),
                     None => (0.0, 0.0),
@@ -306,7 +299,7 @@ pub fn run() {
                     st.peer,
                     speed.abs(),
                     st.rtt_ms,
-                    stats.get().corrections,
+                    pred.get().corrections,
                 );
                 let _ = window.set_title(&title);
             }
@@ -315,5 +308,5 @@ pub fn run() {
 
     // Display refresh paces the loop (WSLg ignores vsync; see solids).
     pm.loop_rate = refresh;
-    pm.loop_run();
+    pm.run::<Drive>().expect("connect");
 }

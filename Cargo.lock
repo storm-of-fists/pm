@@ -509,6 +509,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod_template"
+version = "0.1.0"
+dependencies = [
+ "hellfire_core",
+ "pm",
+]
+
+[[package]]
 name = "naga"
 version = "29.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

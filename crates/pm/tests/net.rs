@@ -194,6 +194,43 @@ fn client_local_entities_coexist_with_replicated_ones() {
     assert_eq!(c_pos.get().get(remote), Some(&Pos { x: 1.0, y: 1.0 }));
 }
 
+/// Pools are addressed on the wire by a hash of their name, not by
+/// registration order — so the two ends may `sync` them in different
+/// orders and replication still lands each section in the right pool.
+/// Two pools with *different* value sizes make a misalignment fatal
+/// (mismatched byte counts), so this only passes if the keying is correct.
+#[test]
+fn pool_order_is_irrelevant_keyed_by_name() {
+    let mut server = Pm::new();
+    let s_pos = server.pool::<Pos>("pos");
+    let s_tag = server.pool::<u32>("tag");
+    let mut snet = NetServer::new(&mut server);
+    // Server registers pos then tag...
+    snet.pool_sync("pos", &s_pos);
+    snet.pool_sync("tag", &s_tag);
+    snet.peer_add(1);
+
+    let mut client = Pm::new();
+    client.local_peer = 1;
+    let c_tag = client.pool::<u32>("tag");
+    let c_pos = client.pool::<Pos>("pos");
+    let mut cnet = NetClient::new();
+    // ...client registers tag then pos (reversed).
+    cnet.pool_sync("tag", &c_tag);
+    cnet.pool_sync("pos", &c_pos);
+
+    let id = server.id_add();
+    s_pos.get_mut().add(id, Pos { x: 3.0, y: 4.0 });
+    s_tag.get_mut().add(id, 0xABCD);
+    server.loop_once(DT);
+
+    let snap = snet.snapshot(&server, 1).unwrap();
+    cnet.apply(&mut client, &snap).unwrap();
+
+    assert_eq!(c_pos.get().get(id), Some(&Pos { x: 3.0, y: 4.0 }));
+    assert_eq!(c_tag.get().get(id), Some(&0xABCD));
+}
+
 #[test]
 fn malformed_snapshots_error_instead_of_panicking() {
     let (mut server, mut snet, mut client, cnet) = server_client_pair();
@@ -359,7 +396,7 @@ fn dense_pool_streams_through_a_byte_budget() {
     }
     server.loop_once(DT);
     let quiet = snet.snapshot_budgeted(&server, 1, BUDGET).unwrap();
-    // Header (8) + removal count (4) + section count (2) + one section
-    // header (6) and zero entries.
-    assert_eq!(quiet.len(), 20, "fully-confirmed world should pack empty");
+    // Header (12: tick + input-seq + avatar) + removal count (4) + section
+    // count (2) + one section header (6) and zero entries.
+    assert_eq!(quiet.len(), 24, "fully-confirmed world should pack empty");
 }

@@ -1,0 +1,7 @@
+# Pinned so dylib mods compile against the byte-identical pm the host
+# links. A hellfire mod resolves host types by TypeId, which is only
+# stable within one rustc; a mod author who uses this file gets the
+# engine's exact compiler automatically and clears the most common
+# silent ABI mismatch. Bump in lockstep with the engine's release rustc.
+[toolchain]
+channel = "1.96.0"

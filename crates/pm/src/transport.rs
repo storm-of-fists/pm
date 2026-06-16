@@ -40,9 +40,14 @@ const INPUT_REDUNDANCY: usize = 8;
 // --- small helpers --------------------------------------------------------
 
 fn schema_encode(schema: &[(String, usize)]) -> Vec<u8> {
+    // Sort by name so the handshake compare is registration-order
+    // independent — both ends agree as long as the *set* of (name, size)
+    // matches, regardless of the order pools were registered in.
+    let mut schema = schema.to_vec();
+    schema.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = Vec::new();
     out.extend_from_slice(&(schema.len() as u16).to_le_bytes());
-    for (name, size) in schema {
+    for (name, size) in &schema {
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(&(*size as u32).to_le_bytes());

@@ -25,11 +25,10 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::time::Duration;
 
 use pm::{
     AppliedLog, ClientEvents, Commands, Id, NetInput, NetStatus, PeerEvents, Pm, Predictor,
-    QuicClient, QuicServer, SentLog, ServerOutbox, pool_mirror,
+    SentLog, ServerOutbox, pool_mirror,
 };
 
 const ADDR: &str = "127.0.0.1:47777";
@@ -86,37 +85,20 @@ fn wrap(v: f32) -> f32 {
     }
 }
 
-fn env_f32(name: &str) -> f32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0)
-}
-
 // --- server -------------------------------------------------------------
 
 #[derive(Default)]
 struct Garage(HashMap<u8, Id>); // peer -> vehicle
 
 fn run_server(quiet: bool) {
-    let mut pm = Pm::new();
-    let car = pm.pool::<Car>("car");
+    let mut pm = Pm::server(ADDR);
+    let car = pm.sync_pool::<Car>("car");
     let garage = pm.single::<Garage>("garage");
-
-    pm.sync(&car);
-    // Bind failure must kill the whole process loudly — a silent thread
-    // panic here once let the demo piggyback a stale server on the port.
-    let quic = QuicServer::bind(ADDR, &pm.net_schema()).unwrap_or_else(|e| {
-        eprintln!("cannot bind {ADDR}: {e}");
-        eprintln!("(a previous demo may still be running: pkill -x demo)");
-        std::process::exit(1);
-    });
+    // The pump/ack/echo/snapshot loop is pm's net module; the game reads
+    // the "net.*" singles it publishes.
     if !quiet {
         eprintln!("pm demo server on {ADDR}");
     }
-    // The pump/ack/echo/snapshot loop is pm's net module; the game reads
-    // the "net.*" singles it publishes.
-    pm.serve::<Drive>(quic);
     let peers = pm.single::<PeerEvents>("net.peers");
     let cmds = pm.single::<Commands<Drive>>("net.cmds");
     let out = pm.single::<ServerOutbox>("net.out");
@@ -194,20 +176,21 @@ fn run_server(quiet: bool) {
         });
     }
 
+    // Bind failure must kill the whole process loudly — a silent thread
+    // panic here once let the demo piggyback a stale server on the port.
     pm.loop_rate = 60;
-    pm.loop_run();
+    pm.run::<Drive>().unwrap_or_else(|e| {
+        eprintln!("cannot serve {ADDR}: {e}");
+        eprintln!("(a previous demo may still be running: pkill -x demo)");
+        std::process::exit(1);
+    });
 }
 
 // --- bot client -----------------------------------------------------------
 
 fn run_bot(phase: f32) {
-    let mut pm = Pm::new();
-    let car = pm.pool::<Car>("car");
-    pm.sync(&car);
-    let Ok(quic) = QuicClient::connect(ADDR, &pm.net_schema()) else {
-        return;
-    };
-    pm.connect::<Drive>(quic, 1.0 / FIXED_DT);
+    let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
+    pm.sync_pool::<Car>("car");
 
     let cmd = pm.single::<NetInput<Drive>>("net.input");
     pm.task_add("bot", 4.0, 0.0, move |pm| {
@@ -219,7 +202,7 @@ fn run_bot(phase: f32) {
     });
 
     pm.loop_rate = 60;
-    pm.loop_run();
+    let _ = pm.run::<Drive>(); // a bot with no server to reach just exits
 }
 
 // --- player client ----------------------------------------------------------
@@ -272,25 +255,14 @@ fn heading_char(h: f32) -> u8 {
     CHARS[oct.min(7)]
 }
 
-/// Build the QUIC client with the PM_LAG_MS / PM_LOSS link simulation.
-fn client_connect(schema: &[(String, usize)]) -> QuicClient {
-    let mut quic = QuicClient::connect(ADDR, schema).expect("connect");
-    let lag_ms = env_f32("PM_LAG_MS");
-    let loss = env_f32("PM_LOSS");
-    if lag_ms > 0.0 || loss > 0.0 {
-        quic.link_lag_set(Duration::from_secs_f32(lag_ms / 1000.0), loss);
-    }
-    quic
-}
-
 /// Everything a player client needs except input and rendering: the
 /// prediction task (driven by the net module's sent/applied logs), the
-/// smoothing/dead-reckoning task, and the profiling collector. The
-/// input layer writes the `"net.input"` single, the renderer reads
-/// `car_draw`, `Stats`, and `"net.status"`.
-fn add_client_tasks(pm: &mut Pm, quic: QuicClient, car: &pm::PoolHandle<Car>, draw: &pm::PoolHandle<Car>) {
-    pm.connect::<Drive>(quic, 1.0 / FIXED_DT);
-
+/// smoothing/dead-reckoning task, and the profiling collector. pm owns the
+/// transport (`PM_LAG_MS`/`PM_LOSS` simulate the link). The input layer
+/// writes the `"net.input"` single, the renderer reads `car_draw`, `Stats`,
+/// and `"net.status"`.
+fn add_client_tasks(pm: &mut Pm, car: &pm::PoolHandle<Car>, draw: &pm::PoolHandle<Car>) {
+    // No connect here — `Pm::run` does that once the schema is complete.
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
     let stats = pm.single::<Stats>("stats");
     let events = pm.single::<ClientEvents>("net.events");
@@ -415,17 +387,15 @@ fn add_client_tasks(pm: &mut Pm, quic: QuicClient, car: &pm::PoolHandle<Car>, dr
 }
 
 fn run_player() {
-    let mut pm = Pm::new();
-    let car = pm.pool::<Car>("car"); // net state from the server (synced)
+    let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
+    let car = pm.sync_pool::<Car>("car"); // net state from the server (synced)
     let draw = pm.pool::<Car>("car_draw"); // display state (local)
     let keys = pm.single::<Keys>("keys");
     let stats = pm.single::<Stats>("stats");
 
-    pm.sync(&car);
-    let quic = client_connect(&pm.net_schema());
     eprintln!("connecting to {ADDR} ...");
     let _raw = RawTerm::enable();
-    add_client_tasks(&mut pm, quic, &car, &draw);
+    add_client_tasks(&mut pm, &car, &draw);
     let cmd = pm.single::<NetInput<Drive>>("net.input");
     let status = pm.single::<NetStatus>("net.status");
 
@@ -523,7 +493,7 @@ fn run_player() {
     });
 
     pm.loop_rate = 60;
-    pm.loop_run();
+    pm.run::<Drive>().expect("connect");
 }
 
 fn main() {

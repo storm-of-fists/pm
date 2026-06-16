@@ -121,11 +121,11 @@ pub use kernel::{
     IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
 };
 pub use math::{Mat4, Rng, Vec2, Vec3, vec2, vec3};
-pub use modload::{MOD_ABI, ModLoader, mod_abi};
+pub use modload::{BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr};
 pub use net::{Applied, NetClient, NetError, NetServer, Outbox};
 pub use netmod::{
     AppliedLog, ClientEvents, Commands, NET_PRIO, NetInput, NetStatus, PeerEvents, SentLog,
-    ServerEvents, ServerOutbox,
+    ServerEvents, ServerOutbox, ServerOwn,
 };
 pub use pool::{Mut, Pool};
 pub use predict::Predictor;

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use pm::{Commands, Id, PeerEvents, Pm, QuicServer, Rng, ServerEvents, SpatialGrid, Vec2, vec2};
+use pm::{Commands, Id, PeerEvents, Pm, Rng, ServerEvents, SpatialGrid, Vec2, vec2};
 
 use crate::common::*;
 
@@ -37,36 +37,23 @@ fn report_dir() -> String {
 }
 
 pub fn run(quiet: bool) {
-    let mut pm = Pm::new();
-    let player = pm.pool::<Player>("player");
-    let monster = pm.pool::<Monster>("monster");
-    let bullet = pm.pool::<Bullet>("bullet");
-    let status = pm.single::<Status>("status");
-    let roster = pm.pool::<Roster>("roster");
-    let dbg = pm.single::<Dbg>("dbg");
-    // Server-only companion pools, keyed by the same ids.
+    let mut pm = Pm::server(ADDR);
+    let player = pm.sync_pool::<Player>("player");
+    let monster = pm.sync_pool::<Monster>("monster");
+    let bullet = pm.sync_pool::<Bullet>("bullet");
+    let status = pm.sync_single::<Status>("status");
+    let roster = pm.sync_pool::<Roster>("roster");
+    let dbg = pm.sync_single::<Dbg>("dbg");
+    // Server-only companion pools, keyed by the same ids (local, not synced).
     let player_srv = pm.pool::<PlayerSrv>("player_srv");
     let monster_srv = pm.pool::<MonsterSrv>("monster_srv");
     let bullet_srv = pm.pool::<BulletSrv>("bullet_srv");
 
-    pm.sync(&player);
-    pm.sync(&monster);
-    pm.sync(&bullet);
-    pm.sync(status.pool());
-    pm.sync(dbg.pool());
-    pm.sync(&roster);
-
-    let quic = QuicServer::bind(ADDR, &pm.net_schema()).unwrap_or_else(|e| {
-        eprintln!("cannot bind {ADDR}: {e}");
-        eprintln!("(a previous hellfire may still be running: pkill -x hellfire)");
-        std::process::exit(1);
-    });
+    // The pump/ack/echo/snapshot loop is pm's net module; gameplay reads
+    // the "net.*" singles it publishes.
     if !quiet {
         eprintln!("hellfire server on {ADDR}");
     }
-    // The pump/ack/echo/snapshot loop is pm's net module; gameplay reads
-    // the "net.*" singles it publishes.
-    pm.serve::<InputCmd>(quic);
     let peers = pm.single::<PeerEvents>("net.peers");
     let cmds = pm.single::<Commands<InputCmd>>("net.cmds");
     let events = pm.single::<ServerEvents>("net.events");
@@ -705,12 +692,23 @@ pub fn run(quiet: bool) {
             path.display(),
             if release { "--release " } else { "" },
         );
+        // Print the host build a mod must match — the manifest the ABI
+        // gate diffs against. Authors building out-of-tree mods target
+        // exactly these values.
+        eprintln!("[server] mods: build mods against:");
+        for (k, v) in pm::build_manifest() {
+            eprintln!("[server] mods:   {k} = {v}");
+        }
         mods.watch(path);
     }
     pm.task_add("mods", 2.0, 1.0, move |pm| mods.poll(pm));
 
     pm.loop_rate = 60;
-    pm.loop_run();
+    pm.run::<InputCmd>().unwrap_or_else(|e| {
+        eprintln!("cannot serve {ADDR}: {e}");
+        eprintln!("(a previous hellfire may still be running: pkill -x hellfire)");
+        std::process::exit(1);
+    });
 }
 
 fn restart(

@@ -4,7 +4,7 @@
 //! that trades exclusively in plain data — games read and write singles
 //! and never touch the transport.
 //!
-//! Server (`pm.sync(&pool)…` then `pm.serve::<C>(quic)`), `C` the input pod:
+//! Server (`Pm::server(addr)`, `pm.sync_pool…`, `pm.run::<C>()`), `C` the input pod:
 //! - `"net.peers"`  [`PeerEvents`] — who joined/left this tick
 //! - `"net.cmds"`   [`Commands<C>`] — per-peer input queues. `pop` is
 //!   the command-frame model (one per tick, bounded skip-ahead),
@@ -13,7 +13,7 @@
 //! - `"net.events"` [`ServerEvents`] — reliable events received this tick
 //! - `"net.out"`    [`ServerOutbox`] — queue reliable events to a peer
 //!
-//! Client (`pm.sync(&pool)…` then `pm.connect::<C>(quic, input_hz)`):
+//! Client (`Pm::client(addr, hz)`, `pm.sync_pool…`, `pm.run::<C>()`):
 //! - `"net.status"`  [`NetStatus`] — peer / rtt / snapshot count / connected
 //! - `"net.input"`   [`NetInput<C>`] — the game writes its current
 //!   command; the module sends it at a fixed `input_hz` cadence,
@@ -36,8 +36,11 @@ use std::collections::{HashMap, VecDeque};
 
 use bytemuck::Pod;
 
-use crate::kernel::{PoolHandle, Pm};
+use crate::id::Id;
+use crate::kernel::{PoolHandle, Pm, SingleHandle};
 use crate::net::{Applied, NetClient, NetServer, Outbox, SyncSet};
+use crate::predict::Predictor;
+use crate::smooth::{InterpBuffer, pool_interp};
 use crate::transport::{QuicClient, QuicServer};
 
 /// Priority of the net task both modules register. It runs first in the
@@ -45,40 +48,244 @@ use crate::transport::{QuicClient, QuicServer};
 /// stamped entries); register game tasks above it.
 pub const NET_PRIO: f32 = 5.0;
 
-/// Networking is part of the kernel: register pools with [`Pm::sync`],
-/// then pick a role with [`Pm::serve`] / [`Pm::connect`]. The transport
-/// pumps in a single task; games only ever touch the `"net.*"` singles.
+/// Artificial link delay/loss from `PM_LAG_MS` (milliseconds) and
+/// `PM_LOSS` (0..1 drop fraction) — the simulation knob clients used to
+/// wire by hand around the QUIC endpoint, now read by `serve`/`connect`.
+/// `None` when both are unset or zero.
+fn link_lag_from_env() -> Option<(std::time::Duration, f32)> {
+    let env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+    };
+    let lag_ms = env("PM_LAG_MS");
+    let loss = env("PM_LOSS");
+    (lag_ms > 0.0 || loss > 0.0)
+        .then(|| (std::time::Duration::from_secs_f32(lag_ms / 1000.0), loss))
+}
+
+/// Networking role + endpoint, set once at construction
+/// (`Pm::server`/`Pm::client`) and consumed by [`Pm::run`]. Stored rather
+/// than acted on immediately because the QUIC handshake needs the full
+/// pool schema, which isn't complete until every `sync_pool` has run.
+pub(crate) enum NetRole {
+    /// Single-player / no networking (the [`Pm::new`] default).
+    Local,
+    /// Authoritative server bound to `addr`.
+    Server { addr: String },
+    /// Client connecting to `addr`, sending input at `input_hz`.
+    Client { addr: String, input_hz: f32 },
+}
+
+/// Networking is part of the kernel: pick a role at construction
+/// ([`Pm::server`] / [`Pm::client`]), register pools with [`Pm::sync_pool`],
+/// then [`Pm::run`]. The transport pumps in a single task bound lazily by
+/// `run`; games only ever touch the `"net.*"` singles.
 impl Pm {
-    /// Register `pool` for replication. The pool's name is its wire
-    /// identity — server and client must register the same pools in the
-    /// same order. Call before `serve`/`connect`.
-    pub fn sync<T: Pod + 'static>(&mut self, pool: &PoolHandle<T>) {
+    /// Construct an authoritative server that will bind `addr` when
+    /// [`run`](Pm::run) is called. pm owns the transport end to end — games
+    /// never touch `Quic*`.
+    pub fn server(addr: &str) -> Self {
+        let mut pm = Pm::new();
+        pm.net_role = NetRole::Server {
+            addr: addr.to_string(),
+        };
+        pm
+    }
+
+    /// Construct a client that will connect to `addr` when [`run`](Pm::run)
+    /// is called, sending its input pod at `input_hz` (match the server's
+    /// sim rate — 60.0 for a 60 Hz server).
+    pub fn client(addr: &str, input_hz: f32) -> Self {
+        let mut pm = Pm::new();
+        pm.net_role = NetRole::Client {
+            addr: addr.to_string(),
+            input_hz,
+        };
+        pm
+    }
+
+    /// Bind/connect the chosen role (the schema is complete by now) and run
+    /// the loop. `C` is the input pod — the one type that can't ride the
+    /// constructor without making the whole kernel generic, so it lands
+    /// here. Honors `PM_LAG_MS`/`PM_LOSS` for link simulation. Returns once
+    /// the loop quits; `Err` if the bind/connect fails. Local games use
+    /// [`Pm::loop_run`] instead.
+    pub fn run<C: Pod + 'static>(&mut self) -> std::io::Result<()> {
+        match std::mem::replace(&mut self.net_role, NetRole::Local) {
+            NetRole::Server { addr } => self.serve::<C>(&addr)?,
+            NetRole::Client { addr, input_hz } => self.connect::<C>(&addr, input_hz)?,
+            NetRole::Local => panic!(
+                "Pm::run::<C>() needs a net role — build with Pm::server/Pm::client, \
+                 or call Pm::loop_run() for a local game"
+            ),
+        }
+        self.loop_run();
+        Ok(())
+    }
+
+    /// Create a pool and register it for replication, returning the handle —
+    /// the one-call replacement for `pool()` + a separate sync step. The
+    /// pool's name is its wire identity (hashed; see `pool_key`), so server
+    /// and client may register in any order.
+    pub fn sync_pool<T: Pod + 'static>(&mut self, name: &str) -> PoolHandle<T> {
+        let pool = self.pool::<T>(name);
+        self.sync(&pool);
+        pool
+    }
+
+    /// Create a singleton and register it for replication (the owning side
+    /// only — a replica reads it with `pool()`; see [`Pm::single`]).
+    pub fn sync_single<T: Pod + Default + 'static>(&mut self, name: &str) -> SingleHandle<T> {
+        let single = self.single::<T>(name);
+        self.sync(single.pool());
+        single
+    }
+
+    /// Register an existing `pool` for replication. Internal: `sync_pool` /
+    /// `sync_single` are the public surface.
+    fn sync<T: Pod + 'static>(&mut self, pool: &PoolHandle<T>) {
         let name = pool.name().to_string();
         self.single::<SyncSet>("net.sync")
             .get_mut()
             .pool_sync(&name, pool);
     }
 
-    /// Schema (pool name + value size, registration order) of everything
-    /// registered with `sync` — hand to `QuicServer::bind` /
-    /// `QuicClient::connect` so the transport can verify both ends match.
-    pub fn net_schema(&mut self) -> Vec<(String, usize)> {
+    /// Schema (pool name + value size) of everything registered for sync,
+    /// for the QUIC handshake. Order-independent: the transport sorts by
+    /// name, and replication keys sections by name hash.
+    fn net_schema(&mut self) -> Vec<(String, usize)> {
         self.single::<SyncSet>("net.sync").get().schema()
     }
 
-    /// Become the authoritative server over `quic`, replicating every
-    /// pool registered with `sync`. `C` is the input pod clients send.
-    pub fn serve<C: Pod + 'static>(&mut self, quic: QuicServer) {
+    /// Bind the server transport and install the net task. Called by `run`.
+    fn serve<C: Pod + 'static>(&mut self, addr: &str) -> std::io::Result<()> {
+        let mut quic = QuicServer::bind(addr, &self.net_schema())?;
+        if let Some((delay, loss)) = link_lag_from_env() {
+            quic.link_lag_set(delay, loss);
+        }
         let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
         self.removal_hold_set(true);
         NetServer::with_sync(sync).serve::<C>(self, quic);
+        Ok(())
     }
 
-    /// Become a client over `quic`, applying snapshots into every pool
-    /// registered with `sync`. `C` is the input pod, sent at `input_hz`.
-    pub fn connect<C: Pod + 'static>(&mut self, quic: QuicClient, input_hz: f32) {
+    /// Connect the client transport and install the net task. Called by `run`.
+    fn connect<C: Pod + 'static>(&mut self, addr: &str, input_hz: f32) -> std::io::Result<()> {
+        let mut quic = QuicClient::connect(addr, &self.net_schema())?;
+        if let Some((delay, loss)) = link_lag_from_env() {
+            quic.link_lag_set(delay, loss);
+        }
         let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
         NetClient::with_sync(sync).connect::<C>(self, quic, input_hz);
+        Ok(())
+    }
+
+    /// This peer's controlled entity, as the server marked it — sugar over
+    /// [`NetStatus::avatar`]. `None` until the first snapshot that carries
+    /// one (client-side; always `None` on the server).
+    pub fn mine(&mut self) -> Option<Id> {
+        self.single::<NetStatus>("net.status").get().avatar
+    }
+
+    /// Client-side prediction for the local avatar ([`Pm::mine`]), wired
+    /// straight to the net module: this installs the task every predicted
+    /// game wrote by hand. Each tick it reconciles the [`Predictor`] against
+    /// every `"net.applied"` snapshot's input-seq echo, replays this tick's
+    /// `"net.sent"` inputs, then writes the smooth-predicted avatar into the
+    /// pool's draw sibling (`"<name>.draw"`, the one [`Pm::interp`] fills) —
+    /// extrapolated by the in-flight input fraction
+    /// ([`NetStatus::input_alpha`]) so the render clock doesn't beat against
+    /// the fixed predict step.
+    ///
+    /// `step` is THE shared integration (the same one the server runs —
+    /// determinism is what makes reconciliation byte-exact); `fixed_dt` is
+    /// the server's sim step. Pair with [`Pm::interp`] on the same pool for
+    /// the remote entities (it returns the draw pool to render). Returns the
+    /// predictor single so rendering can read `state()` / `corrections`.
+    pub fn predict_pool<S: Pod + 'static, C: Pod + 'static>(
+        &mut self,
+        auth: &PoolHandle<S>,
+        step: impl Fn(&mut S, C, f32) + 'static,
+        err: impl Fn(&S, &S) -> f32 + 'static,
+        tolerance: f32,
+        fixed_dt: f32,
+    ) -> SingleHandle<Predictor<S, C>> {
+        let draw = self.pool::<S>(&format!("{}.draw", auth.name()));
+        let pred = self.single::<Predictor<S, C>>("net.pred");
+        let status = self.single::<NetStatus>("net.status");
+        let input = self.single::<NetInput<C>>("net.input");
+        let applied = self.single::<AppliedLog>("net.applied");
+        let sent = self.single::<SentLog<C>>("net.sent");
+        let auth = auth.clone();
+        self.task_add("net.predict", NET_PRIO + 2.0, 0.0, {
+            let pred = pred.clone();
+            move |_pm| {
+                let Some(mine) = status.get().avatar else {
+                    return;
+                };
+                for a in &applied.get().0 {
+                    let Some(auth_s) = auth.get_id(mine).map(|r| *r) else {
+                        continue;
+                    };
+                    pred.get_mut().reconcile(
+                        auth_s,
+                        a.input_seq,
+                        |s, c| step(s, c, fixed_dt),
+                        |a, b| err(a, b),
+                        tolerance,
+                    );
+                }
+                for &(seq, cmd) in &sent.get().0 {
+                    pred.get_mut().predict(seq, cmd, |s, c| step(s, c, fixed_dt));
+                }
+                // Smooth-predicted local avatar into draw, extrapolated by
+                // the in-flight input fraction. Guard on the entity still
+                // existing in `auth` so a despawn can't leave a predicted
+                // ghost behind.
+                if auth.get_id(mine).is_some()
+                    && let Some(mut s) = pred.get().state()
+                {
+                    let alpha = status.get().input_alpha.min(1.0);
+                    step(&mut s, input.get().0, alpha * fixed_dt);
+                    draw.get_mut().add(mine, s);
+                }
+            }
+        });
+        pred
+    }
+
+    /// Snapshot-interpolation presentation for a replicated pool — the
+    /// per-pool sync modifier the [`pool_interp`] note promised. Installs a
+    /// task that eases every entity in `auth` into a draw sibling pool
+    /// (`"<name>.draw"`) ~`delay` seconds behind the newest authoritative
+    /// sample (see [`InterpBuffer`]), via the game's field-aware `lerp`, and
+    /// returns that draw pool — the one rendering should read. Runs before
+    /// [`Pm::predict_pool`] on the same pool, so the local avatar's
+    /// interpolated value is harmlessly overwritten by the predicted one;
+    /// everyone else stays smooth.
+    ///
+    /// `delay`/`extrap_max` are seconds; a snapshot interval or two of delay
+    /// is the usual start, with a small `extrap_max` to ride loss bursts.
+    pub fn interp_pool<T: Pod + PartialEq + 'static>(
+        &mut self,
+        auth: &PoolHandle<T>,
+        lerp: impl Fn(&T, &T, f32) -> T + 'static,
+        delay: f64,
+        extrap_max: f64,
+    ) -> PoolHandle<T> {
+        let draw = self.pool::<T>(&format!("{}.draw", auth.name()));
+        let auth = auth.clone();
+        let ret = draw.clone();
+        let mut buf = InterpBuffer::<T>::new(delay);
+        buf.extrap_max = extrap_max;
+        let mut clock = 0.0f64;
+        self.task_add("net.interp", NET_PRIO + 1.0, 0.0, move |pm| {
+            clock += pm.loop_dt() as f64;
+            pool_interp(&auth, &draw, &mut buf, clock, &lerp);
+        });
+        ret
     }
 }
 
@@ -187,6 +394,29 @@ impl ServerOutbox {
     }
 }
 
+/// Per-peer controlled entity (server, `"net.own"`). The game records each
+/// peer's avatar here on spawn (and clears it on despawn/leave); the net
+/// task ships it in every snapshot header, so the client always knows which
+/// replicated entity is its own — the built-in replacement for a hand-rolled
+/// "here's your id" reliable event, and robust to packet loss (it rides
+/// every snapshot, not one). Doubles as the server's peer→entity lookup.
+#[derive(Default)]
+pub struct ServerOwn(pub HashMap<u8, Id>);
+
+impl ServerOwn {
+    pub fn set(&mut self, peer: u8, id: Id) {
+        self.0.insert(peer, id);
+    }
+
+    pub fn clear(&mut self, peer: u8) {
+        self.0.remove(&peer);
+    }
+
+    pub fn get(&self, peer: u8) -> Option<Id> {
+        self.0.get(&peer).copied()
+    }
+}
+
 /// Connection status (client, `"net.status"`).
 #[derive(Default)]
 pub struct NetStatus {
@@ -194,6 +424,10 @@ pub struct NetStatus {
     pub rtt_ms: f32,
     pub snapshots: u32,
     pub connected: bool,
+    /// This peer's controlled entity, as the server marked it (see
+    /// [`ServerOwn`]). `None` until the first snapshot that carries one.
+    /// [`Pm::mine`] is the sugar most game code reads.
+    pub avatar: Option<Id>,
     /// Fraction (0..1) of the next fixed input step already accumulated
     /// this tick. The predictor advances in whole `1/input_hz` steps; at
     /// render rates not phase-locked to that, draw the local avatar at
@@ -246,6 +480,7 @@ impl NetServer {
         let cmds = pm.single::<Commands<C>>("net.cmds");
         let events = pm.single::<ServerEvents>("net.events");
         let out = pm.single::<ServerOutbox>("net.out");
+        let own = pm.single::<ServerOwn>("net.own");
         pm.task_add("net", NET_PRIO, 0.0, move |pm| {
             quic.pump();
             {
@@ -284,6 +519,12 @@ impl NetServer {
             }
             for (p, ty, payload) in out.get_mut().drain() {
                 quic.event_send(p, ty, &payload);
+            }
+            {
+                let own = own.get();
+                for (&p, &id) in &own.0 {
+                    net.set_avatar(p, id.0);
+                }
             }
             let plist: Vec<u8> = net.peers().collect();
             for p in plist {
@@ -336,6 +577,9 @@ impl NetClient {
                     continue;
                 };
                 quic.ack_send(a.tick);
+                if a.avatar != 0 {
+                    status.get_mut().avatar = Some(Id(a.avatar));
+                }
                 applied.get_mut().0.push(a);
                 status.get_mut().snapshots += 1;
             }

@@ -2,7 +2,7 @@
 //! zoom (wheel) with player follow, sprite rendering with hot-reload,
 //! TTF HUD, lobby screen, and an F1 debug overlay.
 
-use pm::{Cooldown, Hysteresis, Pm, QuicClient, vec2};
+use pm::{Cooldown, Hysteresis, Pm, vec2};
 use pm_sdl::sdl3::event::Event;
 use pm_sdl::sdl3::keyboard::Scancode;
 use pm_sdl::sdl3::mouse::MouseButton;
@@ -24,12 +24,11 @@ fn roster_name(r: &Roster) -> String {
 }
 
 pub fn run() {
-    let mut pm = Pm::new();
+    let mut pm = Pm::client(ADDR, 60.0);
     let pools = client_pools(&mut pm);
-    let quic = QuicClient::connect(ADDR, &pm.net_schema()).expect("connect");
     eprintln!("connecting to {ADDR} ...");
     let name = std::env::var("HELLFIRE_NAME").unwrap_or_else(|_| "player".into());
-    add_client_tasks(&mut pm, quic, &pools, name);
+    add_client_tasks(&mut pm, &pools, name);
 
     let (window, mut pump, refresh) = pm_sdl::window("hellfire", W as u32, H as u32);
     let mut canvas = window.into_canvas();
@@ -348,5 +347,5 @@ pub fn run() {
     // Display refresh paces the loop (WSLg ignores vsync; input still
     // goes out at a fixed 60 Hz via the net module's send cadence).
     pm.loop_rate = refresh;
-    pm.loop_run();
+    pm.run::<InputCmd>().expect("connect");
 }

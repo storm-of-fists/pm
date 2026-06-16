@@ -61,9 +61,6 @@ pub struct Drive {
     pub bot: f32,    // 0/1: AI controller — its steering lags (see drive_step)
 }
 
-/// Server event: your car's id (sent once at join).
-pub const EV_VEHICLE: u16 = 16;
-
 /// Top speed (forward); the `drive_step` clamp and the speed-match scale.
 pub const VMAX: f32 = 18.0;
 /// Car collision capsule: a segment of half-length `CAR_HL` along the

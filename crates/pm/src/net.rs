@@ -74,6 +74,8 @@ impl Outbox {
 #[derive(Debug, PartialEq, Eq)]
 pub enum NetError {
     Truncated,
+    /// Snapshot referenced a pool key (`pool_key`) this end never
+    /// registered with `sync`.
     UnknownPool(u16),
 }
 
@@ -226,6 +228,19 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
     }
 }
 
+/// Stable 16-bit wire identity for a synced pool, derived from its name
+/// (FNV-1a, folded to 16 bits). Pools are addressed on the wire by this
+/// key, never by registration order — so server and client may register
+/// the same pools in any order. Collisions are caught at `sync` time.
+pub(crate) fn pool_key(name: &str) -> u16 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in name.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h ^ (h >> 16)) as u16
+}
+
 #[derive(Default)]
 pub(crate) struct SyncSet {
     adapters: Vec<Box<dyn SyncAdapter>>,
@@ -233,15 +248,31 @@ pub(crate) struct SyncSet {
 
 impl SyncSet {
     pub(crate) fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
+        let key = pool_key(name);
+        if let Some(clash) = self.adapters.iter().find(|a| pool_key(a.name()) == key) {
+            panic!(
+                "synced pool name-hash collision: '{name}' and '{}' both key to {key:#06x} — rename one",
+                clash.name()
+            );
+        }
         self.adapters.push(Box::new(PoolAdapter {
             name: name.to_string(),
             pool: pool.rc().clone(),
         }));
     }
 
-    /// (pool name, value size) per registered pool, in registration order.
-    /// Server and client schemas must match; the QUIC handshake will
-    /// verify this — until then, tests assert it.
+    /// The adapter for a wire key (`pool_key`), looked up by name hash so
+    /// registration order is irrelevant.
+    fn adapter_by_key(&self, key: u16) -> Option<&dyn SyncAdapter> {
+        self.adapters
+            .iter()
+            .find(|a| pool_key(a.name()) == key)
+            .map(|b| b.as_ref())
+    }
+
+    /// (pool name, value size) per registered pool. The QUIC handshake
+    /// verifies both ends agree; it sorts by name first, so order doesn't
+    /// matter there either.
     pub(crate) fn schema(&self) -> Vec<(String, usize)> {
         self.adapters
             .iter()
@@ -253,9 +284,11 @@ impl SyncSet {
 // --- snapshot wire format -------------------------------------------------
 //
 //   u32 tick label (last completed tick)
+//   u32 input seq echo (last input this peer's sim consumed)
+//   u32 avatar id (this peer's controlled entity; 0 = none)
 //   u32 removal count, then count x [id u32]
 //   u16 section count, then per section:
-//     u16 pool index (registration order)
+//     u16 pool key (name hash; see `pool_key`, order-independent)
 //     u32 entry count, then count x [id u32][value bytes]
 
 /// In-flight snapshots older than this many ticks past the newest label
@@ -267,6 +300,12 @@ struct Peer {
     peer: u8,
     acked_tick: u32,
     input_seq: u32,
+    /// This peer's controlled entity, shipped in every snapshot header so
+    /// the client always knows which replicated entity is its own — no
+    /// bespoke "here's your id" handshake. 0 = none assigned yet. Set by
+    /// the game via the net module (see `ServerOwn`); 0 stays harmless for
+    /// games that never assign one.
+    avatar: u32,
     pools: Vec<PeerPool>,
     /// What each unacked snapshot carried, oldest first, so an ack can
     /// confirm exactly that snapshot's entries — and declare everything
@@ -282,6 +321,10 @@ pub struct Applied {
     /// Last input sequence the server processed for this peer — the
     /// reconciliation point for client-side prediction.
     pub input_seq: u32,
+    /// This peer's controlled entity id (0 = none). The net module mirrors
+    /// it into [`NetStatus::avatar`](crate::NetStatus); games rarely read
+    /// it here.
+    pub avatar: u32,
 }
 
 /// Server side: owns the peer table, packs per-peer deltas, gates id
@@ -325,6 +368,7 @@ impl NetServer {
                 peer,
                 acked_tick: 0,
                 input_seq: 0,
+                avatar: 0,
                 pools: (0..self.sync.adapters.len())
                     .map(|_| PeerPool::new())
                     .collect(),
@@ -382,6 +426,16 @@ impl NetServer {
         }
     }
 
+    /// Mark `peer`'s controlled entity (`id.0`, or 0 for none). Shipped in
+    /// every snapshot header so the client always knows which replicated
+    /// entity is its own — the built-in replacement for a hand-rolled
+    /// ownership handshake. Idempotent; call it every tick.
+    pub fn set_avatar(&mut self, peer: u8, id: u32) {
+        if let Some(p) = self.peers.iter_mut().find(|p| p.peer == peer) {
+            p.avatar = id;
+        }
+    }
+
     /// Pack everything `peer` hasn't confirmed, without a size cap.
     /// Prefer `snapshot_budgeted` when the transport bounds datagrams.
     pub fn snapshot(&mut self, pm: &Pm, peer: u8) -> Option<Vec<u8>> {
@@ -424,6 +478,7 @@ impl NetServer {
         let mut out = Vec::new();
         out.extend_from_slice(&label.to_le_bytes());
         out.extend_from_slice(&state.input_seq.to_le_bytes());
+        out.extend_from_slice(&state.avatar.to_le_bytes());
 
         let removals: Vec<u32> = pm
             .removal_log()
@@ -441,7 +496,9 @@ impl NetServer {
         // 6 bytes of section header (index + count) per pool.
         let mut remaining = budget.saturating_sub(out.len() + 6 * self.sync.adapters.len());
         for (i, adapter) in self.sync.adapters.iter().enumerate() {
-            out.extend_from_slice(&(i as u16).to_le_bytes());
+            // Wire identity is the name hash, not the loop index `i` — `i`
+            // stays a local cursor into this peer's `pools`/`sent` tables.
+            out.extend_from_slice(&pool_key(adapter.name()).to_le_bytes());
             let count_at = out.len();
             out.extend_from_slice(&0u32.to_le_bytes());
             let count = adapter.pack_dirty(
@@ -506,6 +563,7 @@ impl NetClient {
         let mut r = Reader::new(snapshot);
         let tick = r.u32()?;
         let input_seq = r.u32()?;
+        let avatar = r.u32()?;
 
         let removal_count = r.u32()?;
         for _ in 0..removal_count {
@@ -517,15 +575,18 @@ impl NetClient {
 
         let section_count = r.u16()?;
         for _ in 0..section_count {
-            let index = r.u16()?;
+            let key = r.u16()?;
             let count = r.u32()?;
             let adapter = self
                 .sync
-                .adapters
-                .get(index as usize)
-                .ok_or(NetError::UnknownPool(index))?;
+                .adapter_by_key(key)
+                .ok_or(NetError::UnknownPool(key))?;
             adapter.apply(pm, count, &mut r)?;
         }
-        Ok(Applied { tick, input_seq })
+        Ok(Applied {
+            tick,
+            input_seq,
+            avatar,
+        })
     }
 }

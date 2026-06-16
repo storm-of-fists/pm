@@ -1,23 +1,12 @@
 //! Drive client gameplay, shared by the SDL player and headless bots.
-//! The transport (pump, snapshot apply + ack, fixed-cadence input send)
-//! is pm's net module; this file adds what the module can't know: which
-//! entity is ours, how to predict it (`pm::Predictor` over the shared
-//! step fn), and how remote cars smooth (`pm::pool_mirror`).
+//! The transport, local-avatar prediction (`pm.predict_pool`), and
+//! remote-car snapshot interpolation (`pm.interp`) are all pm's net module
+//! now; this file supplies only what the module can't know — THE shared
+//! step, the error metric, and how cars interpolate.
 
-use std::time::Duration;
-
-use pm::{
-    AppliedLog, ClientEvents, Id, InterpBuffer, NetInput, NetStatus, Pm, Predictor, QuicClient,
-    SentLog, pool_interp,
-};
+use pm::{NetInput, Pm, Predictor, SingleHandle};
 
 use crate::common::*;
-
-#[derive(Default)]
-pub struct Stats {
-    pub mine: Option<Id>,
-    pub corrections: u32,
-}
 
 fn err_metric(a: &Car, b: &Car) -> f32 {
     (a.x - b.x).abs()
@@ -27,135 +16,50 @@ fn err_metric(a: &Car, b: &Car) -> f32 {
         + (a.steer - b.steer).abs()
 }
 
-pub fn quic_connect(schema: &[(String, usize)]) -> QuicClient {
-    let mut quic = QuicClient::connect(ADDR, schema).expect("connect");
-    let lag_ms: f32 = std::env::var("PM_LAG_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
-    let loss: f32 = std::env::var("PM_LOSS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
-    if lag_ms > 0.0 || loss > 0.0 {
-        quic.link_lag_set(Duration::from_secs_f32(lag_ms / 1000.0), loss);
-    }
-    quic
-}
-
-/// Everything but input generation and rendering. The input layer
-/// writes the `"net.input"` single; rendering reads `car_draw` plus the
-/// predictor's car for the local one.
+/// Connect to the server and install everything but input generation and
+/// rendering. pm owns the transport (`PM_LAG_MS`/`PM_LOSS` simulate the
+/// link). Returns the predictor single (rendering reads `state()` /
+/// `corrections`) and the draw pool (the smoothed view rendering should
+/// iterate — predicted local car, interpolated remotes).
 pub fn add_client_tasks(
     pm: &mut Pm,
-    quic: QuicClient,
     car: &pm::PoolHandle<Car>,
-    draw: &pm::PoolHandle<Car>,
-) {
-    pm.connect::<Drive>(quic, 1.0 / FIXED_DT);
+) -> (SingleHandle<Predictor<Car, Drive>>, pm::PoolHandle<Car>) {
+    // No connect here — `Pm::run` does that once the schema is complete.
+    // Local avatar: reconcile against the server's input-seq echo, replay
+    // unacked inputs, and draw smooth-predicted. The same `drive_step` the
+    // server runs is what makes reconciliation byte-exact.
+    let pred = pm.predict_pool(car, drive_step, err_metric, 1e-4, FIXED_DT);
 
-    let pred = pm.single::<Predictor<Car, Drive>>("pred");
-    let stats = pm.single::<Stats>("stats");
-    let events = pm.single::<ClientEvents>("net.events");
-    let applied = pm.single::<AppliedLog>("net.applied");
-    let sent = pm.single::<SentLog<Drive>>("net.sent");
-    let car = car.clone();
-    let draw = draw.clone();
-
-    // Prediction, right after the net module's tick (prio 6): reconcile
-    // against each applied snapshot's input-seq echo, then feed this
-    // tick's sent inputs into the rewind ring.
-    pm.task_add("predict", 6.0, 0.0, {
-        let pred = pred.clone();
-        let car = car.clone();
-        let stats = stats.clone();
-        move |_pm| {
-            for (ty, payload) in &events.get().0 {
-                if *ty == EV_VEHICLE && payload.len() == 4 {
-                    stats.get_mut().mine = Some(Id(u32::from_le_bytes(
-                        payload.as_slice().try_into().unwrap(),
-                    )));
-                }
-            }
-            let mine = stats.get().mine;
-            for a in &applied.get().0 {
-                let auth = mine.and_then(|id| car.get().get(id).copied());
-                let Some(auth) = auth else { continue };
-                let corrected = pred.get_mut().reconcile(
-                    auth,
-                    a.input_seq,
-                    |s, c| drive_step(s, c, FIXED_DT),
-                    err_metric,
-                    1e-4,
-                );
-                if corrected {
-                    stats.get_mut().corrections += 1;
-                }
-            }
-            for &(seq, cmd) in &sent.get().0 {
-                pred.get_mut()
-                    .predict(seq, cmd, |s, c| drive_step(s, c, FIXED_DT));
-            }
-        }
-    });
-
-    // Remote cars draw by SNAPSHOT INTERPOLATION: `pool_interp` renders
-    // them ~100 ms behind the newest authoritative sample, easing between
-    // two known-true points instead of dead-reckoning past the latest one
-    // — so a juke or a dropped snapshot widens the bracket it spans rather
-    // than snapping when the guess was wrong (the old `coast_blend`).
-    //
-    // The OWN car ignores all that and draws SMOOTH-PREDICTED: the
-    // predictor advances in fixed 60 Hz steps, and at render rates not
-    // phase-locked to that, drawing the raw state hitches (a frame
-    // advances 0 steps, the next 2 — the "camera jitter"). Extrapolate by
-    // the accumulator remainder with the current input — exactly where
-    // the next predict lands — and overwrite the interpolated local car.
-    let status = pm.single::<NetStatus>("net.status");
-    let input = pm.single::<NetInput<Drive>>("net.input");
-    // Interp delay/extrapolation are env-tunable so feel can be A/B'd live
-    // without a rebuild. 50 ms behind newest is plenty at 60 Hz snapshots
-    // (3 intervals) and keeps other cars near their true server positions
-    // so collisions line up with what you see; the 50 ms capped
-    // extrapolation only kicks in on an actual loss burst.
+    // Remote cars: snapshot interpolation ~50 ms behind newest, with a
+    // capped 50 ms extrapolation to ride loss bursts — env-tunable so feel
+    // can be A/B'd live. (The local car is overwritten by the predictor.)
     let env_ms = |k: &str, d: f64| {
         std::env::var(k)
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .map_or(d, |ms| ms / 1000.0)
     };
-    pm.task_add("smooth", 30.0, 0.0, {
-        let stats = stats.clone();
-        let mut interp = InterpBuffer::<Car>::new(env_ms("PM_INTERP_MS", 0.05));
-        interp.extrap_max = env_ms("PM_EXTRAP_MS", 0.05);
-        let mut clock = 0.0f64;
-        move |pm| {
-            clock += pm.loop_dt() as f64;
-            let mine = stats.get().mine;
-            pool_interp(&car, &draw, &mut interp, clock, car_lerp);
-            if let (Some(id), Some(mut p)) = (mine, pred.get().state()) {
-                let alpha = status.get().input_alpha.min(1.0);
-                drive_step(&mut p, input.get().0, alpha * FIXED_DT);
-                draw.get_mut().add(id, p);
-            }
-        }
-    });
+    let draw = pm.interp_pool(
+        car,
+        car_lerp,
+        env_ms("PM_INTERP_MS", 0.05),
+        env_ms("PM_EXTRAP_MS", 0.05),
+    );
+
+    (pred, draw)
 }
 
 /// Headless bot: drives a lazy sine-wave racing line.
 pub fn run_bot(n: u32) {
-    let mut pm = Pm::new();
-    let car = pm.pool::<Car>("car");
-    let score = pm.pool::<Score>("score");
-    let draw = pm.pool::<Car>("car_draw");
-    // Same synced pools in the same order as the server (motion, then score).
-    pm.sync(&car);
-    pm.sync(&score);
-    let quic = quic_connect(&pm.net_schema());
-    add_client_tasks(&mut pm, quic, &car, &draw);
+    let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
+    // Same synced pools as the server (order doesn't matter — keyed by name).
+    let car = pm.sync_pool::<Car>("car");
+    pm.sync_pool::<Score>("score");
+    // Headless: the draw pool is unused (no rendering), only the predictor.
+    let (pred, _draw) = add_client_tasks(&mut pm, &car);
 
     let cmd = pm.single::<NetInput<Drive>>("net.input");
-    let pred = pm.single::<Predictor<Car, Drive>>("pred");
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;
         // Wander on a sine, but steer home before grinding a wall —
@@ -183,5 +87,5 @@ pub fn run_bot(n: u32) {
     });
 
     pm.loop_rate = 60;
-    pm.loop_run();
+    pm.run::<Drive>().expect("connect");
 }
