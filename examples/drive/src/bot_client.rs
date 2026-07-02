@@ -4,7 +4,7 @@
 //! now; this file supplies only what the module can't know — THE shared
 //! step, the error metric, and how cars interpolate.
 
-use pm::{NetInput, Pm, Predictor, SingleHandle};
+use pm::{Pm, PmClient, Predictor, SingleHandle};
 
 use crate::common::*;
 
@@ -22,7 +22,7 @@ fn err_metric(a: &Car, b: &Car) -> f32 {
 /// `corrections`) and the draw pool (the smoothed view rendering should
 /// iterate — predicted local car, interpolated remotes).
 pub fn add_client_tasks(
-    pm: &mut Pm,
+    pm: &mut PmClient,
     car: &pm::PoolHandle<Car>,
 ) -> (SingleHandle<Predictor<Car, Drive>>, pm::PoolHandle<Car>) {
     // No connect here — `Pm::run` does that once the schema is complete.
@@ -58,8 +58,8 @@ pub fn run_bot(n: u32) {
     pm.sync_pool::<Score>("score");
     // Headless: the draw pool is unused (no rendering), only the predictor.
     let (pred, _draw) = add_client_tasks(&mut pm, &car);
+    let net = pm.net::<Drive>();
 
-    let cmd = pm.single::<NetInput<Drive>>("net.input");
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;
         // Wander on a sine, but steer home before grinding a wall —
@@ -78,12 +78,12 @@ pub fn run_bot(n: u32) {
         } else {
             (t * 0.43).sin() * 0.8
         };
-        cmd.get_mut().0 = Drive {
+        net.input(Drive {
             thrust: 0.75 + 0.25 * (t * 0.31).sin(),
             turn,
             drift: 0.0,
             bot: 1.0, // AI: steering lags, arrow leads
-        };
+        });
     });
 
     pm.loop_rate = 60;

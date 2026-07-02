@@ -27,13 +27,11 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use pm::{
-    AppliedLog, ClientEvents, Commands, Id, NetInput, NetStatus, PeerEvents, Pm, Predictor,
-    SentLog, ServerOutbox, pool_mirror,
+    AppliedLog, Commands, Id, PeerEvents, Pm, PmClient, Predictor, SentLog, ServerOwn, pool_mirror,
 };
 
 const ADDR: &str = "127.0.0.1:47777";
 const WORLD: f32 = 12.0; // world is [-WORLD, WORLD] on both axes
-const EV_VEHICLE: u16 = 16; // server -> client: "this entity is yours"
 
 /// Simulation runs on a fixed dt on BOTH sides — reconciliation replays
 /// inputs and must reproduce the server's exact arithmetic.
@@ -87,13 +85,14 @@ fn wrap(v: f32) -> f32 {
 
 // --- server -------------------------------------------------------------
 
-#[derive(Default)]
-struct Garage(HashMap<u8, Id>); // peer -> vehicle
-
 fn run_server(quiet: bool) {
     let mut pm = Pm::server(ADDR);
     let car = pm.sync_pool::<Car>("car");
-    let garage = pm.single::<Garage>("garage");
+    // `ServerOwn` is the built-in peer→entity channel: it ships each peer's
+    // avatar id in the snapshot header (the client reads it via `net.mine()`)
+    // and doubles as our peer→vehicle lookup — no bespoke "here's your id"
+    // reliable event.
+    let own = pm.single::<ServerOwn>("net.own");
     // The pump/ack/echo/snapshot loop is pm's net module; the game reads
     // the "net.*" singles it publishes.
     if !quiet {
@@ -101,11 +100,10 @@ fn run_server(quiet: bool) {
     }
     let peers = pm.single::<PeerEvents>("net.peers");
     let cmds = pm.single::<Commands<Drive>>("net.cmds");
-    let out = pm.single::<ServerOutbox>("net.out");
 
     pm.task_add("roster", 10.0, 0.0, {
         let car = car.clone();
-        let garage = garage.clone();
+        let own = own.clone();
         move |pm| {
             for &p in &peers.get().joined {
                 let id = pm.id_add();
@@ -119,16 +117,16 @@ fn run_server(quiet: bool) {
                         speed: 0.0,
                     },
                 );
-                garage.get_mut().0.insert(p, id);
-                out.get_mut().send(p, EV_VEHICLE, &id.0.to_le_bytes());
+                own.get_mut().set(p, id);
                 if !quiet {
                     eprintln!("peer {p} joined, vehicle index {}", id.index());
                 }
             }
             for &p in &peers.get().left {
-                if let Some(id) = garage.get_mut().0.remove(&p) {
+                if let Some(id) = own.get().get(p) {
                     pm.id_remove(id);
                 }
+                own.get_mut().clear(p);
                 if !quiet {
                     eprintln!("peer {p} left");
                 }
@@ -138,11 +136,11 @@ fn run_server(quiet: bool) {
 
     pm.task_add("drive", 30.0, 0.0, {
         let car = car.clone();
-        let garage = garage.clone();
+        let own = own.clone();
         move |_pm| {
             let mut cmds = cmds.get_mut();
             let mut car = car.get_mut();
-            for (&peer, &id) in &garage.get().0 {
+            for (&peer, &id) in &own.get().0 {
                 // Command-frame consumption: one input per tick (one
                 // prediction step on the client), hold-when-dry, bounded
                 // skip-ahead. The applied seq echoes back automatically.
@@ -192,13 +190,13 @@ fn run_bot(phase: f32) {
     let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
     pm.sync_pool::<Car>("car");
 
-    let cmd = pm.single::<NetInput<Drive>>("net.input");
+    let net = pm.net::<Drive>();
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0;
-        cmd.get_mut().0 = Drive {
+        net.input(Drive {
             thrust: 0.7 + 0.3 * (t * 0.6 + phase).sin(),
             turn: (t * 0.8 + phase * 2.0).sin(),
-        };
+        });
     });
 
     pm.loop_rate = 60;
@@ -261,11 +259,11 @@ fn heading_char(h: f32) -> u8 {
 /// transport (`PM_LAG_MS`/`PM_LOSS` simulate the link). The input layer
 /// writes the `"net.input"` single, the renderer reads `car_draw`, `Stats`,
 /// and `"net.status"`.
-fn add_client_tasks(pm: &mut Pm, car: &pm::PoolHandle<Car>, draw: &pm::PoolHandle<Car>) {
+fn add_client_tasks(pm: &mut PmClient, car: &pm::PoolHandle<Car>, draw: &pm::PoolHandle<Car>) {
+    let net = pm.net::<Drive>();
     // No connect here — `Pm::run` does that once the schema is complete.
     let pred = pm.single::<Predictor<Car, Drive>>("pred");
     let stats = pm.single::<Stats>("stats");
-    let events = pm.single::<ClientEvents>("net.events");
     let applied = pm.single::<AppliedLog>("net.applied");
     let sent = pm.single::<SentLog<Drive>>("net.sent");
     let car = car.clone();
@@ -279,14 +277,10 @@ fn add_client_tasks(pm: &mut Pm, car: &pm::PoolHandle<Car>, draw: &pm::PoolHandl
         let car = car.clone();
         let stats = stats.clone();
         move |_pm| {
-            for (ty, payload) in &events.get().0 {
-                if *ty == EV_VEHICLE && payload.len() == 4 {
-                    stats.get_mut().mine = Some(Id(u32::from_le_bytes(
-                        payload.as_slice().try_into().unwrap(),
-                    )));
-                }
-            }
-            let mine = stats.get().mine;
+            // Which car is ours: read it from the snapshot header (ServerOwn),
+            // not a bespoke "here's your id" reliable event.
+            let mine = net.mine();
+            stats.get_mut().mine = mine;
             for a in &applied.get().0 {
                 {
                     let mut s = stats.get_mut();
@@ -392,19 +386,18 @@ fn run_player() {
     let draw = pm.pool::<Car>("car_draw"); // display state (local)
     let keys = pm.single::<Keys>("keys");
     let stats = pm.single::<Stats>("stats");
+    let net = pm.net::<Drive>();
 
     eprintln!("connecting to {ADDR} ...");
     let _raw = RawTerm::enable();
     add_client_tasks(&mut pm, &car, &draw);
-    let cmd = pm.single::<NetInput<Drive>>("net.input");
-    let status = pm.single::<NetStatus>("net.status");
 
     // Keyboard first in the tick so this tick's input rides this tick's
     // datagram.
     pm.task_add("keys", 4.0, 0.0, {
         let keys = keys.clone();
-        let cmd = cmd.clone();
         let stats = stats.clone();
+        let net = net.clone();
         move |pm| {
             let dt = pm.loop_dt();
             let mut k = keys.get_mut();
@@ -428,7 +421,7 @@ fn run_player() {
                     _ => {}
                 }
             }
-            cmd.get_mut().0 = Drive {
+            net.input(Drive {
                 thrust: k.throttle,
                 turn: if k.left > 0.0 {
                     1.0
@@ -437,13 +430,14 @@ fn run_player() {
                 } else {
                     0.0
                 },
-            };
+            });
         }
     });
 
     pm.task_add("render", 50.0, 1.0 / 30.0, {
         let draw = draw.clone();
         let stats = stats.clone();
+        let net = net.clone();
         move |_pm| {
             let s = stats.get();
             let mut grid = vec![b' '; (COLS * ROWS) as usize];
@@ -468,14 +462,13 @@ fn run_player() {
                 out.push_str("|\r\n");
             }
             out.push_str(&edge);
-            let st = status.get();
             out.push_str(&format!(
                 "you are the arrow (peer {})  w go, s reverse, space coast, a/d steer, q quit\r\n\
                  vehicles {}  rtt {:.1}ms  snapshots {}  tick {}  echo {}  corrections {}\r\n",
-                st.peer,
+                net.peer(),
                 draw.get().len(),
-                st.rtt_ms,
-                st.snapshots,
+                net.rtt_ms(),
+                net.snapshots(),
                 s.acked,
                 s.input_echo,
                 s.corrections,

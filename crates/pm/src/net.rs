@@ -322,8 +322,7 @@ pub struct Applied {
     /// reconciliation point for client-side prediction.
     pub input_seq: u32,
     /// This peer's controlled entity id (0 = none). The net module mirrors
-    /// it into [`NetStatus::avatar`](crate::NetStatus); games rarely read
-    /// it here.
+    /// it into the client's net status; games read it via [`ClientNet::mine`](crate::ClientNet::mine).
     pub avatar: u32,
 }
 

@@ -12,7 +12,7 @@ use pm_sdl::{Font, Sprite};
 
 use crate::client::{Camera, Ui, add_client_tasks, client_pools, current_status};
 use crate::common::*;
-use pm::{NetInput, NetStatus, Outbox};
+use pm::Outbox;
 
 fn resource(name: &str) -> String {
     format!("{}/resources/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -28,13 +28,11 @@ pub fn run() {
     let pools = client_pools(&mut pm);
     eprintln!("connecting to {ADDR} ...");
     let name = std::env::var("HELLFIRE_NAME").unwrap_or_else(|_| "player".into());
-    add_client_tasks(&mut pm, &pools, name);
+    let net = add_client_tasks(&mut pm, &pools, name);
 
     let (window, mut pump, refresh) = pm_sdl::window("hellfire", W as u32, H as u32);
     let mut canvas = window.into_canvas();
 
-    let cmd = pm.single::<NetInput<InputCmd>>("net.input");
-    let stats = pm.single::<NetStatus>("net.status");
     let cam = pm.single::<Camera>("camera");
     let ui = pm.single::<Ui>("ui");
     let outbox = pm.single::<Outbox>("net.out");
@@ -43,13 +41,12 @@ pub fn run() {
     // player, mouse aim goes through the inverse camera transform so it
     // stays correct at any zoom.
     pm.task_add("input", 4.0, 0.0, {
-        let cmd = cmd.clone();
-        let stats = stats.clone();
         let cam = cam.clone();
         let ui = ui.clone();
         let outbox = outbox.clone();
         let player_draw = pools.player_draw.clone();
         let status = pools.status.clone();
+        let net = net.clone();
         move |pm| {
             let in_lobby = current_status(&status).flags & FLAG_STARTED == 0;
             for ev in pump.poll_iter() {
@@ -88,7 +85,7 @@ pub fn run() {
 
             // Camera dynamics: ease zoom, follow own player.
             let dt = pm.loop_dt();
-            let my_peer = stats.get().peer as u32;
+            let my_peer = pm.local_peer as u32;
             let me = player_draw
                 .get()
                 .iter()
@@ -107,8 +104,7 @@ pub fn run() {
             let held = |sc: Scancode| k.is_scancode_pressed(sc);
             let m = pump.mouse_state();
             let aim = cam.get().to_world(m.x(), m.y());
-            let mut c = cmd.get_mut();
-            c.0 = InputCmd {
+            net.input(InputCmd {
                 dx: (held(Scancode::D) as i32 - held(Scancode::A) as i32) as f32,
                 dy: (held(Scancode::S) as i32 - held(Scancode::W) as i32) as f32,
                 ax: aim.x,
@@ -118,16 +114,16 @@ pub fn run() {
                 } else {
                     0
                 },
-            };
+            });
         }
     });
 
     // Render: all world drawing goes through the camera transform; HUD
     // and overlay text draw in screen space with the TTF font.
     pm.task_add("render", 70.0, 0.0, {
-        let stats = stats.clone();
         let cam = cam.clone();
         let ui = ui.clone();
+        let net = net.clone();
         let mut front = Sprite::load(&canvas, resource("connor-front.png"));
         let mut back = Sprite::load(&canvas, resource("connor-back.png"));
         let mut font = match Font::load_default() {
@@ -184,7 +180,7 @@ pub fn run() {
                 let _ = c.fill_rect(FRect::new(x - s * 0.5, y - s * 0.5, s, s));
             }
 
-            let my_peer = stats.get().peer as u32;
+            let my_peer = pm.local_peer as u32;
             for (_, p) in pools.player_draw.get().iter() {
                 if p.alive == 0 {
                     continue;
@@ -298,7 +294,6 @@ pub fn run() {
                 if ui.get().show_debug {
                     c.set_draw_color(Color::RGBA(0, 0, 0, 170));
                     let _ = c.fill_rect(FRect::new(8.0, 34.0, 360.0, 250.0));
-                    let s = stats.get();
                     let dbg = pools
                         .dbg
                         .get()
@@ -308,7 +303,7 @@ pub fn run() {
                         .unwrap_or_default();
                     let mut lines = vec![
                         format!("fps {fps:.0}   frame {:.2} ms", dt * 1000.0),
-                        format!("rtt {:.0} ms   snapshots {}", s.rtt_ms, s.snapshots),
+                        format!("rtt {:.0} ms   snapshots {}", net.rtt_ms(), net.snapshots()),
                         format!(
                             "draw: {} monsters  {} bullets  {} players",
                             pools.monster_draw.get().len(),

@@ -19,7 +19,10 @@
 //!     vel: Vec2,
 //! }
 //!
-//! let mut pm = Pm::new();
+//! // pm is multiplayer-only: a peer is a server or a client, chosen at
+//! // construction. Nothing binds until `run`, so the kernel tour below
+//! // reads the same on either role.
+//! let mut pm = Pm::server("127.0.0.1:0");
 //! let body = pm.pool::<Body>("body"); // PoolHandle<Body>: named, typed pool
 //!
 //! let id = pm.id_add(); // generational id [peer|gen|index]
@@ -55,10 +58,10 @@
 //! Singletons are just single-entity pools ([`Pm::single`]) — there is no
 //! separate "state" concept, so a singleton replicates and tears down
 //! like any other pool. Networking installs as a task over registered
-//! pools: [`Pm::sync`] each replicated pool, then [`Pm::serve`] (server)
-//! or [`Pm::connect`] (client); gameplay reads and writes the `"net.*"`
-//! singletons ([`PeerEvents`], [`Commands`], [`NetStatus`], …) and never
-//! touches the socket.
+//! pools: pick a role with [`Pm::server`] / [`Pm::client`], [`Pm::sync_pool`]
+//! each replicated pool, then [`run`](PmClient::run). Gameplay reads and writes the
+//! `"net.*"` singletons ([`PeerEvents`], [`Commands`], …) and the client's
+//! [`ClientNet`] handle ([`PmClient::net`]), and never touches the socket.
 //!
 //! # Design decisions
 //!
@@ -84,7 +87,7 @@
 //! - **pool**: the sparse-set [`Pool`] and its [`Mut`] write guard.
 //! - **net**: server-authoritative snapshot-delta replication
 //!   ([`NetServer`]/[`NetClient`]) and the installable net modules
-//!   ([`Pm::serve`]/[`Pm::connect`]).
+//!   ([`PmServer`]/[`PmClient`]).
 //! - **predict / smooth**: client [`Predictor`] and the presentation
 //!   helpers [`pool_mirror`], [`coast_blend`], [`pool_interp`]
 //!   ([`InterpBuffer`]).
@@ -124,8 +127,8 @@ pub use math::{Mat4, Rng, Vec2, Vec3, vec2, vec3};
 pub use modload::{BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr};
 pub use net::{Applied, NetClient, NetError, NetServer, Outbox};
 pub use netmod::{
-    AppliedLog, ClientEvents, Commands, NET_PRIO, NetInput, NetStatus, PeerEvents, SentLog,
-    ServerEvents, ServerOutbox, ServerOwn,
+    AppliedLog, ClientNet, Commands, EventRx, EventTx, NET_PRIO, PeerEvents, PmClient, PmServer,
+    SentLog, ServerEvents, ServerOwn,
 };
 pub use pool::{Mut, Pool};
 pub use predict::Predictor;

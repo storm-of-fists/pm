@@ -1,7 +1,8 @@
 //! The net modules end-to-end over real UDP loopback: server and client
 //! games built ONLY from the published "net.*" singles — no direct
 //! transport access — must see joins, flow commands (with the applied-
-//! seq echo), replicate pools, and exchange reliable events both ways.
+//! seq echo), replicate pools, and deliver a reliable client→server event.
+//! (Events are one-way client→server; there is no server→client channel.)
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -34,7 +35,6 @@ struct ServerSeen {
 
 #[derive(Default)]
 struct ClientSeen {
-    event: bool,
     echo: u32,
 }
 
@@ -55,7 +55,6 @@ fn net_modules_loopback() {
         let peers = spm.single::<pm::PeerEvents>("net.peers");
         let cmds = spm.single::<pm::Commands<Cmd>>("net.cmds");
         let sevents = spm.single::<pm::ServerEvents>("net.events");
-        let sout = spm.single::<pm::ServerOutbox>("net.out");
         let garage = garage.clone();
         let sseen = sseen.clone();
         let s_pos = s_pos.clone();
@@ -64,7 +63,6 @@ fn net_modules_loopback() {
                 let id = pm.id_add();
                 s_pos.get_mut().add(id, Pos::default());
                 garage.get_mut().0.insert(p, id);
-                sout.get_mut().send(p, 16, b"welcome");
                 sseen.get_mut().joined = true;
             }
             for &p in &peers.get().left {
@@ -92,32 +90,29 @@ fn net_modules_loopback() {
         });
     }
 
-    // --- client world ---
-    let mut cpm = Pm::new();
+    // --- client world: built via the role wrapper (the only public
+    // construction path); the transport is still driven manually below,
+    // through the Deref to the kernel.
+    let mut cpm = Pm::client("127.0.0.1:0", 60.0);
+    let cnet_status = cpm.net::<Cmd>();
     let c_pos = cpm.pool::<Pos>("pos");
     let mut cnet = NetClient::new();
     cnet.pool_sync("pos", &c_pos);
     let cquic = QuicClient::connect(&addr, &cnet.schema()).expect("connect");
     cnet.connect::<Cmd>(&mut cpm, cquic, 60.0);
 
-    // Queue a reliable event BEFORE the handshake exists — the module
-    // holds it until connected.
+    // Queue a reliable client→server event BEFORE the handshake exists —
+    // the module holds it until connected.
     cpm.single::<pm::Outbox>("net.out")
         .get_mut()
         .send(17, b"hi");
-    cpm.single::<pm::NetInput<Cmd>>("net.input").get_mut().0 = Cmd { dx: 1.0 };
+    cnet_status.input(Cmd { dx: 1.0 });
 
     let cseen = cpm.single::<ClientSeen>("seen");
     {
-        let events = cpm.single::<pm::ClientEvents>("net.events");
         let applied = cpm.single::<pm::AppliedLog>("net.applied");
         let cseen = cseen.clone();
         cpm.task_add("game", 30.0, 0.0, move |_pm| {
-            for (ty, payload) in &events.get().0 {
-                if *ty == 16 && payload == b"welcome" {
-                    cseen.get_mut().event = true;
-                }
-            }
             let mut s = cseen.get_mut();
             for a in &applied.get().0 {
                 s.echo = s.echo.max(a.input_seq);
@@ -126,7 +121,6 @@ fn net_modules_loopback() {
     }
 
     // --- drive both worlds until everything has been observed ---
-    let status = cpm.single::<pm::NetStatus>("net.status");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut done = false;
     while Instant::now() < deadline {
@@ -135,18 +129,18 @@ fn net_modules_loopback() {
         std::thread::sleep(Duration::from_millis(1));
 
         let replicated = c_pos.get().values().iter().any(|p| p.x > 5.0);
+        let connected = cnet_status.connected();
         let s = sseen.get();
         let c = cseen.get();
-        if status.get().connected && s.joined && s.event && c.event && c.echo > 0 && replicated {
+        if connected && s.joined && s.event && c.echo > 0 && replicated {
             done = true;
             break;
         }
     }
 
     assert!(sseen.get().joined, "server never observed the join");
-    assert!(status.get().connected, "client never connected");
+    assert!(cnet_status.connected(), "client never connected");
     assert!(sseen.get().event, "client->server reliable event lost");
-    assert!(cseen.get().event, "server->client reliable event lost");
     assert!(
         cseen.get().echo > 0,
         "applied input-seq echo never arrived"

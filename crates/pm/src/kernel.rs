@@ -17,7 +17,6 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::id::{Id, IdAllocator};
-use crate::netmod::NetRole;
 use crate::pool::{ErasedPool, Pool};
 
 /// What a task hands back when it can't do its job. Boxed so tasks can
@@ -230,12 +229,9 @@ pub struct Pm {
     /// theirs at handshake. `id_add` allocates in this peer's space, and
     /// only this peer's indices are ever recycled locally.
     pub local_peer: u8,
-    /// Networking role + endpoint, chosen at construction
-    /// (`Pm::server`/`Pm::client`, default `Local`). `run` consumes it to
-    /// bind/connect lazily — after every `sync_pool` has built the schema.
-    pub(crate) net_role: NetRole,
 }
 
+#[doc(hidden)]
 impl Default for Pm {
     fn default() -> Self {
         Self {
@@ -258,12 +254,16 @@ impl Default for Pm {
             loop_rate: 60,
             loop_spin_us: 2000,
             local_peer: 0,
-            net_role: NetRole::Local,
         }
     }
 }
 
 impl Pm {
+    /// Bare headless kernel — pools/tasks/ids with no role. For the crate's
+    /// own tests and benches; games are multiplayer-only and construct a
+    /// role instead ([`Pm::server`] / [`Pm::client`]), which is why this is
+    /// hidden from the docs.
+    #[doc(hidden)]
     pub fn new() -> Self {
         Self::default()
     }

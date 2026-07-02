@@ -61,6 +61,17 @@ pub struct Drive {
     pub bot: f32,    // 0/1: AI controller — its steering lags (see drive_step)
 }
 
+/// Reliable client→server event: "flip me back to my spawn." A discrete,
+/// must-arrive intent that doesn't belong in the continuous `Drive` input
+/// pod — the textbook one-way event (the *effect*, a reset car, comes back
+/// as ordinary synced state). Carries nothing; `pad` only exists because a
+/// wire pod needs a field.
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Respawn {
+    pub pad: u32,
+}
+
 /// Top speed (forward); the `drive_step` clamp and the speed-match scale.
 pub const VMAX: f32 = 18.0;
 /// Car collision capsule: a segment of half-length `CAR_HL` along the

@@ -1,5 +1,5 @@
 //! Authoritative drive server. All transport plumbing lives in pm's net
-//! layer (`pm.sync` + `pm.serve`) — this file is pure gameplay: spawn a
+//! layer (`pm.sync_pool` + `pm.run`) — this file is pure gameplay: spawn a
 //! car per peer, step each car with its command-frame input.
 
 use pm::{Commands, Id, PeerEvents, Pm, ServerOwn};
@@ -22,6 +22,25 @@ pub fn run(quiet: bool) {
     // car here both ships its id down (so the client knows which car is
     // its own — no bespoke handshake) and serves as our garage lookup.
     let own = pm.single::<ServerOwn>("net.own");
+    // Reliable client→server events: each peer can ask to be flipped back to
+    // its spawn. The receiver only exists on the server (one-way channel).
+    let respawns = pm.event::<Respawn>("respawn");
+
+    // Apply respawns (prio 11 — after the net task fills net.events, before
+    // the drive step). The reset is a plain state write; it replicates back.
+    pm.task_add("respawn", 11.0, 0.0, {
+        let car = car.clone();
+        let own = own.clone();
+        move |_pm| {
+            for (peer, _) in respawns.drain() {
+                if let Some(id) = own.get().get(peer)
+                    && let Some(mut c) = car.get_mut().get_mut(id)
+                {
+                    *c = spawn_car(peer);
+                }
+            }
+        }
+    });
 
     // Joins and leaves: a car per peer (prio 10 — after the net task).
     pm.task_add("roster", 10.0, 0.0, {

@@ -3,9 +3,9 @@
 //! the whole field rendered through pm_sdl::gpu3d's panini projection.
 //!
 //! WASD drives; 1/2/3 switch cameras (chase / rear / side, each with its
-//! own FOV); P toggles panini; Esc quits. Camera switching and the
-//! panini toggle go through the `CamManager` single — no `pm` in the
-//! per-frame path.
+//! own FOV); P toggles panini; R respawns (a reliable client→server event);
+//! Esc quits. Camera switching and the panini toggle go through the
+//! `CamManager` single — no `pm` in the per-frame path.
 
 use pm::{
     CamAnchor, CamRig, CamView, Mat4, Pm, Vec3, camera_install, camera_manager, camera_track, vec3,
@@ -14,8 +14,6 @@ use pm_sdl::gpu3d::{Frame3, Renderer3d, bake, box_tris, checker_ground, panini_f
 use pm_sdl::sdl3;
 use sdl3::event::Event;
 use sdl3::keyboard::Scancode;
-
-use pm::{NetInput, NetStatus};
 
 use crate::bot_client::add_client_tasks;
 use crate::common::*;
@@ -49,9 +47,12 @@ pub fn run() {
     // `draw` is the smoothed view to render: predicted local car,
     // interpolated remotes, maintained by the net module.
     let (pred, draw) = add_client_tasks(&mut pm, &car);
+    let net = pm.net::<Drive>();
 
-    let cmd = pm.single::<NetInput<Drive>>("net.input");
-    let status = pm.single::<NetStatus>("net.status");
+    // Reliable client→server intent: R flips us back to spawn. Continuous
+    // driving rides the unreliable input pod (`net.input`); this one-shot
+    // rides the event.
+    let respawn = pm.event::<Respawn>("respawn");
     // Install the camera module now so we can capture its manager single
     // for the input task; the rig is mounted later, once we know our car.
     camera_install(&mut pm);
@@ -60,7 +61,7 @@ pub fn run() {
     let draw_pool = draw.clone();
 
     let (mut window, mut pump, refresh) =
-        pm_sdl::window("pm drive — wasd, 1-3 cams, p panini, esc quits", W, H);
+        pm_sdl::window("pm drive — wasd, 1-3 cams, p panini, r respawn, esc quits", W, H);
     let mut r3d = Renderer3d::new(&window).expect("renderer");
     r3d.fog_distance = 160.0;
     let ground = r3d
@@ -108,8 +109,9 @@ pub fn run() {
         .expect("marker");
 
     pm.task_add("input", 4.0, 0.0, {
-        let cmd = cmd.clone();
         let cam_mgr = cam_mgr.clone();
+        let respawn = respawn.clone();
+        let net = net.clone();
         move |pm| {
             for ev in pump.poll_iter() {
                 match ev {
@@ -118,6 +120,12 @@ pub fn run() {
                         scancode: Some(Scancode::Escape),
                         ..
                     } => pm.loop_quit(),
+                    // R: reliable respawn intent to the server.
+                    Event::KeyDown {
+                        scancode: Some(Scancode::R),
+                        repeat: false,
+                        ..
+                    } => respawn.send(Respawn::default()),
                     // Camera controls go straight through the manager
                     // single — no pm.
                     Event::KeyDown {
@@ -142,12 +150,12 @@ pub fn run() {
             let k = pump.keyboard_state();
             let held = |sc: Scancode| k.is_scancode_pressed(sc) as i32 as f32;
             let drift = (held(Scancode::LShift) + held(Scancode::RShift)).min(1.0);
-            cmd.get_mut().0 = Drive {
+            net.input(Drive {
                 thrust: held(Scancode::W) - 0.6 * held(Scancode::S),
                 turn: held(Scancode::D) - held(Scancode::A),
                 drift,
                 bot: 0.0, // human: crisp steering
-            };
+            });
         }
     });
 
@@ -157,8 +165,9 @@ pub fn run() {
     // on it and show the chase. Then this task retires itself.
     pm.task_add("rig_cams", 32.0, 0.0, {
         let draw = draw.clone();
+        let net = net.clone();
         move |pm| {
-            let Some(id) = pm.mine() else {
+            let Some(id) = net.mine() else {
                 return;
             };
             let draw = draw.clone();
@@ -181,6 +190,7 @@ pub fn run() {
     pm.task_add("render", 70.0, 0.0, {
         let view = cam_view.clone();
         let score = score.clone();
+        let net = net.clone();
         move |pm| {
             let (view_mat, fov, panini_on) = {
                 let v = view.get();
@@ -266,7 +276,7 @@ pub fn run() {
                 // Read RAW from the authoritative `score` pool — server-owned,
                 // never predicted — so the number and its rate can't disagree
                 // with each other or lag the truth.
-                let mine = pm.mine();
+                let mine = net.mine();
                 let (points, rate) = match mine.and_then(|id| score.get().get(id).copied()) {
                     Some(s) => (s.points, s.rate),
                     None => (0.0, 0.0),
@@ -288,7 +298,6 @@ pub fn run() {
                 hud_bold(&mut frame, &rate_txt, x0 + sw + gap, 14.0, spx, rcol);
             }
             if pm.tick() % 30 == 0 {
-                let st = status.get();
                 let speed = pred
                     .get()
                     .state()
@@ -296,9 +305,9 @@ pub fn run() {
                     .unwrap_or(0.0); // ~mph, for flavor
                 let title = format!(
                     "pm drive — peer {}  {:.0} mph  rtt {:.0} ms  corrections {}  (wasd, esc)",
-                    st.peer,
+                    net.peer(),
                     speed.abs(),
-                    st.rtt_ms,
+                    net.rtt_ms(),
                     pred.get().corrections,
                 );
                 let _ = window.set_title(&title);

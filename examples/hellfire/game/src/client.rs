@@ -3,7 +3,7 @@
 //! plus the bot's input task. The transport is pm's net module; the SDL
 //! window/input/render live in sdl_client.rs.
 
-use pm::{NetInput, NetStatus, Outbox, Pm, Rng, coast_blend, pool_mirror, vec2};
+use pm::{ClientNet, Outbox, Pm, PmClient, Rng, coast_blend, pool_mirror, vec2};
 
 use crate::common::*;
 
@@ -90,12 +90,15 @@ pub fn current_status(status: &pm::PoolHandle<Status>) -> Status {
 /// Smoothing + diag tasks shared by player and bot clients; the
 /// transport is the net module. The input layer (SDL or bot) writes the
 /// `"net.input"` single; rendering reads the draw pools.
-pub fn add_client_tasks(pm: &mut Pm, pools: &Pools, name: String) {
+pub fn add_client_tasks(pm: &mut PmClient, pools: &Pools, name: String) -> ClientNet<InputCmd> {
+    let net = pm.net::<InputCmd>();
     // No connect here — `Pm::run` does that once the schema is complete.
-    let stats = pm.single::<NetStatus>("net.status");
-
     // Queued before the handshake even exists — the module holds
     // reliable events until connected.
+    // TODO(typed-events): EV_NAME carries a variable-length String, which the
+    // Pod-only `EventTx` can't yet express — so this (and EV_START/EV_RESTART)
+    // stay on the raw `Outbox`/`ServerEvents` until a bytes/var-len event
+    // channel lands. Once it does, migrate these and demote those singles.
     pm.single::<Outbox>("net.out")
         .get_mut()
         .send(EV_NAME, name.as_bytes());
@@ -105,8 +108,8 @@ pub fn add_client_tasks(pm: &mut Pm, pools: &Pools, name: String) {
     // One-shot diag report when the game ends (HELLFIRE_REPORT_DIR).
     pm.task_add("diag", 90.0, 0.5, {
         let status = pools.status.clone();
-        let stats = stats.clone();
         let name = report_name;
+        let net = net.clone();
         let mut written = false;
         move |_pm| {
             let st = current_status(&status);
@@ -117,12 +120,11 @@ pub fn add_client_tasks(pm: &mut Pm, pools: &Pools, name: String) {
             let dir =
                 std::env::var("HELLFIRE_REPORT_DIR").unwrap_or_else(|_| "target/work/reports".into());
             let _ = std::fs::create_dir_all(&dir);
-            let s = stats.get();
             let json = format!(
                 "{{\n  \"role\": \"client\",\n  \"name\": \"{name}\",\n  \"peer\": {},\n  \"snapshots\": {},\n  \"rtt_ms\": {:.1},\n  \"score\": {},\n  \"win\": {}\n}}\n",
-                s.peer,
-                s.snapshots,
-                s.rtt_ms,
+                net.peer(),
+                net.snapshots(),
+                net.rtt_ms(),
                 st.score,
                 st.flags & FLAG_WIN != 0,
             );
@@ -161,6 +163,8 @@ pub fn add_client_tasks(pm: &mut Pm, pools: &Pools, name: String) {
             });
         }
     });
+
+    net
 }
 
 /// Headless bot: wanders, hunts the nearest monster it can see in its
@@ -168,15 +172,15 @@ pub fn add_client_tasks(pm: &mut Pm, pools: &Pools, name: String) {
 pub fn run_bot(n: u32) {
     let mut pm = Pm::client(ADDR, 60.0);
     let pools = client_pools(&mut pm);
-    add_client_tasks(&mut pm, &pools, format!("bot{n}"));
+    let net = add_client_tasks(&mut pm, &pools, format!("bot{n}"));
 
-    let cmd = pm.single::<NetInput<InputCmd>>("net.input");
     let outbox = pm.single::<Outbox>("net.out");
     pm.task_add("bot", 4.0, 0.0, {
         let monster = pools.monster.clone();
         let player = pools.player.clone();
         let status = pools.status.clone();
         let outbox = outbox.clone();
+        let net = net.clone();
         let mut rng = Rng::new(1000 + n);
         let mut dir = vec2(1.0, 0.0);
         let mut turn = pm::Cooldown::new(1.0);
@@ -212,14 +216,13 @@ pub fn run_bot(n: u32) {
                 }
             }
             let st = current_status(&status);
-            let mut c = cmd.get_mut();
-            c.0 = InputCmd {
+            net.input(InputCmd {
                 dx: dir.x,
                 dy: dir.y,
                 ax: aim.x,
                 ay: aim.y,
                 buttons: BTN_SHOOT,
-            };
+            });
             if st.flags & FLAG_GAME_OVER != 0 && rng.rf() < 0.005 {
                 outbox.get_mut().send(EV_RESTART, &[]);
             }

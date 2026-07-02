@@ -5,7 +5,10 @@
       "Grep",
       "Glob",
       "Bash",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python3 -)",
+      "Bash(cargo check *)",
+      "Bash(cargo test *)"
     ]
   }
 }
