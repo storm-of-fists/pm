@@ -48,6 +48,7 @@ pub fn run() {
         let ui = ui.clone();
         let player_draw = pools.player_draw.clone();
         let status = pools.status.clone();
+        let net = net.clone();
         move |pm| {
             let in_lobby = status.get().flags & FLAG_STARTED == 0;
             for ev in pump.poll_iter() {
@@ -84,14 +85,12 @@ pub fn run() {
                 }
             }
 
-            // Camera dynamics: ease zoom, follow own player.
+            // Camera dynamics: ease zoom, follow own player (the entity
+            // the server marked ours, read from the smoothed draw pool).
             let dt = pm.loop_dt();
-            let my_peer = pm.local_peer as u32;
-            let me = player_draw
-                .get()
-                .iter()
-                .find(|(_, p)| p.peer == my_peer)
-                .map(|(_, p)| p.pos);
+            let me = net
+                .mine()
+                .and_then(|id| player_draw.get().get(id).map(|p| p.pos));
             {
                 let mut cam = cam.get_mut();
                 let dz = cam.target_zoom - cam.zoom;
@@ -181,8 +180,9 @@ pub fn run() {
                 let _ = c.fill_rect(FRect::new(x - s * 0.5, y - s * 0.5, s, s));
             }
 
-            let my_peer = pm.local_peer as u32;
-            for (_, p) in pools.player_draw.get().iter() {
+            let mine = net.mine();
+            let my_peer = net.peer() as u32; // roster rows are peer-keyed
+            for (id, p) in pools.player_draw.get().iter() {
                 if p.alive == 0 {
                     continue;
                 }
@@ -215,7 +215,7 @@ pub fn run() {
                 let hy = y - size * 0.62;
                 c.set_draw_color(Color::RGB(40, 40, 48));
                 let _ = c.fill_rect(FRect::new(hx, hy, bw, 5.0));
-                c.set_draw_color(if p.peer == my_peer {
+                c.set_draw_color(if mine == Some(id) {
                     Color::RGB(120, 255, 120)
                 } else {
                     Color::RGB(p.color[0], p.color[1], p.color[2])
@@ -226,12 +226,10 @@ pub fn run() {
             // --- screen-space text ------------------------------------
             if let Some(f) = font.as_mut() {
                 if started {
-                    let me_hp = pools
-                        .player
-                        .get()
-                        .iter()
-                        .find(|(_, p)| p.peer == my_peer)
-                        .map(|(_, p)| p.hp)
+                    // Own hp reads RAW from the authoritative pool by id —
+                    // server-owned state, never smoothed.
+                    let me_hp = mine
+                        .and_then(|id| pools.player.get().get(id).map(|p| p.hp))
                         .unwrap_or(0.0);
                     let hud = format!(
                         "score {}   kills {}   level {}   hp {:.0}",

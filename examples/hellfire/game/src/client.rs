@@ -3,7 +3,7 @@
 //! plus the bot's input task. The transport is pm's net module; the SDL
 //! window/input/render live in sdl_client.rs.
 
-use pm::{ClientNet, Pm, PmClient, Rng, SingleRx, coast_blend, pool_mirror, vec2};
+use pm::{ClientNet, Pm, PmClient, Rng, SingleRx, Vec2, vec2};
 
 use crate::common::*;
 
@@ -72,10 +72,12 @@ pub fn client_pools(pm: &mut PmClient) -> Pools {
         status: pm.sync_single("status"),
         dbg: pm.sync_single("dbg"),
         roster: pm.sync_pool("roster"),
-        // Local draw pools (smoothing targets, never networked).
-        monster_draw: pm.pool("monster_draw"),
-        bullet_draw: pm.pool("bullet_draw"),
-        player_draw: pm.pool("player_draw"),
+        // Draw siblings, local and never networked: the same pools
+        // `interp_pool` fills in add_client_tasks (name-keyed, so these
+        // handles alias the ones it creates).
+        monster_draw: pm.pool("monster.draw"),
+        bullet_draw: pm.pool("bullet.draw"),
+        player_draw: pm.pool("player.draw"),
     }
 }
 
@@ -119,37 +121,45 @@ pub fn add_client_tasks(pm: &mut PmClient, pools: &Pools, name: String) -> Clien
         }
     });
 
-    // Dead-reckon the draw pools between (budget-rotated) refreshes:
-    // pm::pool_mirror handles add/blend/stale-drop; the closures are
-    // just the per-type blend math.
-    pm.task_add("smooth", 30.0, 0.0, {
-        let pools_m = pools.monster.clone();
-        let pools_b = pools.bullet.clone();
-        let pools_p = pools.player.clone();
-        let draw_m = pools.monster_draw.clone();
-        let draw_b = pools.bullet_draw.clone();
-        let draw_p = pools.player_draw.clone();
-        move |pm| {
-            let dt = pm.loop_dt();
-            pool_mirror(&pools_m, &draw_m, |_, d, a: &Monster| Monster {
-                pos: coast_blend(d.pos, d.vel, a.pos, dt, 0.15),
-                ..*a
-            });
-            pool_mirror(&pools_b, &draw_b, |_, d, a: &Bullet| Bullet {
-                pos: coast_blend(d.pos, d.vel, a.pos, dt, 0.15),
-                ..*a
-            });
-            pool_mirror(&pools_p, &draw_p, |_, d, a: &Player| {
-                let snap = d.pos.dist(a.pos) > 120.0; // respawn/level jump
-                let pos = if snap {
-                    a.pos
-                } else {
-                    d.pos + (a.pos - d.pos) * 0.35
-                };
-                Player { pos, ..*a }
-            });
-        }
-    });
+    // Snapshot interpolation into the draw siblings (`"<name>.draw"`), a
+    // beat behind the newest authoritative sample with a small capped
+    // extrapolation to ride loss bursts. Hellfire has no prediction, so
+    // the local player rides the same path as everyone else.
+    let lerp2 = |a: Vec2, b: Vec2, t: f32| a + (b - a) * t;
+    pm.interp_pool(
+        &pools.monster,
+        move |a, b, t| Monster {
+            pos: lerp2(a.pos, b.pos, t),
+            vel: lerp2(a.vel, b.vel, t),
+            ..*b
+        },
+        0.05,
+        0.05,
+    );
+    pm.interp_pool(
+        &pools.bullet,
+        move |a, b, t| Bullet {
+            pos: lerp2(a.pos, b.pos, t),
+            ..*b
+        },
+        0.05,
+        0.05,
+    );
+    pm.interp_pool(
+        &pools.player,
+        move |a, b, t| {
+            if a.pos.dist(b.pos) > 120.0 {
+                *b // respawn/level jump: snap, don't slide across the map
+            } else {
+                Player {
+                    pos: lerp2(a.pos, b.pos, t),
+                    ..*b
+                }
+            }
+        },
+        0.05,
+        0.05,
+    );
 
     net
 }
@@ -159,7 +169,7 @@ pub fn add_client_tasks(pm: &mut PmClient, pools: &Pools, name: String) -> Clien
 pub fn run_bot(n: u32) {
     let mut pm = Pm::client(ADDR, 60.0);
     let pools = client_pools(&mut pm);
-    let _net = add_client_tasks(&mut pm, &pools, format!("bot{n}"));
+    let net = add_client_tasks(&mut pm, &pools, format!("bot{n}"));
     // Every client registers the full channel set — the handshake schema
     // is the connection's contract.
     let input = pm.input::<InputCmd>("input");
@@ -173,18 +183,12 @@ pub fn run_bot(n: u32) {
         let mut rng = Rng::new(1000 + n);
         let mut dir = vec2(1.0, 0.0);
         let mut turn = pm::Cooldown::new(1.0);
-        let mut me = None;
         move |pm| {
             let dt = pm.loop_dt();
-            let my_peer = pm.local_peer as u32;
-            if me.is_none() {
-                me = player
-                    .get()
-                    .iter()
-                    .find(|(_, p)| p.peer == my_peer)
-                    .map(|(id, _)| id);
-            }
-            let pos = me
+            // The server marks our player via own_set; mine() is the
+            // loss-robust "which entity is me" — no pod scan needed.
+            let pos = net
+                .mine()
                 .and_then(|id| player.get().get(id).map(|p| p.pos))
                 .unwrap_or(vec2(W * 0.5, H * 0.5));
             if turn.ready(dt) {

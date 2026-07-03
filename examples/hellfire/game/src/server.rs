@@ -1,9 +1,7 @@
 //! Hellfire authoritative server: headless, owns all gameplay. Clients
 //! send input; everything they see is replicated pool state.
 
-use std::collections::HashMap;
-
-use pm::{Id, Pm, Rng, SpatialGrid, Vec2, vec2};
+use pm::{Id, Pm, Rng, ServerNet, SpatialGrid, Vec2, vec2};
 
 use crate::common::*;
 
@@ -21,8 +19,6 @@ struct Game {
     game_over: bool,
     win: bool,
     rng: Rng,
-    players: HashMap<u8, Id>,
-    rosters: HashMap<u8, Id>,
     grid: SpatialGrid,
     win_score: i32,
     samples: Vec<String>,
@@ -34,6 +30,16 @@ struct Game {
 
 fn report_dir() -> String {
     std::env::var("HELLFIRE_REPORT_DIR").unwrap_or_else(|_| "target/work/reports".into())
+}
+
+/// The roster row for `peer` — the replicated pool IS the peer→name
+/// table (≤ MAX_PLAYERS entries), so a scan replaces a side map.
+fn roster_id(roster: &pm::PoolHandle<Roster>, peer: u8) -> Option<Id> {
+    roster
+        .get()
+        .iter()
+        .find(|(_, r)| r.peer == peer as u32)
+        .map(|(id, _)| id)
 }
 
 pub fn run(quiet: bool) {
@@ -90,7 +96,6 @@ pub fn run(quiet: bool) {
                 roster
                     .get_mut()
                     .add(rid, Roster::new(p, &format!("P{p}")));
-                g.rosters.insert(p, rid);
                 let i = spawn_index(p);
                 let pid = pm.id_add();
                 let c = PCOL[i];
@@ -111,41 +116,44 @@ pub fn run(quiet: bool) {
                         invuln: 2.0,
                     },
                 );
-                g.players.insert(p, pid);
+                // Ships pid in every snapshot header (ClientNet::mine) and
+                // doubles as the server's peer→player lookup.
+                net.own_set(p, pid);
                 if !quiet {
                     eprintln!("[server] peer {p} joined");
                 }
             }
             for p in net.left() {
-                if let Some(id) = g.players.remove(&p) {
-                    pm.id_remove(id);
+                if let Some(pid) = net.own(p) {
+                    pm.id_remove(pid);
                 }
-                if let Some(id) = g.rosters.remove(&p) {
-                    pm.id_remove(id);
+                net.own_clear(p);
+                if let Some(rid) = roster_id(&roster, p) {
+                    pm.id_remove(rid);
                 }
                 if !quiet {
                     eprintln!("[server] peer {p} left");
                 }
             }
             for (p, name) in names.drain() {
-                if let Some(&rid) = g.rosters.get(&p) {
+                if let Some(rid) = roster_id(&roster, p) {
                     roster.get_mut().add(rid, Roster::new(p, name.as_str()));
                 }
             }
             if !g.started && !starts.drain().is_empty() {
                 g.started = true;
                 let time: f32 = g.time;
-                let len: usize = g.players.len();
+                let len: usize = net.owned().len();
                 g.events.push(format!(
                     "{{\"t\": {:.1}, \"event\": \"started with {} players\"}}",
                     time, len
                 ));
                 if !quiet {
-                    eprintln!("[server] game started ({} players)", g.players.len());
+                    eprintln!("[server] game started ({len} players)");
                 }
             }
             if g.game_over && !restarts.drain().is_empty() {
-                restart(pm, &mut g, &player, &player_srv, &monster, &bullet);
+                restart(pm, &mut g, &net, &player, &player_srv, &monster, &bullet);
                 if !quiet {
                     eprintln!("[server] restart (round {})", g.round);
                 }
@@ -160,6 +168,7 @@ pub fn run(quiet: bool) {
         let player_srv = player_srv.clone();
         let bullet = bullet.clone();
         let bullet_srv = bullet_srv.clone();
+        let net = net.clone();
         move |pm| {
             let g = game.get();
             if !g.started || g.game_over {
@@ -170,7 +179,7 @@ pub fn run(quiet: bool) {
             {
                 let mut players = player.get_mut();
                 let mut srv = player_srv.get_mut();
-                for (&peer, &pid) in &g.players {
+                for (peer, pid) in net.owned() {
                     let Some(mut p) = players.get_mut(pid) else {
                         continue;
                     };
@@ -228,6 +237,7 @@ pub fn run(quiet: bool) {
         let monster = monster.clone();
         let monster_srv = monster_srv.clone();
         let bullet = bullet.clone();
+        let net = net.clone();
         move |pm| {
             let mut g = game.get_mut();
             if !g.started || g.game_over {
@@ -250,7 +260,7 @@ pub fn run(quiet: bool) {
                 // Breather: clear the field, regroup the living.
                 pm.id_remove_all(&monster);
                 pm.id_remove_all(&bullet);
-                let entries: Vec<(u8, Id)> = g.players.iter().map(|(&p, &id)| (p, id)).collect();
+                let entries = net.owned();
                 let mut players = player.get_mut();
                 let mut srv = player_srv.get_mut();
                 for (peer, pid) in entries {
@@ -437,6 +447,7 @@ pub fn run(quiet: bool) {
         let player_srv = player_srv.clone();
         let monster = monster.clone();
         let bullet = bullet.clone();
+        let net = net.clone();
         move |pm| {
             let mut g = game.get_mut();
             if !g.started || g.game_over {
@@ -483,7 +494,7 @@ pub fn run(quiet: bool) {
                 let mut srv = player_srv.get_mut();
                 let bullets = bullet.get();
                 let monsters = monster.get();
-                for &pid in g.players.values() {
+                for (_, pid) in net.owned() {
                     let Some(mut p) = players.get_mut(pid) else {
                         continue;
                     };
@@ -561,6 +572,7 @@ pub fn run(quiet: bool) {
     pm.task_add("status_pub", 60.0, 0.0, {
         let game = game.clone();
         let status = status.clone();
+        let net = net.clone();
         move |_pm| {
             let mut g = game.get_mut();
             let mut flags = 0;
@@ -598,7 +610,7 @@ pub fn run(quiet: bool) {
                     g.level + 1,
                     g.round,
                     g.win,
-                    g.players.len(),
+                    net.owned().len(),
                     g.peak_monsters,
                     g.peak_bullets,
                     g.events.join(", "),
@@ -618,6 +630,7 @@ pub fn run(quiet: bool) {
         let dbg = dbg.clone();
         let monster = monster.clone();
         let bullet = bullet.clone();
+        let net = net.clone();
         move |pm| {
             let (m, b) = (monster.get().len(), bullet.get().len());
             *dbg.get_mut() =
@@ -627,7 +640,7 @@ pub fn run(quiet: bool) {
             g.peak_bullets = g.peak_bullets.max(b);
             if g.started && !g.game_over {
                 let alive =
-                    g.players.len(); // connected; per-player alive is in the player pool
+                    net.owned().len(); // connected; per-player alive is in the player pool
                 let sample = format!(
                     "{{\"t\": {:.1}, \"monsters\": {m}, \"bullets\": {b}, \"players\": {alive}, \"score\": {}, \"frame_ms\": {:.2}}}",
                     g.time, g.score, pm.loop_dt() * 1000.0,
@@ -642,6 +655,7 @@ pub fn run(quiet: bool) {
             let game = game.clone();
             let monster = monster.clone();
             let bullet = bullet.clone();
+            let net = net.clone();
             move |_pm| {
                 let g = game.get();
                 if g.started {
@@ -652,7 +666,7 @@ pub fn run(quiet: bool) {
                         g.level + 1,
                         monster.get().len(),
                         bullet.get().len(),
-                        g.players.len(),
+                        net.owned().len(),
                         if g.game_over {
                             if g.win { "WIN" } else { "GAME OVER" }
                         } else {
@@ -712,6 +726,7 @@ pub fn run(quiet: bool) {
 fn restart(
     pm: &mut Pm,
     g: &mut Game,
+    net: &ServerNet,
     player: &pm::PoolHandle<Player>,
     player_srv: &pm::PoolHandle<PlayerSrv>,
     monster: &pm::PoolHandle<Monster>,
@@ -731,7 +746,7 @@ fn restart(
     g.win = false;
     let mut players = player.get_mut();
     let mut srv = player_srv.get_mut();
-    for (&peer, &pid) in &g.players {
+    for (peer, pid) in net.owned() {
         if let Some(mut p) = players.get_mut(pid) {
             let i = spawn_index(peer);
             p.pos = vec2(SPAWN_X[i], SPAWN_Y[i]);
