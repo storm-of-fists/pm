@@ -2,7 +2,7 @@
 //! layer (`pm.sync_pool` + `pm.run`) — this file is pure gameplay: spawn a
 //! car per peer, step each car with its command-frame input.
 
-use pm::{Commands, Id, PeerEvents, Pm, ServerOwn};
+use pm::{Id, Pm};
 
 use crate::common::*;
 
@@ -16,24 +16,26 @@ pub fn run(quiet: bool) {
     if !quiet {
         eprintln!("drive server on {ADDR}");
     }
-    let peers = pm.single::<PeerEvents>("net.peers");
-    let cmds = pm.single::<Commands<Drive>>("net.cmds");
-    // `ServerOwn` is the built-in peer→entity channel: recording a peer's
-    // car here both ships its id down (so the client knows which car is
-    // its own — no bespoke handshake) and serves as our garage lookup.
-    let own = pm.single::<ServerOwn>("net.own");
+    // The server surface: joins/leaves this tick, and the peer→entity
+    // table. `own_set` both ships a peer's car id down in every snapshot
+    // header (so the client knows which car is its own — no bespoke
+    // handshake) and serves as our garage lookup.
+    let net = pm.net();
+    // THE continuous input channel (one per connection): the same name and
+    // pod the clients register — the handshake schema enforces it.
+    let inputs = pm.input::<Drive>("drive");
     // Reliable client→server events: each peer can ask to be flipped back to
     // its spawn. The receiver only exists on the server (one-way channel).
     let respawns = pm.event::<Respawn>("respawn");
 
-    // Apply respawns (prio 11 — after the net task fills net.events, before
+    // Apply respawns (prio 11 — after the net task receives events, before
     // the drive step). The reset is a plain state write; it replicates back.
     pm.task_add("respawn", 11.0, 0.0, {
         let car = car.clone();
-        let own = own.clone();
+        let net = net.clone();
         move |_pm| {
             for (peer, _) in respawns.drain() {
-                if let Some(id) = own.get().get(peer)
+                if let Some(id) = net.own(peer)
                     && let Some(mut c) = car.get_mut().get_mut(id)
                 {
                     *c = spawn_car(peer);
@@ -46,22 +48,22 @@ pub fn run(quiet: bool) {
     pm.task_add("roster", 10.0, 0.0, {
         let car = car.clone();
         let score = score.clone();
-        let own = own.clone();
+        let net = net.clone();
         move |pm| {
-            for &p in &peers.get().joined {
+            for p in net.joined() {
                 let id = pm.id_add();
                 car.get_mut().add(id, spawn_car(p));
                 score.get_mut().add(id, Score::default());
-                own.get_mut().set(p, id);
+                net.own_set(p, id);
                 if !quiet {
                     eprintln!("[server] peer {p} joined");
                 }
             }
-            for &p in &peers.get().left {
-                if let Some(id) = own.get().get(p) {
+            for p in net.left() {
+                if let Some(id) = net.own(p) {
                     pm.id_remove(id);
                 }
-                own.get_mut().clear(p);
+                net.own_clear(p);
                 if !quiet {
                     eprintln!("[server] peer {p} left");
                 }
@@ -71,15 +73,14 @@ pub fn run(quiet: bool) {
 
     pm.task_add("drive", 30.0, 0.0, {
         let car = car.clone();
-        let own = own.clone();
+        let net = net.clone();
         move |_pm| {
-            let mut cmds = cmds.get_mut();
             let mut car = car.get_mut();
-            for (&peer, &id) in &own.get().0 {
+            for (peer, id) in net.owned() {
                 // pop = command-frame consumption: one input per tick,
                 // hold-when-dry, bounded skip-ahead. The consumed seq is
                 // echoed automatically for prediction reconciliation.
-                let cmd = cmds.pop(peer);
+                let cmd = inputs.pop(peer);
                 if let Some(mut c) = car.get_mut(id) {
                     drive_step(&mut c, cmd, FIXED_DT);
                 }
@@ -164,7 +165,7 @@ pub fn run(quiet: bool) {
     }
 
     pm.loop_rate = 60;
-    pm.run::<Drive>().unwrap_or_else(|e| {
+    pm.run().unwrap_or_else(|e| {
         eprintln!("cannot serve {ADDR}: {e}");
         eprintln!("(a previous drive may still be running: pkill -x drive)");
         std::process::exit(1);

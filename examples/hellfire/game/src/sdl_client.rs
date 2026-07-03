@@ -10,9 +10,8 @@ use pm_sdl::sdl3::pixels::Color;
 use pm_sdl::sdl3::render::FRect;
 use pm_sdl::{Font, Sprite};
 
-use crate::client::{Camera, Ui, add_client_tasks, client_pools, current_status};
+use crate::client::{Camera, Ui, add_client_tasks, client_pools};
 use crate::common::*;
-use pm::Outbox;
 
 fn resource(name: &str) -> String {
     format!("{}/resources/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -35,7 +34,11 @@ pub fn run() {
 
     let cam = pm.single::<Camera>("camera");
     let ui = pm.single::<Ui>("ui");
-    let outbox = pm.single::<Outbox>("net.out");
+    // THE continuous input channel plus the discrete intents — the same
+    // channel set the server (and every other client) registers.
+    let input = pm.input::<InputCmd>("input");
+    let starts = pm.event::<Start>("start");
+    let restarts = pm.event::<Restart>("restart");
 
     // Input + camera: wheel zooms (toward 0.5x..3x), camera follows your
     // player, mouse aim goes through the inverse camera transform so it
@@ -43,12 +46,10 @@ pub fn run() {
     pm.task_add("input", 4.0, 0.0, {
         let cam = cam.clone();
         let ui = ui.clone();
-        let outbox = outbox.clone();
         let player_draw = pools.player_draw.clone();
         let status = pools.status.clone();
-        let net = net.clone();
         move |pm| {
-            let in_lobby = current_status(&status).flags & FLAG_STARTED == 0;
+            let in_lobby = status.get().flags & FLAG_STARTED == 0;
             for ev in pump.poll_iter() {
                 match ev {
                     Event::Quit { .. }
@@ -60,13 +61,13 @@ pub fn run() {
                         scancode: Some(Scancode::R),
                         ..
                     } => {
-                        outbox.get_mut().send(EV_RESTART, &[]);
+                        restarts.send(Restart::default());
                     }
                     Event::KeyDown {
                         scancode: Some(Scancode::Return),
                         ..
                     } if in_lobby => {
-                        outbox.get_mut().send(EV_START, &[]);
+                        starts.send(Start::default());
                     }
                     Event::KeyDown {
                         scancode: Some(Scancode::F1),
@@ -104,7 +105,7 @@ pub fn run() {
             let held = |sc: Scancode| k.is_scancode_pressed(sc);
             let m = pump.mouse_state();
             let aim = cam.get().to_world(m.x(), m.y());
-            net.input(InputCmd {
+            input.set(InputCmd {
                 dx: (held(Scancode::D) as i32 - held(Scancode::A) as i32) as f32,
                 dy: (held(Scancode::S) as i32 - held(Scancode::W) as i32) as f32,
                 ax: aim.x,
@@ -150,7 +151,7 @@ pub fn run() {
                 }
             }
 
-            let st = current_status(&pools.status);
+            let st = pools.status.get();
             let started = st.flags & FLAG_STARTED != 0;
             let over = st.flags & FLAG_GAME_OVER != 0;
             let cam = *cam.get();
@@ -294,13 +295,7 @@ pub fn run() {
                 if ui.get().show_debug {
                     c.set_draw_color(Color::RGBA(0, 0, 0, 170));
                     let _ = c.fill_rect(FRect::new(8.0, 34.0, 360.0, 250.0));
-                    let dbg = pools
-                        .dbg
-                        .get()
-                        .values()
-                        .first()
-                        .copied()
-                        .unwrap_or_default();
+                    let dbg = pools.dbg.get();
                     let mut lines = vec![
                         format!("fps {fps:.0}   frame {:.2} ms", dt * 1000.0),
                         format!("rtt {:.0} ms   snapshots {}", net.rtt_ms(), net.snapshots()),
@@ -342,5 +337,5 @@ pub fn run() {
     // Display refresh paces the loop (WSLg ignores vsync; input still
     // goes out at a fixed 60 Hz via the net module's send cadence).
     pm.loop_rate = refresh;
-    pm.run::<InputCmd>().expect("connect");
+    pm.run().expect("connect");
 }

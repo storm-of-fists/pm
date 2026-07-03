@@ -4,7 +4,7 @@
 //! now; this file supplies only what the module can't know — THE shared
 //! step, the error metric, and how cars interpolate.
 
-use pm::{Pm, PmClient, Predictor, SingleHandle};
+use pm::{InputTx, Pm, PmClient, Predictor, SingleHandle};
 
 use crate::common::*;
 
@@ -24,12 +24,14 @@ fn err_metric(a: &Car, b: &Car) -> f32 {
 pub fn add_client_tasks(
     pm: &mut PmClient,
     car: &pm::PoolHandle<Car>,
+    input: &InputTx<Drive>,
 ) -> (SingleHandle<Predictor<Car, Drive>>, pm::PoolHandle<Car>) {
-    // No connect here — `Pm::run` does that once the schema is complete.
+    // No connect here — `run` does that once the schema is complete.
     // Local avatar: reconcile against the server's input-seq echo, replay
-    // unacked inputs, and draw smooth-predicted. The same `drive_step` the
-    // server runs is what makes reconciliation byte-exact.
-    let pred = pm.predict_pool(car, drive_step, err_metric, 1e-4, FIXED_DT);
+    // the input channel's unacked sends, and draw smooth-predicted. The
+    // same `drive_step` the server runs is what makes reconciliation
+    // byte-exact.
+    let pred = pm.predict_pool(car, input, drive_step, err_metric, 1e-4, FIXED_DT);
 
     // Remote cars: snapshot interpolation ~50 ms behind newest, with a
     // capped 50 ms extrapolation to ride loss bursts — env-tunable so feel
@@ -56,9 +58,13 @@ pub fn run_bot(n: u32) {
     // Same synced pools as the server (order doesn't matter — keyed by name).
     let car = pm.sync_pool::<Car>("car");
     pm.sync_pool::<Score>("score");
+    // Same channels as the server, too: the handshake schema covers every
+    // named channel, so even a bot that never respawns registers the
+    // respawn event — the schema is the connection's full contract.
+    let input = pm.input::<Drive>("drive");
+    let _respawn = pm.event::<Respawn>("respawn");
     // Headless: the draw pool is unused (no rendering), only the predictor.
-    let (pred, _draw) = add_client_tasks(&mut pm, &car);
-    let net = pm.net::<Drive>();
+    let (pred, _draw) = add_client_tasks(&mut pm, &car, &input);
 
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;
@@ -78,7 +84,7 @@ pub fn run_bot(n: u32) {
         } else {
             (t * 0.43).sin() * 0.8
         };
-        net.input(Drive {
+        input.set(Drive {
             thrust: 0.75 + 0.25 * (t * 0.31).sin(),
             turn,
             drift: 0.0,
@@ -87,5 +93,5 @@ pub fn run_bot(n: u32) {
     });
 
     pm.loop_rate = 60;
-    pm.run::<Drive>().expect("connect");
+    pm.run().expect("connect");
 }

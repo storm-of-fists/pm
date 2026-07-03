@@ -4,7 +4,12 @@
 //! `EventTx` and a `PmServer`'s `EventRx` agree on the wire tag, round-trip
 //! the pod faithfully, carry the sender peer, and ignore other channels.
 
-use pm::{Outbox, Pm, ServerEvents};
+//! In-crate because the raw event plumbing (`Outbox`/`ServerEvents`) the
+//! `deliver` shim uses is deliberately not public.
+
+use crate::Pm;
+use crate::net::Outbox;
+use crate::netmod::ServerEvents;
 
 #[derive(Clone, Copy, Default, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]

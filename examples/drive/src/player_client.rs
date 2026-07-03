@@ -44,14 +44,17 @@ pub fn run() {
     let car = pm.sync_pool::<Car>("car");
     let score = pm.sync_pool::<Score>("score");
     eprintln!("connecting to {ADDR} ...");
+    // THE continuous input channel: WASD lands in this pod, sampled and
+    // sent at the fixed input cadence.
+    let input = pm.input::<Drive>("drive");
     // `draw` is the smoothed view to render: predicted local car,
     // interpolated remotes, maintained by the net module.
-    let (pred, draw) = add_client_tasks(&mut pm, &car);
-    let net = pm.net::<Drive>();
+    let (pred, draw) = add_client_tasks(&mut pm, &car, &input);
+    let net = pm.net();
 
     // Reliable client→server intent: R flips us back to spawn. Continuous
-    // driving rides the unreliable input pod (`net.input`); this one-shot
-    // rides the event.
+    // driving rides the unreliable input channel; this one-shot rides the
+    // event.
     let respawn = pm.event::<Respawn>("respawn");
     // Install the camera module now so we can capture its manager single
     // for the input task; the rig is mounted later, once we know our car.
@@ -111,7 +114,7 @@ pub fn run() {
     pm.task_add("input", 4.0, 0.0, {
         let cam_mgr = cam_mgr.clone();
         let respawn = respawn.clone();
-        let net = net.clone();
+        let input = input.clone();
         move |pm| {
             for ev in pump.poll_iter() {
                 match ev {
@@ -150,7 +153,7 @@ pub fn run() {
             let k = pump.keyboard_state();
             let held = |sc: Scancode| k.is_scancode_pressed(sc) as i32 as f32;
             let drift = (held(Scancode::LShift) + held(Scancode::RShift)).min(1.0);
-            net.input(Drive {
+            input.set(Drive {
                 thrust: held(Scancode::W) - 0.6 * held(Scancode::S),
                 turn: held(Scancode::D) - held(Scancode::A),
                 drift,
@@ -317,5 +320,5 @@ pub fn run() {
 
     // Display refresh paces the loop (WSLg ignores vsync; see solids).
     pm.loop_rate = refresh;
-    pm.run::<Drive>().expect("connect");
+    pm.run().expect("connect");
 }

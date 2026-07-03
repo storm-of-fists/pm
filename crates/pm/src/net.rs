@@ -41,17 +41,12 @@ use crate::id::Id;
 use crate::kernel::{PoolHandle, Pm};
 use crate::paged::PagedArray;
 use crate::pool::Pool;
+use crate::transport::EVENT_USER_BASE;
 
-/// Client-side reliable-event outbox, as ordinary singleton data: any
-/// task (input, UI, a mod) pushes events; the net task — the one owner
-/// of the QUIC handle — drains it and sends. Exists so tasks don't need
-/// transport access (or pseudo-button hacks) to emit a reliable event.
-///
-/// ```ignore
-/// let outbox = pm.single::<Outbox>("outbox");
-/// outbox.borrow_mut().send(EV_START, &[]);            // any task
-/// for (ty, p) in outbox.borrow_mut().drain() { quic.event_send(ty, &p); } // net task
-/// ```
+/// Client-side reliable-event outbox (the `"net.out"` single): `EventTx`
+/// senders push tagged frames; the net task — the one owner of the QUIC
+/// handle — drains it and sends once connected. Internal plumbing behind
+/// the typed event channels; games never touch it.
 #[derive(Default)]
 pub struct Outbox {
     events: Vec<(u16, Vec<u8>)>,
@@ -64,10 +59,6 @@ impl Outbox {
 
     pub fn drain(&mut self) -> Vec<(u16, Vec<u8>)> {
         std::mem::take(&mut self.events)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
     }
 }
 
@@ -143,6 +134,7 @@ type SentEntry = (u16, u32, u32);
 
 trait SyncAdapter {
     fn name(&self) -> &str;
+    #[cfg_attr(not(test), allow(dead_code))] // test seam (SyncSet::schema)
     fn value_size(&self) -> usize;
     /// Append `[id u32][value]` entries the peer hasn't confirmed, in
     /// rotation order, while `budget` lasts; returns count.
@@ -228,10 +220,11 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
     }
 }
 
-/// Stable 16-bit wire identity for a synced pool, derived from its name
-/// (FNV-1a, folded to 16 bits). Pools are addressed on the wire by this
-/// key, never by registration order — so server and client may register
-/// the same pools in any order. Collisions are caught at `sync` time.
+/// Stable 16-bit wire identity for a named channel (pool, event, or the
+/// input channel), derived from its name (FNV-1a, folded to 16 bits).
+/// Everything is addressed on the wire by this key, never by registration
+/// order — so server and client may register in any order. Collisions are
+/// caught at registration by the one [`WireReg`] guard.
 pub(crate) fn pool_key(name: &str) -> u16 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in name.as_bytes() {
@@ -241,6 +234,97 @@ pub(crate) fn pool_key(name: &str) -> u16 {
     (h ^ (h >> 16)) as u16
 }
 
+/// Stable wire tag for a named event channel, in the user-tag space
+/// (`>= EVENT_USER_BASE`) so it can't collide with internal frame types.
+/// Same name → same tag on both ends; derived from [`pool_key`].
+pub(crate) fn event_tag(name: &str) -> u16 {
+    let span = u16::MAX - EVENT_USER_BASE;
+    EVENT_USER_BASE + pool_key(name) % span
+}
+
+/// What a wire-registry entry is — three API views (sync vs send vs set)
+/// over one table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WireKind {
+    Pool,
+    Event,
+    Input,
+}
+
+impl WireKind {
+    pub(crate) fn byte(self) -> u8 {
+        match self {
+            WireKind::Pool => b'p',
+            WireKind::Event => b'e',
+            WireKind::Input => b'i',
+        }
+    }
+}
+
+/// THE wire registry (the `"net.reg"` single): every named, typed,
+/// name-hashed channel — synced pools, event channels, the input channel —
+/// in one table with one hash keyspace and one collision panic. The QUIC
+/// handshake schema is this table, so a name/size/kind disagreement
+/// between server and client fails the connection instead of
+/// mis-delivering.
+#[derive(Default)]
+pub(crate) struct WireReg {
+    entries: Vec<(WireKind, String, usize)>,
+}
+
+impl WireReg {
+    pub(crate) fn register(&mut self, kind: WireKind, name: &str, size: usize) {
+        if kind == WireKind::Input
+            && let Some((_, prev, _)) = self.entries.iter().find(|(k, ..)| *k == WireKind::Input)
+        {
+            panic!(
+                "one continuous input channel per connection: '{prev}' is already \
+                 registered — clone its InputTx/InputRx instead of registering '{name}' \
+                 (a pod with more fields beats a second channel)"
+            );
+        }
+        let key = pool_key(name);
+        if let Some((pk, pn, ps)) = self.entries.iter().find(|(_, n, _)| pool_key(n) == key) {
+            // Re-registering the same event channel (setup helper + task
+            // both grab it) shares the tag; anything else is a real clash.
+            if *pk == kind && kind == WireKind::Event && pn == name && *ps == size {
+                return;
+            }
+            if pn == name {
+                panic!("wire channel '{name}' registered twice with a different kind or size");
+            }
+            panic!(
+                "wire name-hash collision: '{name}' and '{pn}' both key to {key:#06x} — rename one"
+            );
+        }
+        // The event wire tag folds the key into the user-tag span; two
+        // distinct keys can alias there only across the span boundary, so
+        // guard that edge too — same panic, same place.
+        if kind == WireKind::Event {
+            let tag = event_tag(name);
+            if let Some((_, pn, _)) = self
+                .entries
+                .iter()
+                .find(|(k, n, _)| *k == WireKind::Event && event_tag(n) == tag)
+            {
+                panic!(
+                    "event name-hash collision: '{name}' and '{pn}' both tag to {tag:#06x} — rename one"
+                );
+            }
+        }
+        self.entries.push((kind, name.to_string(), size));
+    }
+
+    /// (kind, name, size) of everything registered, for the QUIC
+    /// handshake. Order-independent: the transport sorts by name.
+    pub(crate) fn schema(&self) -> Vec<(u8, String, usize)> {
+        self.entries
+            .iter()
+            .map(|(k, n, s)| (k.byte(), n.clone(), *s))
+            .collect()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SyncSet {
     adapters: Vec<Box<dyn SyncAdapter>>,
@@ -248,13 +332,6 @@ pub(crate) struct SyncSet {
 
 impl SyncSet {
     pub(crate) fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
-        let key = pool_key(name);
-        if let Some(clash) = self.adapters.iter().find(|a| pool_key(a.name()) == key) {
-            panic!(
-                "synced pool name-hash collision: '{name}' and '{}' both key to {key:#06x} — rename one",
-                clash.name()
-            );
-        }
         self.adapters.push(Box::new(PoolAdapter {
             name: name.to_string(),
             pool: pool.rc().clone(),
@@ -270,13 +347,15 @@ impl SyncSet {
             .map(|b| b.as_ref())
     }
 
-    /// (pool name, value size) per registered pool. The QUIC handshake
-    /// verifies both ends agree; it sorts by name first, so order doesn't
-    /// matter there either.
-    pub(crate) fn schema(&self) -> Vec<(String, usize)> {
+    /// (kind, pool name, value size) per registered pool — the pool rows
+    /// of the handshake schema. The full schema (events + input channel
+    /// included) lives in [`WireReg`]; this exists for the sync layer's
+    /// own tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn schema(&self) -> Vec<(u8, String, usize)> {
         self.adapters
             .iter()
-            .map(|a| (a.name().to_string(), a.value_size()))
+            .map(|a| (WireKind::Pool.byte(), a.name().to_string(), a.value_size()))
             .collect()
     }
 }
@@ -336,6 +415,7 @@ pub struct NetServer {
 impl NetServer {
     /// Attaching a server holds the kernel's removal log so removed
     /// indices aren't recycled before every peer has acked the removal.
+    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
     pub fn new(pm: &mut Pm) -> Self {
         pm.removal_hold_set(true);
         Self {
@@ -353,11 +433,13 @@ impl NetServer {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
     pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
     }
 
-    pub fn schema(&self) -> Vec<(String, usize)> {
+    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    pub fn schema(&self) -> Vec<(u8, String, usize)> {
         self.sync.schema()
     }
 
@@ -437,6 +519,7 @@ impl NetServer {
 
     /// Pack everything `peer` hasn't confirmed, without a size cap.
     /// Prefer `snapshot_budgeted` when the transport bounds datagrams.
+    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
     pub fn snapshot(&mut self, pm: &Pm, peer: u8) -> Option<Vec<u8>> {
         self.snapshot_budgeted(pm, peer, usize::MAX)
     }
@@ -538,6 +621,7 @@ pub struct NetClient {
 }
 
 impl NetClient {
+    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
     pub fn new() -> Self {
         Self::default()
     }
@@ -548,11 +632,13 @@ impl NetClient {
         Self { sync }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
     pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
     }
 
-    pub fn schema(&self) -> Vec<(String, usize)> {
+    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    pub fn schema(&self) -> Vec<(u8, String, usize)> {
         self.sync.schema()
     }
 

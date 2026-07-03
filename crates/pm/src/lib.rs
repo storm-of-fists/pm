@@ -57,11 +57,14 @@
 //!
 //! Singletons are just single-entity pools ([`Pm::single`]) — there is no
 //! separate "state" concept, so a singleton replicates and tears down
-//! like any other pool. Networking installs as a task over registered
-//! pools: pick a role with [`Pm::server`] / [`Pm::client`], [`Pm::sync_pool`]
-//! each replicated pool, then [`run`](PmClient::run). Gameplay reads and writes the
-//! `"net.*"` singletons ([`PeerEvents`], [`Commands`], …) and the client's
-//! [`ClientNet`] handle ([`PmClient::net`]), and never touches the socket.
+//! like any other pool. Networking is built in and not replaceable: pick a
+//! role with [`Pm::server`] / [`Pm::client`], [`Pm::sync_pool`] each
+//! replicated pool, register channels ([`input`](PmClient::input) /
+//! [`event`](PmClient::event)), then [`run`](PmClient::run). Gameplay holds
+//! typed handles from the role wrapper ([`ClientNet`]/[`ServerNet`],
+//! [`InputTx`]/[`InputRx`], [`EventTx`]/[`EventRx`], [`SingleRx`]) and
+//! never touches the socket. The doctrine: the client only ever sends
+//! channels; the server only ever replicates pools.
 //!
 //! # Design decisions
 //!
@@ -85,9 +88,9 @@
 //! - **kernel**: [`Pm`], [`PoolHandle`], [`SingleHandle`] — tasks, ids,
 //!   the loop.
 //! - **pool**: the sparse-set [`Pool`] and its [`Mut`] write guard.
-//! - **net**: server-authoritative snapshot-delta replication
-//!   ([`NetServer`]/[`NetClient`]) and the installable net modules
-//!   ([`PmServer`]/[`PmClient`]).
+//! - **net**: server-authoritative snapshot-delta replication behind the
+//!   role wrappers ([`PmServer`]/[`PmClient`]) and their typed channel
+//!   handles.
 //! - **predict / smooth**: client [`Predictor`] and the presentation
 //!   helpers [`pool_mirror`], [`coast_blend`], [`pool_interp`]
 //!   ([`InterpBuffer`]).
@@ -125,14 +128,25 @@ pub use kernel::{
 };
 pub use math::{Mat4, Rng, Vec2, Vec3, vec2, vec3};
 pub use modload::{BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr};
-pub use net::{Applied, NetClient, NetError, NetServer, Outbox};
+pub use net::Applied;
 pub use netmod::{
-    AppliedLog, ClientNet, Commands, EventRx, EventTx, NET_PRIO, PeerEvents, PmClient, PmServer,
-    SentLog, ServerEvents, ServerOwn,
+    ClientNet, EventRx, EventTx, InputRx, InputTx, NET_PRIO, PmClient, PmServer, ServerNet,
+    SingleRx,
 };
 pub use pool::{Mut, Pool};
 pub use predict::Predictor;
 pub use smooth::{InterpBuffer, coast_blend, pool_interp, pool_mirror};
 pub use spatial::SpatialGrid;
-pub use transport::{EVENT_USER_BASE, QuicClient, QuicServer};
 pub use util::{Cooldown, Counter, DelayTimer, FallingEdge, Hysteresis, Latch, RisingEdge};
+
+// The sync layer, transport, and raw event plumbing are deliberately not
+// public: networking is core, not a pluggable suite. Their tests live
+// in-crate below.
+#[cfg(test)]
+mod events_tests;
+#[cfg(test)]
+mod net_tests;
+#[cfg(test)]
+mod netmod_tests;
+#[cfg(test)]
+mod quic_tests;

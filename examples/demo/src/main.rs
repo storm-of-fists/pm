@@ -26,9 +26,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-use pm::{
-    AppliedLog, Commands, Id, PeerEvents, Pm, PmClient, Predictor, SentLog, ServerOwn, pool_mirror,
-};
+use pm::{Id, InputTx, Pm, PmClient, pool_mirror};
 
 const ADDR: &str = "127.0.0.1:47777";
 const WORLD: f32 = 12.0; // world is [-WORLD, WORLD] on both axes
@@ -88,24 +86,23 @@ fn wrap(v: f32) -> f32 {
 fn run_server(quiet: bool) {
     let mut pm = Pm::server(ADDR);
     let car = pm.sync_pool::<Car>("car");
-    // `ServerOwn` is the built-in peer→entity channel: it ships each peer's
-    // avatar id in the snapshot header (the client reads it via `net.mine()`)
-    // and doubles as our peer→vehicle lookup — no bespoke "here's your id"
-    // reliable event.
-    let own = pm.single::<ServerOwn>("net.own");
-    // The pump/ack/echo/snapshot loop is pm's net module; the game reads
-    // the "net.*" singles it publishes.
+    // The server surface: joins/leaves this tick, plus the built-in
+    // peer→entity channel — `own_set` ships each peer's avatar id in the
+    // snapshot header (the client reads it via `net.mine()`) and doubles
+    // as our peer→vehicle lookup, no bespoke "here's your id" event.
+    let net = pm.net();
+    // THE continuous input channel: same name and pod on the clients (the
+    // handshake schema enforces it).
+    let inputs = pm.input::<Drive>("drive");
     if !quiet {
         eprintln!("pm demo server on {ADDR}");
     }
-    let peers = pm.single::<PeerEvents>("net.peers");
-    let cmds = pm.single::<Commands<Drive>>("net.cmds");
 
     pm.task_add("roster", 10.0, 0.0, {
         let car = car.clone();
-        let own = own.clone();
+        let net = net.clone();
         move |pm| {
-            for &p in &peers.get().joined {
+            for p in net.joined() {
                 let id = pm.id_add();
                 let spread = p as f32 * 0.8;
                 car.get_mut().add(
@@ -117,16 +114,16 @@ fn run_server(quiet: bool) {
                         speed: 0.0,
                     },
                 );
-                own.get_mut().set(p, id);
+                net.own_set(p, id);
                 if !quiet {
                     eprintln!("peer {p} joined, vehicle index {}", id.index());
                 }
             }
-            for &p in &peers.get().left {
-                if let Some(id) = own.get().get(p) {
+            for p in net.left() {
+                if let Some(id) = net.own(p) {
                     pm.id_remove(id);
                 }
-                own.get_mut().clear(p);
+                net.own_clear(p);
                 if !quiet {
                     eprintln!("peer {p} left");
                 }
@@ -136,15 +133,14 @@ fn run_server(quiet: bool) {
 
     pm.task_add("drive", 30.0, 0.0, {
         let car = car.clone();
-        let own = own.clone();
+        let net = net.clone();
         move |_pm| {
-            let mut cmds = cmds.get_mut();
             let mut car = car.get_mut();
-            for (&peer, &id) in &own.get().0 {
+            for (peer, id) in net.owned() {
                 // Command-frame consumption: one input per tick (one
                 // prediction step on the client), hold-when-dry, bounded
                 // skip-ahead. The applied seq echoes back automatically.
-                let cmd = cmds.pop(peer);
+                let cmd = inputs.pop(peer);
                 if let Some(mut c) = car.get_mut(id) {
                     drive_step(&mut c, cmd, FIXED_DT);
                 }
@@ -177,7 +173,7 @@ fn run_server(quiet: bool) {
     // Bind failure must kill the whole process loudly — a silent thread
     // panic here once let the demo piggyback a stale server on the port.
     pm.loop_rate = 60;
-    pm.run::<Drive>().unwrap_or_else(|e| {
+    pm.run().unwrap_or_else(|e| {
         eprintln!("cannot serve {ADDR}: {e}");
         eprintln!("(a previous demo may still be running: pkill -x demo)");
         std::process::exit(1);
@@ -190,17 +186,17 @@ fn run_bot(phase: f32) {
     let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
     pm.sync_pool::<Car>("car");
 
-    let net = pm.net::<Drive>();
+    let input = pm.input::<Drive>("drive");
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0;
-        net.input(Drive {
+        input.set(Drive {
             thrust: 0.7 + 0.3 * (t * 0.6 + phase).sin(),
             turn: (t * 0.8 + phase * 2.0).sin(),
         });
     });
 
     pm.loop_rate = 60;
-    let _ = pm.run::<Drive>(); // a bot with no server to reach just exits
+    let _ = pm.run(); // a bot with no server to reach just exits
 }
 
 // --- player client ----------------------------------------------------------
@@ -254,74 +250,64 @@ fn heading_char(h: f32) -> u8 {
 }
 
 /// Everything a player client needs except input and rendering: the
-/// prediction task (driven by the net module's sent/applied logs), the
-/// smoothing/dead-reckoning task, and the profiling collector. pm owns the
-/// transport (`PM_LAG_MS`/`PM_LOSS` simulate the link). The input layer
-/// writes the `"net.input"` single, the renderer reads `car_draw`, `Stats`,
-/// and `"net.status"`.
-fn add_client_tasks(pm: &mut PmClient, car: &pm::PoolHandle<Car>, draw: &pm::PoolHandle<Car>) {
-    let net = pm.net::<Drive>();
-    // No connect here — `Pm::run` does that once the schema is complete.
-    let pred = pm.single::<Predictor<Car, Drive>>("pred");
+/// built-in prediction (`pm.predict_pool` — reconcile against the applied
+/// snapshots' echo, replay unacked inputs, smooth-predict into the draw
+/// pool), the dead-reckoning task for remote cars, and the profiling
+/// collector. pm owns the transport (`PM_LAG_MS`/`PM_LOSS` simulate the
+/// link). Returns the draw pool (`"car.draw"`) the renderer should read.
+fn add_client_tasks(
+    pm: &mut PmClient,
+    car: &pm::PoolHandle<Car>,
+    input: &InputTx<Drive>,
+) -> pm::PoolHandle<Car> {
+    let net = pm.net();
+    // No connect here — `run` does that once the schema is complete.
+    // Local avatar: the same `drive_step` the server runs is what makes
+    // reconciliation byte-exact. The predictor writes the smooth-predicted
+    // car into the draw sibling pool every tick.
+    let pred = pm.predict_pool(
+        car,
+        input,
+        drive_step,
+        |a, b| {
+            (a.x - b.x).abs()
+                + (a.y - b.y).abs()
+                + (a.heading - b.heading).abs()
+                + (a.speed - b.speed).abs()
+        },
+        1e-4,
+        FIXED_DT,
+    );
+    let draw = pm.pool::<Car>("car.draw");
     let stats = pm.single::<Stats>("stats");
-    let applied = pm.single::<AppliedLog>("net.applied");
-    let sent = pm.single::<SentLog<Drive>>("net.sent");
-    let car = car.clone();
-    let draw = draw.clone();
 
-    // Prediction, right after the net module's tick (prio 6): reconcile
-    // against each applied snapshot's echo of the last input the server
-    // applied, then feed this tick's sent inputs into the rewind ring.
-    pm.task_add("predict", 6.0, 0.0, {
+    // HUD stats, right after the predictor's tick (prio 8): which car is
+    // ours (from the snapshot header, not a bespoke event), the newest
+    // ack/echo, and the predictor's correction count.
+    pm.task_add("stats", 8.0, 0.0, {
+        let net = net.clone();
         let pred = pred.clone();
-        let car = car.clone();
         let stats = stats.clone();
         move |_pm| {
-            // Which car is ours: read it from the snapshot header (ServerOwn),
-            // not a bespoke "here's your id" reliable event.
-            let mine = net.mine();
-            stats.get_mut().mine = mine;
-            for a in &applied.get().0 {
-                {
-                    let mut s = stats.get_mut();
-                    s.acked = a.tick;
-                    s.input_echo = a.input_seq;
-                }
-                let auth = mine.and_then(|id| car.get().get(id).copied());
-                let Some(auth) = auth else { continue };
-                let corrected = pred.get_mut().reconcile(
-                    auth,
-                    a.input_seq,
-                    |s, c| drive_step(s, c, FIXED_DT),
-                    |a, b| {
-                        (a.x - b.x).abs()
-                            + (a.y - b.y).abs()
-                            + (a.heading - b.heading).abs()
-                            + (a.speed - b.speed).abs()
-                    },
-                    1e-4,
-                );
-                if corrected {
-                    stats.get_mut().corrections += 1;
-                }
+            let mut s = stats.get_mut();
+            s.mine = net.mine();
+            for a in net.applied() {
+                s.acked = a.tick;
+                s.input_echo = a.input_seq;
             }
-            for &(seq, cmd) in &sent.get().0 {
-                pred.get_mut()
-                    .predict(seq, cmd, |s, c| drive_step(s, c, FIXED_DT));
-            }
+            s.corrections = pred.get().corrections;
         }
     });
 
     // Display: own car comes straight from the prediction (instant input
-    // response); remote cars dead-reckon along their last known velocity
-    // and ease toward fresh server state as it arrives. pm::pool_mirror
-    // handles add/blend/stale-drop; the closure is just the blend math.
-    // A jump wider than the world means a wrap — snap instead of
-    // streaking across.
+    // response — predict_pool wrote it at prio 7, so keep that entry);
+    // remote cars dead-reckon along their last known velocity and ease
+    // toward fresh server state as it arrives. pm::pool_mirror handles
+    // add/blend/stale-drop; the closure is just the blend math. A jump
+    // wider than the world means a wrap — snap instead of streaking across.
     pm.task_add("smooth", 30.0, 0.0, {
         let car = car.clone();
         let draw = draw.clone();
-        let pred = pred.clone();
         let stats = stats.clone();
         move |pm| {
             let _p = pm::probe::scope("smooth.reckon");
@@ -329,7 +315,7 @@ fn add_client_tasks(pm: &mut PmClient, car: &pm::PoolHandle<Car>, draw: &pm::Poo
             let mine = stats.get().mine;
             pool_mirror(&car, &draw, |id, mut d, a: &Car| {
                 if Some(id) == mine {
-                    return *a; // overwritten below from the predictor
+                    return d; // keep the predictor's smooth-predicted value
                 }
                 coast_step(&mut d, dt);
                 let wrapped = (a.x - d.x).abs() > WORLD || (a.y - d.y).abs() > WORLD;
@@ -343,9 +329,6 @@ fn add_client_tasks(pm: &mut PmClient, car: &pm::PoolHandle<Car>, draw: &pm::Poo
                     }
                 }
             });
-            if let (Some(id), Some(predicted)) = (mine, pred.get().state()) {
-                draw.get_mut().add(id, predicted);
-            }
         }
     });
 
@@ -378,26 +361,30 @@ fn add_client_tasks(pm: &mut PmClient, car: &pm::PoolHandle<Car>, draw: &pm::Poo
             stats.get_mut().prof = lines;
         }
     });
+
+    draw
 }
 
 fn run_player() {
     let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
     let car = pm.sync_pool::<Car>("car"); // net state from the server (synced)
-    let draw = pm.pool::<Car>("car_draw"); // display state (local)
+    let input = pm.input::<Drive>("drive"); // THE continuous input channel
     let keys = pm.single::<Keys>("keys");
     let stats = pm.single::<Stats>("stats");
-    let net = pm.net::<Drive>();
+    let net = pm.net();
 
     eprintln!("connecting to {ADDR} ...");
     let _raw = RawTerm::enable();
-    add_client_tasks(&mut pm, &car, &draw);
+    // `draw` ("car.draw") is the display state: predicted local car,
+    // dead-reckoned remotes.
+    let draw = add_client_tasks(&mut pm, &car, &input);
 
     // Keyboard first in the tick so this tick's input rides this tick's
     // datagram.
     pm.task_add("keys", 4.0, 0.0, {
         let keys = keys.clone();
         let stats = stats.clone();
-        let net = net.clone();
+        let input = input.clone();
         move |pm| {
             let dt = pm.loop_dt();
             let mut k = keys.get_mut();
@@ -421,7 +408,7 @@ fn run_player() {
                     _ => {}
                 }
             }
-            net.input(Drive {
+            input.set(Drive {
                 thrust: k.throttle,
                 turn: if k.left > 0.0 {
                     1.0
@@ -486,7 +473,7 @@ fn run_player() {
     });
 
     pm.loop_rate = 60;
-    pm.run::<Drive>().expect("connect");
+    pm.run().expect("connect");
 }
 
 fn main() {

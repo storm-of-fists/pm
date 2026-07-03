@@ -34,10 +34,47 @@ pub const MONSTER_MIN_SZ: f32 = 8.0;
 pub const MONSTER_MAX_SZ: f32 = 16.0;
 pub const MONSTER_SPEED: f32 = 60.0;
 
-/// Typed events on the reliable stream (>= pm::EVENT_USER_BASE).
-pub const EV_NAME: u16 = 16; // client -> server: utf8 player name
-pub const EV_RESTART: u16 = 17; // client -> server: restart after game over
-pub const EV_START: u16 = 18; // client -> server: leave lobby, start game
+// --- client → server intents (typed reliable event channels) ------------
+//
+// Fixed-size pods on pm's EventTx/EventRx — there are no var-len events;
+// a name is a fixed buffer, not a String.
+
+/// Client → server: the player's display name (channel `"name"`).
+/// Truncated to the buffer, NUL-scanned back out; [`Roster`] stores the
+/// same shape.
+#[derive(Clone, Copy, PartialEq, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct Name(pub [u8; 24]);
+
+impl Name {
+    pub fn new(s: &str) -> Self {
+        let mut buf = [0u8; 24];
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Name(buf)
+    }
+
+    pub fn as_str(&self) -> &str {
+        let end = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
+        std::str::from_utf8(&self.0[..end]).unwrap_or("?")
+    }
+}
+
+/// Client → server: leave the lobby, start the game (channel `"start"`).
+/// Carries nothing; `pad` only exists because a wire pod needs a field.
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Start {
+    pub pad: u32,
+}
+
+/// Client → server: restart after game over (channel `"restart"`).
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Restart {
+    pub pad: u32,
+}
 
 pub const PCOL: [[u8; 3]; 8] = [
     [0, 220, 255],

@@ -2,9 +2,13 @@
 //! snapshot replication with acks, removal + recycling, and events on the
 //! reliable stream.
 
+//! The transport is deliberately not public, so these live in-crate.
+
 use std::time::{Duration, Instant};
 
-use pm::{NetClient, NetServer, Pm, QuicClient, QuicServer};
+use crate::Pm;
+use crate::net::{NetClient, NetServer};
+use crate::transport::{QuicClient, QuicServer};
 
 const DT: f32 = 1.0 / 60.0;
 

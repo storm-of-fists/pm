@@ -3,7 +3,7 @@
 //! plus the bot's input task. The transport is pm's net module; the SDL
 //! window/input/render live in sdl_client.rs.
 
-use pm::{ClientNet, Outbox, Pm, PmClient, Rng, coast_blend, pool_mirror, vec2};
+use pm::{ClientNet, Pm, PmClient, Rng, SingleRx, coast_blend, pool_mirror, vec2};
 
 use crate::common::*;
 
@@ -53,23 +53,24 @@ pub struct Pools {
     pub player: pm::PoolHandle<Player>,
     pub monster: pm::PoolHandle<Monster>,
     pub bullet: pm::PoolHandle<Bullet>,
-    pub status: pm::PoolHandle<Status>,
-    pub dbg: pm::PoolHandle<Dbg>,
+    pub status: SingleRx<Status>,
+    pub dbg: SingleRx<Dbg>,
     pub roster: pm::PoolHandle<Roster>,
     pub monster_draw: pm::PoolHandle<Monster>,
     pub bullet_draw: pm::PoolHandle<Bullet>,
     pub player_draw: pm::PoolHandle<Player>,
 }
 
-pub fn client_pools(pm: &mut Pm) -> Pools {
+pub fn client_pools(pm: &mut PmClient) -> Pools {
     Pools {
-        // Replicated (registered for sync; a replica reads synced singletons
-        // as plain pools, so status/dbg come through `sync_pool` here too).
+        // Replicated (registered for sync). status/dbg are the server's
+        // synced singles; `sync_single` on a client hands back the typed
+        // read side.
         player: pm.sync_pool("player"),
         monster: pm.sync_pool("monster"),
         bullet: pm.sync_pool("bullet"),
-        status: pm.sync_pool("status"),
-        dbg: pm.sync_pool("dbg"),
+        status: pm.sync_single("status"),
+        dbg: pm.sync_single("dbg"),
         roster: pm.sync_pool("roster"),
         // Local draw pools (smoothing targets, never networked).
         monster_draw: pm.pool("monster_draw"),
@@ -78,30 +79,16 @@ pub fn client_pools(pm: &mut Pm) -> Pools {
     }
 }
 
-pub fn current_status(status: &pm::PoolHandle<Status>) -> Status {
-    status
-        .get()
-        .values()
-        .first()
-        .copied()
-        .unwrap_or_default()
-}
-
 /// Smoothing + diag tasks shared by player and bot clients; the
-/// transport is the net module. The input layer (SDL or bot) writes the
-/// `"net.input"` single; rendering reads the draw pools.
-pub fn add_client_tasks(pm: &mut PmClient, pools: &Pools, name: String) -> ClientNet<InputCmd> {
-    let net = pm.net::<InputCmd>();
-    // No connect here — `Pm::run` does that once the schema is complete.
+/// transport is the net module. The input layer (SDL or bot) sets the
+/// input channel; rendering reads the draw pools.
+pub fn add_client_tasks(pm: &mut PmClient, pools: &Pools, name: String) -> ClientNet {
+    let net = pm.net();
+    // No connect here — `run` does that once the schema is complete.
     // Queued before the handshake even exists — the module holds
-    // reliable events until connected.
-    // TODO(typed-events): EV_NAME carries a variable-length String, which the
-    // Pod-only `EventTx` can't yet express — so this (and EV_START/EV_RESTART)
-    // stay on the raw `Outbox`/`ServerEvents` until a bytes/var-len event
-    // channel lands. Once it does, migrate these and demote those singles.
-    pm.single::<Outbox>("net.out")
-        .get_mut()
-        .send(EV_NAME, name.as_bytes());
+    // reliable events until connected. Names are a fixed pod on a typed
+    // channel; there are no var-len events.
+    pm.event::<Name>("name").send(Name::new(&name));
 
     let report_name = name;
 
@@ -112,7 +99,7 @@ pub fn add_client_tasks(pm: &mut PmClient, pools: &Pools, name: String) -> Clien
         let net = net.clone();
         let mut written = false;
         move |_pm| {
-            let st = current_status(&status);
+            let st = status.get();
             if st.flags & FLAG_GAME_OVER == 0 || written {
                 return;
             }
@@ -172,15 +159,17 @@ pub fn add_client_tasks(pm: &mut PmClient, pools: &Pools, name: String) -> Clien
 pub fn run_bot(n: u32) {
     let mut pm = Pm::client(ADDR, 60.0);
     let pools = client_pools(&mut pm);
-    let net = add_client_tasks(&mut pm, &pools, format!("bot{n}"));
+    let _net = add_client_tasks(&mut pm, &pools, format!("bot{n}"));
+    // Every client registers the full channel set — the handshake schema
+    // is the connection's contract.
+    let input = pm.input::<InputCmd>("input");
+    let starts = pm.event::<Start>("start");
+    let restarts = pm.event::<Restart>("restart");
 
-    let outbox = pm.single::<Outbox>("net.out");
     pm.task_add("bot", 4.0, 0.0, {
         let monster = pools.monster.clone();
         let player = pools.player.clone();
         let status = pools.status.clone();
-        let outbox = outbox.clone();
-        let net = net.clone();
         let mut rng = Rng::new(1000 + n);
         let mut dir = vec2(1.0, 0.0);
         let mut turn = pm::Cooldown::new(1.0);
@@ -215,8 +204,8 @@ pub fn run_bot(n: u32) {
                     aim = m.pos;
                 }
             }
-            let st = current_status(&status);
-            net.input(InputCmd {
+            let st = status.get();
+            input.set(InputCmd {
                 dx: dir.x,
                 dy: dir.y,
                 ax: aim.x,
@@ -224,15 +213,15 @@ pub fn run_bot(n: u32) {
                 buttons: BTN_SHOOT,
             });
             if st.flags & FLAG_GAME_OVER != 0 && rng.rf() < 0.005 {
-                outbox.get_mut().send(EV_RESTART, &[]);
+                restarts.send(Restart::default());
             }
             // Nobody to press ENTER in a bot lobby: start after a beat.
             if st.flags & FLAG_STARTED == 0 && rng.rf() < 0.02 {
-                outbox.get_mut().send(EV_START, &[]);
+                starts.send(Start::default());
             }
         }
     });
 
     pm.loop_rate = 60;
-    let _ = pm.run::<InputCmd>(); // a bot with no server to reach just exits
+    let _ = pm.run(); // a bot with no server to reach just exits
 }

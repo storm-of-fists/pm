@@ -1,13 +1,18 @@
 //! The net modules end-to-end over real UDP loopback: server and client
-//! games built ONLY from the published "net.*" singles — no direct
-//! transport access — must see joins, flow commands (with the applied-
-//! seq echo), replicate pools, and deliver a reliable client→server event.
-//! (Events are one-way client→server; there is no server→client channel.)
+//! games built from typed channel handles — no transport access in the
+//! game tasks — must see joins, flow input (with the applied-seq echo),
+//! replicate pools, and deliver a reliable client→server event. (Events
+//! are one-way client→server; there is no server→client channel.) Lives
+//! in-crate because the manual bind/connect split (port 0, two kernels in
+//! one thread) needs the non-public seams.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use pm::{Id, NetClient, NetServer, Pm, QuicClient, QuicServer};
+use crate::net::{NetClient, NetServer, Outbox};
+use crate::netmod::{PeerEvents, ServerEvents, input_rx};
+use crate::transport::{QuicClient, QuicServer};
+use crate::{Id, Pm};
 
 const DT: f32 = 1.0 / 60.0;
 
@@ -40,24 +45,27 @@ struct ClientSeen {
 
 #[test]
 fn net_modules_loopback() {
-    // --- server world: game logic reads/writes only "net.*" singles ---
+    // --- server world: game logic holds only channel handles ---
     let mut spm = Pm::new();
     let s_pos = spm.pool::<Pos>("pos");
     let mut snet = NetServer::new(&mut spm);
     snet.pool_sync("pos", &s_pos);
     let squic = QuicServer::bind("127.0.0.1:0", &snet.schema()).expect("bind");
     let addr = squic.local_addr().unwrap().to_string();
-    snet.serve::<Cmd>(&mut spm, squic);
+    // Register the input channel before serve() — the net task captures
+    // the erased sink at install time.
+    let cmds = input_rx::<Cmd>(&mut spm, "cmd");
+    snet.serve(&mut spm, squic);
 
     let garage = spm.single::<Garage>("garage");
     let sseen = spm.single::<ServerSeen>("seen");
     {
-        let peers = spm.single::<pm::PeerEvents>("net.peers");
-        let cmds = spm.single::<pm::Commands<Cmd>>("net.cmds");
-        let sevents = spm.single::<pm::ServerEvents>("net.events");
+        let peers = spm.single::<PeerEvents>("net.peers");
+        let sevents = spm.single::<ServerEvents>("net.events");
         let garage = garage.clone();
         let sseen = sseen.clone();
         let s_pos = s_pos.clone();
+        let cmds = cmds.clone();
         spm.task_add("game", 30.0, 0.0, move |pm| {
             for &p in &peers.get().joined {
                 let id = pm.id_add();
@@ -70,10 +78,9 @@ fn net_modules_loopback() {
                     pm.id_remove(id);
                 }
             }
-            let mut cs = cmds.get_mut();
             let mut pool = s_pos.get_mut();
             for (&p, &id) in &garage.get().0 {
-                let c = cs.pop(p);
+                let c = cmds.pop(p);
                 if let Some(mut e) = pool.get_mut(id) {
                     let next = Pos {
                         x: e.x + c.dx,
@@ -94,27 +101,26 @@ fn net_modules_loopback() {
     // construction path); the transport is still driven manually below,
     // through the Deref to the kernel.
     let mut cpm = Pm::client("127.0.0.1:0", 60.0);
-    let cnet_status = cpm.net::<Cmd>();
+    let cnet_status = cpm.net();
+    let input = cpm.input::<Cmd>("cmd");
     let c_pos = cpm.pool::<Pos>("pos");
     let mut cnet = NetClient::new();
     cnet.pool_sync("pos", &c_pos);
     let cquic = QuicClient::connect(&addr, &cnet.schema()).expect("connect");
-    cnet.connect::<Cmd>(&mut cpm, cquic, 60.0);
+    cnet.connect(&mut cpm, cquic, 60.0);
 
     // Queue a reliable client→server event BEFORE the handshake exists —
     // the module holds it until connected.
-    cpm.single::<pm::Outbox>("net.out")
-        .get_mut()
-        .send(17, b"hi");
-    cnet_status.input(Cmd { dx: 1.0 });
+    cpm.single::<Outbox>("net.out").get_mut().send(17, b"hi");
+    input.set(Cmd { dx: 1.0 });
 
     let cseen = cpm.single::<ClientSeen>("seen");
     {
-        let applied = cpm.single::<pm::AppliedLog>("net.applied");
+        let net = cnet_status.clone();
         let cseen = cseen.clone();
         cpm.task_add("game", 30.0, 0.0, move |_pm| {
             let mut s = cseen.get_mut();
-            for a in &applied.get().0 {
+            for a in net.applied() {
                 s.echo = s.echo.max(a.input_seq);
             }
         });

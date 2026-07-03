@@ -39,15 +39,18 @@ const INPUT_REDUNDANCY: usize = 8;
 
 // --- small helpers --------------------------------------------------------
 
-fn schema_encode(schema: &[(String, usize)]) -> Vec<u8> {
+fn schema_encode(schema: &[(u8, String, usize)]) -> Vec<u8> {
     // Sort by name so the handshake compare is registration-order
-    // independent — both ends agree as long as the *set* of (name, size)
-    // matches, regardless of the order pools were registered in.
+    // independent — both ends agree as long as the *set* of (kind, name,
+    // size) entries matches, regardless of registration order. The kind
+    // byte keeps a pool and an event channel that share a name from
+    // silently passing as each other.
     let mut schema = schema.to_vec();
-    schema.sort_by(|a, b| a.0.cmp(&b.0));
+    schema.sort_by(|a, b| a.1.cmp(&b.1));
     let mut out = Vec::new();
     out.extend_from_slice(&(schema.len() as u16).to_le_bytes());
-    for (name, size) in &schema {
+    for (kind, name, size) in &schema {
+        out.push(*kind);
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(&(*size as u32).to_le_bytes());
@@ -229,6 +232,7 @@ impl LagSocket {
         Err(io::ErrorKind::WouldBlock.into())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // test seam
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -266,7 +270,7 @@ pub struct QuicServer {
 }
 
 impl QuicServer {
-    pub fn bind(addr: &str, schema: &[(String, usize)]) -> io::Result<Self> {
+    pub fn bind(addr: &str, schema: &[(u8, String, usize)]) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
 
@@ -305,6 +309,7 @@ impl QuicServer {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // test seam
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -474,6 +479,7 @@ impl QuicServer {
         std::mem::take(&mut self.inputs)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // test seam
     pub fn events_drain(&mut self) -> Vec<(u8, u16, Vec<u8>)> {
         std::mem::take(&mut self.events)
     }
@@ -517,6 +523,7 @@ impl QuicServer {
 
     /// Send a typed event on the reliable ordered stream (`ty` must be
     /// >= EVENT_USER_BASE).
+    #[cfg_attr(not(test), allow(dead_code))] // test seam
     pub fn event_send(&mut self, peer: u8, ty: u16, payload: &[u8]) {
         debug_assert!(ty >= EVENT_USER_BASE);
         if let Some(st) = self
@@ -591,7 +598,7 @@ pub struct QuicClient {
 }
 
 impl QuicClient {
-    pub fn connect(addr: &str, schema: &[(String, usize)]) -> io::Result<Self> {
+    pub fn connect(addr: &str, schema: &[(u8, String, usize)]) -> io::Result<Self> {
         let server: SocketAddr = addr.parse().map_err(io::Error::other)?;
         let bind = if server.is_ipv4() {
             "0.0.0.0:0"
@@ -752,6 +759,7 @@ impl QuicClient {
         std::mem::take(&mut self.snapshots)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // test seam
     pub fn events_drain(&mut self) -> Vec<(u16, Vec<u8>)> {
         std::mem::take(&mut self.events)
     }

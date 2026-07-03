@@ -8,7 +8,10 @@
       "WebSearch",
       "Bash(python3 -)",
       "Bash(cargo check *)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "Bash(cargo build *)",
+      "Bash(cargo doc *)",
+      "Bash(awk -F'[.;]' '{p+=$2; f+=$3} END {print \"total passed:\" p, \"failed:\" f}')"
     ]
   }
 }

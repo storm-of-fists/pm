@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use pm::{Commands, Id, PeerEvents, Pm, Rng, ServerEvents, SpatialGrid, Vec2, vec2};
+use pm::{Id, Pm, Rng, SpatialGrid, Vec2, vec2};
 
 use crate::common::*;
 
@@ -49,14 +49,19 @@ pub fn run(quiet: bool) {
     let monster_srv = pm.pool::<MonsterSrv>("monster_srv");
     let bullet_srv = pm.pool::<BulletSrv>("bullet_srv");
 
-    // The pump/ack/echo/snapshot loop is pm's net module; gameplay reads
-    // the "net.*" singles it publishes.
+    // The pump/ack/echo/snapshot loop is pm's net module; gameplay holds
+    // the typed channel handles.
     if !quiet {
         eprintln!("hellfire server on {ADDR}");
     }
-    let peers = pm.single::<PeerEvents>("net.peers");
-    let cmds = pm.single::<Commands<InputCmd>>("net.cmds");
-    let events = pm.single::<ServerEvents>("net.events");
+    let net = pm.net();
+    // THE continuous input channel, plus the three discrete intents — the
+    // same names and pods every client registers (the handshake schema
+    // enforces it).
+    let inputs = pm.input::<InputCmd>("input");
+    let names = pm.event::<Name>("name");
+    let starts = pm.event::<Start>("start");
+    let restarts = pm.event::<Restart>("restart");
 
     let game = pm.single::<Game>("game");
     {
@@ -77,9 +82,10 @@ pub fn run(quiet: bool) {
         let roster = roster.clone();
         let monster = monster.clone();
         let bullet = bullet.clone();
+        let net = net.clone();
         move |pm| {
             let mut g = game.get_mut();
-            for &p in &peers.get().joined {
+            for p in net.joined() {
                 let rid = pm.id_add();
                 roster
                     .get_mut()
@@ -110,7 +116,7 @@ pub fn run(quiet: bool) {
                     eprintln!("[server] peer {p} joined");
                 }
             }
-            for &p in &peers.get().left {
+            for p in net.left() {
                 if let Some(id) = g.players.remove(&p) {
                     pm.id_remove(id);
                 }
@@ -121,34 +127,27 @@ pub fn run(quiet: bool) {
                     eprintln!("[server] peer {p} left");
                 }
             }
-            for (p, ty, payload) in &events.get().0 {
-                match *ty {
-                    EV_NAME => {
-                        if let (Some(&rid), Ok(name)) =
-                            (g.rosters.get(p), std::str::from_utf8(payload))
-                        {
-                            roster.get_mut().add(rid, Roster::new(*p, name));
-                        }
-                    }
-                    EV_START if !g.started => {
-                        g.started = true;
-                        let time: f32 = g.time;
-                        let len: usize = g.players.len();
-                        g.events.push(format!(
-                            "{{\"t\": {:.1}, \"event\": \"started with {} players\"}}",
-                            time, len
-                        ));
-                        if !quiet {
-                            eprintln!("[server] game started ({} players)", g.players.len());
-                        }
-                    }
-                    EV_RESTART if g.game_over => {
-                        restart(pm, &mut g, &player, &player_srv, &monster, &bullet);
-                        if !quiet {
-                            eprintln!("[server] restart (round {})", g.round);
-                        }
-                    }
-                    _ => {}
+            for (p, name) in names.drain() {
+                if let Some(&rid) = g.rosters.get(&p) {
+                    roster.get_mut().add(rid, Roster::new(p, name.as_str()));
+                }
+            }
+            if !g.started && !starts.drain().is_empty() {
+                g.started = true;
+                let time: f32 = g.time;
+                let len: usize = g.players.len();
+                g.events.push(format!(
+                    "{{\"t\": {:.1}, \"event\": \"started with {} players\"}}",
+                    time, len
+                ));
+                if !quiet {
+                    eprintln!("[server] game started ({} players)", g.players.len());
+                }
+            }
+            if g.game_over && !restarts.drain().is_empty() {
+                restart(pm, &mut g, &player, &player_srv, &monster, &bullet);
+                if !quiet {
+                    eprintln!("[server] restart (round {})", g.round);
                 }
             }
         }
@@ -171,7 +170,6 @@ pub fn run(quiet: bool) {
             {
                 let mut players = player.get_mut();
                 let mut srv = player_srv.get_mut();
-                let mut cmds = cmds.get_mut();
                 for (&peer, &pid) in &g.players {
                     let Some(mut p) = players.get_mut(pid) else {
                         continue;
@@ -181,7 +179,7 @@ pub fn run(quiet: bool) {
                     }
                     // Newest-wins: hellfire input is continuous held
                     // state, not per-tick command frames.
-                    let cmd = cmds.latest(peer);
+                    let cmd = inputs.latest(peer);
                     let mv = vec2(cmd.dx, cmd.dy).norm();
                     if mv != Vec2::ZERO {
                         let hs = PLAYER_SIZE * 0.5;
@@ -704,7 +702,7 @@ pub fn run(quiet: bool) {
     pm.task_add("mods", 2.0, 1.0, move |pm| mods.poll(pm));
 
     pm.loop_rate = 60;
-    pm.run::<InputCmd>().unwrap_or_else(|e| {
+    pm.run().unwrap_or_else(|e| {
         eprintln!("cannot serve {ADDR}: {e}");
         eprintln!("(a previous hellfire may still be running: pkill -x hellfire)");
         std::process::exit(1);

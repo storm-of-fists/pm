@@ -14,7 +14,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use pm::{NetClient, NetServer, Pm, Predictor, SpatialGrid, pool_mirror, vec2};
+use pm::{Pm, Predictor, SpatialGrid, pool_mirror, vec2};
 
 #[derive(Clone, Copy, PartialEq, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -159,49 +159,6 @@ fn spatial() {
     });
 }
 
-fn net_sync() {
-    println!("-- net sync (10k entities, one peer) --");
-    const M: u32 = 10_000;
-    let mut spm = Pm::new();
-    let s_pos = spm.pool::<P>("pos");
-    let mut net = NetServer::new(&mut spm);
-    net.pool_sync("pos", &s_pos);
-    net.peer_add(1);
-    for i in 0..M {
-        let id = spm.id_add();
-        s_pos.get_mut().add(
-            id,
-            P {
-                x: i as f32,
-                y: 0.0,
-            },
-        );
-    }
-    spm.loop_once(1.0 / 60.0);
-
-    let mut cpm = Pm::new();
-    let c_pos = cpm.pool::<P>("pos");
-    let mut cnet = NetClient::new();
-    cnet.pool_sync("pos", &c_pos);
-
-    let mut snap = Vec::new();
-    time("pack, all dirty (uncapped)", M as u64, || {
-        snap = net.snapshot(&spm, 1).unwrap();
-    });
-    println!("    ({} KiB on the wire)", snap.len() / 1024);
-    time("apply, all entries", M as u64, || {
-        cnet.apply(&mut cpm, &snap).unwrap();
-    });
-    let label = u32::from_le_bytes(snap[0..4].try_into().unwrap());
-    net.ack(1, label);
-    spm.loop_once(1.0 / 60.0);
-    // The documented known limit: a converged pool still costs a full
-    // per-peer scan every net tick. This is that scan, per entity.
-    time("pack, converged (idle scan)", M as u64, || {
-        black_box(net.snapshot_budgeted(&spm, 1, 1200));
-    });
-}
-
 fn predictor() {
     println!("-- predictor (rewind-replay ring) --");
     let step = |s: &mut P, c: Cmd| {
@@ -266,7 +223,8 @@ fn main() {
     pools();
     id_lifecycle();
     spatial();
-    net_sync();
+    // net pack/apply lives in-crate now (the sync layer is not public):
+    //     cargo test --release -p pm --lib -- --ignored net_bench --nocapture
     predictor();
     mirror();
     println!("(task dispatch overhead: see `taskbench`; end-to-end loop: see `sim`)");
