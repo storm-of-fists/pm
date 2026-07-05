@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::net::{NetClient, NetServer, Outbox};
-use crate::netmod::{PeerEvents, ServerEvents, input_rx};
+use crate::netmod::{PeerEvents, ServerEvents, ServerOwn, input_rx};
 use crate::transport::{QuicClient, QuicServer};
 use crate::{Id, Pm};
 
@@ -161,5 +161,93 @@ fn net_modules_loopback() {
         cpm.task_faults().is_empty(),
         "client task faults: {:?}",
         cpm.task_faults()
+    );
+}
+
+/// Ownership auto-clears ONE tick after the leave is reported: the game's
+/// leave handler (running above NET_PRIO in the same tick) must still see
+/// `own(p)` to despawn by, and by the next tick the entry must be gone —
+/// peer ids recycle, so a stale entry would hand the next player on this
+/// id the departed player's entity.
+#[test]
+fn ownership_auto_clears_after_leave_tick() {
+    #[derive(Default)]
+    struct Seen {
+        peer: Option<u8>,
+        id: Option<Id>,
+        own_at_leave: Option<Option<Id>>,
+        cleared_next_tick: bool,
+    }
+
+    let mut spm = Pm::new();
+    let s_pos = spm.pool::<Pos>("pos");
+    let mut snet = NetServer::new(&mut spm);
+    snet.pool_sync("pos", &s_pos);
+    let squic = QuicServer::bind("127.0.0.1:0", &snet.schema()).expect("bind");
+    let addr = squic.local_addr().unwrap().to_string();
+    snet.serve(&mut spm, squic);
+
+    let seen = spm.single::<Seen>("seen");
+    {
+        let peers = spm.single::<PeerEvents>("net.peers");
+        let own = spm.single::<ServerOwn>("net.own");
+        let s_pos = s_pos.clone();
+        let seen = seen.clone();
+        spm.task_add("game", 30.0, 0.0, move |pm| {
+            let mut s = seen.get_mut();
+            for &p in &peers.get().joined {
+                let id = pm.id_add();
+                s_pos.get_mut().add(id, Pos::default());
+                own.get_mut().set(p, id);
+                s.peer = Some(p);
+                s.id = Some(id);
+            }
+            for &p in &peers.get().left {
+                // The leave tick: capture what the game can still see.
+                s.own_at_leave = Some(own.get().get(p));
+            }
+            // Any tick after the leave was reported: the entry must be gone.
+            if let (Some(p), Some(_)) = (s.peer, s.own_at_leave)
+                && peers.get().left.is_empty()
+                && own.get().get(p).is_none()
+            {
+                s.cleared_next_tick = true;
+            }
+        });
+    }
+
+    let mut cnet = NetClient::new();
+    let mut cpm = Pm::new();
+    let c_pos = cpm.pool::<Pos>("pos");
+    cnet.pool_sync("pos", &c_pos);
+    let mut cquic = Some(QuicClient::connect(&addr, &cnet.schema()).expect("connect"));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !seen.get().cleared_next_tick {
+        spm.loop_once(DT);
+        if seen.get().peer.is_some() {
+            cquic = None; // client "dies" silently: reaped by idle timeout
+        }
+        if let Some(c) = cquic.as_mut() {
+            c.pump();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let s = seen.get();
+    assert!(s.peer.is_some(), "client never joined");
+    assert_eq!(
+        s.own_at_leave,
+        Some(s.id),
+        "leave tick must still see the owned entity (games despawn via own(p))"
+    );
+    assert!(
+        s.cleared_next_tick,
+        "ownership entry must be gone after the leave tick (peer ids recycle)"
+    );
+    assert!(
+        spm.task_faults().is_empty(),
+        "server task faults: {:?}",
+        spm.task_faults()
     );
 }

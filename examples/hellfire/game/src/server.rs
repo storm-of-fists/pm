@@ -124,10 +124,10 @@ pub fn run(quiet: bool) {
                 }
             }
             for p in net.left() {
+                // Ownership auto-clears next tick; despawning is ours.
                 if let Some(pid) = net.own(p) {
                     pm.id_remove(pid);
                 }
-                net.own_clear(p);
                 if let Some(rid) = roster_id(&roster, p) {
                     pm.id_remove(rid);
                 }

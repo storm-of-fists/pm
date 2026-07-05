@@ -530,12 +530,9 @@ impl ServerNet {
         self.own.get_mut().set(peer, id);
     }
 
-    /// Clear `peer`'s controlled entity (despawn/leave).
-    pub fn own_clear(&self, peer: u8) {
-        self.own.get_mut().clear(peer);
-    }
-
-    /// `peer`'s controlled entity, if one is marked.
+    /// `peer`'s controlled entity, if one is marked. Cleared automatically
+    /// by the net task when the peer leaves — peer ids recycle, so a stale
+    /// entry would hand the next player on this id someone else's entity.
     pub fn own(&self, peer: u8) -> Option<Id> {
         self.own.get().get(peer)
     }
@@ -702,12 +699,15 @@ impl PmClient {
         extrap_max: f64,
     ) -> PoolHandle<T> {
         let draw = self.pool::<T>(&format!("{}.draw", auth.name()));
+        // Per-pool task name: several interp'd pools coexist and each
+        // shows up on its own in task_stats / task_stop.
+        let task = format!("net.interp.{}", auth.name());
         let auth = auth.clone();
         let ret = draw.clone();
         let mut buf = InterpBuffer::<T>::new(delay);
         buf.extrap_max = extrap_max;
         let mut clock = 0.0f64;
-        self.task_add("net.interp", NET_PRIO + 1.0, 0.0, move |pm| {
+        self.task_add(&task, NET_PRIO + 1.0, 0.0, move |pm| {
             clock += pm.loop_dt() as f64;
             pool_interp(&auth, &draw, &mut buf, clock, &lerp);
         });
@@ -927,6 +927,15 @@ impl NetServer {
             quic.pump();
             {
                 let mut pe = peers.get_mut();
+                // Leaves reported last tick have had a full tick above
+                // NET_PRIO with ownership intact (games despawn via
+                // `own(p)`); drop their entries now — peer ids recycle,
+                // and a stale entry would mark the departed player's
+                // entity as the NEXT player's own. Runs before this
+                // tick's joins, so a same-id rejoin starts clean.
+                for &p in &pe.left {
+                    own.get_mut().clear(p);
+                }
                 pe.joined.clear();
                 pe.left.clear();
                 for p in quic.joined_drain() {

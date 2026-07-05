@@ -120,10 +120,10 @@ fn run_server(quiet: bool) {
                 }
             }
             for p in net.left() {
+                // Ownership auto-clears next tick; despawning is ours.
                 if let Some(id) = net.own(p) {
                     pm.id_remove(id);
                 }
-                net.own_clear(p);
                 if !quiet {
                     eprintln!("peer {p} left");
                 }
