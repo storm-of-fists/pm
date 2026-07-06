@@ -25,12 +25,14 @@
 // otherwise — per-peer pack scan is O(entities) per net tick (interest
 // management is future work); lag-compensation history and
 // reconnect/peer-id reassignment are unbuilt; u32 ticks last ~2.2 years.
-// TODO(roadmap): per-pool sync modifiers — `sync_with(&pool,
-// SyncMode::interp())` to formalize the presentation-side interpolation
-// (see smooth), and a `duration` modifier (TTL on transient entries +
-// a server-side past-tick ring). That ring is what unlocks
-// lag-compensated contact resolution: rewind other entities to the view
-// the acting peer actually saw.
+// TODO(roadmap): both sync modifiers are LANDED — interp as
+// `PmClient::interp_pool`, duration as `PmServer::ttl_pool` (transient
+// entries expire) + `PmServer::history_pool` (past-tick ring; rewind to
+// `ServerNet::acked_tick(peer) - interp ticks` = lag-compensated contact
+// resolution, proven in drive's scoring). Still open: replicating the
+// ownership table to every peer (the snapshot header carries only YOUR
+// avatar; a full peer→entity table would let pods drop hand-carried peer
+// fields — see hellfire's Player.peer).
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -267,6 +269,14 @@ impl WireKind {
 /// handshake schema is this table, so a name/size/kind disagreement
 /// between server and client fails the connection instead of
 /// mis-delivering.
+///
+/// Strict schema EQUALITY is deliberate (decided over a subset rule):
+/// local pools/singles never register here, so server-only state
+/// (metrics) and client-only state (draw pools) are already free —
+/// everything that IS here crosses the wire, must agree on both ends to
+/// parse at all, and a client-side extra is always a bug. Equality turns
+/// every drift into a loud connect error. Revisit only if spectator
+/// clients (no input channel) or version-skewed fleets become real.
 #[derive(Default)]
 pub(crate) struct WireReg {
     entries: Vec<(WireKind, String, usize)>,
@@ -497,6 +507,18 @@ impl NetServer {
                 }
             }
         }
+    }
+
+    /// The newest snapshot tick `peer` has acknowledged (0 for an unknown
+    /// peer or before the first ack). Because acks and inputs share the
+    /// client→server path, this is also ≈ the newest snapshot the client
+    /// *had* when it sent the inputs now arriving — the anchor for
+    /// lag-compensation rewind (see `PmServer::history_pool`).
+    pub fn acked_tick(&self, peer: u8) -> u32 {
+        self.peers
+            .iter()
+            .find(|p| p.peer == peer)
+            .map_or(0, |p| p.acked_tick)
     }
 
     /// Record the newest input sequence consumed for `peer`; echoed in

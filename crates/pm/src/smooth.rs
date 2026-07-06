@@ -166,10 +166,10 @@ impl<T: Copy + PartialEq> InterpBuffer<T> {
 /// interpolated value out (via the game's angle-/field-aware `lerp`).
 /// Entities gone from `auth` drop from both the buffer and `draw`. The
 /// snapshot-interpolation counterpart to `pool_mirror` + `coast_blend`.
-// TODO(roadmap): promote this to a per-pool sync modifier —
-// `sync_with(&pool, SyncMode::interp())` — so a synced pool smooths
-// itself instead of every game wiring up a draw pool by hand (see the
-// sync-modifiers note in net).
+///
+/// This is the manual seam; the per-pool modifier it was promoted into is
+/// [`PmClient::interp_pool`](crate::PmClient::interp_pool) — one call
+/// installs the task, owns the buffer, and hands back the draw pool.
 pub fn pool_interp<T: Copy + PartialEq + 'static>(
     auth: &PoolHandle<T>,
     draw: &PoolHandle<T>,

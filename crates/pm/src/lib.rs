@@ -91,9 +91,15 @@
 //! - **net**: server-authoritative snapshot-delta replication behind the
 //!   role wrappers ([`PmServer`]/[`PmClient`]) and their typed channel
 //!   handles.
-//! - **predict / smooth**: client [`Predictor`] and the presentation
-//!   helpers [`pool_mirror`], [`coast_blend`], [`pool_interp`]
-//!   ([`InterpBuffer`]).
+//! - **predict / smooth**: the front doors are
+//!   [`PmClient::predict_pool`] (local avatar) and
+//!   [`PmClient::interp_pool`] (remote entities); [`Predictor`] and the
+//!   manual helpers [`pool_mirror`], [`coast_blend`], [`pool_interp`]
+//!   ([`InterpBuffer`]) are their seams.
+//! - **duration**: the server-side counterparts —
+//!   [`PmServer::ttl_pool`] (transient entries expire) and
+//!   [`PmServer::history_pool`] (past-tick window + rewind, the lag-comp
+//!   memory); [`pool_expire`] and [`HistoryRing`] are their seams.
 //! - **camera**: cameras as entities attached to other entities
 //!   ([`camera_track`], [`CameraRack`], [`CamManager`]).
 //! - [`modload`]: dylib hot-reload mods.
@@ -103,6 +109,7 @@
 //!   [`Cooldown`], [`RisingEdge`], …).
 
 mod camera;
+mod duration;
 mod id;
 mod kernel;
 mod math;
@@ -122,6 +129,7 @@ pub use camera::{
     CAMERA_PRIO, CamAnchor, CamManager, CamRig, CamView, CameraRack, camera_install,
     camera_manager, camera_track,
 };
+pub use duration::{HistoryRing, pool_expire};
 pub use id::Id;
 pub use kernel::{
     IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
@@ -130,8 +138,8 @@ pub use math::{Mat4, Rng, Vec2, Vec3, vec2, vec3};
 pub use modload::{BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr};
 pub use net::Applied;
 pub use netmod::{
-    ClientNet, EventRx, EventTx, InputRx, InputTx, NET_PRIO, PmClient, PmServer, ServerNet,
-    SingleRx,
+    ClientNet, EventRx, EventTx, InputRx, InputTx, NET_PRIO, PmClient, PmServer, PoolHistory,
+    ServerNet, SingleRx,
 };
 pub use pool::{Mut, Pool};
 pub use predict::Predictor;

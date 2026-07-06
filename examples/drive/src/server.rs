@@ -13,6 +13,14 @@ pub fn run(quiet: bool) {
     // are keyed by name on the wire.
     let car = pm.sync_pool::<Car>("car");
     let score = pm.sync_pool::<Score>("score");
+    // Billed collisions as transient replicated facts: fresh id per hit,
+    // expired by the server's TTL — clients render entries and never clean
+    // up. (Every client registers this pool too: one handshake schema.)
+    let contact = pm.sync_pool::<Contact>("contact");
+    pm.ttl_pool(&contact, CONTACT_TTL);
+    // A second of car history — the rewind memory that lets scoring judge
+    // each peer against the world THEY saw (acked tick − interp delay).
+    let hist = pm.history_pool(&car, 1.0);
     if !quiet {
         eprintln!("drive server on {ADDR}");
     }
@@ -88,19 +96,26 @@ pub fn run(quiet: bool) {
         }
     });
 
-    // Collision + scoring, right after the drive step (prio 31). Both are
-    // server-authoritative: collisions push cars apart in the `car` (motion)
-    // pool, and scoring banks into the separate `score` pool joined by id.
-    // The split keeps motion predictable and score authoritative-only.
+    // Collision + scoring, right after the drive step (prio 31). The
+    // positional push stays server-present physics — mutual, one truth.
+    // The JUDGMENT (were you on someone; how close was the pass) is
+    // per-actor and LAG-COMPENSATED: each peer is scored against the
+    // rivals as they saw them — their acked tick minus their interp
+    // delay, rewound through the car pool's history ring — so a pass
+    // that looked clean on your screen doesn't bill you just because
+    // the server's present had moved on ("favor the actor"; on mutual
+    // contact each side is judged from its own view, independently).
     pm.task_add("score", 31.0, 0.0, {
         let car = car.clone();
         let score = score.clone();
-        move |_pm| {
+        let contact = contact.clone();
+        let net = net.clone();
+        move |pm| {
             let mut cars = car.get_mut();
             let snap: Vec<(Id, Car)> = cars.iter().map(|(id, c)| (id, *c)).collect();
             let state: Vec<Car> = snap.iter().map(|(_, c)| *c).collect();
 
-            // Positional push from the pre-move snapshot.
+            // Positional push from the pre-move snapshot (present time).
             let push = collide_push(&state);
             for (k, (id, _)) in snap.iter().enumerate() {
                 if push[k] == (0.0, 0.0) {
@@ -112,27 +127,52 @@ pub fn run(quiet: bool) {
                     c.speed *= 0.85; // crunch scrubs a little speed
                 }
             }
-            drop(cars); // motion done; scoring touches the other pool only
+            drop(cars); // motion done; judgment reads, never writes, cars
 
-            // Bank each car's score: a flat HIT_COST per collision (push[k]
-            // non-zero == overlapping this tick), debounced by HIT_COOLDOWN
-            // so the push flicking us across the overlap line can't bill us
-            // every tick, plus the continuous positive proximity earning.
+            // Bank each actor's score against their own view: a flat
+            // HIT_COST on overlap (debounced by HIT_COOLDOWN so the push
+            // flicking cars across the overlap line can't bill every
+            // tick) plus the continuous proximity earning.
+            let iticks = interp_ticks();
             let mut scores = score.get_mut();
-            for (k, (id, _)) in snap.iter().enumerate() {
-                let others: Vec<Car> = state
-                    .iter()
-                    .enumerate()
-                    .filter(|(o, _)| *o != k)
-                    .map(|(_, c)| *c)
-                    .collect();
-                let reward = score_rate(&state[k], &others);
-                let hit = push[k] != (0.0, 0.0);
-                if let Some(mut s) = scores.get_mut(*id) {
+            let mut hits: Vec<Contact> = Vec::new();
+            for (peer, id) in net.owned() {
+                let Some(me) = car.get().get(id).copied() else {
+                    continue;
+                };
+                // The world this peer was looking at when they steered
+                // into (or clear of) the contact. A just-joined peer has
+                // acked nothing yet: view 0 clamps to the oldest frame
+                // and settles within an RTT.
+                let view = net.acked_tick(peer).saturating_sub(iticks);
+                let others: Vec<Car> = hist.frame(view).map_or(Vec::new(), |f| {
+                    f.iter()
+                        .filter(|&&(fid, _)| fid != id)
+                        .map(|&(_, c)| c)
+                        .collect()
+                });
+                let hit_at = others.iter().find_map(|o| {
+                    capsule_overlap(&me, o)
+                        .map(|_| ((me.x + o.x) * 0.5, (me.z + o.z) * 0.5))
+                });
+                let reward = score_rate(&me, &others);
+                if let Some(mut s) = scores.get_mut(id) {
                     s.hit_cd = (s.hit_cd - FIXED_DT).max(0.0);
-                    if hit && s.hit_cd <= 0.0 {
+                    if let Some((hx, hz)) = hit_at
+                        && s.hit_cd <= 0.0
+                    {
                         s.points = (s.points - HIT_COST).max(0.0);
                         s.hit_cd = HIT_COOLDOWN;
+                        hits.push(Contact { x: hx, z: hz });
+                        if !quiet {
+                            // The lag-comp story in one line: billed at the
+                            // world THIS peer saw (view), not the server's
+                            // present tick.
+                            eprintln!(
+                                "[server] hit billed: peer {peer} at ({hx:.1},{hz:.1}) view={view} now={}",
+                                pm.tick()
+                            );
+                        }
                     }
                     s.points = (s.points + reward * FIXED_DT).max(0.0);
                     // HUD rate: bleed red for the cooldown after a hit so the
@@ -141,12 +181,21 @@ pub fn run(quiet: bool) {
                     s.rate = if s.hit_cd > 0.0 { -HIT_COST } else { reward };
                 }
             }
+            drop(scores);
+            // Each billed hit becomes a transient replicated fact on a
+            // fresh id; the pool's TTL is the whole cleanup story.
+            for c in hits {
+                let id = pm.id_add();
+                contact.get_mut().add(id, c);
+            }
         }
     });
 
     if !quiet {
         pm.task_add("status", 90.0, 5.0, {
             let car = car.clone();
+            let score = score.clone();
+            let contact = contact.clone();
             move |pm| {
                 let cars = car.get();
                 let speeds: Vec<String> = cars
@@ -154,10 +203,22 @@ pub fn run(quiet: bool) {
                     .iter()
                     .map(|c| format!("{:.1}", c.speed))
                     .collect();
+                let pts: Vec<String> = score
+                    .get()
+                    .values()
+                    .iter()
+                    .map(|s| format!("{:.0}", s.points))
+                    .collect();
+                // contacts churns 0..few if the TTL is doing its job —
+                // monotonic growth here means expiry broke. pts moving
+                // proves the lag-comped judgment reads real frames (a
+                // broken rewind zeroes the proximity reward silently).
                 eprintln!(
-                    "[server] t={} cars={} speeds=[{}]",
+                    "[server] t={} cars={} contacts={} pts=[{}] speeds=[{}]",
                     pm.tick() / 60,
                     cars.len(),
+                    contact.get().len(),
+                    pts.join(", "),
                     speeds.join(", ")
                 );
             }

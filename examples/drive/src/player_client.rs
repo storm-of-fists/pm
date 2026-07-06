@@ -43,6 +43,9 @@ pub fn run() {
     // Same synced pools as the server (order doesn't matter — keyed by name).
     let car = pm.sync_pool::<Car>("car");
     let score = pm.sync_pool::<Score>("score");
+    // Transient collision markers, server-spawned and server-expired
+    // (ttl_pool): render whatever entries exist, clean up nothing.
+    let contact = pm.sync_pool::<Contact>("contact");
     eprintln!("connecting to {ADDR} ...");
     // THE continuous input channel: WASD lands in this pod, sampled and
     // sent at the fixed input cadence.
@@ -272,6 +275,18 @@ pub fn run() {
                             );
                         }
                     }
+                }
+
+                // Contact flashes: hot little pylons where a hit was billed.
+                // Transient facts straight off the synced pool — the server's
+                // TTL removes them, so existence == recency.
+                for (_, c) in contact.get().iter() {
+                    frame.draw(
+                        &marker,
+                        Mat4::translate(vec3(c.x, 0.0, c.z)) * Mat4::scale(2.2),
+                        (1.0, 0.45, 0.10),
+                        true,
+                    );
                 }
 
                 // HUD: one bold line, top-middle — total score (white) with

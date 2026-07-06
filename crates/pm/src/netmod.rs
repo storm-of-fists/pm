@@ -9,13 +9,23 @@
 //! event channels, the input channel — lives in one registry (one hash
 //! keyspace, one collision panic) and is schema-checked at the handshake,
 //! so both ends must agree on the full channel set before a single tick
-//! of state flows.
+//! of state flows. The strictness is deliberate: local pools and singles
+//! never enter the schema (server-only metrics and client-only draw
+//! pools are free), so a mismatch in what remains is always a bug, and
+//! equality turns it into a loud connect error.
 //!
 //! Server (`Pm::server(addr)`), everything from the [`PmServer`] wrapper:
 //! - [`net`](PmServer::net) → [`ServerNet`]: who joined/left this tick,
-//!   and each peer's controlled entity (`own_set` ships the id in every
+//!   each peer's controlled entity (`own_set` ships the id in every
 //!   snapshot header — the built-in replacement for a hand-rolled
-//!   "here's your id" event).
+//!   "here's your id" event), and per-peer link stats
+//!   ([`acked_tick`](ServerNet::acked_tick)/[`rtt_ms`](ServerNet::rtt_ms)).
+//!   Ownership auto-clears the tick after a leave: the leave handler
+//!   still sees `own(p)` to despawn by.
+//! - [`ttl_pool`](PmServer::ttl_pool) / [`history_pool`](PmServer::history_pool):
+//!   the duration modifiers — transient entries expire after a lifetime;
+//!   a pool keeps a window of past ticks the server can rewind into
+//!   (lag compensation).
 //! - [`input`](PmServer::input) → [`InputRx`]: the continuous input
 //!   channel. `pop` is the command-frame model (one per tick, bounded
 //!   skip-ahead), `latest` is newest-wins; consuming records the seq
@@ -53,7 +63,7 @@
 //! of that tick. A client whose connection errors or closes quits the
 //! loop.
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -61,6 +71,7 @@ use std::rc::Rc;
 
 use bytemuck::Pod;
 
+use crate::duration::{HistoryRing, pool_expire};
 use crate::id::Id;
 use crate::kernel::{PoolHandle, Pm, SingleHandle};
 use crate::net::{Applied, NetClient, NetServer, Outbox, SyncSet, WireKind, WireReg, event_tag};
@@ -499,13 +510,15 @@ impl ClientNet {
     }
 }
 
-/// The server role's in-task surface: peer joins/leaves this tick and the
-/// peer→controlled-entity table. Obtained from [`PmServer::net`] — only a
-/// server can construct one. Clone into the closures that need it.
+/// The server role's in-task surface: peer joins/leaves this tick, the
+/// peer→controlled-entity table, and per-peer link stats. Obtained from
+/// [`PmServer::net`] — only a server can construct one. Clone into the
+/// closures that need it.
 #[derive(Clone)]
 pub struct ServerNet {
     peers: SingleHandle<PeerEvents>,
     own: SingleHandle<ServerOwn>,
+    stats: SingleHandle<PeerStats>,
 }
 
 impl ServerNet {
@@ -542,6 +555,25 @@ impl ServerNet {
     pub fn owned(&self) -> Vec<(u8, Id)> {
         self.own.get().0.iter().map(|(&p, &id)| (p, id)).collect()
     }
+
+    /// The newest snapshot tick `peer` has acknowledged (0 until the
+    /// first ack). Acks and inputs share the client→server path, so this
+    /// is ≈ the newest snapshot the client *had* when it sent the inputs
+    /// arriving now — which makes
+    /// `acked_tick(peer) - interp_delay_in_ticks` the tick that peer was
+    /// *looking at*: the rewind point for lag compensation (see
+    /// [`history_pool`](PmServer::history_pool)).
+    pub fn acked_tick(&self, peer: u8) -> u32 {
+        self.stats.get().0.get(&peer).map_or(0, |s| s.acked_tick)
+    }
+
+    /// Round-trip time to `peer` in milliseconds (0 for an unknown peer).
+    /// The server-side sibling of [`ClientNet::rtt_ms`] — a link-health
+    /// readout for metrics, and the raw ingredient if a game wants an
+    /// RTT-based rewind instead of the acked-tick one.
+    pub fn rtt_ms(&self, peer: u8) -> f32 {
+        self.stats.get().0.get(&peer).map_or(0.0, |s| s.rtt_ms)
+    }
 }
 
 /// Typed read handle for a **synced single** on the client — the replica
@@ -572,6 +604,33 @@ impl<T: Pod + 'static> SingleRx<T> {
             .first()
             .copied()
             .unwrap_or_else(T::zeroed)
+    }
+}
+
+/// Read handle over a server-side window of a pool's past ticks — what
+/// [`PmServer::history_pool`] returns. Clone into the tasks that rewind
+/// (the handles share one ring; the installed task writes it each tick).
+pub struct PoolHistory<T> {
+    ring: Rc<RefCell<HistoryRing<T>>>,
+}
+
+// Hand-implemented (not derived) so cloning the *handle* never demands
+// `T: Clone` — a derive bounds the impl on T. Same idiom as `InputTx`.
+impl<T> Clone for PoolHistory<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: self.ring.clone(),
+        }
+    }
+}
+
+impl<T: Copy + 'static> PoolHistory<T> {
+    /// The recorded frame nearest `tick` (clamped to the window edges;
+    /// see [`HistoryRing::frame`]) as a zero-copy borrow. `None` only
+    /// before the first frame is recorded. Don't hold it across a call
+    /// that ticks the ring — it borrows the shared `RefCell`.
+    pub fn frame(&self, tick: u32) -> Option<Ref<'_, [(Id, T)]>> {
+        Ref::filter_map(self.ring.borrow(), |r| r.frame(tick)).ok()
     }
 }
 
@@ -748,13 +807,75 @@ impl PmClient {
 
 impl PmServer {
     /// The server's in-task surface as a handle: fetch once at init, clone
-    /// into the tasks that react to joins/leaves or mark controlled
-    /// entities ([`own_set`](ServerNet::own_set)).
+    /// into the tasks that react to joins/leaves, mark controlled
+    /// entities ([`own_set`](ServerNet::own_set)), or read per-peer link
+    /// stats ([`acked_tick`](ServerNet::acked_tick)/[`rtt_ms`](ServerNet::rtt_ms)).
     pub fn net(&mut self) -> ServerNet {
         ServerNet {
             peers: self.pm.single::<PeerEvents>("net.peers"),
             own: self.pm.single::<ServerOwn>("net.own"),
+            stats: self.pm.single::<PeerStats>("net.peerstat"),
         }
+    }
+
+    /// Give `pool`'s entries a lifetime: any entry not written for `secs`
+    /// is removed (entity and all — see [`pool_expire`]), and the removal
+    /// replicates like any other. This is what makes **transient facts
+    /// safe as pool entries** (a contact point, a hit marker, a grenade
+    /// ping): spawn each occurrence on a fresh id and let the TTL clean
+    /// up — never hand-roll a removal timer per game.
+    ///
+    /// Keep `secs` comfortably above one resend window (~1 RTT + a couple
+    /// of snapshot intervals): an entry that dies faster than that can
+    /// expire before a lossy client ever saw it — its add and its removal
+    /// coalesce into nothing.
+    pub fn ttl_pool<T: 'static>(&mut self, pool: &PoolHandle<T>, secs: f32) {
+        let task = format!("net.ttl.{}", pool.name());
+        let pool = pool.clone();
+        self.task_add(&task, NET_PRIO + 0.5, 0.0, move |pm| {
+            // loop_rate is read every tick (not captured at install) — it
+            // is usually set after the modifiers, just before run().
+            let ttl_ticks = (secs * pm.loop_rate.max(1) as f32).ceil() as u32;
+            pool_expire(pm, &pool, ttl_ticks);
+        });
+    }
+
+    /// Keep a `secs`-deep window of `pool`'s **past ticks** on the server
+    /// and return the [`PoolHistory`] handle that rewinds into it — the
+    /// memory lag compensation reads.
+    ///
+    /// Frames are labeled like snapshots (`tick - 1`, the last completed
+    /// tick, recorded right after the net task packs), so a frame label
+    /// IS a snapshot tick a client may have seen. To judge an acting
+    /// peer's view — "was I really on that car when I hit it?" — rewind
+    /// to what they were looking at when they issued the input:
+    ///
+    /// ```text
+    /// let view = net.acked_tick(peer)              // newest tick they HAD
+    ///     .saturating_sub(interp_ticks);           // minus their interp delay
+    /// let frame = hist.frame(view);                // other entities, as seen
+    /// ```
+    ///
+    /// The interp delay is the client's presentation constant
+    /// ([`interp_pool`](PmClient::interp_pool)'s `delay`, in ticks) —
+    /// share it between both builds like the fixed dt. Rewinds deeper
+    /// than the window clamp to the oldest frame (bounded rewind).
+    pub fn history_pool<T: Copy + 'static>(
+        &mut self,
+        pool: &PoolHandle<T>,
+        secs: f32,
+    ) -> PoolHistory<T> {
+        let ring = Rc::new(RefCell::new(HistoryRing::new(1)));
+        let task = format!("net.hist.{}", pool.name());
+        let pool = pool.clone();
+        let handle = PoolHistory { ring: ring.clone() };
+        self.task_add(&task, NET_PRIO + 0.5, 0.0, move |pm| {
+            let mut ring = ring.borrow_mut();
+            ring.cap_set(((secs * pm.loop_rate.max(1) as f32).ceil() as usize).max(1));
+            let frame: Vec<(Id, T)> = pool.get().iter().map(|(id, v)| (id, *v)).collect();
+            ring.push(pm.tick().saturating_sub(1), frame);
+        });
+        handle
     }
 
     /// Register the **continuous input channel** and return its receiver.
@@ -863,6 +984,18 @@ pub(crate) struct PeerEvents {
 #[derive(Default)]
 pub(crate) struct ServerEvents(pub Vec<(u8, u16, Vec<u8>)>);
 
+/// Per-peer link/ack stats (server, `"net.peerstat"`), refreshed by the
+/// net task every tick. Internal plumbing behind
+/// [`ServerNet::acked_tick`]/[`ServerNet::rtt_ms`].
+#[derive(Default)]
+pub(crate) struct PeerStats(pub HashMap<u8, PeerStat>);
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PeerStat {
+    pub acked_tick: u32,
+    pub rtt_ms: f32,
+}
+
 /// Per-peer controlled entity (server, `"net.own"`). Internal plumbing
 /// behind [`ServerNet::own_set`]; the net task ships it in every snapshot
 /// header.
@@ -922,6 +1055,7 @@ impl NetServer {
         let peers = pm.single::<PeerEvents>("net.peers");
         let events = pm.single::<ServerEvents>("net.events");
         let own = pm.single::<ServerOwn>("net.own");
+        let stats = pm.single::<PeerStats>("net.peerstat");
         let sink = pm.single::<ServerInputChan>("net.input").get().0.clone();
         pm.task_add("net", NET_PRIO, 0.0, move |pm| {
             quic.pump();
@@ -966,6 +1100,20 @@ impl NetServer {
             for (p, tick) in quic.acks_drain() {
                 net.ack(p, tick);
             }
+            let plist: Vec<u8> = net.peers().collect();
+            {
+                // Per-peer stats, refreshed now that this tick's acks
+                // landed; departed peers' rows drop with them (peer ids
+                // recycle — a stale row would hand the next player on
+                // this id the old link's numbers).
+                let mut st = stats.get_mut();
+                st.0.retain(|p, _| plist.contains(p));
+                for &p in &plist {
+                    let e = st.0.entry(p).or_default();
+                    e.acked_tick = net.acked_tick(p);
+                    e.rtt_ms = quic.rtt(p).as_secs_f32() * 1e3;
+                }
+            }
             {
                 let ev = &mut events.get_mut().0;
                 ev.clear();
@@ -977,7 +1125,6 @@ impl NetServer {
                     net.set_avatar(p, id.0);
                 }
             }
-            let plist: Vec<u8> = net.peers().collect();
             for p in plist {
                 let budget = quic.snapshot_budget(p);
                 if let Some(snap) = net.snapshot_budgeted(pm, p, budget) {

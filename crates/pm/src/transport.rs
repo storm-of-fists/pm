@@ -484,6 +484,16 @@ impl QuicServer {
         std::mem::take(&mut self.events)
     }
 
+    /// Round-trip time to `peer` as quinn currently estimates it
+    /// (`Duration::ZERO` for an unknown peer). The server-side sibling of
+    /// `QuicClient::rtt`.
+    pub fn rtt(&self, peer: u8) -> Duration {
+        self.peer_conns
+            .get(&peer)
+            .and_then(|ch| self.conns.get(ch))
+            .map_or(Duration::ZERO, |st| st.conn.rtt())
+    }
+
     /// How many snapshot bytes fit in one datagram to `peer` right now
     /// (~1200 until MTU discovery raises it). Feed this to
     /// `NetServer::snapshot_budgeted` so snapshots never oversize.

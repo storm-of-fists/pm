@@ -11,6 +11,29 @@ pub const FIXED_DT: f32 = 1.0 / 60.0;
 /// Half-extent of the square arena (walls at +-ARENA on x and z).
 pub const ARENA: f32 = 38.0;
 
+/// Remote-car interpolation delay (seconds): clients render rivals this
+/// far behind the newest snapshot. Shared like `FIXED_DT` because BOTH
+/// sides read it — the client hands it to `interp_pool`, the server
+/// subtracts it (in ticks) from a peer's acked tick to rewind scoring to
+/// what that peer was looking at. `PM_INTERP_MS` overrides it for feel
+/// A/B's; drive runs server and clients in one process, so one env keeps
+/// them agreeing.
+pub const INTERP_DELAY: f32 = 0.05;
+
+/// [`INTERP_DELAY`] with the `PM_INTERP_MS` override applied.
+pub fn interp_delay() -> f32 {
+    std::env::var("PM_INTERP_MS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map_or(INTERP_DELAY, |ms| ms / 1000.0)
+}
+
+/// The interp delay in whole sim ticks — what the server subtracts from a
+/// peer's acked tick to find the tick that peer was *seeing*.
+pub fn interp_ticks() -> u32 {
+    (interp_delay() / FIXED_DT).round() as u32
+}
+
 /// Replicated car state. Ground-plane physics: heading 0 faces +z,
 /// forward = (sin h, cos h) on (x, z). y stays 0 — the presentation is
 /// 3D, the simulation deliberately isn't (yet). This is the PREDICTED
@@ -71,6 +94,22 @@ pub struct Drive {
 pub struct Respawn {
     pub pad: u32,
 }
+
+/// A billed collision, as a transient replicated FACT: the server spawns
+/// one on a fresh id at the impact point and its `ttl_pool` lifetime
+/// removes it — the contact-points pattern. No event channel down, no
+/// client-side cleanup; clients just render whatever entries exist.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Contact {
+    pub x: f32,
+    pub z: f32,
+}
+
+/// Contact marker lifetime (seconds). Comfortably above one resend window
+/// (~RTT + a couple of snapshot intervals) so even a lossy client sees
+/// every hit before it expires — the contact-points rule.
+pub const CONTACT_TTL: f32 = 1.0;
 
 /// Top speed (forward); the `drive_step` clamp and the speed-match scale.
 pub const VMAX: f32 = 18.0;

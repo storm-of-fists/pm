@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::net::{NetClient, NetServer, Outbox};
-use crate::netmod::{PeerEvents, ServerEvents, ServerOwn, input_rx};
+use crate::netmod::{PeerEvents, PeerStats, ServerEvents, ServerOwn, input_rx};
 use crate::transport::{QuicClient, QuicServer};
 use crate::{Id, Pm};
 
@@ -152,6 +152,17 @@ fn net_modules_loopback() {
         "applied input-seq echo never arrived"
     );
     assert!(done, "replication never converged (cmd-driven pos.x > 5)");
+    // Per-peer link stats rode along: the client acked snapshots, so its
+    // acked_tick advanced (the lag-comp rewind anchor), and quinn has an
+    // RTT estimate from the moment the connection exists.
+    {
+        let p = *garage.get().0.keys().next().expect("a joined peer");
+        let stats = spm.single::<PeerStats>("net.peerstat");
+        let st = stats.get();
+        let ps = st.0.get(&p).expect("peerstat row for the joined peer");
+        assert!(ps.acked_tick > 0, "acks flowed but acked_tick never advanced");
+        assert!(ps.rtt_ms > 0.0, "rtt_ms never measured");
+    }
     assert!(
         spm.task_faults().is_empty(),
         "server task faults: {:?}",
@@ -162,6 +173,58 @@ fn net_modules_loopback() {
         "client task faults: {:?}",
         cpm.task_faults()
     );
+}
+
+/// `ttl_pool`: a synced entry not written for the lifetime is removed —
+/// entity and all — with no game-side timer. Runs on an unbound PmServer:
+/// the duration modifiers are tasks, not transport.
+#[test]
+fn ttl_pool_expires_stale_entries() {
+    let mut pm = Pm::server("127.0.0.1:0");
+    pm.loop_rate = 60;
+    let pool = pm.sync_pool::<Pos>("pos");
+    pm.ttl_pool(&pool, 0.1); // 6 ticks at 60 Hz
+
+    let a = pm.id_add();
+    pool.get_mut().add(a, Pos { x: 1.0, y: 0.0 });
+    for _ in 0..3 {
+        pm.loop_once(DT);
+    }
+    assert!(pool.get().contains(a), "still inside the lifetime");
+    for _ in 0..10 {
+        pm.loop_once(DT);
+    }
+    assert!(!pool.get().contains(a), "expired after the ttl");
+    assert!(!pm.id_alive(a), "expiry removes the entity, not just the entry");
+}
+
+/// `history_pool` frames carry the snapshot label convention (`tick - 1`):
+/// the frame labeled T holds the state the tick-T snapshot packed. The
+/// window clamps — a rewind past its edges gets the nearest kept frame.
+#[test]
+fn history_pool_rewinds_past_ticks() {
+    let mut pm = Pm::server("127.0.0.1:0");
+    pm.loop_rate = 60;
+    let pool = pm.sync_pool::<Pos>("pos");
+    let hist = pm.history_pool(&pool, 0.5); // 30 frames
+
+    let id = pm.id_add();
+    pool.get_mut().add(id, Pos::default());
+    for i in 0..40 {
+        if let Some(mut e) = pool.get_mut().get_mut(id) {
+            e.x = i as f32;
+        }
+        pm.loop_once(DT);
+    }
+    // The kernel is born at tick 1, so iteration i runs as tick i+2 and
+    // the frame it records is labeled i+1 holding x == i: frame L reads
+    // L-1 — exactly the state a snapshot labeled L would have packed
+    // (both copy the pool as the tick begins).
+    let probe = |label: u32| hist.frame(label).expect("frame")[0].1.x;
+    assert_eq!(probe(35), 34.0, "exact rewind");
+    assert_eq!(probe(12), 11.0, "exact rewind near the window edge");
+    assert_eq!(probe(0), 10.0, "older than the window clamps to oldest");
+    assert_eq!(probe(1000), 39.0, "future clamps to newest");
 }
 
 /// Ownership auto-clears ONE tick after the leave is reported: the game's

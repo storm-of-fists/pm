@@ -8,7 +8,13 @@
 //! - on each applied snapshot: `reconcile(auth_state, applied.input_seq, ...)`
 //! - after sending input:      `predict(seq, cmd, ...)`
 //! - rendering reads `state()` for the local avatar (instant input
-//!   response); remote entities go through `pool_mirror` instead.
+//!   response); remote entities go through
+//!   [`PmClient::interp_pool`](crate::PmClient::interp_pool) instead.
+//!
+//! The installed form is [`PmClient::predict_pool`](crate::PmClient::predict_pool) —
+//! it wires reconcile/replay to the net task and writes the smoothed
+//! avatar into the draw pool; drive this type directly only for a
+//! hand-rolled predictor.
 
 use std::collections::VecDeque;
 

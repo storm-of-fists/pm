@@ -33,21 +33,17 @@ pub fn add_client_tasks(
     // byte-exact.
     let pred = pm.predict_pool(car, input, drive_step, err_metric, 1e-4, FIXED_DT);
 
-    // Remote cars: snapshot interpolation ~50 ms behind newest, with a
-    // capped 50 ms extrapolation to ride loss bursts — env-tunable so feel
-    // can be A/B'd live. (The local car is overwritten by the predictor.)
-    let env_ms = |k: &str, d: f64| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map_or(d, |ms| ms / 1000.0)
-    };
-    let draw = pm.interp_pool(
-        car,
-        car_lerp,
-        env_ms("PM_INTERP_MS", 0.05),
-        env_ms("PM_EXTRAP_MS", 0.05),
-    );
+    // Remote cars: snapshot interpolation behind the newest snapshot, with
+    // a capped 50 ms extrapolation to ride loss bursts. The delay is the
+    // shared INTERP_DELAY constant (PM_INTERP_MS overrides for live A/B) —
+    // shared because the server rewinds scoring by this same amount to
+    // judge each peer against what they were rendering. (The local car is
+    // overwritten by the predictor.)
+    let extrap = std::env::var("PM_EXTRAP_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(0.05, |ms| ms / 1000.0);
+    let draw = pm.interp_pool(car, car_lerp, interp_delay() as f64, extrap);
 
     (pred, draw)
 }
@@ -58,6 +54,9 @@ pub fn run_bot(n: u32) {
     // Same synced pools as the server (order doesn't matter — keyed by name).
     let car = pm.sync_pool::<Car>("car");
     pm.sync_pool::<Score>("score");
+    // Bots never look at contact markers, but the handshake schema is the
+    // full channel set — every client registers every synced pool.
+    pm.sync_pool::<Contact>("contact");
     // Same channels as the server, too: the handshake schema covers every
     // named channel, so even a bot that never respawns registers the
     // respawn event — the schema is the connection's full contract.

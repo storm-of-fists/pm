@@ -16,7 +16,8 @@
       "Bash(pgrep -f \"hellfire server\")",
       "Bash(ls reports/)",
       "Bash(pkill -f \"hellfire server\")",
-      "Bash(pkill -f \"hellfire bot\")"
+      "Bash(pkill -f \"hellfire bot\")",
+      "Bash(cargo clippy *)"
     ]
   }
 }
