@@ -17,7 +17,8 @@
       "Bash(ls reports/)",
       "Bash(pkill -f \"hellfire server\")",
       "Bash(pkill -f \"hellfire bot\")",
-      "Bash(cargo clippy *)"
+      "Bash(cargo clippy *)",
+      "Bash(echo \"clippy-exit: $?\")"
     ]
   }
 }

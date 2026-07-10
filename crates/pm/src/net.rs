@@ -34,7 +34,7 @@
 // avatar; a full peer→entity table would let pods drop hand-carried peer
 // fields — see hellfire's Player.peer).
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use bytemuck::Pod;
@@ -136,7 +136,7 @@ type SentEntry = (u16, u32, u32);
 
 trait SyncAdapter {
     fn name(&self) -> &str;
-    #[cfg_attr(not(test), allow(dead_code))] // test seam (SyncSet::schema)
+    #[cfg(test)] // test seam (SyncSet::schema)
     fn value_size(&self) -> usize;
     /// Append `[id u32][value]` entries the peer hasn't confirmed, in
     /// rotation order, while `budget` lasts; returns count.
@@ -162,6 +162,7 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
         &self.name
     }
 
+    #[cfg(test)]
     fn value_size(&self) -> usize {
         size_of::<T>()
     }
@@ -361,7 +362,7 @@ impl SyncSet {
     /// of the handshake schema. The full schema (events + input channel
     /// included) lives in [`WireReg`]; this exists for the sync layer's
     /// own tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn schema(&self) -> Vec<(u8, String, usize)> {
         self.adapters
             .iter()
@@ -386,7 +387,6 @@ impl SyncSet {
 const INFLIGHT_EXPIRY_TICKS: u32 = 60;
 
 struct Peer {
-    peer: u8,
     acked_tick: u32,
     input_seq: u32,
     /// This peer's controlled entity, shipped in every snapshot header so
@@ -400,6 +400,25 @@ struct Peer {
     /// confirm exactly that snapshot's entries — and declare everything
     /// older lost (a later snapshot arrived; earlier ones didn't).
     sent: VecDeque<(u32, Vec<SentEntry>)>,
+}
+
+impl Peer {
+    /// Settle a sent snapshot: confirm its entries if the peer `received`
+    /// it, and either way clear their in-flight markers (unless a newer
+    /// send superseded them) so lost entries re-qualify for packing.
+    fn settle(&mut self, label: u32, entries: Vec<SentEntry>, received: bool) {
+        for (pool_idx, slot, sent_tick) in entries {
+            let pp = &mut self.pools[pool_idx as usize];
+            if received {
+                let c = pp.confirmed.get(slot);
+                pp.confirmed.set(slot, c.max(sent_tick));
+            }
+            if pp.inflight_label.get(slot) == label {
+                pp.inflight_tick.set(slot, 0);
+                pp.inflight_label.set(slot, 0);
+            }
+        }
+    }
 }
 
 /// What a successfully applied snapshot tells the client.
@@ -419,18 +438,18 @@ pub struct Applied {
 /// recycling on acks. Create during init and move into the net task.
 pub struct NetServer {
     sync: SyncSet,
-    peers: Vec<Peer>,
+    peers: BTreeMap<u8, Peer>,
 }
 
 impl NetServer {
     /// Attaching a server holds the kernel's removal log so removed
     /// indices aren't recycled before every peer has acked the removal.
-    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    #[cfg(test)] // test seam: manual bind path
     pub fn new(pm: &mut Pm) -> Self {
         pm.removal_hold_set(true);
         Self {
             sync: SyncSet::default(),
-            peers: Vec::new(),
+            peers: BTreeMap::new(),
         }
     }
 
@@ -439,41 +458,38 @@ impl NetServer {
     pub(crate) fn with_sync(sync: SyncSet) -> Self {
         Self {
             sync,
-            peers: Vec::new(),
+            peers: BTreeMap::new(),
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    #[cfg(test)] // test seam: manual bind path
     pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    #[cfg(test)] // test seam: manual bind path
     pub fn schema(&self) -> Vec<(u8, String, usize)> {
         self.sync.schema()
     }
 
     pub fn peer_add(&mut self, peer: u8) {
-        if !self.peers.iter().any(|p| p.peer == peer) {
-            self.peers.push(Peer {
-                peer,
-                acked_tick: 0,
-                input_seq: 0,
-                avatar: 0,
-                pools: (0..self.sync.adapters.len())
-                    .map(|_| PeerPool::new())
-                    .collect(),
-                sent: VecDeque::new(),
-            });
-        }
+        self.peers.entry(peer).or_insert_with(|| Peer {
+            acked_tick: 0,
+            input_seq: 0,
+            avatar: 0,
+            pools: (0..self.sync.adapters.len())
+                .map(|_| PeerPool::new())
+                .collect(),
+            sent: VecDeque::new(),
+        });
     }
 
     pub fn peer_remove(&mut self, peer: u8) {
-        self.peers.retain(|p| p.peer != peer);
+        self.peers.remove(&peer);
     }
 
     pub fn peers(&self) -> impl Iterator<Item = u8> + '_ {
-        self.peers.iter().map(|p| p.peer)
+        self.peers.keys().copied()
     }
 
     /// Record a peer's ack of snapshot `tick`: its entries are confirmed
@@ -482,7 +498,7 @@ impl NetServer {
     /// a late ack for an already-dropped label is ignored, costing at
     /// most a redundant resend (snapshots are idempotent upserts).
     pub fn ack(&mut self, peer: u8, tick: u32) {
-        let Some(p) = self.peers.iter_mut().find(|p| p.peer == peer) else {
+        let Some(p) = self.peers.get_mut(&peer) else {
             return;
         };
         p.acked_tick = p.acked_tick.max(tick);
@@ -491,21 +507,7 @@ impl NetServer {
                 break;
             }
             let (label, entries) = p.sent.pop_front().unwrap();
-            let received = label == tick;
-            for (pool_idx, slot, sent_tick) in entries {
-                let pp = &mut p.pools[pool_idx as usize];
-                if received {
-                    let c = pp.confirmed.get(slot);
-                    pp.confirmed.set(slot, c.max(sent_tick));
-                }
-                // Either way this snapshot is settled: clear the
-                // in-flight marker (unless a newer send superseded it)
-                // so lost entries re-qualify for packing.
-                if pp.inflight_label.get(slot) == label {
-                    pp.inflight_tick.set(slot, 0);
-                    pp.inflight_label.set(slot, 0);
-                }
-            }
+            p.settle(label, entries, label == tick);
         }
     }
 
@@ -515,16 +517,13 @@ impl NetServer {
     /// *had* when it sent the inputs now arriving — the anchor for
     /// lag-compensation rewind (see `PmServer::history_pool`).
     pub fn acked_tick(&self, peer: u8) -> u32 {
-        self.peers
-            .iter()
-            .find(|p| p.peer == peer)
-            .map_or(0, |p| p.acked_tick)
+        self.peers.get(&peer).map_or(0, |p| p.acked_tick)
     }
 
     /// Record the newest input sequence consumed for `peer`; echoed in
     /// every snapshot header so the client can reconcile predictions.
     pub fn input_processed(&mut self, peer: u8, seq: u32) {
-        if let Some(p) = self.peers.iter_mut().find(|p| p.peer == peer) {
+        if let Some(p) = self.peers.get_mut(&peer) {
             p.input_seq = p.input_seq.max(seq);
         }
     }
@@ -534,14 +533,14 @@ impl NetServer {
     /// entity is its own — the built-in replacement for a hand-rolled
     /// ownership handshake. Idempotent; call it every tick.
     pub fn set_avatar(&mut self, peer: u8, id: u32) {
-        if let Some(p) = self.peers.iter_mut().find(|p| p.peer == peer) {
+        if let Some(p) = self.peers.get_mut(&peer) {
             p.avatar = id;
         }
     }
 
     /// Pack everything `peer` hasn't confirmed, without a size cap.
     /// Prefer `snapshot_budgeted` when the transport bounds datagrams.
-    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    #[cfg(test)] // test seam: manual bind path
     pub fn snapshot(&mut self, pm: &Pm, peer: u8) -> Option<Vec<u8>> {
         self.snapshot_budgeted(pm, peer, usize::MAX)
     }
@@ -555,7 +554,7 @@ impl NetServer {
     /// to silence — one mechanism, both behaviors. Removals are always
     /// included (small, and they gate id recycling).
     pub fn snapshot_budgeted(&mut self, pm: &Pm, peer: u8, budget: usize) -> Option<Vec<u8>> {
-        let state = self.peers.iter_mut().find(|p| p.peer == peer)?;
+        let state = self.peers.get_mut(&peer)?;
         // Lazily grow per-pool state for pools registered after peer_add.
         while state.pools.len() < self.sync.adapters.len() {
             state.pools.push(PeerPool::new());
@@ -570,13 +569,7 @@ impl NetServer {
                 break;
             }
             let (l, entries) = state.sent.pop_front().unwrap();
-            for (pool_idx, slot, _) in entries {
-                let pp = &mut state.pools[pool_idx as usize];
-                if pp.inflight_label.get(slot) == l {
-                    pp.inflight_tick.set(slot, 0);
-                    pp.inflight_label.set(slot, 0);
-                }
-            }
+            state.settle(l, entries, false);
         }
 
         let mut out = Vec::new();
@@ -626,7 +619,7 @@ impl NetServer {
     pub fn prune(&self, pm: &mut Pm) {
         let min = self
             .peers
-            .iter()
+            .values()
             .map(|p| p.acked_tick)
             .min()
             .unwrap_or(pm.tick());
@@ -643,7 +636,7 @@ pub struct NetClient {
 }
 
 impl NetClient {
-    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    #[cfg(test)] // test seam: manual bind path
     pub fn new() -> Self {
         Self::default()
     }
@@ -654,12 +647,12 @@ impl NetClient {
         Self { sync }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    #[cfg(test)] // test seam: manual bind path
     pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // test seam: manual bind path
+    #[cfg(test)] // test seam: manual bind path
     pub fn schema(&self) -> Vec<(u8, String, usize)> {
         self.sync.schema()
     }

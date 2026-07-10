@@ -317,6 +317,17 @@ impl<C: Pod> Default for InputQueues<C> {
     }
 }
 
+impl<C: Pod> InputQueues<C> {
+    /// The command held for `peer` — the last one consumed, or zeroed
+    /// before any input arrived.
+    fn held(&self, peer: u8) -> C {
+        self.applied
+            .get(&peer)
+            .map(|&(_, c)| c)
+            .unwrap_or_else(C::zeroed)
+    }
+}
+
 /// Receiver half of the continuous input channel ([`PmServer::input`]).
 /// The net task pushes decoded pods in; the sim consumes per peer via
 /// [`pop`](InputRx::pop) or [`latest`](InputRx::latest), which also
@@ -352,10 +363,7 @@ impl<C: Pod + 'static> InputRx<C> {
         if let Some(c) = consumed {
             sh.applied.insert(peer, c);
         }
-        sh.applied
-            .get(&peer)
-            .map(|&(_, c)| c)
-            .unwrap_or_else(C::zeroed)
+        sh.held(peer)
     }
 
     /// Newest-wins consumption: drain to the latest command and hold it.
@@ -367,10 +375,7 @@ impl<C: Pod + 'static> InputRx<C> {
         if let Some(last) = q.drain(..).last() {
             sh.applied.insert(peer, last);
         }
-        sh.applied
-            .get(&peer)
-            .map(|&(_, c)| c)
-            .unwrap_or_else(C::zeroed)
+        sh.held(peer)
     }
 }
 
@@ -707,17 +712,19 @@ impl PmClient {
                 let Some(mine) = status.get().avatar else {
                     return;
                 };
-                for a in &applied.get().0 {
-                    let Some(auth_s) = auth.get_id(mine).map(|r| *r) else {
-                        continue;
-                    };
-                    pred.get_mut().reconcile(
-                        auth_s,
-                        a.input_seq,
-                        |s, c| step(s, c, fixed_dt),
-                        |a, b| err(a, b),
-                        tolerance,
-                    );
+                // One fetch for all of this tick's snapshots — the pool
+                // doesn't change between them (the net task already
+                // applied every snapshot before this task runs).
+                if let Some(auth_s) = auth.get_id(mine).map(|r| *r) {
+                    for a in &applied.get().0 {
+                        pred.get_mut().reconcile(
+                            auth_s,
+                            a.input_seq,
+                            |s, c| step(s, c, fixed_dt),
+                            |a, b| err(a, b),
+                            tolerance,
+                        );
+                    }
                 }
                 for &(seq, cmd) in &shared.borrow().sent {
                     pred.get_mut().predict(seq, cmd, |s, c| step(s, c, fixed_dt));
@@ -805,6 +812,13 @@ impl PmClient {
     }
 }
 
+/// Seconds → whole sim ticks at the current loop rate. Read every tick
+/// (not captured at task install) — `loop_rate` is usually set after the
+/// duration modifiers, just before run().
+fn secs_ticks(pm: &Pm, secs: f32) -> u32 {
+    (secs * pm.loop_rate.max(1) as f32).ceil() as u32
+}
+
 impl PmServer {
     /// The server's in-task surface as a handle: fetch once at init, clone
     /// into the tasks that react to joins/leaves, mark controlled
@@ -833,10 +847,7 @@ impl PmServer {
         let task = format!("net.ttl.{}", pool.name());
         let pool = pool.clone();
         self.task_add(&task, NET_PRIO + 0.5, 0.0, move |pm| {
-            // loop_rate is read every tick (not captured at install) — it
-            // is usually set after the modifiers, just before run().
-            let ttl_ticks = (secs * pm.loop_rate.max(1) as f32).ceil() as u32;
-            pool_expire(pm, &pool, ttl_ticks);
+            pool_expire(pm, &pool, secs_ticks(pm, secs));
         });
     }
 
@@ -871,7 +882,7 @@ impl PmServer {
         let handle = PoolHistory { ring: ring.clone() };
         self.task_add(&task, NET_PRIO + 0.5, 0.0, move |pm| {
             let mut ring = ring.borrow_mut();
-            ring.cap_set(((secs * pm.loop_rate.max(1) as f32).ceil() as usize).max(1));
+            ring.cap_set(secs_ticks(pm, secs).max(1) as usize);
             let frame: Vec<(Id, T)> = pool.get().iter().map(|(id, v)| (id, *v)).collect();
             ring.push(pm.tick().saturating_sub(1), frame);
         });

@@ -53,7 +53,8 @@ fn quic_loopback_full_stack() {
     };
     let mut cquic = QuicClient::connect(&addr, &cnet.schema()).expect("connect");
 
-    let mut event_echoed = false;
+    let mut event_sent = false;
+    let mut event_received = false;
     let mut removed = false;
     let mut input_sent = 0u32;
     let mut input_echo = 0u32;
@@ -65,7 +66,6 @@ fn quic_loopback_full_stack() {
         squic.pump();
         for p in squic.joined_drain() {
             snet.peer_add(p);
-            squic.event_send(p, 16, b"welcome");
         }
         for p in squic.left_drain() {
             snet.peer_remove(p);
@@ -77,9 +77,10 @@ fn quic_loopback_full_stack() {
             assert_eq!(payload, b"drv", "input payload corrupted");
             snet.input_processed(p, seq);
         }
+        // Events are one-way client→server; the server just receives.
         for (_, ty, payload) in squic.events_drain() {
-            if ty == 17 && payload == b"hello back" {
-                event_echoed = true;
+            if ty == 17 && payload == b"hello" {
+                event_received = true;
             }
         }
         spm.loop_once(DT);
@@ -97,12 +98,11 @@ fn quic_loopback_full_stack() {
         if let Some(peer) = cquic.handshake_done() {
             cpm.local_peer = peer;
         }
-        for (ty, payload) in cquic.events_drain() {
-            if ty == 16 && payload == b"welcome" {
-                cquic.event_send(17, b"hello back");
-            }
-        }
         if cquic.handshake_done().is_some() {
+            if !event_sent {
+                cquic.event_send(17, b"hello");
+                event_sent = true;
+            }
             input_sent = cquic.input_send(b"drv");
         }
         for snap in cquic.snapshots_drain() {
@@ -122,7 +122,7 @@ fn quic_loopback_full_stack() {
         if removed
             && !cpm.id_alive(ids[3])
             && c_pos.get().len() == 19
-            && event_echoed
+            && event_received
             && input_echo > 0
         {
             converged_then_removed = true;

@@ -6,8 +6,11 @@
 //!
 //! - unreliable datagrams: snapshots (server -> client), acks and later
 //!   input (client -> server)
-//! - one bidirectional reliable stream per connection: handshake (peer id
-//!   + schema table) and typed events, framed `[type u16][len u32][bytes]`
+//! - one bidirectional reliable stream per connection, framed
+//!   `[type u16][len u32][bytes]`: the handshake (peer id + schema table)
+//!   goes down it, typed events come up it — events are client→server
+//!   only (server→client facts are state), so the transport has no
+//!   server-side event send at all
 //!
 //! Certificates are self-signed and the client skips verification — fine
 //! for development; real deployments pin or verify.
@@ -134,6 +137,61 @@ fn transmits_flush(conn: &mut Connection, socket: &mut LagSocket, now: Instant) 
     }
 }
 
+/// Advance a connection's timers: quinn asks to be woken at
+/// `poll_timeout`; a past-due deadline is delivered here.
+fn conn_tick(conn: &mut Connection, now: Instant) {
+    if let Some(deadline) = conn.poll_timeout()
+        && now >= deadline
+    {
+        conn.handle_timeout(now);
+    }
+}
+
+/// The shared tail of a connection's pump: flush the reliable stream,
+/// run the connection↔endpoint event roundtrip, and put what the
+/// connection wants to send on the wire.
+fn conn_flush(
+    conn: &mut Connection,
+    endpoint: &mut Endpoint,
+    ch: ConnectionHandle,
+    stream: Option<StreamId>,
+    stream_out: &mut Vec<u8>,
+    socket: &mut LagSocket,
+    now: Instant,
+) {
+    if let Some(id) = stream {
+        stream_flush(conn, id, stream_out);
+    }
+    while let Some(ev) = conn.poll_endpoint_events() {
+        if let Some(cev) = endpoint.handle_event(ch, ev) {
+            conn.handle_event(cev);
+        }
+    }
+    transmits_flush(conn, socket, now);
+}
+
+/// Drain the UDP socket through the endpoint until it would block. Each
+/// datagram either produces a [`DatagramEvent`] — handed to `on_event`
+/// along with the scratch buffer quinn may have written a response into —
+/// or was consumed internally.
+fn socket_ingest(
+    socket: &mut LagSocket,
+    endpoint: &mut Endpoint,
+    now: Instant,
+    mut on_event: impl FnMut(&mut LagSocket, &mut Endpoint, DatagramEvent, &mut Vec<u8>),
+) {
+    let mut buf = [0u8; 4096];
+    let mut out = Vec::new();
+    while let Ok((len, from)) = socket.recv_from(now, &mut buf) {
+        out.clear();
+        if let Some(ev) =
+            endpoint.handle(now, from, None, None, BytesMut::from(&buf[..len]), &mut out)
+        {
+            on_event(socket, endpoint, ev, &mut out);
+        }
+    }
+}
+
 fn transport_config() -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
     // Live connections ping every 2s; anything silent for 5s is dead and
@@ -232,7 +290,7 @@ impl LagSocket {
         Err(io::ErrorKind::WouldBlock.into())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // test seam
+    #[cfg(test)] // test seam
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -309,7 +367,7 @@ impl QuicServer {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // test seam
+    #[cfg(test)] // test seam
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -325,76 +383,57 @@ impl QuicServer {
     /// acks and events, flush outgoing packets. Call once per tick.
     pub fn pump(&mut self) {
         let now = Instant::now();
-        let mut buf = [0u8; 4096];
-        let mut out = Vec::new();
         self.socket.flush(now);
 
-        loop {
-            match self.socket.recv_from(now, &mut buf) {
-                Ok((len, from)) => {
+        socket_ingest(
+            &mut self.socket,
+            &mut self.endpoint,
+            now,
+            |socket, endpoint, ev, out| match ev {
+                DatagramEvent::NewConnection(incoming) => {
                     out.clear();
-                    match self.endpoint.handle(
-                        now,
-                        from,
-                        None,
-                        None,
-                        BytesMut::from(&buf[..len]),
-                        &mut out,
-                    ) {
-                        Some(DatagramEvent::NewConnection(incoming)) => {
-                            out.clear();
-                            match self.endpoint.accept(incoming, now, &mut out, None) {
-                                Ok((ch, conn)) => {
-                                    let peer = self.next_peer;
-                                    // Peer ids are not reused; u8 wrap aborts
-                                    // accepting rather than colliding.
-                                    self.next_peer = self.next_peer.saturating_add(1);
-                                    self.conns.insert(
-                                        ch,
-                                        ConnState {
-                                            conn,
-                                            peer,
-                                            connected: false,
-                                            gone: false,
-                                            stream: None,
-                                            stream_in: Vec::new(),
-                                            stream_out: Vec::new(),
-                                            last_input_seq: 0,
-                                        },
-                                    );
-                                    self.peer_conns.insert(peer, ch);
-                                }
-                                Err(err) => {
-                                    if let Some(t) = err.response {
-                                        self.socket.send_to(now, &out[..t.size], t.destination);
-                                    }
-                                }
+                    match endpoint.accept(incoming, now, out, None) {
+                        Ok((ch, conn)) => {
+                            let peer = self.next_peer;
+                            // Peer ids are not reused; u8 wrap aborts
+                            // accepting rather than colliding.
+                            self.next_peer = self.next_peer.saturating_add(1);
+                            self.conns.insert(
+                                ch,
+                                ConnState {
+                                    conn,
+                                    peer,
+                                    connected: false,
+                                    gone: false,
+                                    stream: None,
+                                    stream_in: Vec::new(),
+                                    stream_out: Vec::new(),
+                                    last_input_seq: 0,
+                                },
+                            );
+                            self.peer_conns.insert(peer, ch);
+                        }
+                        Err(err) => {
+                            if let Some(t) = err.response {
+                                socket.send_to(now, &out[..t.size], t.destination);
                             }
                         }
-                        Some(DatagramEvent::ConnectionEvent(ch, ev)) => {
-                            if let Some(st) = self.conns.get_mut(&ch) {
-                                st.conn.handle_event(ev);
-                            }
-                        }
-                        Some(DatagramEvent::Response(response)) => {
-                            self.socket
-                                .send_to(now, &out[..response.size], response.destination);
-                        }
-                        None => {}
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+                DatagramEvent::ConnectionEvent(ch, ev) => {
+                    if let Some(st) = self.conns.get_mut(&ch) {
+                        st.conn.handle_event(ev);
+                    }
+                }
+                DatagramEvent::Response(response) => {
+                    socket.send_to(now, &out[..response.size], response.destination);
+                }
+            },
+        );
 
         let mut drained = Vec::new();
         for (&ch, st) in self.conns.iter_mut() {
-            if let Some(deadline) = st.conn.poll_timeout()
-                && now >= deadline
-            {
-                st.conn.handle_timeout(now);
-            }
+            conn_tick(&mut st.conn, now);
             while let Some(ev) = st.conn.poll() {
                 match ev {
                     Event::Connected => {
@@ -436,15 +475,15 @@ impl QuicServer {
                     self.events.push((st.peer, ty, payload));
                 }
             }
-            if let Some(id) = st.stream {
-                stream_flush(&mut st.conn, id, &mut st.stream_out);
-            }
-            while let Some(ev) = st.conn.poll_endpoint_events() {
-                if let Some(cev) = self.endpoint.handle_event(ch, ev) {
-                    st.conn.handle_event(cev);
-                }
-            }
-            transmits_flush(&mut st.conn, &mut self.socket, now);
+            conn_flush(
+                &mut st.conn,
+                &mut self.endpoint,
+                ch,
+                st.stream,
+                &mut st.stream_out,
+                &mut self.socket,
+                now,
+            );
             if st.gone && st.conn.is_drained() {
                 drained.push(ch);
             }
@@ -479,7 +518,9 @@ impl QuicServer {
         std::mem::take(&mut self.inputs)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // test seam
+    /// Reliable client→server events received since the last drain:
+    /// (peer, type, payload). The net task feeds these to the typed
+    /// `EventRx` channels.
     pub fn events_drain(&mut self) -> Vec<(u8, u16, Vec<u8>)> {
         std::mem::take(&mut self.events)
     }
@@ -529,20 +570,6 @@ impl QuicServer {
         d.push(DGRAM_SNAPSHOT);
         d.extend_from_slice(snapshot);
         let _ = st.conn.datagrams().send(d.into(), true);
-    }
-
-    /// Send a typed event on the reliable ordered stream (`ty` must be
-    /// >= EVENT_USER_BASE).
-    #[cfg_attr(not(test), allow(dead_code))] // test seam
-    pub fn event_send(&mut self, peer: u8, ty: u16, payload: &[u8]) {
-        debug_assert!(ty >= EVENT_USER_BASE);
-        if let Some(st) = self
-            .peer_conns
-            .get(&peer)
-            .and_then(|ch| self.conns.get_mut(ch))
-        {
-            frame_write(&mut st.stream_out, ty, payload);
-        }
     }
 }
 
@@ -601,10 +628,9 @@ pub struct QuicClient {
     schema: Vec<u8>,
     peer: Option<u8>,
     snapshots: Vec<Vec<u8>>,
-    events: Vec<(u16, Vec<u8>)>,
     error: Option<String>,
     input_seq: u32,
-    input_buf: std::collections::VecDeque<(u32, Vec<u8>)>,
+    input_buf: VecDeque<(u32, Vec<u8>)>,
 }
 
 impl QuicClient {
@@ -645,50 +671,31 @@ impl QuicClient {
             schema: schema_encode(schema),
             peer: None,
             snapshots: Vec::new(),
-            events: Vec::new(),
             error: None,
             input_seq: 0,
-            input_buf: std::collections::VecDeque::new(),
+            input_buf: VecDeque::new(),
         })
     }
 
     /// Drive the connection. Call once per tick.
     pub fn pump(&mut self) {
         let now = Instant::now();
-        let mut buf = [0u8; 4096];
-        let mut out = Vec::new();
         self.socket.flush(now);
 
-        loop {
-            match self.socket.recv_from(now, &mut buf) {
-                Ok((len, from)) => {
-                    out.clear();
-                    match self.endpoint.handle(
-                        now,
-                        from,
-                        None,
-                        None,
-                        BytesMut::from(&buf[..len]),
-                        &mut out,
-                    ) {
-                        Some(DatagramEvent::ConnectionEvent(_, ev)) => self.conn.handle_event(ev),
-                        Some(DatagramEvent::Response(response)) => {
-                            self.socket
-                                .send_to(now, &out[..response.size], response.destination);
-                        }
-                        _ => {}
-                    }
+        socket_ingest(
+            &mut self.socket,
+            &mut self.endpoint,
+            now,
+            |socket, _endpoint, ev, out| match ev {
+                DatagramEvent::ConnectionEvent(_, ev) => self.conn.handle_event(ev),
+                DatagramEvent::Response(response) => {
+                    socket.send_to(now, &out[..response.size], response.destination);
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+                _ => {}
+            },
+        );
 
-        if let Some(deadline) = self.conn.poll_timeout()
-            && now >= deadline
-        {
-            self.conn.handle_timeout(now);
-        }
+        conn_tick(&mut self.conn, now);
         while let Some(ev) = self.conn.poll() {
             match ev {
                 Event::Connected => self.connected = true,
@@ -716,6 +723,8 @@ impl QuicClient {
                 self.snapshots.push(d[1..].to_vec());
             }
         }
+        // The reliable stream only ever carries the hello downstream:
+        // events are one-way client→server; server→client facts are state.
         for (ty, payload) in frames_parse(&mut self.stream_in) {
             if ty == FRAME_HELLO {
                 if payload.len() < 1 + self.schema.len() || payload[1..] != self.schema[..] {
@@ -725,19 +734,17 @@ impl QuicClient {
                     continue;
                 }
                 self.peer = Some(payload[0]);
-            } else if ty >= EVENT_USER_BASE {
-                self.events.push((ty, payload));
             }
         }
-        if let Some(id) = self.stream {
-            stream_flush(&mut self.conn, id, &mut self.stream_out);
-        }
-        while let Some(ev) = self.conn.poll_endpoint_events() {
-            if let Some(cev) = self.endpoint.handle_event(self.ch, ev) {
-                self.conn.handle_event(cev);
-            }
-        }
-        transmits_flush(&mut self.conn, &mut self.socket, now);
+        conn_flush(
+            &mut self.conn,
+            &mut self.endpoint,
+            self.ch,
+            self.stream,
+            &mut self.stream_out,
+            &mut self.socket,
+            now,
+        );
     }
 
     /// Some(peer id) once the hello arrived and the schema matched. Assign
@@ -767,11 +774,6 @@ impl QuicClient {
 
     pub fn snapshots_drain(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.snapshots)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))] // test seam
-    pub fn events_drain(&mut self) -> Vec<(u16, Vec<u8>)> {
-        std::mem::take(&mut self.events)
     }
 
     /// Ack a snapshot tick (unreliable datagram; loss just delays the
