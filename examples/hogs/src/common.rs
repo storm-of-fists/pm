@@ -151,6 +151,12 @@ pub const HOG_SLOW: f32 = 3.0;
 pub const HOG_TURN: f32 = 2.6;
 /// After a bite the hog breaks off for this long (seconds).
 pub const HOG_FLEE: f32 = 1.5;
+/// Hog-hog separation radius: neighbors closer than this push apart, so
+/// a charging horde arrives as a wavefront instead of a stacked point.
+pub const HOG_SEP: f32 = 2.0;
+/// Separation push speed at full overlap (m/s, fades linearly to zero
+/// at [`HOG_SEP`]).
+pub const SEP_PUSH: f32 = 9.0;
 /// Per-hog re-bite lockout (seconds) — debounces the overlap flicker.
 pub const BITE_CD: f32 = 1.0;
 /// Points a bite costs the team.

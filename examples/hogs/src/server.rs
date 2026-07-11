@@ -5,13 +5,14 @@
 //! looking at (`acked_tick − interp_ticks`, rewound through the hog
 //! pool's history ring), while damage lands in the present.
 //!
-//! Deliberate simplicities (this example is the replication stress lab,
-//! not an AI showcase): hogs don't avoid each other (no separation
-//! force — pm::SpatialGrid is the tool when that matters), and a miss
-//! spawns no marker (the client draws its own aim line; hit/kill/bite
-//! markers are the replicated facts).
+//! Hogs avoid each other with a separation push, broad-phased through
+//! [`pm::SpatialGrid`] (rebuilt every tick — the intended usage), so a
+//! wave arrives as a front instead of a stacked point. Deliberate
+//! simplicity that remains (this example is the replication stress lab,
+//! not an AI showcase): a miss spawns no marker — the client draws its
+//! own aim line; hit/kill/bite markers are the replicated facts.
 
-use pm::{Id, Pm, Rng};
+use pm::{Id, Pm, Rng, SpatialGrid, vec2};
 
 use crate::common::*;
 
@@ -104,9 +105,16 @@ pub fn run(quiet: bool) {
         let truck = truck.clone();
         let impact = impact.clone();
         let hunt = hunt.clone();
+        // Separation broad phase, rebuilt from scratch every tick (grid
+        // coords are arena coords shifted to start at 0).
+        let mut grid = SpatialGrid::new(2.0 * ARENA, 2.0 * ARENA, 8.0);
         move |pm| {
             let now = pm.tick() as f32 * FIXED_DT;
             let trucks: Vec<(Id, Truck)> = truck.get().iter().map(|(id, t)| (id, *t)).collect();
+            grid.clear();
+            for (id, h) in hog.get().iter() {
+                grid.insert(id, vec2(h.x + ARENA, h.z + ARENA));
+            }
             // (bitten truck, where) — applied after the hog borrows drop.
             let mut bites: Vec<(Id, f32, f32)> = Vec::new();
             {
@@ -146,6 +154,23 @@ pub fn run(quiet: bool) {
                     h.speed += (target_speed - h.speed) * (3.0 * FIXED_DT).min(1.0);
                     h.x += h.heading.sin() * h.speed * FIXED_DT;
                     h.z += h.heading.cos() * h.speed * FIXED_DT;
+                    // Separation: push away from packed neighbors
+                    // (start-of-tick positions — the grid isn't updated
+                    // mid-loop, which is fine for a soft force).
+                    let me = vec2(h.x + ARENA, h.z + ARENA);
+                    let (mut px, mut pz) = (0.0f32, 0.0f32);
+                    grid.query(me, HOG_SEP, |nid, npos| {
+                        if nid == id {
+                            return;
+                        }
+                        let (dx, dz) = (me.x - npos.x, me.y - npos.y);
+                        let d = (dx * dx + dz * dz).sqrt().max(1e-3);
+                        let w = 1.0 - d / HOG_SEP;
+                        px += dx / d * w;
+                        pz += dz / d * w;
+                    });
+                    h.x += px * SEP_PUSH * FIXED_DT;
+                    h.z += pz * SEP_PUSH * FIXED_DT;
                     // Walls: clamp and head back toward the middle.
                     if h.x.abs() > ARENA || h.z.abs() > ARENA {
                         h.x = h.x.clamp(-ARENA, ARENA);
@@ -316,16 +341,29 @@ pub fn run(quiet: bool) {
             let hunt = hunt.clone();
             move |pm| {
                 let sb = hunt.get();
+                // Closest hog pair — separation holding it near HOG_SEP
+                // (not ~0) proves the push works. O(n²) but verbose-only
+                // and 5s-gated.
+                let hogs = hog.get();
+                let all: Vec<Hog> = hogs.values().to_vec();
+                let mut packed = f32::INFINITY;
+                for (k, a) in all.iter().enumerate() {
+                    for b in &all[k + 1..] {
+                        let (dx, dz) = (a.x - b.x, a.z - b.z);
+                        packed = packed.min((dx * dx + dz * dz).sqrt());
+                    }
+                }
                 // impacts churning 0..few proves the TTL; alive falling
                 // proves shots land through the rewound frames.
                 eprintln!(
-                    "[server] t={} wave={} hogs={} trucks={} pts={:.0} impacts={}",
+                    "[server] t={} wave={} hogs={} trucks={} pts={:.0} impacts={} packed={:.1}",
                     pm.tick() / 60,
                     sb.wave,
-                    hog.get().len(),
+                    hogs.len(),
                     truck.get().len(),
                     sb.points,
                     impact.get().len(),
+                    packed,
                 );
             }
         });
