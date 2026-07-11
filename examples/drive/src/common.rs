@@ -18,6 +18,13 @@ pub const ARENA: f32 = 38.0;
 /// what that peer was looking at. `PM_INTERP_MS` overrides it for feel
 /// A/B's; drive runs server and clients in one process, so one env keeps
 /// them agreeing.
+// TODO(roadmap): tune the default in the 17–25 ms range (the unit is
+// SNAPSHOT INTERVALS: one interval ≈ 17 ms @ 60 Hz = zero loss
+// tolerance, ~3 absorbs a drop + jitter). Because this constant now sets
+// render delay AND rewind depth together, tuning it is one knob for
+// both. Then the interactive fairness pass: does per-actor lag-comped
+// billing feel fair to a human at real 60–100 ms RTTs (PM_LAG_MS), or
+// does "favor the actor" need a cap?
 pub const INTERP_DELAY: f32 = 0.05;
 
 /// [`INTERP_DELAY`] with the `PM_INTERP_MS` override applied.

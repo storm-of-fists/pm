@@ -178,6 +178,13 @@ impl Pm {
     /// the one-call replacement for `pool()` + a separate sync step. The
     /// pool's name is its wire identity (hashed; see `pool_key`), so server
     /// and client may register in any order.
+    //
+    // TODO(roadmap): synced-pod derive macro — the pool IS the wire
+    // format (see lib.rs design decisions), so bandwidth work means
+    // compact pods; a derive with quantization attributes (e.g. i16
+    // positions with a scale) would keep the game's struct ergonomic
+    // while the registered pod stays small. This registration seam is
+    // where the derived type would plug in.
     pub fn sync_pool<T: Pod + 'static>(&mut self, name: &str) -> PoolHandle<T> {
         let pool = self.pool::<T>(name);
         self.sync(&pool);
@@ -544,6 +551,14 @@ impl ServerNet {
     /// hand-rolled "here's your id" reliable event, robust to packet loss
     /// (it rides every snapshot, not one). Doubles as the server's
     /// peer→entity lookup ([`own`](ServerNet::own)/[`owned`](ServerNet::owned)).
+    //
+    // TODO(roadmap): ONE entity per peer by design — a second per-peer
+    // entity (a roster row, say) is a pool with a peer field, scanned
+    // (fine at ≤8 peers). And the table is server-only: clients see only
+    // their OWN id in the header, so cross-player association still rides
+    // a replicated peer field (hellfire's Player.peer). Replicating this
+    // table to every peer would delete those hand-carried fields — see
+    // the net.rs roadmap block.
     pub fn own_set(&self, peer: u8, id: Id) {
         self.own.get_mut().set(peer, id);
     }

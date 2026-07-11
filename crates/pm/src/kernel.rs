@@ -228,6 +228,9 @@ pub struct Pm {
     /// This instance's peer id: 0 = server/single-player; clients get
     /// theirs at handshake. `id_add` allocates in this peer's space, and
     /// only this peer's indices are ever recycled locally.
+    // TODO(roadmap): candidate pub(crate) — no game reads this anymore
+    // (`ClientNet::peer()` is the game-facing read); it stays pub only
+    // as the write seam the net task assigns at handshake.
     pub local_peer: u8,
 }
 

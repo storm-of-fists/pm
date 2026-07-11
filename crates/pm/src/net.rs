@@ -22,9 +22,18 @@
 //! (first in the tick) to avoid the duplicate sends entirely.
 
 // TODO(roadmap): known limits, deliberate until a workload demands
-// otherwise — per-peer pack scan is O(entities) per net tick (interest
-// management is future work); lag-compensation history and
-// reconnect/peer-id reassignment are unbuilt; u32 ticks last ~2.2 years.
+// otherwise — per-peer pack scan is O(entities) per net tick;
+// reconnect/peer-id reassignment is unbuilt; removal recycling is
+// ack-gated ONLY (a peer that stops acking without disconnecting stalls
+// id recycling until the idle timeout reaps it — an ack-OR-timer release
+// is the fix if that ever bites); u32 ticks last ~2.2 years.
+// TODO(roadmap): foveal relevancy = a SORT KEY, not a scheduler — parked
+// until a demo has enough entities that the byte budget actually
+// rotates. The packer + rotation cursor already IS graduated cadence:
+// importance (distance + angle-off-view-center) would only change the
+// visit order inside `pack_dirty`; the budget keeps doing all the
+// throttling. NOT per-entity due-times, NOT culling. The client's
+// view-pose report is just another input channel.
 // TODO(roadmap): both sync modifiers are LANDED — interp as
 // `PmClient::interp_pool`, duration as `PmServer::ttl_pool` (transient
 // entries expire) + `PmServer::history_pool` (past-tick ring; rewind to
