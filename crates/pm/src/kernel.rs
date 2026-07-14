@@ -3,12 +3,21 @@
 //! end-of-tick deferred removal.
 //!
 //! Usage pattern: fetch pool/singleton handles during init, clone them
-//! into the task closure, and access inside the task. Tasks are plain
-//! closures; a task's "state" is its captures. A closure may return
-//! `Result` — an `Err` benches the task (recorded in `task_faults`) and
-//! the loop survives — but that's for the task's own errors; per-entity
-//! data access is just `Option` (there or not), since single-threaded
-//! pm has no cross-pool contention to model.
+//! into the task closure — the [`task!`](crate::task) macro writes the
+//! clone block from a capture list — and access inside the task. Tasks
+//! are plain closures; a task's "state" is its captures. A closure may
+//! return `Result` — an `Err` benches the task (recorded in
+//! `task_faults`) and the loop survives — but that's for the task's own
+//! errors; per-entity data access is just `Option` (there or not), since
+//! single-threaded pm has no cross-pool contention to model.
+//!
+//! Two rules make gameplay tasks compose without collect-then-apply
+//! ceremony: `id_add`/`id_remove` never borrow pools (removal is
+//! DEFERRED to end of tick), and different pools are different
+//! `RefCell`s — so spawning, killing, and writing OTHER pools are all
+//! fine mid-iteration. Only touching the pool you're currently
+//! iterating double-borrows; reach for [`Pool::retain`] or
+//! [`Pool::each_with`] there.
 
 use std::any::Any;
 use std::cell::{Ref, RefCell, RefMut};
@@ -148,10 +157,11 @@ impl<T: 'static> PoolHandle<T> {
     }
 
     /// Reach one entity for writing — `None` if it isn't in the pool.
-    /// Stamps the changed-tick immediately, so a synced entity replicates
-    /// after this.
-    pub fn get_id_mut(&self, id: Id) -> Option<RefMut<'_, T>> {
-        RefMut::filter_map(self.rc.borrow_mut(), |p| p.get_mut_stamped(id)).ok()
+    /// Write-gated like everything else: the changed-tick stamps on the
+    /// first mutable access through the guard, not on the lookup.
+    pub fn get_id_mut(&self, id: Id) -> Option<EntryMut<'_, T>> {
+        let pool = self.rc.borrow_mut();
+        pool.contains(id).then_some(EntryMut { pool, id })
     }
 }
 
@@ -168,26 +178,29 @@ pub struct SingleHandle<T> {
     id: Id,
 }
 
-/// Write guard for a singleton — [`SingleHandle::get_mut`]'s return.
-/// Holds the pool lock; reads through it are free, the first mutable
-/// deref stamps the changed-tick (the same write-gating as [`crate::Mut`]).
-pub struct SingleMut<'a, T: 'static> {
+/// Write guard for one entity — what [`PoolHandle::get_id_mut`] and
+/// [`SingleHandle::get_mut`] return. Holds the pool lock; reads through
+/// it are free, the first mutable deref stamps the changed-tick (the
+/// same write-gating as [`crate::Mut`]). The entity can't vanish while
+/// the guard lives: removal is deferred to end of tick, which needs the
+/// pool borrow this guard is holding.
+pub struct EntryMut<'a, T: 'static> {
     pool: RefMut<'a, Pool<T>>,
     id: Id,
 }
 
-impl<T: 'static> std::ops::Deref for SingleMut<'_, T> {
+impl<T: 'static> std::ops::Deref for EntryMut<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.pool.get(self.id).expect("singleton entity missing")
+        self.pool.get(self.id).expect("guarded entity missing")
     }
 }
 
-impl<T: 'static> std::ops::DerefMut for SingleMut<'_, T> {
+impl<T: 'static> std::ops::DerefMut for EntryMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         self.pool
             .get_mut_stamped(self.id)
-            .expect("singleton entity missing")
+            .expect("guarded entity missing")
     }
 }
 
@@ -220,8 +233,8 @@ impl<T: 'static> SingleHandle<T> {
     /// first mutable access through the guard, not on taking it — read
     /// first, write only what changed, and an unchanged synced singleton
     /// stays off the wire.
-    pub fn get_mut(&self) -> SingleMut<'_, T> {
-        SingleMut {
+    pub fn get_mut(&self) -> EntryMut<'_, T> {
+        EntryMut {
             pool: self.handle.get_mut(),
             id: self.id,
         }

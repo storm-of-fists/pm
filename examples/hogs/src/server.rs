@@ -112,10 +112,10 @@ pub fn run(quiet: bool) {
             let Some(id) = net.own(peer) else {
                 continue;
             };
-            if let Some(mut t) = truck.get_mut().get_mut(id) {
+            if let Some(mut t) = truck.get_id_mut(id) {
                 *t = spawn_truck(peer);
             }
-            if let Some(mut v) = health.get_mut().get_mut(id) {
+            if let Some(mut v) = health.get_id_mut(id) {
                 v.hp = TRUCK_HP;
             }
         }
@@ -208,14 +208,14 @@ pub fn run(quiet: bool) {
                 {
                     b.bite_cd = BITE_CD;
                     b.flee = HOG_FLEE;
-                    if let Some(mut tr) = truck.get_mut().get_mut(tid) {
+                    if let Some(mut tr) = truck.get_id_mut(tid) {
                         // The hit you feel — but not a pin: turn
                         // authority scales with speed, so scrubbing
                         // too hard leaves a swarmed truck unable to
                         // steer out at all.
                         tr.speed *= 0.65;
                     }
-                    if let Some(mut v) = health.get_mut().get_mut(tid) {
+                    if let Some(mut v) = health.get_id_mut(tid) {
                         // Chip the truck; the drive task turns hp 0
                         // into the explosion (one place owns death).
                         v.hp -= BITE_DMG;
@@ -249,7 +249,7 @@ pub fn run(quiet: bool) {
         move |pm| {
             for (peer, id) in net.owned() {
                 let cmd = inputs.pop(peer);
-                let Some(shooter) = truck.get_mut().get_mut(id).map(|mut t| {
+                let Some(shooter) = truck.get_id_mut(id).map(|mut t| {
                     truck_step(&mut t, cmd, FIXED_DT);
                     *t
                 }) else {
@@ -260,12 +260,12 @@ pub fn run(quiet: bool) {
                 // predict the heat climbing but never the boom — that's
                 // authoritative state, like all damage. Fresh truck at
                 // the spawn slot; prediction snaps the owner home.
-                let dead = shooter.heat >= 1.0 || health.get().get(id).is_some_and(|v| v.hp <= 0.0);
+                let dead = shooter.heat >= 1.0 || health.get_id(id).is_some_and(|v| v.hp <= 0.0);
                 if dead {
-                    if let Some(mut t) = truck.get_mut().get_mut(id) {
+                    if let Some(mut t) = truck.get_id_mut(id) {
                         *t = spawn_truck(peer);
                     }
-                    if let Some(mut v) = health.get_mut().get_mut(id) {
+                    if let Some(mut v) = health.get_id_mut(id) {
                         v.hp = TRUCK_HP;
                     }
                     let mut sb = hunt.get_mut();
@@ -289,7 +289,7 @@ pub fn run(quiet: bool) {
                     continue;
                 }
 
-                let ready = gun.get_mut().get_mut(id).is_some_and(|mut g| {
+                let ready = gun.get_id_mut(id).is_some_and(|mut g| {
                     *g = (*g - FIXED_DT).max(0.0);
                     let ready = cmd.fire > 0.5 && *g <= 0.0;
                     if ready {
@@ -353,7 +353,7 @@ pub fn run(quiet: bool) {
                     // or THIS tick, to an earlier bullet (hp already 0,
                     // removal pending): a corpse absorbs no damage and
                     // pays no double kill points.
-                    let killed = match hog.get_mut().get_mut(hid) {
+                    let killed = match hog.get_id_mut(hid) {
                         Some(mut h) if h.hp > 0.0 => {
                             h.hp -= GUN_DMG;
                             h.hp <= 0.0

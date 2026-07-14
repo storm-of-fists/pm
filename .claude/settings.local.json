@@ -24,7 +24,11 @@
       "Bash(timeout 10 ./target/release/hogs)",
       "Bash(echo \"exit: $?\")",
       "Bash(pkill -x hogs)",
-      "Bash(cargo fmt *)"
+      "Bash(cargo fmt *)",
+      "Bash(sed -i 's/\\\\.get_mut\\(\\)\\\\.get_mut\\(/.get_id_mut\\(/g; s/health\\\\.get\\(\\)\\\\.get\\(/health.get_id\\(/g' examples/hogs/src/server.rs)",
+      "Bash(sed -i 's/draw\\\\.get\\(\\)\\\\.get\\(id\\)\\\\.copied\\(\\)\\\\.map\\(|t| {/draw.get_id\\(id\\).map\\(|t| {/' examples/hogs/src/player_client.rs)",
+      "Bash(grep -n \"w\\\\s*$\\\\|\\\\.health\\\\s*$\\\\|health\" examples/hogs/src/player_client.rs)",
+      "Bash(sed -i 's/^use pm::{Id, InputTx, Pm, PmClient, pool_mirror};/use pm::{Id, InputTx, Pm, PmClient, pool_mirror, task};/' examples/demo/src/main.rs)"
     ]
   }
 }

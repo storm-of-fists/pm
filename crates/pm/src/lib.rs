@@ -12,7 +12,7 @@
 //! changed-tick, which is what change-detection replication runs on).
 //!
 //! ```
-//! use pm::{Pm, Vec2, vec2};
+//! use pm::{Pm, Vec2, task, vec2};
 //!
 //! struct Body {
 //!     pos: Vec2,
@@ -34,12 +34,13 @@
 //!     },
 //! );
 //!
-//! // Register a task: priority (lowest runs first), interval (0 = every
-//! // tick), then the closure. Clone the handle in at registration.
-//! let integrate = body.clone();
-//! pm.task_add("integrate", 30.0, 0.0, move |pm| {
+//! // Register a task: priority (lowest runs first), then the closure.
+//! // Handles in the [..] list are cloned into the closure (`task!` is
+//! // sugar for `task_add` + the clone block; an interval in seconds
+//! // goes before the list, 0 = every tick when omitted).
+//! task!(pm, "integrate", 30.0, [body], move |pm| {
 //!     let dt = pm.loop_dt();
-//!     for (_id, mut b) in integrate.get_mut().iter_mut() {
+//!     for (_id, mut b) in body.get_mut().iter_mut() {
 //!         // The Mut guard can't split-borrow (`b.pos += b.vel * dt`
 //!         // won't compile): read locals first, then write.
 //!         let step = b.vel * dt;
@@ -105,8 +106,10 @@
 //! - [`modload`]: dylib hot-reload mods.
 //! - [`probe`]: drop-in scoped profiling; see also [`Pm::task_stats`].
 //! - **math / spatial / util**: [`Vec2`]/[`Vec3`]/[`Mat4`]/[`Rng`], the
-//!   [`SpatialGrid`], and PLC-style logic helpers ([`Hysteresis`],
-//!   [`Cooldown`], [`RisingEdge`], …).
+//!   angle helpers [`wrap_angle`]/[`lerp_angle`] (use `lerp_angle` for
+//!   every angular field in a pool lerp), the [`SpatialGrid`], and
+//!   PLC-style logic helpers ([`Hysteresis`], [`Cooldown`],
+//!   [`RisingEdge`], …).
 
 mod camera;
 mod duration;
@@ -132,7 +135,7 @@ pub use camera::{
 pub use duration::{HistoryRing, pool_expire};
 pub use id::Id;
 pub use kernel::{
-    IntoTaskResult, Pm, PoolHandle, SingleHandle, SingleMut, TaskError, TaskFault, TaskStat,
+    EntryMut, IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
 };
 pub use math::{Mat4, Rng, Vec2, Vec3, lerp_angle, vec2, vec3, wrap_angle};
 pub use modload::{BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr};

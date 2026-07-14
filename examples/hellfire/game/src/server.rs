@@ -1,7 +1,7 @@
 //! Hellfire authoritative server: headless, owns all gameplay. Clients
 //! send input; everything they see is replicated pool state.
 
-use pm::{Id, Pm, Rng, ServerNet, SpatialGrid, Vec2, vec2};
+use pm::{Id, Pm, Rng, ServerNet, SpatialGrid, Vec2, task, vec2};
 
 use crate::common::*;
 
@@ -81,14 +81,11 @@ pub fn run(quiet: bool) {
     }
 
     // --- lobby: joins, leaves, reliable events (prio 10, after net) ----
-    pm.task_add("lobby", 10.0, 0.0, {
-        let game = game.clone();
-        let player = player.clone();
-        let player_srv = player_srv.clone();
-        let roster = roster.clone();
-        let monster = monster.clone();
-        let bullet = bullet.clone();
-        let net = net.clone();
+    task!(
+        pm,
+        "lobby",
+        10.0,
+        [game, player, player_srv, roster, monster, bullet, net],
         move |pm| {
             let mut g = game.get_mut();
             for p in net.joined() {
@@ -157,16 +154,14 @@ pub fn run(quiet: bool) {
                 }
             }
         }
-    });
+    );
 
     // --- player movement + shooting (prio 29) --------------------------
-    pm.task_add("player_move", 29.0, 0.0, {
-        let game = game.clone();
-        let player = player.clone();
-        let player_srv = player_srv.clone();
-        let bullet = bullet.clone();
-        let bullet_srv = bullet_srv.clone();
-        let net = net.clone();
+    task!(
+        pm,
+        "player_move",
+        29.0,
+        [game, player, player_srv, bullet, bullet_srv, net],
         move |pm| {
             let g = game.get();
             if !g.started || g.game_over {
@@ -225,17 +220,14 @@ pub fn run(quiet: bool) {
                     .add(id, BulletSrv { life: PBULLET_LIFE });
             }
         }
-    });
+    );
 
     // --- spawning + level progression (prio 28) ------------------------
-    pm.task_add("spawn", 28.0, 0.0, {
-        let game = game.clone();
-        let player = player.clone();
-        let player_srv = player_srv.clone();
-        let monster = monster.clone();
-        let monster_srv = monster_srv.clone();
-        let bullet = bullet.clone();
-        let net = net.clone();
+    task!(
+        pm,
+        "spawn",
+        28.0,
+        [game, player, player_srv, monster, monster_srv, bullet, net],
         move |pm| {
             let mut g = game.get_mut();
             if !g.started || g.game_over {
@@ -338,13 +330,14 @@ pub fn run(quiet: bool) {
                 monster_srv.get_mut().add(id, MonsterSrv { shoot_timer });
             }
         }
-    });
+    );
 
     // --- bullet physics (prio 30) ---------------------------------------
-    pm.task_add("bullet_phys", 30.0, 0.0, {
-        let game = game.clone();
-        let bullet = bullet.clone();
-        let bullet_srv = bullet_srv.clone();
+    task!(
+        pm,
+        "bullet_phys",
+        30.0,
+        [game, bullet, bullet_srv],
         move |pm| {
             let g = game.get();
             if !g.started || g.game_over {
@@ -367,16 +360,14 @@ pub fn run(quiet: bool) {
                     }
                 });
         }
-    });
+    );
 
     // --- monster AI (prio 31) --------------------------------------------
-    pm.task_add("monster_ai", 31.0, 0.0, {
-        let game = game.clone();
-        let player = player.clone();
-        let monster = monster.clone();
-        let monster_srv = monster_srv.clone();
-        let bullet = bullet.clone();
-        let bullet_srv = bullet_srv.clone();
+    task!(
+        pm,
+        "monster_ai",
+        31.0,
+        [game, player, monster, monster_srv, bullet, bullet_srv],
         move |pm| {
             let mut g = game.get_mut();
             if !g.started || g.game_over {
@@ -436,16 +427,14 @@ pub fn run(quiet: bool) {
                     .add(id, BulletSrv { life: MBULLET_LIFE });
             }
         }
-    });
+    );
 
     // --- collision (prio 50) ----------------------------------------------
-    pm.task_add("collision", 50.0, 0.0, {
-        let game = game.clone();
-        let player = player.clone();
-        let player_srv = player_srv.clone();
-        let monster = monster.clone();
-        let bullet = bullet.clone();
-        let net = net.clone();
+    task!(
+        pm,
+        "collision",
+        50.0,
+        [game, player, player_srv, monster, bullet, net],
         move |pm| {
             let mut g = game.get_mut();
             if !g.started || g.game_over {
@@ -537,123 +526,114 @@ pub fn run(quiet: bool) {
                 pm.id_remove_all(&bullet);
             }
         }
-    });
+    );
 
     // --- cleanup out-of-bounds (prio 55) ---------------------------------
-    pm.task_add("cleanup", 55.0, 0.0, {
-        let game = game.clone();
-        let monster = monster.clone();
-        let bullet = bullet.clone();
-        move |pm| {
-            if !game.get().started {
-                return;
+    task!(pm, "cleanup", 55.0, [game, monster, bullet], move |pm| {
+        if !game.get().started {
+            return;
+        }
+        // Deferred id_remove: safe to call mid-iteration.
+        for (id, m) in monster.get().iter() {
+            if m.pos.x < -100.0 || m.pos.x > W + 100.0 || m.pos.y < -100.0 || m.pos.y > H + 100.0 {
+                pm.id_remove(id);
             }
-            // Deferred id_remove: safe to call mid-iteration.
-            for (id, m) in monster.get().iter() {
-                if m.pos.x < -100.0
-                    || m.pos.x > W + 100.0
-                    || m.pos.y < -100.0
-                    || m.pos.y > H + 100.0
-                {
-                    pm.id_remove(id);
-                }
-            }
-            for (id, b) in bullet.get().iter() {
-                if b.pos.x < -50.0 || b.pos.x > W + 50.0 || b.pos.y < -50.0 || b.pos.y > H + 50.0 {
-                    pm.id_remove(id);
-                }
+        }
+        for (id, b) in bullet.get().iter() {
+            if b.pos.x < -50.0 || b.pos.x > W + 50.0 || b.pos.y < -50.0 || b.pos.y > H + 50.0 {
+                pm.id_remove(id);
             }
         }
     });
 
     // --- publish status (prio 60): write only on change -------------------
-    pm.task_add("status_pub", 60.0, 0.0, {
-        let game = game.clone();
-        let status = status.clone();
-        let net = net.clone();
-        move |_pm| {
-            let mut g = game.get_mut();
-            let mut flags = 0;
-            if g.started {
-                flags |= FLAG_STARTED;
-            }
-            if g.game_over {
-                flags |= FLAG_GAME_OVER;
-            }
-            if g.win {
-                flags |= FLAG_WIN;
-            }
-            let next = Status {
-                time: (g.time * 10.0).round() / 10.0, // 0.1s granularity: don't re-sync every tick
-                score: g.score,
-                kills: g.kills,
-                level: g.level as i32,
-                round: g.round,
-                flags,
-                level_flash: (g.level_flash * 4.0).round() / 4.0,
-            };
-            if *status.get() != next {
-                *status.get_mut() = next;
-            }
-            if g.game_over && !g.report_written {
-                g.report_written = true;
-                let dir = report_dir();
-                let _ = std::fs::create_dir_all(&dir);
-                let path = format!("{dir}/server.json");
-                let json = format!(
-                    "{{\n  \"role\": \"server\",\n  \"duration\": {:.1},\n  \"score\": {},\n  \"kills\": {},\n  \"level\": {},\n  \"round\": {},\n  \"win\": {},\n  \"game_over\": true,\n  \"players\": {},\n  \"peak_monsters\": {},\n  \"peak_bullets\": {},\n  \"events\": [{}],\n  \"samples\": [{}]\n}}\n",
-                    g.time,
-                    g.score,
-                    g.kills,
-                    g.level + 1,
-                    g.round,
-                    g.win,
-                    net.owned().len(),
-                    g.peak_monsters,
-                    g.peak_bullets,
-                    g.events.join(", "),
-                    g.samples.join(", "),
-                );
-                match std::fs::write(&path, json) {
-                    Ok(()) => eprintln!("[server] report written to {path}"),
-                    Err(e) => eprintln!("[server] report write failed: {e}"),
-                }
+    task!(pm, "status_pub", 60.0, [game, status, net], move |_pm| {
+        let mut g = game.get_mut();
+        let mut flags = 0;
+        if g.started {
+            flags |= FLAG_STARTED;
+        }
+        if g.game_over {
+            flags |= FLAG_GAME_OVER;
+        }
+        if g.win {
+            flags |= FLAG_WIN;
+        }
+        let next = Status {
+            time: (g.time * 10.0).round() / 10.0, // 0.1s granularity: don't re-sync every tick
+            score: g.score,
+            kills: g.kills,
+            level: g.level as i32,
+            round: g.round,
+            flags,
+            level_flash: (g.level_flash * 4.0).round() / 4.0,
+        };
+        if *status.get() != next {
+            *status.get_mut() = next;
+        }
+        if g.game_over && !g.report_written {
+            g.report_written = true;
+            let dir = report_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let path = format!("{dir}/server.json");
+            let json = format!(
+                "{{\n  \"role\": \"server\",\n  \"duration\": {:.1},\n  \"score\": {},\n  \"kills\": {},\n  \"level\": {},\n  \"round\": {},\n  \"win\": {},\n  \"game_over\": true,\n  \"players\": {},\n  \"peak_monsters\": {},\n  \"peak_bullets\": {},\n  \"events\": [{}],\n  \"samples\": [{}]\n}}\n",
+                g.time,
+                g.score,
+                g.kills,
+                g.level + 1,
+                g.round,
+                g.win,
+                net.owned().len(),
+                g.peak_monsters,
+                g.peak_bullets,
+                g.events.join(", "),
+                g.samples.join(", "),
+            );
+            match std::fs::write(&path, json) {
+                Ok(()) => eprintln!("[server] report written to {path}"),
+                Err(e) => eprintln!("[server] report write failed: {e}"),
             }
         }
     });
 
     // --- replicated diagnostics + diag sampling (1 Hz, prio 61) -----------
-    pm.task_add("dbg_pub", 61.0, 1.0, {
-        let game = game.clone();
-        let dbg = dbg.clone();
-        let monster = monster.clone();
-        let bullet = bullet.clone();
-        let net = net.clone();
+    task!(
+        pm,
+        "dbg_pub",
+        61.0,
+        1.0,
+        [game, dbg, monster, bullet, net],
         move |pm| {
             let (m, b) = (monster.get().len(), bullet.get().len());
-            *dbg.get_mut() =
-                Dbg { monsters: m as u32, bullets: b as u32, tick_ms: pm.loop_dt() * 1000.0 };
+            *dbg.get_mut() = Dbg {
+                monsters: m as u32,
+                bullets: b as u32,
+                tick_ms: pm.loop_dt() * 1000.0,
+            };
             let mut g = game.get_mut();
             g.peak_monsters = g.peak_monsters.max(m);
             g.peak_bullets = g.peak_bullets.max(b);
             if g.started && !g.game_over {
-                let alive =
-                    net.owned().len(); // connected; per-player alive is in the player pool
+                let alive = net.owned().len(); // connected; per-player alive is in the player pool
                 let sample = format!(
                     "{{\"t\": {:.1}, \"monsters\": {m}, \"bullets\": {b}, \"players\": {alive}, \"score\": {}, \"frame_ms\": {:.2}}}",
-                    g.time, g.score, pm.loop_dt() * 1000.0,
+                    g.time,
+                    g.score,
+                    pm.loop_dt() * 1000.0,
                 );
                 g.samples.push(sample);
             }
         }
-    });
+    );
 
     if !quiet {
-        pm.task_add("status_print", 99.0, 5.0, {
-            let game = game.clone();
-            let monster = monster.clone();
-            let bullet = bullet.clone();
-            let net = net.clone();
+        task!(
+            pm,
+            "status_print",
+            99.0,
+            5.0,
+            [game, monster, bullet, net],
             move |_pm| {
                 let g = game.get();
                 if g.started {
@@ -673,7 +653,7 @@ pub fn run(quiet: bool) {
                     );
                 }
             }
-        });
+        );
     }
 
     // --- dylib mods: watch target/<profile>/ for mod libraries ----------

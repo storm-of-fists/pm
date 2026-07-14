@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-use pm::{Id, InputTx, Pm, PmClient, pool_mirror};
+use pm::{Id, InputTx, Pm, PmClient, pool_mirror, task};
 
 const ADDR: &str = "127.0.0.1:47777";
 const WORLD: f32 = 12.0; // world is [-WORLD, WORLD] on both axes
@@ -98,52 +98,44 @@ fn run_server(quiet: bool) {
         eprintln!("pm demo server on {ADDR}");
     }
 
-    pm.task_add("roster", 10.0, 0.0, {
-        let car = car.clone();
-        let net = net.clone();
-        move |pm| {
-            for p in net.joined() {
-                let id = pm.id_add();
-                let spread = p as f32 * 0.8;
-                car.get_mut().add(
-                    id,
-                    Car {
-                        x: 7.0 * spread.cos(),
-                        y: 7.0 * spread.sin(),
-                        heading: spread + 1.6,
-                        speed: 0.0,
-                    },
-                );
-                net.own_set(p, id);
-                if !quiet {
-                    eprintln!("peer {p} joined, vehicle index {}", id.index());
-                }
+    task!(pm, "roster", 10.0, [car, net], move |pm| {
+        for p in net.joined() {
+            let id = pm.id_add();
+            let spread = p as f32 * 0.8;
+            car.get_mut().add(
+                id,
+                Car {
+                    x: 7.0 * spread.cos(),
+                    y: 7.0 * spread.sin(),
+                    heading: spread + 1.6,
+                    speed: 0.0,
+                },
+            );
+            net.own_set(p, id);
+            if !quiet {
+                eprintln!("peer {p} joined, vehicle index {}", id.index());
             }
-            for p in net.left() {
-                // Ownership auto-clears next tick; despawning is ours.
-                if let Some(id) = net.own(p) {
-                    pm.id_remove(id);
-                }
-                if !quiet {
-                    eprintln!("peer {p} left");
-                }
+        }
+        for p in net.left() {
+            // Ownership auto-clears next tick; despawning is ours.
+            if let Some(id) = net.own(p) {
+                pm.id_remove(id);
+            }
+            if !quiet {
+                eprintln!("peer {p} left");
             }
         }
     });
 
-    pm.task_add("drive", 30.0, 0.0, {
-        let car = car.clone();
-        let net = net.clone();
-        move |_pm| {
-            let mut car = car.get_mut();
-            for (peer, id) in net.owned() {
-                // Command-frame consumption: one input per tick (one
-                // prediction step on the client), hold-when-dry, bounded
-                // skip-ahead. The applied seq echoes back automatically.
-                let cmd = inputs.pop(peer);
-                if let Some(mut c) = car.get_mut(id) {
-                    drive_step(&mut c, cmd, FIXED_DT);
-                }
+    task!(pm, "drive", 30.0, [car, net], move |_pm| {
+        let mut car = car.get_mut();
+        for (peer, id) in net.owned() {
+            // Command-frame consumption: one input per tick (one
+            // prediction step on the client), hold-when-dry, bounded
+            // skip-ahead. The applied seq echoes back automatically.
+            let cmd = inputs.pop(peer);
+            if let Some(mut c) = car.get_mut(id) {
+                drive_step(&mut c, cmd, FIXED_DT);
             }
         }
     });
@@ -284,19 +276,14 @@ fn add_client_tasks(
     // HUD stats, right after the predictor's tick (prio 8): which car is
     // ours (from the snapshot header, not a bespoke event), the newest
     // ack/echo, and the predictor's correction count.
-    pm.task_add("stats", 8.0, 0.0, {
-        let net = net.clone();
-        let pred = pred.clone();
-        let stats = stats.clone();
-        move |_pm| {
-            let mut s = stats.get_mut();
-            s.mine = net.mine();
-            for a in net.applied() {
-                s.acked = a.tick;
-                s.input_echo = a.input_seq;
-            }
-            s.corrections = pred.get().corrections;
+    task!(pm, "stats", 8.0, [net, pred, stats], move |_pm| {
+        let mut s = stats.get_mut();
+        s.mine = net.mine();
+        for a in net.applied() {
+            s.acked = a.tick;
+            s.input_echo = a.input_seq;
         }
+        s.corrections = pred.get().corrections;
     });
 
     // Display: own car comes straight from the prediction (instant input
@@ -305,61 +292,54 @@ fn add_client_tasks(
     // toward fresh server state as it arrives. pm::pool_mirror handles
     // add/blend/stale-drop; the closure is just the blend math. A jump
     // wider than the world means a wrap — snap instead of streaking across.
-    pm.task_add("smooth", 30.0, 0.0, {
-        let car = car.clone();
-        let draw = draw.clone();
-        let stats = stats.clone();
-        move |pm| {
-            let _p = pm::probe::scope("smooth.reckon");
-            let dt = pm.loop_dt();
-            let mine = stats.get().mine;
-            pool_mirror(&car, &draw, |id, mut d, a: &Car| {
-                if Some(id) == mine {
-                    return d; // keep the predictor's smooth-predicted value
+    task!(pm, "smooth", 30.0, [car, draw, stats], move |pm| {
+        let _p = pm::probe::scope("smooth.reckon");
+        let dt = pm.loop_dt();
+        let mine = stats.get().mine;
+        pool_mirror(&car, &draw, |id, mut d, a: &Car| {
+            if Some(id) == mine {
+                return d; // keep the predictor's smooth-predicted value
+            }
+            coast_step(&mut d, dt);
+            let wrapped = (a.x - d.x).abs() > WORLD || (a.y - d.y).abs() > WORLD;
+            if wrapped {
+                *a
+            } else {
+                Car {
+                    x: d.x + (a.x - d.x) * 0.12,
+                    y: d.y + (a.y - d.y) * 0.12,
+                    ..*a
                 }
-                coast_step(&mut d, dt);
-                let wrapped = (a.x - d.x).abs() > WORLD || (a.y - d.y).abs() > WORLD;
-                if wrapped {
-                    *a
-                } else {
-                    Car {
-                        x: d.x + (a.x - d.x) * 0.12,
-                        y: d.y + (a.y - d.y) * 0.12,
-                        ..*a
-                    }
-                }
-            });
-        }
+            }
+        });
     });
 
     // Profiling panel data: per-second deltas of the kernel task stats,
-    // plus any drop-in probes on this thread.
-    pm.task_add("prof", 55.0, 1.0, {
-        let stats = stats.clone();
-        let mut prev: HashMap<String, pm::TaskStat> = HashMap::new();
-        move |pm| {
-            let mut lines = Vec::new();
-            for (name, s) in pm.task_stats() {
-                let p = prev.get(&name).cloned().unwrap_or_default();
-                let calls = s.calls - p.calls;
-                if calls > 0 {
-                    let avg_us = (s.ns_total - p.ns_total) as f32 / calls as f32 / 1000.0;
-                    lines.push(format!(
-                        "{name:<8} {avg_us:>8.1} us/call  {calls:>4}/s  max {:>8.1} us",
-                        s.ns_max as f32 / 1000.0
-                    ));
-                }
-                prev.insert(name, s);
-            }
-            for (name, s) in pm::probe::stats() {
-                let avg_us = s.ns_total as f32 / s.calls.max(1) as f32 / 1000.0;
+    // plus any drop-in probes on this thread. (`prev` is plain closure
+    // state — moved in, not a cloned handle, so it stays out of the list.)
+    let mut prev: HashMap<String, pm::TaskStat> = HashMap::new();
+    task!(pm, "prof", 55.0, 1.0, [stats], move |pm| {
+        let mut lines = Vec::new();
+        for (name, s) in pm.task_stats() {
+            let p = prev.get(&name).cloned().unwrap_or_default();
+            let calls = s.calls - p.calls;
+            if calls > 0 {
+                let avg_us = (s.ns_total - p.ns_total) as f32 / calls as f32 / 1000.0;
                 lines.push(format!(
-                    "~{name:<20} {avg_us:>6.1} us avg  max {:>8.1} us",
+                    "{name:<8} {avg_us:>8.1} us/call  {calls:>4}/s  max {:>8.1} us",
                     s.ns_max as f32 / 1000.0
                 ));
             }
-            stats.get_mut().prof = lines;
+            prev.insert(name, s);
         }
+        for (name, s) in pm::probe::stats() {
+            let avg_us = s.ns_total as f32 / s.calls.max(1) as f32 / 1000.0;
+            lines.push(format!(
+                "~{name:<20} {avg_us:>6.1} us avg  max {:>8.1} us",
+                s.ns_max as f32 / 1000.0
+            ));
+        }
+        stats.get_mut().prof = lines;
     });
 
     draw
@@ -381,50 +361,47 @@ fn run_player() {
 
     // Keyboard first in the tick so this tick's input rides this tick's
     // datagram.
-    pm.task_add("keys", 4.0, 0.0, {
-        let keys = keys.clone();
-        let stats = stats.clone();
-        let input = input.clone();
-        move |pm| {
-            let dt = pm.loop_dt();
-            let mut k = keys.get_mut();
-            k.left -= dt;
-            k.right -= dt;
-            let mut buf = [0u8; 64];
-            let n = std::io::stdin().read(&mut buf).unwrap_or(0);
-            for &b in &buf[..n] {
-                const HOLD: f32 = 0.18;
-                match b {
-                    b'w' => k.throttle = 1.0,
-                    b's' => k.throttle = -0.7,
-                    b' ' | b'x' => k.throttle = 0.0,
-                    b'a' => k.left = HOLD,
-                    b'd' => k.right = HOLD,
-                    b'p' => {
-                        let mut s = stats.get_mut();
-                        s.show_prof = !s.show_prof;
-                    }
-                    b'q' | 3 => pm.loop_quit(), // q or ctrl-c
-                    _ => {}
+    task!(pm, "keys", 4.0, [keys, stats, input], move |pm| {
+        let dt = pm.loop_dt();
+        let mut k = keys.get_mut();
+        k.left -= dt;
+        k.right -= dt;
+        let mut buf = [0u8; 64];
+        let n = std::io::stdin().read(&mut buf).unwrap_or(0);
+        for &b in &buf[..n] {
+            const HOLD: f32 = 0.18;
+            match b {
+                b'w' => k.throttle = 1.0,
+                b's' => k.throttle = -0.7,
+                b' ' | b'x' => k.throttle = 0.0,
+                b'a' => k.left = HOLD,
+                b'd' => k.right = HOLD,
+                b'p' => {
+                    let mut s = stats.get_mut();
+                    s.show_prof = !s.show_prof;
                 }
+                b'q' | 3 => pm.loop_quit(), // q or ctrl-c
+                _ => {}
             }
-            input.set(Drive {
-                thrust: k.throttle,
-                turn: if k.left > 0.0 {
-                    1.0
-                } else if k.right > 0.0 {
-                    -1.0
-                } else {
-                    0.0
-                },
-            });
         }
+        input.set(Drive {
+            thrust: k.throttle,
+            turn: if k.left > 0.0 {
+                1.0
+            } else if k.right > 0.0 {
+                -1.0
+            } else {
+                0.0
+            },
+        });
     });
 
-    pm.task_add("render", 50.0, 1.0 / 30.0, {
-        let draw = draw.clone();
-        let stats = stats.clone();
-        let net = net.clone();
+    task!(
+        pm,
+        "render",
+        50.0,
+        1.0 / 30.0,
+        [draw, stats, net],
         move |_pm| {
             let s = stats.get();
             let mut grid = vec![b' '; (COLS * ROWS) as usize];
@@ -470,7 +447,7 @@ fn run_player() {
             print!("{out}");
             let _ = std::io::stdout().flush();
         }
-    });
+    );
 
     pm.loop_rate = 60;
     pm.run().expect("connect");

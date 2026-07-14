@@ -3,7 +3,7 @@
 //! plus the bot's input task. The transport is pm's net module; the SDL
 //! window/input/render live in sdl_client.rs.
 
-use pm::{ClientNet, Pm, PmClient, Rng, SingleRx, Vec2, vec2};
+use pm::{ClientNet, Pm, PmClient, Rng, SingleRx, Vec2, task, vec2};
 
 use crate::common::*;
 
@@ -95,30 +95,27 @@ pub fn add_client_tasks(pm: &mut PmClient, pools: &Pools, name: String) -> Clien
     let report_name = name;
 
     // One-shot diag report when the game ends (HELLFIRE_REPORT_DIR).
-    pm.task_add("diag", 90.0, 0.5, {
-        let status = pools.status.clone();
-        let name = report_name;
-        let net = net.clone();
-        let mut written = false;
-        move |_pm| {
-            let st = status.get();
-            if st.flags & FLAG_GAME_OVER == 0 || written {
-                return;
-            }
-            written = true;
-            let dir =
-                std::env::var("HELLFIRE_REPORT_DIR").unwrap_or_else(|_| "target/work/reports".into());
-            let _ = std::fs::create_dir_all(&dir);
-            let json = format!(
-                "{{\n  \"role\": \"client\",\n  \"name\": \"{name}\",\n  \"peer\": {},\n  \"snapshots\": {},\n  \"rtt_ms\": {:.1},\n  \"score\": {},\n  \"win\": {}\n}}\n",
-                net.peer(),
-                net.snapshots(),
-                net.rtt_ms(),
-                st.score,
-                st.flags & FLAG_WIN != 0,
-            );
-            let _ = std::fs::write(format!("{dir}/{name}.json"), json);
+    let status = pools.status.clone();
+    let name = report_name;
+    let mut written = false;
+    task!(pm, "diag", 90.0, 0.5, [net], move |_pm| {
+        let st = status.get();
+        if st.flags & FLAG_GAME_OVER == 0 || written {
+            return;
         }
+        written = true;
+        let dir =
+            std::env::var("HELLFIRE_REPORT_DIR").unwrap_or_else(|_| "target/work/reports".into());
+        let _ = std::fs::create_dir_all(&dir);
+        let json = format!(
+            "{{\n  \"role\": \"client\",\n  \"name\": \"{name}\",\n  \"peer\": {},\n  \"snapshots\": {},\n  \"rtt_ms\": {:.1},\n  \"score\": {},\n  \"win\": {}\n}}\n",
+            net.peer(),
+            net.snapshots(),
+            net.rtt_ms(),
+            st.score,
+            st.flags & FLAG_WIN != 0,
+        );
+        let _ = std::fs::write(format!("{dir}/{name}.json"), json);
     });
 
     // Snapshot interpolation into the draw siblings (`"<name>.draw"`), a
@@ -189,7 +186,7 @@ pub fn run_bot(n: u32) {
             // loss-robust "which entity is me" — no pod scan needed.
             let pos = net
                 .mine()
-                .and_then(|id| player.get().get(id).map(|p| p.pos))
+                .and_then(|id| player.get_id(id).map(|p| p.pos))
                 .unwrap_or(vec2(W * 0.5, H * 0.5));
             if turn.ready(dt) {
                 turn.interval = rng.rfr(0.6, 1.6);

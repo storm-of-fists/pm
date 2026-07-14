@@ -201,7 +201,7 @@ impl CamManager {
         v.panini = !v.panini;
     }
 
-    fn view(&self) -> crate::SingleMut<'_, CamView> {
+    fn view(&self) -> crate::EntryMut<'_, CamView> {
         self.view
             .as_ref()
             .expect("camera module not installed")

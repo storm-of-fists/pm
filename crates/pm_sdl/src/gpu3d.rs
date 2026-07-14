@@ -41,7 +41,9 @@
 //! textures want combined image-samplers, which naga can't emit — avoid
 //! (`textureLoad` needs no sampler). The practical fallout: anything
 //! that would sample a texture in a fragment shader — HUD, sprites,
-//! decals — must instead be a compute pass that `textureLoad`s.
+//! decals — must instead be a compute pass that `textureLoad`s. The
+//! built-in 2D layer that pass provides: [`Frame3::text`] for glyphs
+//! and [`Frame3::rect`] for solid quads (bars, panels, crosshairs).
 
 use std::collections::HashMap;
 

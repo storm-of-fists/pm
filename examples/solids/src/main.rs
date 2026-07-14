@@ -9,7 +9,7 @@
 //! back-face culling (fly under the ground to see what it does), Esc
 //! quits.
 
-use pm::{Mat4, Pm, Vec3, vec3};
+use pm::{Mat4, Pm, Vec3, task, vec3};
 use pm_sdl::gpu3d::{Renderer3d, bake, box_tris, checker_ground};
 use pm_sdl::sdl3;
 use sdl3::event::Event;
@@ -178,100 +178,87 @@ fn main() {
         .upload_mesh(&bake(&octa_tris(), (0.85, 0.35, 0.42)))
         .expect("octa");
 
-    pm.task_add("input", 4.0, 0.0, {
-        let cam = cam.clone();
-        let cull = cull.clone();
-        move |pm| {
-            let dt = pm.loop_dt();
-            let mut c = cam.get_mut();
-            for ev in pump.poll_iter() {
-                match ev {
-                    Event::Quit { .. }
-                    | Event::KeyDown {
-                        scancode: Some(Scancode::Escape),
-                        ..
-                    } => pm.loop_quit(),
-                    Event::KeyDown {
-                        scancode: Some(Scancode::C),
-                        repeat: false,
-                        ..
-                    } => {
-                        let now = !cull.get().0;
-                        cull.get_mut().0 = now;
-                    }
-                    Event::MouseMotion {
-                        xrel,
-                        yrel,
-                        mousestate,
-                        ..
-                    } if mousestate.is_mouse_button_pressed(MouseButton::Right) => {
-                        c.yaw += xrel * 0.004;
-                        c.pitch = (c.pitch - yrel * 0.004).clamp(-1.5, 1.5);
-                    }
-                    Event::MouseWheel { y, .. } => {
-                        c.speed = (c.speed * 1.15_f32.powf(y)).clamp(1.0, 60.0);
-                    }
-                    _ => {}
+    task!(pm, "input", 4.0, [cam, cull], move |pm| {
+        let dt = pm.loop_dt();
+        let mut c = cam.get_mut();
+        for ev in pump.poll_iter() {
+            match ev {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    scancode: Some(Scancode::Escape),
+                    ..
+                } => pm.loop_quit(),
+                Event::KeyDown {
+                    scancode: Some(Scancode::C),
+                    repeat: false,
+                    ..
+                } => {
+                    let now = !cull.get().0;
+                    cull.get_mut().0 = now;
                 }
+                Event::MouseMotion {
+                    xrel,
+                    yrel,
+                    mousestate,
+                    ..
+                } if mousestate.is_mouse_button_pressed(MouseButton::Right) => {
+                    c.yaw += xrel * 0.004;
+                    c.pitch = (c.pitch - yrel * 0.004).clamp(-1.5, 1.5);
+                }
+                Event::MouseWheel { y, .. } => {
+                    c.speed = (c.speed * 1.15_f32.powf(y)).clamp(1.0, 60.0);
+                }
+                _ => {}
             }
-            let k = pump.keyboard_state();
-            let held = |sc: Scancode| k.is_scancode_pressed(sc) as i32 as f32;
-            c.yaw += (held(Scancode::Right) - held(Scancode::Left)) * 1.8 * dt;
-            c.pitch =
-                (c.pitch + (held(Scancode::Up) - held(Scancode::Down)) * 1.2 * dt).clamp(-1.5, 1.5);
-            let fwd = c.forward();
-            let right = c.right();
-            let mv = fwd * (held(Scancode::W) - held(Scancode::S))
-                + right * (held(Scancode::D) - held(Scancode::A))
-                + Vec3::UP * (held(Scancode::E) - held(Scancode::Q));
-            let speed = c.speed;
-            c.pos += mv.norm() * (speed * dt);
+        }
+        let k = pump.keyboard_state();
+        let held = |sc: Scancode| k.is_scancode_pressed(sc) as i32 as f32;
+        c.yaw += (held(Scancode::Right) - held(Scancode::Left)) * 1.8 * dt;
+        c.pitch =
+            (c.pitch + (held(Scancode::Up) - held(Scancode::Down)) * 1.2 * dt).clamp(-1.5, 1.5);
+        let fwd = c.forward();
+        let right = c.right();
+        let mv = fwd * (held(Scancode::W) - held(Scancode::S))
+            + right * (held(Scancode::D) - held(Scancode::A))
+            + Vec3::UP * (held(Scancode::E) - held(Scancode::Q));
+        let speed = c.speed;
+        c.pos += mv.norm() * (speed * dt);
+    });
+
+    task!(pm, "spin", 30.0, [solids], move |pm| {
+        let dt = pm.loop_dt();
+        for (_, mut s) in solids.get_mut().iter_mut() {
+            let spin = s.spin;
+            s.angle += spin * dt;
         }
     });
 
-    pm.task_add("spin", 30.0, 0.0, {
-        let solids = solids.clone();
-        move |pm| {
-            let dt = pm.loop_dt();
-            for (_, mut s) in solids.get_mut().iter_mut() {
-                let spin = s.spin;
-                s.angle += spin * dt;
+    task!(pm, "render", 70.0, [solids, cam, cull], move |pm| {
+        let c = *cam.get();
+        let culling = cull.get().0;
+        let white = (1.0, 1.0, 1.0);
+        if let Some(mut frame) = r3d.frame(&window, c.view(), vec3(0.45, 1.0, 0.35)) {
+            frame.draw(&ground, Mat4::IDENTITY, white, culling);
+            for (_, s) in solids.get().iter() {
+                let model =
+                    Mat4::translate(s.pos) * Mat4::rot_axis(s.axis, s.angle) * Mat4::scale(s.scale);
+                let mesh = match s.mesh {
+                    Mesh::Cube => &cube,
+                    Mesh::Tetra => &tetra,
+                    Mesh::Octa => &octa,
+                };
+                frame.draw(mesh, model, white, culling);
             }
         }
-    });
 
-    pm.task_add("render", 70.0, 0.0, {
-        let solids = solids.clone();
-        let cam = cam.clone();
-        let cull = cull.clone();
-        move |pm| {
-            let c = *cam.get();
-            let culling = cull.get().0;
-            let white = (1.0, 1.0, 1.0);
-            if let Some(mut frame) = r3d.frame(&window, c.view(), vec3(0.45, 1.0, 0.35)) {
-                frame.draw(&ground, Mat4::IDENTITY, white, culling);
-                for (_, s) in solids.get().iter() {
-                    let model = Mat4::translate(s.pos)
-                        * Mat4::rot_axis(s.axis, s.angle)
-                        * Mat4::scale(s.scale);
-                    let mesh = match s.mesh {
-                        Mesh::Cube => &cube,
-                        Mesh::Tetra => &tetra,
-                        Mesh::Octa => &octa,
-                    };
-                    frame.draw(mesh, model, white, culling);
-                }
-            }
-
-            if pm.tick() % 30 == 0 {
-                let title = format!(
-                    "pm solids (gpu) — {} solids, {:.0} fps, cull {} (C toggles; wasd+eq fly, RMB look)",
-                    solids.get().len(),
-                    1.0 / pm.loop_dt().max(1e-6),
-                    if culling { "ON" } else { "off" },
-                );
-                let _ = window.set_title(&title);
-            }
+        if pm.tick() % 30 == 0 {
+            let title = format!(
+                "pm solids (gpu) — {} solids, {:.0} fps, cull {} (C toggles; wasd+eq fly, RMB look)",
+                solids.get().len(),
+                1.0 / pm.loop_dt().max(1e-6),
+                if culling { "ON" } else { "off" },
+            );
+            let _ = window.set_title(&title);
         }
     });
 

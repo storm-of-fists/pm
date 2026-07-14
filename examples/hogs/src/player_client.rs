@@ -206,7 +206,7 @@ pub fn run() {
             let draw = draw.clone();
             {
                 let mut rack = camera_track(pm, id, move |_pm| {
-                    draw.get().get(id).copied().map(|t| {
+                    draw.get_id(id).map(|t| {
                         // The anchor faces where the TURRET points, not
                         // where the truck drives: holding RMB swings the
                         // camera with the gun (and the ease-back swings
@@ -398,8 +398,7 @@ pub fn run() {
                 if let Some(id) = mine {
                     let hp = w
                         .health
-                        .get()
-                        .get(id)
+                        .get_id(id)
                         .map_or(0.0, |v| (v.hp / TRUCK_HP).clamp(0.0, 1.0));
                     let heat = w.pred.get().state().map_or(0.0, |t| t.heat.clamp(0.0, 1.0));
                     let hp_col = (
