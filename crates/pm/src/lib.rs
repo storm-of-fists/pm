@@ -148,7 +148,7 @@ pub use pool::{Mut, Pool};
 pub use predict::Predictor;
 pub use smooth::{InterpBuffer, coast_blend, pool_interp, pool_mirror};
 pub use spatial::SpatialGrid;
-pub use util::{Cooldown, Counter, DelayTimer, FallingEdge, Hysteresis, Latch, RisingEdge};
+pub use util::{Births, Cooldown, Counter, DelayTimer, FallingEdge, Hysteresis, Latch, RisingEdge};
 
 // The sync layer, transport, and raw event plumbing are deliberately not
 // public: networking is core, not a pluggable suite. Their tests live

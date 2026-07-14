@@ -44,6 +44,8 @@ pub fn run() {
     let w = client_setup(&mut pm);
     eprintln!("connecting to {ADDR} ...");
     let net = pm.net();
+    // Sounds ride the same replicated facts the renderer draws — see sfx.rs.
+    crate::sfx::install(&mut pm, &w);
 
     camera_install(&mut pm);
     let cam_mgr = camera_manager(&mut pm);

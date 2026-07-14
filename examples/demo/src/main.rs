@@ -57,6 +57,15 @@ struct Drive {
 /// THE step function: server simulation, client prediction, and
 /// reconciliation replay all call exactly this.
 fn drive_step(c: &mut Car, cmd: Drive, dt: f32) {
+    // Exhaustive destructure: new Car fields must be handled here (the
+    // predicted pod's contract — see predict_pool's docs).
+    let Car {
+        x: _,
+        y: _,
+        heading: _,
+        speed: _,
+    } = *c;
+
     c.speed = ((c.speed + cmd.thrust * 9.0 * dt) * (1.0 - 1.5 * dt)).clamp(-3.0, 7.0);
     c.heading += cmd.turn * 2.8 * dt;
     let (sin, cos) = c.heading.sin_cos();

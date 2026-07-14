@@ -15,8 +15,11 @@ use crate::common::*;
 pub struct ClientWorld {
     /// Authoritative replicas. Health is server-owned truth read RAW
     /// (never predicted, never interp'd — a HUD wants the latest word).
+    /// Bullet/impact raw replicas also feed the sfx `Births` trackers —
+    /// edges come off the earliest copy, not the delayed draw pools.
     pub hog: PoolHandle<Hog>,
     pub health: PoolHandle<Health>,
+    pub bullet: PoolHandle<Bullet>,
     pub impact: PoolHandle<Impact>,
     /// Smoothed views rendering should read (predicted own truck wins on
     /// the truck draw pool; hogs and bullets are pure interp).
@@ -62,6 +65,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     ClientWorld {
         hog,
         health,
+        bullet,
         impact,
         truck_draw,
         hog_draw,
@@ -157,6 +161,30 @@ pub fn run_bot(n: u32) {
             bot: 1.0,   // AI: steering lags
         });
     });
+
+    // PM_PROF=1: where a CLIENT's tick goes (prediction, the two interp
+    // pools riding the horde) — bot 0 only, so the dumps don't interleave.
+    if n == 0 && std::env::var("PM_PROF").is_ok() {
+        let mut prev: std::collections::HashMap<String, pm::TaskStat> = Default::default();
+        pm::task!(pm, "prof", 91.0, 5.0, [], move |pm| {
+            eprintln!("-- bot0 task stats (last 5s) --");
+            let mut tick_total = 0.0f32;
+            for (name, s) in pm.task_stats() {
+                let p = prev.get(&name).cloned().unwrap_or_default();
+                let calls = s.calls - p.calls;
+                if calls > 0 {
+                    let avg_us = (s.ns_total - p.ns_total) as f32 / calls as f32 / 1000.0;
+                    tick_total += (s.ns_total - p.ns_total) as f32 / 300.0 / 1000.0;
+                    eprintln!(
+                        "  {name:<16} {avg_us:>8.1} us/call  {calls:>5} calls  max {:>8.1} us",
+                        s.ns_max as f32 / 1000.0
+                    );
+                }
+                prev.insert(name, s);
+            }
+            eprintln!("  ~{tick_total:.0} us/tick of the 16667 us budget");
+        });
+    }
 
     pm.loop_rate = 60;
     pm.run().expect("connect");

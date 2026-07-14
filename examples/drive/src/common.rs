@@ -159,6 +159,19 @@ pub const STEER_TAU: f32 = 0.18;
 /// Drift (shift) tightens the turn rate (and the bot lag). Speed-scaled
 /// steering, quadratic-ish drag, hard arena walls that scrub speed.
 pub fn drive_step(c: &mut Car, cmd: Drive, dt: f32) {
+    // Exhaustive destructure (no `..`): a new Car field won't compile
+    // until it's named here — and the contract is that THIS function
+    // evolves every field from the command. Server-written quantities
+    // (damage, scores) go in their own synced pool, never in the
+    // predicted pod (see predict_pool's docs).
+    let Car {
+        x: _,
+        z: _,
+        heading: _,
+        speed: _,
+        steer: _,
+    } = *c;
+
     let drifting = cmd.drift > 0.5;
     if cmd.bot > 0.5 {
         // Bot steering catches up to the commanded turn over STEER_TAU

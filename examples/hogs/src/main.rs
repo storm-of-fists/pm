@@ -17,6 +17,7 @@ mod bot_client;
 mod common;
 mod player_client;
 mod server;
+mod sfx;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

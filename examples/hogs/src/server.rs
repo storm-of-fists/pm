@@ -478,6 +478,31 @@ pub fn run(quiet: bool) {
         );
     }
 
+    // PM_PROF=1: per-task cycle times every 5 s — the stress lab should
+    // answer "where does the tick go?" without a profiler attached.
+    if std::env::var("PM_PROF").is_ok() {
+        let mut prev: std::collections::HashMap<String, pm::TaskStat> = Default::default();
+        task!(pm, "prof", 91.0, 5.0, [], move |pm| {
+            eprintln!("-- server task stats (last 5s) --");
+            let mut tick_total = 0.0f32;
+            for (name, s) in pm.task_stats() {
+                let p = prev.get(&name).cloned().unwrap_or_default();
+                let calls = s.calls - p.calls;
+                if calls > 0 {
+                    let avg_us = (s.ns_total - p.ns_total) as f32 / calls as f32 / 1000.0;
+                    // Interval tasks amortize over the window's ~300 ticks.
+                    tick_total += (s.ns_total - p.ns_total) as f32 / 300.0 / 1000.0;
+                    eprintln!(
+                        "  {name:<12} {avg_us:>8.1} us/call  {calls:>5} calls  max {:>8.1} us",
+                        s.ns_max as f32 / 1000.0
+                    );
+                }
+                prev.insert(name, s);
+            }
+            eprintln!("  ~{tick_total:.0} us/tick of the 16667 us budget");
+        });
+    }
+
     pm.loop_rate = 60;
     pm.run().unwrap_or_else(|e| {
         eprintln!("cannot serve {ADDR}: {e}");

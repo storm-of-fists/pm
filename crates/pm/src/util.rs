@@ -216,6 +216,50 @@ impl Latch {
     }
 }
 
+/// `RisingEdge` for pool membership: which entities appeared since the
+/// last call? Replication converges STATE ("what exists"), but one-shot
+/// reactions — sounds, camera shake, particles — need the EDGE ("it
+/// just appeared"). Point one of these at a synced pool (impacts,
+/// bullets) and react to what it returns each tick.
+///
+/// The first call primes silently and reports nothing: on connect, the
+/// initial snapshot dumps the whole existing world, and a join
+/// shouldn't replay every standing entity as if it just happened.
+///
+/// ```
+/// use pm::{Births, Id, Pool};
+///
+/// let mut pool: Pool<f32> = Pool::new();
+/// let mut sfx = Births::default();
+/// pool.add(Id::new(0, 0, 1), 1.0);
+/// assert!(sfx.drain(&pool).is_empty()); // first call: prime, no replay
+/// pool.add(Id::new(0, 0, 2), 2.0);
+/// assert_eq!(sfx.drain(&pool), vec![Id::new(0, 0, 2)]); // the newborn
+/// assert!(sfx.drain(&pool).is_empty()); // an entity is born once
+/// ```
+#[derive(Default)]
+pub struct Births {
+    seen: std::collections::HashSet<crate::Id>,
+    primed: bool,
+}
+
+impl Births {
+    /// Ids present in `pool` that weren't present last call, and forget
+    /// ids that have since been removed (so a recycled slot's next
+    /// occupant — a new generation — still counts as born).
+    pub fn drain<T>(&mut self, pool: &crate::Pool<T>) -> Vec<crate::Id> {
+        let mut born = Vec::new();
+        for &id in pool.ids() {
+            if self.seen.insert(id) && self.primed {
+                born.push(id);
+            }
+        }
+        self.seen.retain(|id| pool.contains(*id));
+        self.primed = true;
+        born
+    }
+}
+
 /// Count up/down toward a preset with a done flag. Compose with
 /// `RisingEdge` for edge-triggered counting.
 #[derive(Clone, Copy, Debug, Default)]

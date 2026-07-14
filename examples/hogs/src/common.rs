@@ -301,6 +301,25 @@ pub fn building_push(x: f32, z: f32, r: f32) -> (f32, f32, f32, f32) {
 /// filter, so the near future is a real prediction), humans steer crisp,
 /// speed-scaled turning, drag, hard arena walls that scrub speed.
 pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32) {
+    // COMPILE-TIME COVERAGE: an exhaustive destructure (no `..`), so
+    // adding a Truck field refuses to compile until it's named here —
+    // and the rule this line sends you here to obey is: every field in
+    // the predicted pod must be EVOLVED BY THIS FUNCTION from the
+    // command. If the server writes it outside this step (damage,
+    // pickups), it does NOT belong in Truck — give it its own
+    // authoritative pool (that's why hp lives in `Health`). Then cover
+    // the new field in `err_metric` and `truck_lerp` below (the lerp's
+    // exhaustive struct literal breaks on its own; the metric won't).
+    let Truck {
+        x: _,
+        z: _,
+        heading: _,
+        speed: _,
+        steer: _,
+        aim: _,
+        heat: _,
+    } = *t;
+
     if cmd.bot > 0.5 {
         let k = 1.0 - (-dt / STEER_TAU).exp();
         t.steer += (cmd.turn - t.steer) * k;

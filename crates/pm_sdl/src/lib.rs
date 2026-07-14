@@ -8,10 +8,12 @@
 
 pub use sdl3;
 
+pub mod audio;
 mod font;
 pub mod gpu3d;
 mod sprite;
 
+pub use audio::{Audio, Clip};
 pub use font::{Font, Raster};
 pub use sprite::Sprite;
 

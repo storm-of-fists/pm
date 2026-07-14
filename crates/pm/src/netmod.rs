@@ -706,6 +706,17 @@ impl PmClient {
     /// [`interp_pool`](PmClient::interp_pool) on the same pool for the
     /// remote entities (it returns the draw pool to render). Returns the
     /// predictor single so rendering can read `state()` / `corrections`.
+    ///
+    /// **Every field of `S` must be something `step` evolves from the
+    /// command.** A field the server writes OUTSIDE the step (damage,
+    /// pickups, scores) compiles fine and then misbehaves subtly: it
+    /// freezes between corrections when read from `state()`, and every
+    /// server write registers as a prediction miss, forcing spurious
+    /// correction snaps. Server-owned quantities belong in their own
+    /// synced pool, read raw. Enforce the rule mechanically with an
+    /// exhaustive destructure (no `..`) at the top of `step` — a new
+    /// field then refuses to compile until someone visits the one place
+    /// where this contract is written down (see hogs' `truck_step`).
     pub fn predict_pool<S: Pod + 'static, C: Pod + 'static>(
         &mut self,
         auth: &PoolHandle<S>,
