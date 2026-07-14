@@ -14,7 +14,7 @@
 // real storage image); set 2 = uniforms.
 
 struct TextU {
-    rect: vec4<f32>,  // x, y: dest top-left in pixels (zw unused)
+    rect: vec4<f32>,  // xy: dest top-left in pixels; zw: dest size
     color: vec4<f32>, // rgb tint; a scales coverage (fade / alpha)
 }
 
@@ -29,11 +29,16 @@ var<uniform> u: TextU;
 
 @compute @workgroup_size(8, 8, 1)
 fn cs_text(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let gdims = textureDimensions(glyph);
-    if (gid.x >= gdims.x || gid.y >= gdims.y) {
+    // Dest size comes from the uniform, source coords clamp into the
+    // texture: for glyphs the two match (1:1 texels), while a 1x1 white
+    // texture stretches into any solid rectangle (`Frame3::rect`) — the
+    // whole HUD is this one shader.
+    if (gid.x >= u32(u.rect.z) || gid.y >= u32(u.rect.w)) {
         return;
     }
-    let cov = textureLoad(glyph, vec2<i32>(gid.xy), 0).r * u.color.a;
+    let gdims = textureDimensions(glyph);
+    let src = min(gid.xy, gdims - vec2<u32>(1u, 1u));
+    let cov = textureLoad(glyph, vec2<i32>(src), 0).r * u.color.a;
     if (cov <= 0.0) {
         return;
     }

@@ -132,9 +132,9 @@ pub use camera::{
 pub use duration::{HistoryRing, pool_expire};
 pub use id::Id;
 pub use kernel::{
-    IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
+    IntoTaskResult, Pm, PoolHandle, SingleHandle, SingleMut, TaskError, TaskFault, TaskStat,
 };
-pub use math::{Mat4, Rng, Vec2, Vec3, vec2, vec3};
+pub use math::{Mat4, Rng, Vec2, Vec3, lerp_angle, vec2, vec3, wrap_angle};
 pub use modload::{BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr};
 pub use net::Applied;
 pub use netmod::{

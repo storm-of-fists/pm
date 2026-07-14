@@ -55,7 +55,9 @@ pub extern "C-unwind" fn pm_mod_init(pm: &mut Pm) -> bool {
                 color: [120, 200, 255, 255],
             },
         );
-        monster_srv.get_mut().add(id, MonsterSrv { shoot_timer: 2.0 });
+        monster_srv
+            .get_mut()
+            .add(id, MonsterSrv { shoot_timer: 2.0 });
     });
     true
 }

@@ -66,8 +66,11 @@ pub fn run() {
     let cam_view = pm.single::<CamView>("cam.view");
     let draw_pool = draw.clone();
 
-    let (mut window, mut pump, refresh) =
-        pm_sdl::window("pm drive — wasd, 1-3 cams, p panini, r respawn, esc quits", W, H);
+    let (mut window, mut pump, refresh) = pm_sdl::window(
+        "pm drive — wasd, 1-3 cams, p panini, r respawn, esc quits",
+        W,
+        H,
+    );
     let mut r3d = Renderer3d::new(&window).expect("renderer");
     r3d.fog_distance = 160.0;
     let ground = r3d
@@ -264,7 +267,8 @@ pub fn run() {
                             drift: 0.0,
                             bot: 0.0,
                         };
-                        for (k, (px, pz)) in predict_path(*c, hold, 14, 0.045).into_iter().enumerate()
+                        for (k, (px, pz)) in
+                            predict_path(*c, hold, 14, 0.045).into_iter().enumerate()
                         {
                             let fade = 1.0 - k as f32 / 20.0;
                             frame.draw(

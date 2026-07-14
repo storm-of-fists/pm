@@ -147,10 +147,7 @@ fn net_modules_loopback() {
     assert!(sseen.get().joined, "server never observed the join");
     assert!(cnet_status.connected(), "client never connected");
     assert!(sseen.get().event, "client->server reliable event lost");
-    assert!(
-        cseen.get().echo > 0,
-        "applied input-seq echo never arrived"
-    );
+    assert!(cseen.get().echo > 0, "applied input-seq echo never arrived");
     assert!(done, "replication never converged (cmd-driven pos.x > 5)");
     // Per-peer link stats rode along: the client acked snapshots, so its
     // acked_tick advanced (the lag-comp rewind anchor), and quinn has an
@@ -160,7 +157,10 @@ fn net_modules_loopback() {
         let stats = spm.single::<PeerStats>("net.peerstat");
         let st = stats.get();
         let ps = st.0.get(&p).expect("peerstat row for the joined peer");
-        assert!(ps.acked_tick > 0, "acks flowed but acked_tick never advanced");
+        assert!(
+            ps.acked_tick > 0,
+            "acks flowed but acked_tick never advanced"
+        );
         assert!(ps.rtt_ms > 0.0, "rtt_ms never measured");
     }
     assert!(
@@ -195,7 +195,10 @@ fn ttl_pool_expires_stale_entries() {
         pm.loop_once(DT);
     }
     assert!(!pool.get().contains(a), "expired after the ttl");
-    assert!(!pm.id_alive(a), "expiry removes the entity, not just the entry");
+    assert!(
+        !pm.id_alive(a),
+        "expiry removes the entity, not just the entry"
+    );
 }
 
 /// `history_pool` frames carry the snapshot label convention (`tick - 1`):

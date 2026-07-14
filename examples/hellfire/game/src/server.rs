@@ -93,9 +93,7 @@ pub fn run(quiet: bool) {
             let mut g = game.get_mut();
             for p in net.joined() {
                 let rid = pm.id_add();
-                roster
-                    .get_mut()
-                    .add(rid, Roster::new(p, &format!("P{p}")));
+                roster.get_mut().add(rid, Roster::new(p, &format!("P{p}")));
                 let i = spawn_index(p);
                 let pid = pm.id_add();
                 let c = PCOL[i];

@@ -289,6 +289,38 @@ impl MulAssign<f32> for Vec3 {
     }
 }
 
+/// Wrap an angle difference to the shortest arc, in [-pi, pi]. The
+/// building block for steering ("how far do I turn?") and for
+/// interpolating headings without the long-way-around spin.
+///
+/// ```
+/// use pm::wrap_angle;
+/// use std::f32::consts::PI;
+///
+/// assert!((wrap_angle(1.5 * PI) + 0.5 * PI).abs() < 1e-6); // 270deg -> -90deg
+/// assert!((wrap_angle(0.1 - 2.0 * PI) - 0.1).abs() < 1e-6);
+/// ```
+pub fn wrap_angle(dh: f32) -> f32 {
+    (dh + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+/// Interpolate between two angles along the SHORTEST arc. Use this in a
+/// pool lerp for every angular field (heading, aim, ...) — a plain lerp
+/// spins entities the long way round when the angle crosses the wrap,
+/// and that's a silent visual bug.
+///
+/// ```
+/// use pm::lerp_angle;
+/// use std::f32::consts::PI;
+///
+/// // Crossing the pi/-pi wrap: halfway is just past the wrap, not 0.
+/// let h = lerp_angle(PI - 0.1, -PI + 0.1, 0.5);
+/// assert!((h.abs() - PI).abs() < 1e-6);
+/// ```
+pub fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+    a + wrap_angle(b - a) * t
+}
+
 /// Column-major 4x4 — the layout WGSL/SPIR-V uniforms expect, so `.0`
 /// can be memcpy'd into a shader uniform directly. Compose with `*`
 /// (or `.mul(..)`, same thing): `proj * view * model` applies model
@@ -355,6 +387,20 @@ impl Mat4 {
         m.0[0] = s;
         m.0[5] = s;
         m.0[10] = s;
+        m
+    }
+
+    /// Per-axis scale — stretch one authored mesh into many shapes
+    /// (a unit cube into every wall and building) instead of baking a
+    /// mesh per shape. Note for lit meshes: shaders that transform
+    /// normals by the model matrix (pm_sdl's does, then normalizes)
+    /// skew normals under non-uniform scale — exact for axis-aligned
+    /// boxes, increasingly wrong for angled faces at extreme ratios.
+    pub fn scale_xyz(sx: f32, sy: f32, sz: f32) -> Mat4 {
+        let mut m = Mat4::IDENTITY;
+        m.0[0] = sx;
+        m.0[5] = sy;
+        m.0[10] = sz;
         m
     }
 

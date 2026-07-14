@@ -43,6 +43,41 @@ impl<E: Into<TaskError>> IntoTaskResult for Result<(), E> {
     }
 }
 
+/// Sugar for the task-registration idiom: clone the listed handles into
+/// scope, then `task_add`. Every capture in the `[..]` list gets a
+/// `let x = x.clone();` before the closure, so the closure's `move`
+/// takes the clones (handles are cheap `Rc` bumps) and the originals
+/// stay usable for the next task. Anything NOT in the list (window
+/// pumps, local state) is moved as usual.
+///
+/// ```
+/// use pm::{Pm, task};
+///
+/// let mut pm = Pm::server("127.0.0.1:0");
+/// let score = pm.pool::<u32>("score");
+/// // Without the macro this needs `{ let score = score.clone(); move |pm| ... }`.
+/// task!(pm, "tally", 30.0, [score], move |_pm| {
+///     let _total: u32 = score.get().values().iter().sum();
+/// });
+/// task!(pm, "report", 90.0, 5.0, [score], move |_pm| {
+///     // interval form: runs every 5 seconds
+///     let _ = score.get().len();
+/// });
+/// score.get_mut(); // original handle still usable after both tasks
+/// pm.loop_once(1.0 / 60.0);
+/// ```
+#[macro_export]
+macro_rules! task {
+    // Every-tick form: interval defaults to 0.0.
+    ($pm:expr, $name:expr, $prio:expr, [$($cap:ident),* $(,)?], $body:expr) => {
+        $crate::task!($pm, $name, $prio, 0.0, [$($cap),*], $body)
+    };
+    ($pm:expr, $name:expr, $prio:expr, $interval:expr, [$($cap:ident),* $(,)?], $body:expr) => {{
+        $(let $cap = $cap.clone();)*
+        $pm.task_add($name, $prio, $interval, $body)
+    }};
+}
+
 type TaskFn = Box<dyn FnMut(&mut Pm) -> Result<(), TaskError>>;
 
 struct TaskEntry {
@@ -123,11 +158,37 @@ impl<T: 'static> PoolHandle<T> {
 /// Handle to a named singleton: one entity in an ordinary pool (there is
 /// no separate "state" concept). Its one entity always exists (created
 /// with the handle and protected by a pool lock), so `get`/`get_mut`
-/// hand back the value directly — no `Option`. `get_mut` stamps the
-/// changed-tick, so a synced singleton replicates on write.
+/// hand back the value directly — no `Option`. `get_mut` is write-gated
+/// like a pool's [`Mut`](crate::Mut): the changed-tick stamps on the
+/// first mutable access, so a task that only READS through `get_mut`
+/// (or takes the guard and decides not to write) doesn't make a synced
+/// singleton re-replicate.
 pub struct SingleHandle<T> {
     handle: PoolHandle<T>,
     id: Id,
+}
+
+/// Write guard for a singleton — [`SingleHandle::get_mut`]'s return.
+/// Holds the pool lock; reads through it are free, the first mutable
+/// deref stamps the changed-tick (the same write-gating as [`crate::Mut`]).
+pub struct SingleMut<'a, T: 'static> {
+    pool: RefMut<'a, Pool<T>>,
+    id: Id,
+}
+
+impl<T: 'static> std::ops::Deref for SingleMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.pool.get(self.id).expect("singleton entity missing")
+    }
+}
+
+impl<T: 'static> std::ops::DerefMut for SingleMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.pool
+            .get_mut_stamped(self.id)
+            .expect("singleton entity missing")
+    }
 }
 
 impl<T> Clone for SingleHandle<T> {
@@ -155,10 +216,15 @@ impl<T: 'static> SingleHandle<T> {
             .unwrap_or_else(|_| panic!("singleton '{}' entity missing", self.handle.name()))
     }
 
-    /// Mutate the singleton's value (stamps the changed-tick).
-    pub fn get_mut(&self) -> RefMut<'_, T> {
-        RefMut::filter_map(self.handle.get_mut(), |p| p.get_mut_stamped(self.id))
-            .unwrap_or_else(|_| panic!("singleton '{}' entity missing", self.handle.name()))
+    /// Lock the singleton for writing. The changed-tick stamps on the
+    /// first mutable access through the guard, not on taking it — read
+    /// first, write only what changed, and an unchanged synced singleton
+    /// stays off the wire.
+    pub fn get_mut(&self) -> SingleMut<'_, T> {
+        SingleMut {
+            pool: self.handle.get_mut(),
+            id: self.id,
+        }
     }
 }
 

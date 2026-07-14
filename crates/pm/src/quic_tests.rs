@@ -113,8 +113,8 @@ fn quic_loopback_full_stack() {
         cpm.loop_once(DT);
 
         // once converged, remove an entity server-side (exactly once)
-        let synced = c_pos.get().len() == 20
-            && c_pos.get().get(ids[7]) == Some(&Pos { x: 7.0, y: 14.0 });
+        let synced =
+            c_pos.get().len() == 20 && c_pos.get().get(ids[7]) == Some(&Pos { x: 7.0, y: 14.0 });
         if synced && !removed {
             spm.id_remove(ids[3]);
             removed = true;

@@ -93,7 +93,7 @@ struct PostU {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct TextU {
-    rect: [f32; 4],  // dest top-left x, y in pixels (zw unused)
+    rect: [f32; 4],  // dest top-left x, y in pixels; zw = dest size
     color: [f32; 4], // rgb tint, a = coverage scale
 }
 
@@ -145,6 +145,9 @@ struct TextCache {
     font: Font,
     glyphs: HashMap<(char, u32), GpuGlyph>,
     pending: Vec<PendingGlyph>,
+    /// 1x1 full-coverage texture: `Frame3::rect` stretches it into any
+    /// solid rectangle through the same compute pass as the glyphs.
+    white: Option<Texture<'static>>,
 }
 
 /// One laid-out glyph to composite this frame: its texture and where.
@@ -206,6 +209,35 @@ impl TextCache {
             );
         }
         self.glyphs.get(&key).unwrap()
+    }
+
+    /// The 1x1 white texture, created (and its upload queued) on first
+    /// use — same deferred-copy path as a fresh glyph.
+    fn ensure_white(&mut self, device: &Device) -> Option<Texture<'static>> {
+        if self.white.is_none() {
+            self.white = device
+                .create_texture(
+                    TextureCreateInfo::new()
+                        .with_type(TextureType::_2D)
+                        .with_width(1)
+                        .with_height(1)
+                        .with_layer_count_or_depth(1)
+                        .with_num_levels(1)
+                        .with_sample_count(SampleCount::NoMultiSampling)
+                        .with_format(TextureFormat::R8g8b8a8Unorm)
+                        .with_usage(TextureUsage::COMPUTE_STORAGE_READ),
+                )
+                .ok()
+                .inspect(|tex| {
+                    self.pending.push(PendingGlyph {
+                        tex: (*tex).clone(),
+                        rgba: vec![255; 4],
+                        w: 1,
+                        h: 1,
+                    });
+                });
+        }
+        self.white.clone()
     }
 }
 
@@ -419,6 +451,7 @@ impl Renderer3d {
             scene: None,
             present: None,
             text: TextCache {
+                white: None,
                 font,
                 glyphs: HashMap::new(),
                 pending: Vec::new(),
@@ -796,7 +829,7 @@ impl Frame3<'_> {
             if let Some(tex) = &g.tex {
                 self.cmds.push(TextCmd {
                     tex: tex.clone(),
-                    rect: [pen + g.xmin, baseline + g.top, 0.0, 0.0],
+                    rect: [pen + g.xmin, baseline + g.top, g.w as f32, g.h as f32],
                     color: col,
                     w: g.w,
                     h: g.h,
@@ -805,6 +838,31 @@ impl Frame3<'_> {
             pen += g.advance;
         }
         pen - x
+    }
+
+    /// Queue a solid screen-space rectangle, top-left at (x, y), `w` x
+    /// `h` pixels, alpha-blended over the final image at drop (same
+    /// compute pass as text — the 2D HUD primitive for bars, panels,
+    /// crosshairs). `alpha` 1.0 = opaque paint, lower = tinted panel.
+    pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: (u8, u8, u8), alpha: f32) {
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
+        let Some(tex) = self.text.ensure_white(self.device) else {
+            return;
+        };
+        self.cmds.push(TextCmd {
+            tex,
+            rect: [x, y, w, h],
+            color: [
+                color.0 as f32 / 255.0,
+                color.1 as f32 / 255.0,
+                color.2 as f32 / 255.0,
+                alpha,
+            ],
+            w: w as u32,
+            h: h as u32,
+        });
     }
 
     /// Width `s` would occupy at `px` without drawing — for centering and

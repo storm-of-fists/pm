@@ -93,11 +93,10 @@ fn pools() {
         }
     });
     time("each_with join (vel -> pos, write)", N as u64, || {
-        vel.get_mut()
-            .each_with(&mut pos.get_mut(), |_, v, mut p| {
-                p.x += v.x;
-                p.y += v.y;
-            });
+        vel.get_mut().each_with(&mut pos.get_mut(), |_, v, mut p| {
+            p.x += v.x;
+            p.y += v.y;
+        });
     });
     time("iter_with join (read)", N as u64, || {
         let p = pos.get();

@@ -190,17 +190,14 @@ pub fn drive_step(c: &mut Car, cmd: Drive, dt: f32) {
 
 /// Interpolate between two replicated car samples for snapshot
 /// interpolation (`pm::pool_interp`). Linear on the scalar fields;
-/// heading takes the SHORTEST arc so a car crossing the +z wrap (pi to
-/// -pi) eases across instead of spinning the long way round.
+/// heading through `pm::lerp_angle` so a car crossing the +z wrap (pi
+/// to -pi) eases across instead of spinning the long way round.
 pub fn car_lerp(a: &Car, b: &Car, t: f32) -> Car {
     let l = |x: f32, y: f32| x + (y - x) * t;
-    let dh = (b.heading - a.heading + std::f32::consts::PI)
-        .rem_euclid(std::f32::consts::TAU)
-        - std::f32::consts::PI;
     Car {
         x: l(a.x, b.x),
         z: l(a.z, b.z),
-        heading: a.heading + dh * t,
+        heading: pm::lerp_angle(a.heading, b.heading, t),
         speed: l(a.speed, b.speed),
         steer: l(a.steer, b.steer),
     }
@@ -220,12 +217,7 @@ fn car_seg(c: &Car) -> ((f32, f32), (f32, f32)) {
 
 /// Closest distance between two 2D segments (Ericson, RTCD) and the unit
 /// axis from segment 2's closest point toward segment 1's: `(nx, nz, d)`.
-fn seg_seg(
-    p1: (f32, f32),
-    q1: (f32, f32),
-    p2: (f32, f32),
-    q2: (f32, f32),
-) -> (f32, f32, f32) {
+fn seg_seg(p1: (f32, f32), q1: (f32, f32), p2: (f32, f32), q2: (f32, f32)) -> (f32, f32, f32) {
     let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
     let sub = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0, a.1 - b.1);
     let (d1, d2, r) = (sub(q1, p1), sub(q2, p2), sub(p1, p2));

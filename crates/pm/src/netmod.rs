@@ -73,7 +73,7 @@ use bytemuck::Pod;
 
 use crate::duration::{HistoryRing, pool_expire};
 use crate::id::Id;
-use crate::kernel::{PoolHandle, Pm, SingleHandle};
+use crate::kernel::{Pm, PoolHandle, SingleHandle};
 use crate::net::{Applied, NetClient, NetServer, Outbox, SyncSet, WireKind, WireReg, event_tag};
 use crate::predict::Predictor;
 use crate::smooth::{InterpBuffer, pool_interp};
@@ -742,7 +742,8 @@ impl PmClient {
                     }
                 }
                 for &(seq, cmd) in &shared.borrow().sent {
-                    pred.get_mut().predict(seq, cmd, |s, c| step(s, c, fixed_dt));
+                    pred.get_mut()
+                        .predict(seq, cmd, |s, c| step(s, c, fixed_dt));
                 }
                 // Smooth-predicted local avatar into draw, extrapolated by
                 // the in-flight input fraction. Guard on the entity still

@@ -76,10 +76,7 @@ pub fn run_bot(n: u32) {
         let r = (c.x * c.x + c.z * c.z).sqrt();
         let turn = if r > ARENA - 14.0 {
             let desired = (-c.x).atan2(-c.z); // heading toward the center
-            let err = (desired - c.heading + std::f32::consts::PI)
-                .rem_euclid(std::f32::consts::TAU)
-                - std::f32::consts::PI;
-            err.clamp(-1.0, 1.0)
+            pm::wrap_angle(desired - c.heading).clamp(-1.0, 1.0)
         } else {
             (t * 0.43).sin() * 0.8
         };

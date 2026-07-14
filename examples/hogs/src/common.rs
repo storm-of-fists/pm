@@ -11,8 +11,9 @@ pub const ADDR: &str = "127.0.0.1:48223";
 /// Fixed simulation step on both sides (prediction replays it).
 pub const FIXED_DT: f32 = 1.0 / 60.0;
 /// Half-extent of the square arena (walls at +-ARENA on x and z).
-/// Bigger than drive's: a horde needs room to flank.
-pub const ARENA: f32 = 55.0;
+/// Big: the horde needs room to flank and the trucks need room to run,
+/// with buildings breaking up the sightlines.
+pub const ARENA: f32 = 100.0;
 
 /// Remote interpolation delay (seconds) — same shared-constant contract
 /// as drive: the client hands it to `interp_pool` (trucks AND hogs), the
@@ -60,6 +61,27 @@ pub struct Truck {
     /// Filtered steering (bots lag; humans are crisp) — replicated so a
     /// truck's near future is determined, like drive.
     pub steer: f32,
+    /// Turret angle relative to `heading` (the mouse-aim seam). Evolved
+    /// by `truck_step` from the command frame like everything else, so
+    /// it predicts and replicates for free — remote players see your
+    /// turret swing.
+    pub aim: f32,
+    /// Boost heat, 0..1 — rises while boosting, cools otherwise, all in
+    /// `truck_step`, so the meter predicts smoothly. Hitting 1.0 is the
+    /// SERVER's cue to explode the truck (consequences aren't predicted;
+    /// see `Health` for why).
+    pub heat: f32,
+}
+
+/// Server-owned truck vitals, deliberately NOT in the predicted pod:
+/// damage comes from server events (bites), not from replaying commands,
+/// so predicting it is impossible — and a non-predicted field inside a
+/// Predictor's state pod freezes between corrections. Separate synced
+/// pool, same id as the truck; clients read it raw.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Health {
+    pub hp: f32,
 }
 
 /// A biomod feral hog: server-owned, never predicted — clients read it
@@ -88,6 +110,19 @@ pub struct Hunt {
     pub wave: u32,
 }
 
+/// A live bullet: server-owned like the hogs — the server steps it,
+/// judges its hits (lag-compensated per shooter, each tick of flight),
+/// and removes it on impact or at max range; clients only interpolate
+/// and draw the tracer. Which peer fired it is server-local state
+/// (`id.peer()` is recycling, not control), so the pod stays lean.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Bullet {
+    pub x: f32,
+    pub z: f32,
+    pub heading: f32,
+}
+
 /// A transient replicated FACT (the contact-points pattern): the server
 /// spawns one on a fresh id where something landed and `ttl_pool`
 /// removes it. Clients render whatever entries exist, clean up nothing.
@@ -103,20 +138,26 @@ pub struct Impact {
 pub const IMPACT_HIT: f32 = 0.0; // a shot connected
 pub const IMPACT_KILL: f32 = 1.0; // a hog died here
 pub const IMPACT_BITE: f32 = 2.0; // a hog rammed a truck
+pub const IMPACT_BOOM: f32 = 3.0; // a truck exploded (overheat or hp 0)
 /// Marker lifetime — comfortably above one resend window so lossy
 /// clients see every flash before it expires.
 pub const IMPACT_TTL: f32 = 1.0;
 
 // --- channels --------------------------------------------------------------
 
-/// Command-frame input payload: driving plus the trigger. `fire` is held
+/// Command-frame input payload: driving plus the turret. `fire` is held
 /// state, not an event — the server's gun cooldown turns it into shots.
+/// `aim` is the turret angle the client wants THIS frame: the hold-to-aim
+/// accumulation and the smooth snap-back on release are both client-side
+/// animation; the server just gets a stream of absolute angles.
 #[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
 #[repr(C)]
 pub struct Drive {
     pub thrust: f32, // -1..1
-    pub turn: f32,   // -1..1 (positive = left)
+    pub turn: f32,   // -1..1
     pub fire: f32,   // 0/1: trigger held
+    pub aim: f32,    // turret angle relative to heading, +-AIM_MAX
+    pub boost: f32,  // 0/1: burn heat for speed (1.0 heat = boom)
     pub bot: f32,    // 0/1: AI controller — its steering lags
 }
 
@@ -129,8 +170,19 @@ pub struct Respawn {
 
 // --- tuning ----------------------------------------------------------------
 
-/// Truck top speed (forward).
+/// Truck top speed (forward), and boosted.
 pub const VMAX: f32 = 18.0;
+pub const BOOST_VMAX: f32 = 30.0;
+/// Heat per second while boosting / cooling per second while not. Full
+/// burn to explosion in ~2.5 s; a full cooldown takes ~4 s.
+pub const HEAT_RATE: f32 = 0.4;
+pub const HEAT_COOL: f32 = 0.25;
+/// Truck hitpoints and what one bite takes.
+pub const TRUCK_HP: f32 = 1.0;
+pub const BITE_DMG: f32 = 0.25;
+/// Points an exploded truck costs the team (on top of the bites that
+/// probably caused it).
+pub const DEATH_COST: f32 = 30.0;
 /// Truck collision capsule: half-length along forward, radius.
 pub const TRUCK_HL: f32 = 0.8;
 pub const TRUCK_R: f32 = 0.9;
@@ -143,9 +195,9 @@ pub const HOG_R: f32 = 0.7;
 pub const HOG_HP: f32 = 1.0;
 /// A truck inside this range gets charged.
 pub const HOG_AGGRO: f32 = 26.0;
-/// Charge / wander speeds.
+/// Charge / roam speeds.
 pub const HOG_FAST: f32 = 11.0;
-pub const HOG_SLOW: f32 = 3.0;
+pub const HOG_ROAM: f32 = 4.5;
 /// Hog turn rate (rad/s) — slower than a truck can steer, so you can
 /// juke a charge.
 pub const HOG_TURN: f32 = 2.6;
@@ -157,11 +209,91 @@ pub const BITE_CD: f32 = 1.0;
 pub const BITE_COST: f32 = 15.0;
 /// Points a kill earns the team.
 pub const KILL_POINTS: f32 = 10.0;
+/// While roaming, a hog walks to a random goal and picks a new one
+/// inside this many seconds (or on arrival) — real wandering, not the
+/// old stand-and-wiggle.
+pub const ROAM_REPICK: f32 = 9.0;
 
-/// Fixed forward gun: hitscan range, refire period, damage per shot.
-pub const GUN_RANGE: f32 = 30.0;
+/// Turret gun: refire period, damage per shot, and the projectile —
+/// bullets are real replicated entities now, so range is max travel.
 pub const GUN_CD: f32 = 0.25;
 pub const GUN_DMG: f32 = 0.5;
+pub const GUN_RANGE: f32 = 45.0;
+pub const BULLET_SPEED: f32 = 70.0;
+/// Turret swing limit either side of straight ahead.
+pub const AIM_MAX: f32 = 2.6;
+
+// --- buildings ---------------------------------------------------------------
+
+/// Static obstacles as `(center x, center z, half w, half d, height)`.
+/// Shared const data compiled into BOTH binaries — server and clients
+/// collide against the same walls, so nothing about them replicates
+/// (height is render-only). The south strip (z < -85) stays clear: that's
+/// where trucks spawn.
+pub const BUILDINGS: [(f32, f32, f32, f32, f32); 14] = [
+    (10.0, 8.0, 4.0, 4.0, 11.0), // the downtown tower
+    (0.0, -22.0, 11.0, 4.0, 6.0),
+    (-40.0, -30.0, 8.0, 6.0, 5.0),
+    (35.0, -45.0, 6.0, 9.0, 4.0),
+    (-20.0, -60.0, 5.0, 5.0, 4.0),
+    (-80.0, -55.0, 6.0, 6.0, 5.0),
+    (75.0, -20.0, 4.0, 8.0, 6.0),
+    (-65.0, 10.0, 7.0, 7.0, 8.0),
+    (60.0, 20.0, 9.0, 5.0, 5.0),
+    (20.0, 45.0, 5.0, 5.0, 7.0),
+    (-25.0, 55.0, 8.0, 4.0, 4.0),
+    (45.0, 70.0, 7.0, 6.0, 9.0),
+    (-55.0, 75.0, 5.0, 8.0, 5.0),
+    (80.0, 60.0, 6.0, 6.0, 7.0),
+];
+
+/// Whether `(x, z)` is inside any building footprint grown by `pad`.
+pub fn in_building(x: f32, z: f32, pad: f32) -> bool {
+    BUILDINGS
+        .iter()
+        .any(|&(bx, bz, hw, hd, _)| (x - bx).abs() < hw + pad && (z - bz).abs() < hd + pad)
+}
+
+/// Push a circle at `(x, z)` radius `r` out of every building it
+/// overlaps. Returns the corrected position and the last push normal
+/// (zero if nothing touched) — callers use the normal to scrub speed
+/// (trucks) or slide the heading along the wall (hogs).
+pub fn building_push(x: f32, z: f32, r: f32) -> (f32, f32, f32, f32) {
+    let (mut x, mut z) = (x, z);
+    let (mut nx, mut nz) = (0.0, 0.0);
+    for &(bx, bz, hw, hd, _) in &BUILDINGS {
+        // Closest point on the box to the circle center.
+        let cx = x.clamp(bx - hw, bx + hw);
+        let cz = z.clamp(bz - hd, bz + hd);
+        let (dx, dz) = (x - cx, z - cz);
+        let d2 = dx * dx + dz * dz;
+        if d2 >= r * r {
+            continue;
+        }
+        if d2 > 1e-8 {
+            // Center outside the box: push straight away from the wall.
+            let d = d2.sqrt();
+            nx = dx / d;
+            nz = dz / d;
+            x = cx + nx * r;
+            z = cz + nz * r;
+        } else {
+            // Center INSIDE the box (tunneled): exit by the nearest face.
+            let ex = hw + r - (x - bx).abs();
+            let ez = hd + r - (z - bz).abs();
+            if ex < ez {
+                nx = (x - bx).signum();
+                nz = 0.0;
+                x = bx + nx * (hw + r);
+            } else {
+                nx = 0.0;
+                nz = (z - bz).signum();
+                z = bz + nz * (hd + r);
+            }
+        }
+    }
+    (x, z, nx, nz)
+}
 
 // --- THE truck step ----------------------------------------------------------
 
@@ -175,8 +307,25 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32) {
     } else {
         t.steer = cmd.turn;
     }
-    t.speed = (t.speed + cmd.thrust * 14.0 * dt) * (1.0 - 1.2 * dt);
-    t.speed = t.speed.clamp(-7.0, VMAX);
+    // Turret: crisp copy of the commanded angle — the client animates
+    // the hold/snap-back, so replaying commands reproduces it exactly.
+    t.aim = cmd.aim.clamp(-AIM_MAX, AIM_MAX);
+    // Boost: extra shove and a higher ceiling, paid in heat. Heat is
+    // predicted state (this is THE shared step), so the client's meter
+    // is live; the EXPLOSION at 1.0 is the server's move alone.
+    let boosting = cmd.boost > 0.5 && cmd.thrust > 0.0 && t.heat < 1.0;
+    t.heat = if boosting {
+        (t.heat + HEAT_RATE * dt).min(1.0)
+    } else {
+        (t.heat - HEAT_COOL * dt).max(0.0)
+    };
+    let (accel, vmax) = if boosting {
+        (26.0, BOOST_VMAX)
+    } else {
+        (14.0, VMAX)
+    };
+    t.speed = (t.speed + cmd.thrust * accel * dt) * (1.0 - 1.2 * dt);
+    t.speed = t.speed.clamp(-7.0, vmax);
     let authority = (t.speed.abs() / 6.0).min(1.0);
     t.heading += t.steer * 2.2 * authority * dt * t.speed.signum();
     t.x += t.heading.sin() * t.speed * dt;
@@ -189,6 +338,15 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32) {
         t.z = t.z.clamp(-ARENA, ARENA);
         t.speed *= 0.4;
     }
+    // Buildings: same shared step on both sides, so driving into one
+    // predicts byte-exact. The truck collides as a circle — close enough
+    // at driving speeds, and capsule-vs-box isn't worth the code here.
+    let (px, pz, nx, nz) = building_push(t.x, t.z, TRUCK_R + 0.3);
+    if nx != 0.0 || nz != 0.0 {
+        t.x = px;
+        t.z = pz;
+        t.speed *= 1.0 - 1.6 * dt; // grinding a wall bleeds speed
+    }
 }
 
 /// Prediction error metric: max caring about position first.
@@ -198,18 +356,15 @@ pub fn err_metric(a: &Truck, b: &Truck) -> f32 {
         + (a.heading - b.heading).abs()
         + (a.speed - b.speed).abs()
         + (a.steer - b.steer).abs()
+        + (a.aim - b.aim).abs()
+        + (a.heat - b.heat).abs()
 }
 
 // --- geometry ---------------------------------------------------------------
 
-/// Wrap an angle difference to the shortest arc in [-pi, pi].
-pub fn wrap_angle(dh: f32) -> f32 {
-    (dh + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
-}
-
-fn lerp_heading(a: f32, b: f32, t: f32) -> f32 {
-    a + wrap_angle(b - a) * t
-}
+// Angle helpers come from the engine; re-exported so the whole example
+// reaches them through `common::*` like the rest of the shared math.
+pub use pm::{lerp_angle, wrap_angle};
 
 /// Interpolate two truck samples (`pm::pool_interp`'s lerp).
 pub fn truck_lerp(a: &Truck, b: &Truck, t: f32) -> Truck {
@@ -217,9 +372,21 @@ pub fn truck_lerp(a: &Truck, b: &Truck, t: f32) -> Truck {
     Truck {
         x: l(a.x, b.x),
         z: l(a.z, b.z),
-        heading: lerp_heading(a.heading, b.heading, t),
+        heading: lerp_angle(a.heading, b.heading, t),
         speed: l(a.speed, b.speed),
         steer: l(a.steer, b.steer),
+        aim: lerp_angle(a.aim, b.aim, t),
+        heat: l(a.heat, b.heat),
+    }
+}
+
+/// Interpolate two bullet samples.
+pub fn bullet_lerp(a: &Bullet, b: &Bullet, t: f32) -> Bullet {
+    let l = |x: f32, y: f32| x + (y - x) * t;
+    Bullet {
+        x: l(a.x, b.x),
+        z: l(a.z, b.z),
+        heading: lerp_angle(a.heading, b.heading, t),
     }
 }
 
@@ -229,7 +396,7 @@ pub fn hog_lerp(a: &Hog, b: &Hog, t: f32) -> Hog {
     Hog {
         x: l(a.x, b.x),
         z: l(a.z, b.z),
-        heading: lerp_heading(a.heading, b.heading, t),
+        heading: lerp_angle(a.heading, b.heading, t),
         speed: l(a.speed, b.speed),
         hp: l(a.hp, b.hp),
     }
@@ -262,17 +429,24 @@ pub fn hog_bites_truck(h: &Hog, t: &Truck) -> bool {
     seg_point_dist(a, b, (h.x, h.z)) < HOG_R + TRUCK_R
 }
 
-/// Hitscan from `(x, z)` along `heading` against hog circles: the
-/// nearest hog whose body the ray crosses within [`GUN_RANGE`], as
-/// `(index into hogs, hit x, hit z)`. Pure — the server calls it with a
-/// REWOUND frame (the shooter's view), which is the whole lag-comp trick.
-pub fn ray_hit_hog(x: f32, z: f32, heading: f32, hogs: &[(Id, Hog)]) -> Option<(usize, f32, f32)> {
+/// Ray from `(x, z)` along `heading` against hog circles: the nearest
+/// hog whose body the ray crosses within `range`, as `(index into hogs,
+/// hit x, hit z)`. The server sweeps each bullet's per-tick travel with
+/// it, against a REWOUND frame (the shooter's view) — which is the whole
+/// lag-comp trick.
+pub fn ray_hit_hog(
+    x: f32,
+    z: f32,
+    heading: f32,
+    range: f32,
+    hogs: &[(Id, Hog)],
+) -> Option<(usize, f32, f32)> {
     let (dx, dz) = (heading.sin(), heading.cos());
     let mut best: Option<(usize, f32)> = None;
     for (k, (_, h)) in hogs.iter().enumerate() {
         let (ox, oz) = (h.x - x, h.z - z);
         let t = ox * dx + oz * dz; // along-ray distance to closest approach
-        if !(0.0..=GUN_RANGE).contains(&t) {
+        if !(0.0..=range).contains(&t) {
             continue;
         }
         let (cx, cz) = (ox - dx * t, oz - dz * t);
@@ -309,8 +483,6 @@ pub fn spawn_truck(peer: u8) -> Truck {
     Truck {
         x: (peer as f32 - 4.5) * 5.0,
         z: -ARENA + 6.0,
-        heading: 0.0,
-        speed: 0.0,
-        steer: 0.0,
+        ..Truck::default()
     }
 }

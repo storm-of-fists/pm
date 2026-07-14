@@ -19,7 +19,12 @@
       "Bash(pkill -f \"hellfire bot\")",
       "Bash(cargo clippy *)",
       "Bash(echo \"clippy-exit: $?\")",
-      "Bash(echo \"doc-exit: $?\")"
+      "Bash(echo \"doc-exit: $?\")",
+      "Bash(echo \"clippy: $?\")",
+      "Bash(timeout 10 ./target/release/hogs)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(pkill -x hogs)",
+      "Bash(cargo fmt *)"
     ]
   }
 }

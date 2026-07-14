@@ -201,7 +201,7 @@ impl CamManager {
         v.panini = !v.panini;
     }
 
-    fn view(&self) -> std::cell::RefMut<'_, CamView> {
+    fn view(&self) -> crate::SingleMut<'_, CamView> {
         self.view
             .as_ref()
             .expect("camera module not installed")
@@ -316,10 +316,7 @@ impl CameraRack<'_> {
 
     /// Make `cam` drive the screen now.
     pub fn show(&mut self, cam: Id) {
-        self.pm
-            .single::<CamManager>("cam.manager")
-            .get()
-            .show(cam);
+        self.pm.single::<CamManager>("cam.manager").get().show(cam);
     }
 }
 

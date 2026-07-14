@@ -13,13 +13,16 @@ use crate::common::*;
 /// doesn't read (draw pools, scoreboard) still exist — registration is
 /// the schema contract; reading is optional.
 pub struct ClientWorld {
-    /// Authoritative replicas.
+    /// Authoritative replicas. Health is server-owned truth read RAW
+    /// (never predicted, never interp'd — a HUD wants the latest word).
     pub hog: PoolHandle<Hog>,
+    pub health: PoolHandle<Health>,
     pub impact: PoolHandle<Impact>,
     /// Smoothed views rendering should read (predicted own truck wins on
-    /// the truck draw pool; hogs are pure interp).
+    /// the truck draw pool; hogs and bullets are pure interp).
     pub truck_draw: PoolHandle<Truck>,
     pub hog_draw: PoolHandle<Hog>,
+    pub bullet_draw: PoolHandle<Bullet>,
     /// The co-op scoreboard (server-owned synced single).
     pub hunt: SingleRx<Hunt>,
     pub input: InputTx<Drive>,
@@ -31,7 +34,9 @@ pub struct ClientWorld {
 /// No connect here — `run` does that once the schema is complete.
 pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     let truck = pm.sync_pool::<Truck>("truck");
+    let health = pm.sync_pool::<Health>("truck.health");
     let hog = pm.sync_pool::<Hog>("hog");
+    let bullet = pm.sync_pool::<Bullet>("bullet");
     let impact = pm.sync_pool::<Impact>("impact");
     let hunt = pm.sync_single::<Hunt>("hunt");
     let input = pm.input::<Drive>("drive");
@@ -50,12 +55,17 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
         .map_or(0.05, |ms| ms / 1000.0);
     let truck_draw = pm.interp_pool(&truck, truck_lerp, interp_delay() as f64, extrap);
     let hog_draw = pm.interp_pool(&hog, hog_lerp, interp_delay() as f64, extrap);
+    // Bullets too: they live ~0.6 s and cross the map in a straight
+    // line — interp (plus the extrapolation cap) is plenty.
+    let bullet_draw = pm.interp_pool(&bullet, bullet_lerp, interp_delay() as f64, extrap);
 
     ClientWorld {
         hog,
+        health,
         impact,
         truck_draw,
         hog_draw,
+        bullet_draw,
         hunt,
         input,
         respawn,
@@ -68,6 +78,11 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
 pub fn run_bot(n: u32) {
     let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
     let w = client_setup(&mut pm);
+
+    // Building-jam recovery state: seconds spent commanding thrust while
+    // not moving, and seconds of back-out left once we give up.
+    let mut jam = 0.0f32;
+    let mut back = 0.0f32;
 
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;
@@ -114,11 +129,32 @@ pub fn run_bot(n: u32) {
             thrust = 0.7;
             fire = 0.0;
         }
+        // Building jam beats even that: commanding thrust while going
+        // nowhere means a wall is eating it — back out turning, then
+        // resume the chase from the new angle.
+        if back > 0.0 {
+            back -= FIXED_DT;
+            thrust = -0.7;
+            turn = 1.0;
+            fire = 0.0;
+        } else {
+            if thrust > 0.2 && me.speed.abs() < 1.0 {
+                jam += FIXED_DT;
+            } else {
+                jam = 0.0;
+            }
+            if jam > 0.8 {
+                jam = 0.0;
+                back = 1.2;
+            }
+        }
         w.input.set(Drive {
             thrust,
             turn,
             fire,
-            bot: 1.0, // AI: steering lags
+            aim: 0.0,   // bots shoot over the hood
+            boost: 0.0, // and drive responsibly
+            bot: 1.0,   // AI: steering lags
         });
     });
 

@@ -84,5 +84,8 @@ fn same_name_registers_idempotently() {
     a.send(Honk { freq: 1 });
     b.send(Honk { freq: 2 });
     deliver(&mut client, &mut server, 5);
-    assert_eq!(rx.drain(), vec![(5, Honk { freq: 1 }), (5, Honk { freq: 2 })]);
+    assert_eq!(
+        rx.drain(),
+        vec![(5, Honk { freq: 1 }), (5, Honk { freq: 2 })]
+    );
 }

@@ -195,6 +195,9 @@ mod tests {
         }
         assert!(!pool.get().contains(a), "expired after ttl ticks");
         assert!(pool.get().contains(b), "writes refreshed b's ttl");
-        assert!(!pm.id_alive(a), "expiry removes the entity, not just the entry");
+        assert!(
+            !pm.id_alive(a),
+            "expiry removes the entity, not just the entry"
+        );
     }
 }

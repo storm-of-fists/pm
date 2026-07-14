@@ -1,8 +1,9 @@
 //! hogs — the replication stress lab: co-op trucks vs a server-driven
-//! horde of biomod feral hogs. Everything drive proved (prediction,
-//! interp, lag comp, TTL facts) pointed at the two things it didn't:
-//! NPC entities at horde scale (the byte budget actually rotates) and
-//! aimed, lag-compensated shooting.
+//! horde of biomod feral hogs, on a big map with buildings to weave
+//! through. Everything drive proved (prediction, interp, lag comp, TTL
+//! facts) pointed at what it didn't: NPC entities at horde scale (the
+//! byte budget actually rotates), a mouse-aimed turret riding the
+//! predicted pod, and lag-compensated projectiles you can see fly.
 //!
 //!   cargo run --release -p hogs           # play: server + 2 bots + you
 //!   cargo run --release -p hogs server    # dedicated server

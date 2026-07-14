@@ -49,7 +49,7 @@ use std::rc::Rc;
 use bytemuck::Pod;
 
 use crate::id::Id;
-use crate::kernel::{PoolHandle, Pm};
+use crate::kernel::{Pm, PoolHandle};
 use crate::paged::PagedArray;
 use crate::pool::Pool;
 use crate::transport::EVENT_USER_BASE;

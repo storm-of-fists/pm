@@ -58,11 +58,10 @@ fn main() {
         let vel = vel.clone();
         move |pm| {
             let dt = pm.loop_dt();
-            vel.get_mut()
-                .each_with(&mut pos.get_mut(), |_, v, mut p| {
-                    p.x += v.x * dt;
-                    p.y += v.y * dt;
-                });
+            vel.get_mut().each_with(&mut pos.get_mut(), |_, v, mut p| {
+                p.x += v.x * dt;
+                p.y += v.y * dt;
+            });
         }
     });
 

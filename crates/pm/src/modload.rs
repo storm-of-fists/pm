@@ -80,20 +80,35 @@ pub fn mod_abi() -> u64 {
 /// see [`build_manifest`] for the parsed form and the `pm_mod_manifest`
 /// export below for how a mod surfaces its own.
 pub const BUILD_MANIFEST: &str = concat!(
-    "rustc=", env!("PM_RUSTC_VERSION"), "\n",
-    "profile=", env!("PM_PROFILE"), "\n",
-    "target=", env!("PM_TARGET"), "\n",
-    "pm=", env!("CARGO_PKG_VERSION"),
+    "rustc=",
+    env!("PM_RUSTC_VERSION"),
+    "\n",
+    "profile=",
+    env!("PM_PROFILE"),
+    "\n",
+    "target=",
+    env!("PM_TARGET"),
+    "\n",
+    "pm=",
+    env!("CARGO_PKG_VERSION"),
 );
 
 /// [`BUILD_MANIFEST`] with a trailing NUL so its pointer is a valid C
 /// string — what crosses the dylib boundary (a `*const c_char` touches
 /// no Rust-layout type, so it's safe to call even from a mismatched mod).
 const BUILD_MANIFEST_NUL: &str = concat!(
-    "rustc=", env!("PM_RUSTC_VERSION"), "\n",
-    "profile=", env!("PM_PROFILE"), "\n",
-    "target=", env!("PM_TARGET"), "\n",
-    "pm=", env!("CARGO_PKG_VERSION"), "\0",
+    "rustc=",
+    env!("PM_RUSTC_VERSION"),
+    "\n",
+    "profile=",
+    env!("PM_PROFILE"),
+    "\n",
+    "target=",
+    env!("PM_TARGET"),
+    "\n",
+    "pm=",
+    env!("CARGO_PKG_VERSION"),
+    "\0",
 );
 
 /// Pointer a mod re-exports as `pm_mod_manifest` (mirroring how it
