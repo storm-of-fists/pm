@@ -475,6 +475,210 @@ impl Mat4 {
     }
 }
 
+// --- orientation & kinematics ------------------------------------------------
+
+/// Unit quaternion — THE orientation representation for anything that
+/// leaves the ground plane. A 2D vehicle's pose is honestly (x, z, yaw);
+/// a 3D one stores a `Quat` (no gimbal lock at nose-straight-up, which
+/// is exactly where a jet lives). Conventions match [`Mat4`]: right-
+/// handed, +Z forward, +Y up; `from_yaw(a)` agrees with `Mat4::rot_y(a)`
+/// and positive pitch tips the nose DOWN (`Mat4::rot_x`), asserted in
+/// tests.
+///
+/// Constrained-attitude vehicles (helis: pitch/roll limits) extract
+/// euler with [`to_yaw_pitch_roll`](Quat::to_yaw_pitch_roll), clamp, and
+/// rebuild with [`from_yaw_pitch_roll`](Quat::from_yaw_pitch_roll) —
+/// stable for |pitch| < 90°. Free-attitude vehicles (jets) skip the
+/// extraction and compose axis rotations directly.
+#[derive(Clone, Copy, PartialEq, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct Quat {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub w: f32,
+}
+
+impl Default for Quat {
+    /// Identity (no rotation) — NOT zeroed; an all-zero quat is not a
+    /// rotation, which is why this impl is manual.
+    fn default() -> Self {
+        Quat::IDENTITY
+    }
+}
+
+impl Quat {
+    pub const IDENTITY: Quat = Quat {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        w: 1.0,
+    };
+
+    /// Rotation of `angle` radians about a UNIT `axis` (right-handed).
+    pub fn from_axis_angle(axis: Vec3, angle: f32) -> Quat {
+        let (s, c) = (angle * 0.5).sin_cos();
+        Quat {
+            x: axis.x * s,
+            y: axis.y * s,
+            z: axis.z * s,
+            w: c,
+        }
+    }
+
+    /// Yaw about +Y — the 2D heading, as a quat.
+    pub fn from_yaw(yaw: f32) -> Quat {
+        Quat::from_axis_angle(Vec3::UP, yaw)
+    }
+
+    /// Compose yaw (about Y), then pitch (about X, + = nose down), then
+    /// roll (about Z) — the constrained-vehicle attitude constructor.
+    pub fn from_yaw_pitch_roll(yaw: f32, pitch: f32, roll: f32) -> Quat {
+        Quat::from_yaw(yaw)
+            * Quat::from_axis_angle(vec3(1.0, 0.0, 0.0), pitch)
+            * Quat::from_axis_angle(vec3(0.0, 0.0, 1.0), roll)
+    }
+
+    /// The inverse extraction of [`from_yaw_pitch_roll`](Self::from_yaw_pitch_roll)
+    /// (round-trips for |pitch| < 90°).
+    pub fn to_yaw_pitch_roll(self) -> (f32, f32, f32) {
+        let (x, y, z, w) = (self.x, self.y, self.z, self.w);
+        // Matrix elements of the YXZ composition (see to_mat4).
+        let m9 = 2.0 * (y * z - w * x);
+        let m8 = 2.0 * (x * z + w * y);
+        let m10 = 1.0 - 2.0 * (x * x + y * y);
+        let m1 = 2.0 * (x * y + w * z);
+        let m5 = 1.0 - 2.0 * (x * x + z * z);
+        (
+            m8.atan2(m10),
+            (-m9).clamp(-1.0, 1.0).asin(),
+            m1.atan2(m5),
+        )
+    }
+
+    pub fn dot(self, o: Quat) -> f32 {
+        self.x * o.x + self.y * o.y + self.z * o.z + self.w * o.w
+    }
+
+    /// Renormalize — call after long chains of composition/interpolation
+    /// so drift never accumulates (steps that write `rot` every tick do).
+    pub fn norm(self) -> Quat {
+        let l = self.dot(self).sqrt();
+        if l > 1e-6 {
+            Quat {
+                x: self.x / l,
+                y: self.y / l,
+                z: self.z / l,
+                w: self.w / l,
+            }
+        } else {
+            Quat::IDENTITY
+        }
+    }
+
+    /// Rotate a vector: `q * v * q⁻¹`, in the cheap two-cross form.
+    pub fn rotate(self, v: Vec3) -> Vec3 {
+        let u = vec3(self.x, self.y, self.z);
+        let t = u.cross(v) * 2.0;
+        v + t * self.w + u.cross(t)
+    }
+
+    /// Normalized lerp along the SHORT arc — the pool-interp / attitude-
+    /// easing workhorse (slerp's constant angular velocity isn't worth
+    /// its cost at snapshot-interval deltas; if a use case ever shows
+    /// visible nlerp speed-warp, add slerp then).
+    pub fn nlerp(a: Quat, b: Quat, t: f32) -> Quat {
+        let s = if a.dot(b) < 0.0 { -1.0 } else { 1.0 };
+        Quat {
+            x: a.x + (b.x * s - a.x) * t,
+            y: a.y + (b.y * s - a.y) * t,
+            z: a.z + (b.z * s - a.z) * t,
+            w: a.w + (b.w * s - a.w) * t,
+        }
+        .norm()
+    }
+
+    /// The equivalent rotation matrix (column-major, matches `Mat4`).
+    pub fn to_mat4(self) -> Mat4 {
+        let (x, y, z, w) = (self.x, self.y, self.z, self.w);
+        Mat4([
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y + w * z),
+            2.0 * (x * z - w * y),
+            0.0,
+            2.0 * (x * y - w * z),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z + w * x),
+            0.0,
+            2.0 * (x * z + w * y),
+            2.0 * (y * z - w * x),
+            1.0 - 2.0 * (x * x + y * y),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ])
+    }
+}
+
+impl Mul for Quat {
+    type Output = Quat;
+    /// Hamilton product: `a * b` applies `b` first, then `a` — same
+    /// composition order as `Mat4`.
+    fn mul(self, o: Quat) -> Quat {
+        Quat {
+            x: self.w * o.x + self.x * o.w + self.y * o.z - self.z * o.y,
+            y: self.w * o.y - self.x * o.z + self.y * o.w + self.z * o.x,
+            z: self.w * o.z + self.x * o.y - self.y * o.x + self.z * o.w,
+            w: self.w * o.w - self.x * o.x - self.y * o.y - self.z * o.z,
+        }
+    }
+}
+
+/// Rigid-body kinematic state: position, velocity, orientation — the
+/// shared chunk every vehicle pod EMBEDS (composition, deliberately not
+/// a separate pool: the predicted-pod contract needs pose and velocity
+/// inside the pod its step evolves). Step functions map input to forces
+/// and rates, mutate `vel`/`rot`, then [`integrate`](Body::integrate);
+/// rendering takes [`model`](Body::model). This is the seam a future
+/// physics layer grows behind — angular velocity joins when a vehicle
+/// (jets) actually integrates it.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct Body {
+    pub pos: Vec3,
+    pub vel: Vec3,
+    pub rot: Quat,
+}
+
+impl Body {
+    /// Forward (+Z through `rot`) — a 2D `heading`'s (sin, 0, cos)
+    /// when `rot` is pure yaw.
+    pub fn fwd(self) -> Vec3 {
+        self.rot.rotate(vec3(0.0, 0.0, 1.0))
+    }
+
+    pub fn up(self) -> Vec3 {
+        self.rot.rotate(Vec3::UP)
+    }
+
+    /// The 2D heading most gameplay wants (AI bearings, spawn facing).
+    pub fn yaw(self) -> f32 {
+        self.rot.to_yaw_pitch_roll().0
+    }
+
+    /// Advance position by velocity.
+    pub fn integrate(&mut self, dt: f32) {
+        self.pos = self.pos + self.vel * dt;
+    }
+
+    /// Model matrix: rotate, then place.
+    pub fn model(self) -> Mat4 {
+        Mat4::translate(self.pos) * self.rot.to_mat4()
+    }
+}
+
 #[cfg(test)]
 mod tests3d {
     use super::*;
@@ -497,6 +701,81 @@ mod tests3d {
         let m = Mat4::translate(vec3(5.0, 0.0, 0.0)).mul(Mat4::scale(2.0));
         // Scale first, then translate.
         assert_eq!(m.transform_point(vec3(1.0, 0.0, 0.0)), vec3(7.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn quat_matches_mat4_conventions() {
+        // from_yaw ≡ rot_y, pitch ≡ rot_x, roll ≡ rot_axis(Z) — the whole
+        // point: quats and matrices must agree on every convention.
+        for a in [-2.1f32, -0.4, 0.0, 0.7, 3.0] {
+            for (q, m) in [
+                (Quat::from_yaw(a), Mat4::rot_y(a)),
+                (
+                    Quat::from_axis_angle(vec3(1.0, 0.0, 0.0), a),
+                    Mat4::rot_x(a),
+                ),
+                (
+                    Quat::from_axis_angle(vec3(0.0, 0.0, 1.0), a),
+                    Mat4::rot_axis(vec3(0.0, 0.0, 1.0), a),
+                ),
+            ] {
+                for i in 0..16 {
+                    assert!((q.to_mat4().0[i] - m.0[i]).abs() < 1e-5);
+                }
+            }
+        }
+        // rotate() agrees with the matrix path.
+        let q = Quat::from_yaw_pitch_roll(1.1, 0.4, -0.3);
+        let v = vec3(0.3, -1.2, 2.0);
+        assert!(q.rotate(v).dist(q.to_mat4().transform_dir(v)) < 1e-5);
+        // Positive pitch tips the nose down, like rot_x.
+        let f = Quat::from_yaw_pitch_roll(0.0, 0.5, 0.0).rotate(vec3(0.0, 0.0, 1.0));
+        assert!(f.y < 0.0);
+    }
+
+    #[test]
+    fn quat_ypr_round_trips() {
+        for &(y, p, r) in &[
+            (0.0f32, 0.0f32, 0.0f32),
+            (1.2, 0.4, -0.3),
+            (-2.8, -0.44, 0.34),
+            (3.0, 0.0, 0.0),
+        ] {
+            let (y2, p2, r2) = Quat::from_yaw_pitch_roll(y, p, r).to_yaw_pitch_roll();
+            assert!((y - y2).abs() < 1e-4, "yaw {y} -> {y2}");
+            assert!((p - p2).abs() < 1e-4, "pitch {p} -> {p2}");
+            assert!((r - r2).abs() < 1e-4, "roll {r} -> {r2}");
+        }
+    }
+
+    #[test]
+    fn quat_nlerp_short_arc() {
+        // ±q is the same rotation; nlerp must interpolate the short way
+        // even when the signs disagree (the pool-interp wrap case).
+        let a = Quat::from_yaw(3.0);
+        let b = Quat::from_yaw(-3.0); // ~0.28 rad away through ±pi
+        let mid = Quat::nlerp(a, Quat { x: -b.x, y: -b.y, z: -b.z, w: -b.w }, 0.5);
+        let (yaw, _, _) = mid.to_yaw_pitch_roll();
+        assert!(yaw.abs() > 3.0 || yaw.abs() > 3.0 - 1e-3); // near ±pi, not 0
+        assert!((mid.dot(mid) - 1.0).abs() < 1e-5); // unit after lerp
+    }
+
+    #[test]
+    fn body_basics() {
+        let mut b = Body {
+            vel: vec3(0.0, 0.0, 10.0),
+            ..Body::default()
+        };
+        assert_eq!(b.rot, Quat::IDENTITY); // Default = identity, not zero
+        assert!(b.fwd().dist(vec3(0.0, 0.0, 1.0)) < 1e-6);
+        b.integrate(0.5);
+        assert!(b.pos.dist(vec3(0.0, 0.0, 5.0)) < 1e-6);
+        b.rot = Quat::from_yaw(std::f32::consts::FRAC_PI_2);
+        assert!((b.yaw() - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!(b.fwd().dist(vec3(1.0, 0.0, 0.0)) < 1e-5);
+        // model() places after rotating.
+        let p = b.model().transform_point(vec3(0.0, 0.0, 1.0));
+        assert!(p.dist(vec3(1.0, 0.0, 5.0)) < 1e-5);
     }
 
     #[test]

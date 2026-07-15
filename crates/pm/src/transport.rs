@@ -199,12 +199,35 @@ fn transport_config() -> Arc<TransportConfig> {
     // entities don't linger server-side.
     tc.keep_alive_interval(Some(Duration::from_secs(2)));
     tc.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(5)).unwrap()));
+    // Snapshots are STATE, not a stream: a newer one supersedes anything
+    // still queued, so the datagram send buffer holds a handful of
+    // packets (send(.., drop=true) evicts the oldest), never seconds of
+    // backlog. quinn's 1 MiB default held ~14 s of snapshots — a
+    // congestion-throttled link served clients ever-staler state and
+    // lag-comp rewinds starved (the acked-starvation bug, 2026-07-15).
+    tc.datagram_send_buffer_size(16 * 1024);
+    // BBR instead of the default Cubic: loss-based congestion control
+    // reads random link loss as congestion and collapses the window,
+    // throttling 60 Hz snapshots to ~half rate at PM_LOSS=0.02. BBR
+    // models bandwidth/RTT instead and shrugs off random loss.
+    tc.congestion_controller_factory(Arc::new(quinn_proto::congestion::BbrConfig::default()));
     Arc::new(tc)
 }
 
 /// UDP socket with an optional simulated link: one-way delay and packet
 /// loss applied in both directions. QUIC sees the conditions as real —
 /// RTT estimates rise, retransmits and redundancy actually earn their keep.
+//
+// FIXME(lag-sim, found 2026-07-15): under PM_LAG_MS=40 the client's
+// acked_tick advances at ~HALF rate and the gap grows without bound
+// (client applies ~170 of 300 snapshots per 5 s; rtt_ms reads ~217 ms on
+// an ~85 ms link) — so lag-comp rewinds clamp to the history ring's
+// oldest frame and hit tests judge second-stale state (hogs: zero kills
+// under lag, fine on a clean link). Predates the 07-14/15 work (bisected
+// to 5c9d37a). The delivery loop below drains all DUE packets per pump
+// (checked); suspects are quinn pacing against the once-per-tick pump
+// under inflated RTT, and these queues only moving on pump/recv. Every
+// latency-dependent test is invalid until this is diagnosed.
 struct LagSocket {
     socket: UdpSocket,
     delay: Duration,
@@ -570,6 +593,16 @@ impl QuicServer {
         d.push(DGRAM_SNAPSHOT);
         d.extend_from_slice(snapshot);
         let _ = st.conn.datagrams().send(d.into(), true);
+    }
+
+    /// Remaining space in `peer`'s outgoing datagram buffer — the net
+    /// doctor's backlog gauge (a shrinking value means snapshots are
+    /// queueing behind pacing/congestion instead of hitting the wire).
+    pub fn dgram_space(&mut self, peer: u8) -> usize {
+        self.peer_conns
+            .get(&peer)
+            .and_then(|ch| self.conns.get_mut(ch))
+            .map_or(0, |st| st.conn.datagrams().send_buffer_space())
     }
 }
 

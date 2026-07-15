@@ -30,15 +30,32 @@ struct HogBrain {
     /// Where this hog is roaming to, and seconds until it picks anew.
     goal: (f32, f32),
     repick: f32,
+    /// Knockback velocity from bullet hits — SERVER-OWNED impulse
+    /// physics (physics layer 2): hogs are interp'd, never predicted,
+    /// so this needs no determinism/replay story, just tick budget. It
+    /// reaches clients through the hog's replicated position like any
+    /// other movement.
+    shove: (f32, f32),
 }
 
-/// Server-local per-bullet state: who fired it (that peer's latency is
-/// what each hit test rewinds by — `id.peer()` would be the recycling
-/// owner, not the shooter) and how much travel is left.
+/// Bullet-hit knockback speed (u/s) and its decay rate (1/s).
+const KNOCK: f32 = 9.0;
+const KNOCK_DECAY: f32 = 6.0;
+
+/// Server-local per-bullet state: how much travel is left, and the
+/// shooter-timeline tick the NEXT hit test rewinds to. The view is
+/// captured ONCE at fire (the shooter's `acked − interp_ticks` — what
+/// they saw when they pulled the trigger) and advanced by exactly one
+/// per flight tick. Re-reading `acked_tick` every tick let ack
+/// burstiness (acks arrive 0..3 per tick under real lag) make the
+/// tested frame JUMP, and a charging hog could skip the one-tick sweep
+/// window entirely — zero kills under 40 ms lag until this. A steady
+/// timeline is also the honest semantics: the bullet flies through the
+/// world its shooter was watching.
 #[derive(Clone, Copy, Default)]
 struct Shot {
-    peer: u8,
     left: f32,
+    view: u32,
 }
 
 /// A roam destination: anywhere in the arena that isn't inside a
@@ -60,6 +77,7 @@ pub fn run(quiet: bool) {
     // client-side), impact markers (TTL'd transient facts). Plus the
     // co-op scoreboard as a synced single.
     let truck = pm.sync_pool::<Truck>("truck");
+    let heli = pm.sync_pool::<Heli>("heli");
     let health = pm.sync_pool::<Health>("truck.health");
     let hog = pm.wire_pool::<Hog>("hog");
     let bullet = pm.wire_pool::<Bullet>("bullet");
@@ -104,20 +122,29 @@ pub fn run(quiet: bool) {
         }
     });
 
-    // Respawn events: flip the sender's truck back to its spawn slot,
-    // vitals included. (`respawns` isn't in the capture list: not a
-    // shared handle, just moved in like any other closure state.)
-    task!(pm, "respawn", 11.0, [truck, health, net], move |_pm| {
-        for (peer, _) in respawns.drain() {
-            let Some(id) = net.own(peer) else {
+    // Respawn events: back to your spawn slot as the CHOSEN vehicle.
+    // A vehicle swap must be a FRESH ENTITY: replication has no "entry
+    // left this pool" message (snapshots are upserts plus ENTITY
+    // removals), so pulling a live id out of the truck pool would ghost
+    // that truck on every client forever. An entity IS its pool
+    // membership — swap the entity, and the removal log plus the
+    // ownership table tell every client the whole story. (`respawns`
+    // isn't in the capture list: not a shared handle, just moved in.)
+    task!(pm, "respawn", 11.0, [truck, heli, health, gun, net], move |pm| {
+        for (peer, ev) in respawns.drain() {
+            let Some(old) = net.own(peer) else {
                 continue;
             };
-            if let Some(mut t) = truck.get_id_mut(id) {
-                *t = spawn_truck(peer);
+            pm.id_remove(old); // truck/heli + health + gun entries go with it
+            let id = pm.id_add();
+            if ev.vehicle == VEH_HELI {
+                heli.get_mut().add(id, spawn_heli(peer));
+            } else {
+                truck.get_mut().add(id, spawn_truck(peer));
             }
-            if let Some(mut v) = health.get_id_mut(id) {
-                v.hp = TRUCK_HP;
-            }
+            health.get_mut().add(id, Health { hp: TRUCK_HP });
+            gun.get_mut().add(id, 0.0);
+            net.own_set(peer, id);
         }
     });
 
@@ -130,11 +157,24 @@ pub fn run(quiet: bool) {
         pm,
         "hog_ai",
         28.0,
-        [hog, brain, truck, health, impact, hunt],
+        [hog, brain, truck, heli, health, impact, hunt],
         move |pm| {
             let now = pm.tick() as f32 * FIXED_DT;
             let mut rng = Rng::new(pm.tick().wrapping_mul(0x51D7_ACE5) | 1);
-            let trucks: Vec<(Id, Truck)> = truck.get().iter().map(|(id, t)| (id, *t)).collect();
+            // Everything a hog can chase and bite: trucks always, helis
+            // only while they hover inside leaping range — climb and the
+            // horde loses you (that's the heli's whole trade).
+            let targets: Vec<(Id, f32, f32, bool)> = truck
+                .get()
+                .iter()
+                .map(|(id, t)| (id, t.body.pos.x, t.body.pos.z, false))
+                .chain(
+                    heli.get()
+                        .iter()
+                        .filter(|(_, hl)| hl.body.pos.y < HOG_LEAP)
+                        .map(|(id, hl)| (id, hl.body.pos.x, hl.body.pos.z, true)),
+                )
+                .collect();
             let mut hogs = hog.get_mut();
             let mut brains = brain.get_mut();
             // each_with is the hog<->brain join; bite consequences apply
@@ -145,18 +185,22 @@ pub fn run(quiet: bool) {
                 b.bite_cd = (b.bite_cd - FIXED_DT).max(0.0);
                 b.flee = (b.flee - FIXED_DT).max(0.0);
 
-                let nearest = trucks
+                let nearest = targets
                     .iter()
-                    .map(|&(tid, t)| {
-                        let (dx, dz) = (t.x - h.x, t.z - h.z);
-                        (tid, t, (dx * dx + dz * dz).sqrt())
+                    .map(|&(tid, tx, tz, fly)| {
+                        let (dx, dz) = (tx - h.x, tz - h.z);
+                        (tid, (tx, tz, fly), (dx * dx + dz * dz).sqrt())
                     })
                     .min_by(|a, b| a.2.total_cmp(&b.2));
 
                 // Pick a desired heading and speed.
                 let (desired, target_speed) = match nearest {
-                    Some((_, t, _)) if b.flee > 0.0 => ((h.x - t.x).atan2(h.z - t.z), HOG_FAST),
-                    Some((_, t, d)) if d < HOG_AGGRO => ((t.x - h.x).atan2(t.z - h.z), HOG_FAST),
+                    Some((_, (tx, tz, _), _)) if b.flee > 0.0 => {
+                        ((h.x - tx).atan2(h.z - tz), HOG_FAST)
+                    }
+                    Some((_, (tx, tz, _), d)) if d < HOG_AGGRO => {
+                        ((tx - h.x).atan2(tz - h.z), HOG_FAST)
+                    }
                     // Roaming: walk to a goal point, pick a fresh one
                     // on arrival or timeout — the horde spreads over
                     // the whole map instead of milling in place. The
@@ -179,6 +223,18 @@ pub fn run(quiet: bool) {
                 h.speed += (target_speed - h.speed) * (3.0 * FIXED_DT).min(1.0);
                 h.x += h.heading.sin() * h.speed * FIXED_DT;
                 h.z += h.heading.cos() * h.speed * FIXED_DT;
+                // Knockback rides on top of locomotion and decays fast —
+                // a hit visibly staggers the hog without stun-locking it.
+                if b.shove.0 != 0.0 || b.shove.1 != 0.0 {
+                    h.x += b.shove.0 * FIXED_DT;
+                    h.z += b.shove.1 * FIXED_DT;
+                    let k = 1.0 - (KNOCK_DECAY * FIXED_DT).min(1.0);
+                    b.shove.0 *= k;
+                    b.shove.1 *= k;
+                    if b.shove.0 * b.shove.0 + b.shove.1 * b.shove.1 < 0.05 {
+                        b.shove = (0.0, 0.0);
+                    }
+                }
                 // Walls: clamp and head back toward the middle.
                 if h.x.abs() > ARENA || h.z.abs() > ARENA {
                     h.x = h.x.clamp(-ARENA, ARENA);
@@ -203,19 +259,29 @@ pub fn run(quiet: bool) {
                     }
                 }
 
-                // Bite: contact with any truck while off cooldown.
-                if b.bite_cd <= 0.0
-                    && let Some((tid, t, _)) = nearest
-                    && hog_bites_truck(&h, &t)
-                {
+                // Bite: contact with the nearest target while off
+                // cooldown — trucks as capsules, low helis as circles.
+                let bites = b.bite_cd <= 0.0
+                    && nearest.is_some_and(|(tid, (tx, tz, fly), _)| {
+                        if fly {
+                            let (dx, dz) = (tx - h.x, tz - h.z);
+                            dx * dx + dz * dz < (HOG_R + HELI_R) * (HOG_R + HELI_R)
+                        } else {
+                            truck.get_id(tid).is_some_and(|t| hog_bites_truck(&h, &t))
+                        }
+                    });
+                if bites {
+                    let (tid, (_, _, fly), _) = nearest.unwrap();
                     b.bite_cd = BITE_CD;
                     b.flee = HOG_FLEE;
-                    if let Some(mut tr) = truck.get_id_mut(tid) {
+                    if !fly && let Some(mut tr) = truck.get_id_mut(tid) {
                         // The hit you feel — but not a pin: turn
                         // authority scales with speed, so scrubbing
                         // too hard leaves a swarmed truck unable to
-                        // steer out at all.
-                        tr.speed *= 0.65;
+                        // steer out at all. (Speed lives in the body's
+                        // velocity now; scrubbing the vector is the
+                        // same scrub.)
+                        tr.body.vel = tr.body.vel * 0.65;
                     }
                     if let Some(mut v) = health.get_id_mut(tid) {
                         // Chip the truck; the drive task turns hp 0
@@ -247,49 +313,91 @@ pub fn run(quiet: bool) {
         pm,
         "drive",
         30.0,
-        [truck, health, bullet, gun, shot, impact, hunt, net],
+        [truck, heli, health, bullet, gun, shot, impact, hunt, net],
         move |pm| {
             for (peer, id) in net.owned() {
                 let cmd = inputs.pop(peer);
-                let Some(shooter) = truck.get_id_mut(id).map(|mut t| {
-                    truck_step(&mut t, cmd, FIXED_DT);
-                    *t
-                }) else {
+
+                // Step whichever vehicle pool holds the avatar; each
+                // branch resolves to the muzzle pose (position, yaw,
+                // climb) or `continue`s on death. Death is authoritative
+                // state, never predicted: bitten to 0 hp (both), or
+                // boosted to 1.0 heat (trucks). Fresh vehicle at the
+                // spawn slot; prediction snaps the owner home.
+                let (mx, my, mz, dir, climb) = if let Some(shooter) =
+                    truck.get_id_mut(id).map(|mut t| {
+                        truck_step(&mut t, cmd, FIXED_DT);
+                        *t
+                    }) {
+                    let (x, z) = (shooter.body.pos.x, shooter.body.pos.z);
+                    let dead =
+                        shooter.heat >= 1.0 || health.get_id(id).is_some_and(|v| v.hp <= 0.0);
+                    if dead {
+                        if let Some(mut t) = truck.get_id_mut(id) {
+                            *t = spawn_truck(peer);
+                        }
+                        if let Some(mut v) = health.get_id_mut(id) {
+                            v.hp = TRUCK_HP;
+                        }
+                        let mut sb = hunt.get_mut();
+                        sb.points = (sb.points - DEATH_COST).max(0.0);
+                        drop(sb);
+                        let mid = pm.id_add();
+                        impact.get_mut().add(mid, Impact { x, z, kind: IMPACT_BOOM });
+                        if !quiet {
+                            eprintln!("[server] peer {peer} exploded at ({x:.1},{z:.1})");
+                        }
+                        continue;
+                    }
+                    // Turret muzzle at the barrel tip: flat shot.
+                    let dir = shooter.heading() + shooter.aim;
+                    (x + dir.sin() * 1.9, 1.45, z + dir.cos() * 1.9, dir, 0.0)
+                } else if let Some(shooter) = heli.get_id_mut(id).map(|mut hl| {
+                    heli_step(&mut hl, cmd, FIXED_DT);
+                    *hl
+                }) {
+                    let b = shooter.body;
+                    if health.get_id(id).is_some_and(|v| v.hp <= 0.0) {
+                        if let Some(mut hl) = heli.get_id_mut(id) {
+                            *hl = spawn_heli(peer);
+                        }
+                        if let Some(mut v) = health.get_id_mut(id) {
+                            v.hp = TRUCK_HP;
+                        }
+                        let mut sb = hunt.get_mut();
+                        sb.points = (sb.points - DEATH_COST).max(0.0);
+                        drop(sb);
+                        let mid = pm.id_add();
+                        impact.get_mut().add(
+                            mid,
+                            Impact {
+                                x: b.pos.x,
+                                z: b.pos.z,
+                                kind: IMPACT_BOOM,
+                            },
+                        );
+                        if !quiet {
+                            eprintln!(
+                                "[server] peer {peer} downed at ({:.1},{:.1})",
+                                b.pos.x, b.pos.z
+                            );
+                        }
+                        continue;
+                    }
+                    // Nose gun fires where the nose points — dive to
+                    // strafe the horde. Body pitch>0 = nose down, so the
+                    // bullet's climb is its negation.
+                    let (yaw, pitch, _) = b.rot.to_yaw_pitch_roll();
+                    (
+                        b.pos.x + yaw.sin() * 2.3,
+                        (b.pos.y - 0.35).max(0.2),
+                        b.pos.z + yaw.cos() * 2.3,
+                        yaw,
+                        -pitch,
+                    )
+                } else {
                     continue;
                 };
-
-                // Death: bitten to 0 hp, or boosted to 1.0 heat. Clients
-                // predict the heat climbing but never the boom — that's
-                // authoritative state, like all damage. Fresh truck at
-                // the spawn slot; prediction snaps the owner home.
-                let dead = shooter.heat >= 1.0 || health.get_id(id).is_some_and(|v| v.hp <= 0.0);
-                if dead {
-                    if let Some(mut t) = truck.get_id_mut(id) {
-                        *t = spawn_truck(peer);
-                    }
-                    if let Some(mut v) = health.get_id_mut(id) {
-                        v.hp = TRUCK_HP;
-                    }
-                    let mut sb = hunt.get_mut();
-                    sb.points = (sb.points - DEATH_COST).max(0.0);
-                    drop(sb);
-                    let mid = pm.id_add();
-                    impact.get_mut().add(
-                        mid,
-                        Impact {
-                            x: shooter.x,
-                            z: shooter.z,
-                            kind: IMPACT_BOOM,
-                        },
-                    );
-                    if !quiet {
-                        eprintln!(
-                            "[server] peer {peer} exploded at ({:.1},{:.1})",
-                            shooter.x, shooter.z
-                        );
-                    }
-                    continue;
-                }
 
                 let ready = gun.get_id_mut(id).is_some_and(|mut g| {
                     *g = (*g - FIXED_DT).max(0.0);
@@ -303,24 +411,32 @@ pub fn run(quiet: bool) {
                     continue;
                 }
 
-                // Muzzle at the barrel tip, along the turret direction.
-                let dir = shooter.heading + shooter.aim;
                 let bid = pm.id_add();
                 bullet.get_mut().add(
                     bid,
                     Bullet {
-                        x: shooter.x + dir.sin() * 1.9,
-                        z: shooter.z + dir.cos() * 1.9,
+                        x: mx,
+                        y: my,
+                        z: mz,
                         // heading + aim can exceed ±pi; wrap for the
                         // quantized wire repr (saturates past ±3.27 rad).
                         heading: wrap_angle(dir),
+                        pitch: wrap_angle(climb),
                     },
                 );
                 shot.get_mut().add(
                     bid,
                     Shot {
-                        peer,
                         left: GUN_RANGE,
+                        // The shooter's view when the trigger pulled —
+                        // this bullet's whole flight is judged along the
+                        // timeline that starts here (see Shot). The
+                        // anchor is the FIRE INPUT's arrival-time ack
+                        // (`InputRx::view`), not `net.acked_tick` at
+                        // consumption — the queue makes the latter run
+                        // a few ticks fresh, which is a clean miss on a
+                        // charging hog.
+                        view: inputs.view(peer).saturating_sub(interp_ticks()),
                     },
                 );
             }
@@ -337,9 +453,8 @@ pub fn run(quiet: bool) {
         pm,
         "bullets",
         31.0,
-        [bullet, shot, hog, impact, hunt, net],
+        [bullet, shot, hog, brain, impact, hunt, net],
         move |pm| {
-            let iticks = interp_ticks();
             let step = BULLET_SPEED * FIXED_DT;
             let mut bullets = bullet.get_mut();
             let mut shots = shot.get_mut();
@@ -347,9 +462,23 @@ pub fn run(quiet: bool) {
             // DEFERRED (kernel flushes at end of tick, so the join isn't
             // invalidated) and hogs/impacts/hunt are other pools.
             bullets.each_with(&mut shots, |id, mut b, mut s| {
-                let view = net.acked_tick(s.peer).saturating_sub(iticks);
+                // One steady tick along the shooter's timeline per
+                // flight tick — never re-read from acked (bursty).
+                s.view = s.view.saturating_add(1);
+                let view = s.view;
+                // 3D flight: the climb angle splits the tick's travel
+                // into a ground-plane sweep (the existing 2D ray) and a
+                // vertical component; a hit only counts if the shot's
+                // altitude at the hit point is inside the hog's band.
+                let hstep = b.pitch.cos() * step;
+                let dy = b.pitch.sin() * step;
                 let hit = hist.frame(view).and_then(|f| {
-                    ray_hit_hog(b.x, b.z, b.heading, step, &f).map(|(k, hx, hz)| (f[k].0, hx, hz))
+                    ray_hit_hog(b.x, b.z, b.heading, hstep, &f).and_then(|(k, hx, hz)| {
+                        let (ox, oz) = (hx - b.x, hz - b.z);
+                        let frac = (ox * ox + oz * oz).sqrt() / hstep.max(1e-6);
+                        let yh = b.y + dy * frac;
+                        (0.0..=HOG_H).contains(&yh).then(|| (f[k].0, hx, hz))
+                    })
                 });
                 if let Some((hid, hx, hz)) = hit {
                     pm.id_remove(id); // shot entry goes with it
@@ -364,6 +493,11 @@ pub fn run(quiet: bool) {
                         }
                         _ => return,
                     };
+                    // Survivors stagger away from the shot (the ragdoll
+                    // for the dead is client-side; see player_client).
+                    if !killed && let Some(mut br) = brain.get_id_mut(hid) {
+                        br.shove = (b.heading.sin() * KNOCK, b.heading.cos() * KNOCK);
+                    }
                     if killed {
                         pm.id_remove(hid); // brain entry goes with it
                         hunt.get_mut().points += KILL_POINTS;
@@ -382,12 +516,14 @@ pub fn run(quiet: bool) {
                     );
                     return;
                 }
-                b.x += b.heading.sin() * step;
-                b.z += b.heading.cos() * step;
+                b.x += b.heading.sin() * hstep;
+                b.z += b.heading.cos() * hstep;
+                b.y += dy;
                 s.left -= step;
-                if in_building(b.x, b.z, 0.0) {
-                    // Wall hits flash too — with real tracers, seeing
-                    // WHERE the shot died is most of the feedback.
+                if b.y <= 0.0 || (b.y < building_top(b.x, b.z) && in_building(b.x, b.z, 0.0)) {
+                    // Dirt and wall hits flash too — with real tracers,
+                    // seeing WHERE the shot died is most of the feedback.
+                    // Above the roofline the shot overflies the block.
                     pm.id_remove(id);
                     let mid = pm.id_add();
                     impact.get_mut().add(
@@ -398,7 +534,8 @@ pub fn run(quiet: bool) {
                             kind: IMPACT_HIT,
                         },
                     );
-                } else if s.left <= 0.0 || b.x.abs() > ARENA || b.z.abs() > ARENA {
+                } else if s.left <= 0.0 || b.x.abs() > ARENA || b.z.abs() > ARENA || b.y > HELI_CEIL
+                {
                     pm.id_remove(id);
                 }
             });
@@ -462,18 +599,19 @@ pub fn run(quiet: bool) {
             "status",
             90.0,
             5.0,
-            [hog, truck, bullet, impact, hunt],
+            [hog, truck, heli, bullet, impact, hunt],
             move |pm| {
                 let sb = hunt.get();
                 // impacts churning 0..few proves the TTL; alive falling
                 // proves shots land through the rewound frames; bullets
                 // churning proves entity add/remove replicates at pace.
                 eprintln!(
-                    "[server] t={} wave={} hogs={} trucks={} pts={:.0} impacts={} bullets={}",
+                    "[server] t={} wave={} hogs={} trucks={} helis={} pts={:.0} impacts={} bullets={}",
                     pm.tick() / 60,
                     sb.wave,
                     hog.get().len(),
                     truck.get().len(),
+                    heli.get().len(),
                     sb.points,
                     impact.get().len(),
                     bullet.get().len(),

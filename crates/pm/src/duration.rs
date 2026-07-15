@@ -109,7 +109,33 @@ impl<T> HistoryRing<T> {
     /// The frame recorded at `tick`, clamped to the window: older than the
     /// window serves the oldest frame, newer than the newest serves the
     /// newest. `None` only before anything was pushed.
+    ///
+    /// The clamp is silent by design (bounded rewind) — but a rewind
+    /// falling off the back of the window means the caller is judging
+    /// against state older than the whole ring, which is how the
+    /// acked-starvation bug hid for weeks. `PM_NETDBG=1` makes it loud.
     pub fn frame(&self, tick: u32) -> Option<&[(Id, T)]> {
+        if crate::netmod::netdbg()
+            && let Some(&(oldest, _)) = self.frames.front()
+            && tick < oldest
+        {
+            // Rate-limited: under full starvation this fires per bullet
+            // per tick.
+            thread_local! {
+                static NTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            let n = NTH.with(|c| {
+                let n = c.get();
+                c.set(n.wrapping_add(1));
+                n
+            });
+            if n % 64 == 0 {
+                eprintln!(
+                    "[netdbg hist] rewind to {tick} clamped to window start {oldest} ({} ticks past the back; {n} clamps so far)",
+                    oldest - tick
+                );
+            }
+        }
         // partition_point = binary search for the first frame with a label
         // PAST tick; the one before it is the newest frame at-or-before.
         let at = self.frames.partition_point(|&(t, _)| t <= tick);

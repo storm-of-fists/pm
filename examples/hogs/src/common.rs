@@ -4,7 +4,7 @@
 //! never step them, only interpolate — so `hog` state has no client-side
 //! step function at all, just a lerp.
 
-use pm::Id;
+use pm::{Body, Id, Quat, vec3};
 
 pub const ADDR: &str = "127.0.0.1:48223";
 /// Fixed simulation step on both sides (prediction replays it).
@@ -48,18 +48,18 @@ pub const WAVE_GROW: u32 = 15;
 // --- replicated pods -----------------------------------------------------
 
 /// Replicated truck state — the PREDICTED substate only, same discipline
-/// as drive's Car: every field is something `truck_step` evolves. Ground
-/// plane: heading 0 faces +z, forward = (sin h, cos h) on (x, z).
+/// as drive's Car: every field is something `truck_step` evolves. The
+/// kinematic chunk is the shared [`pm::Body`] (embedded, per the
+/// predicted-pod contract — pose and velocity must live in the pod the
+/// step evolves): a truck is `Body` with the ground-vehicle constraints
+/// (pos.y = 0, rot pure yaw, vel along forward) applied by its step.
 #[pm::pod]
 pub struct Truck {
-    pub x: f32,
-    pub z: f32,
-    pub heading: f32,
-    pub speed: f32,
+    pub body: Body,
     /// Filtered steering (bots lag; humans are crisp) — replicated so a
     /// truck's near future is determined, like drive.
     pub steer: f32,
-    /// Turret angle relative to `heading` (the mouse-aim seam). Evolved
+    /// Turret angle relative to heading (the mouse-aim seam). Evolved
     /// by `truck_step` from the command frame like everything else, so
     /// it predicts and replicates for free — remote players see your
     /// turret swing.
@@ -71,6 +71,19 @@ pub struct Truck {
     pub heat: f32,
 }
 
+impl Truck {
+    /// The 2D heading gameplay reads everywhere (yaw of the body).
+    pub fn heading(&self) -> f32 {
+        self.body.yaw()
+    }
+
+    /// Signed forward speed — the step keeps `vel` exactly along
+    /// forward, so this is the scalar the old pod stored.
+    pub fn speed(&self) -> f32 {
+        self.body.vel.dot(self.body.fwd())
+    }
+}
+
 /// Server-owned truck vitals, deliberately NOT in the predicted pod:
 /// damage comes from server events (bites), not from replaying commands,
 /// so predicting it is impossible — and a non-predicted field inside a
@@ -79,6 +92,19 @@ pub struct Truck {
 #[pm::pod]
 pub struct Health {
     pub hp: f32,
+}
+
+/// Replicated helicopter state — the other player vehicle, and the
+/// engine's first full-3D predicted pod. It is EXACTLY a [`pm::Body`]:
+/// attitude lives in the quaternion (pitch/roll limits are enforced by
+/// the step via yaw-pitch-roll extract/clamp/rebuild — a jet would skip
+/// the extraction and integrate body rates on the quat directly).
+/// Deliberately NOT quantized: predicted pools stay full precision so
+/// reconcile error never sits at the quantization step. Arcade model:
+/// collective climbs, nose-down tilt accelerates forward, yaw banks.
+#[pm::pod]
+pub struct Heli {
+    pub body: Body,
 }
 
 /// A biomod feral hog: server-owned, never predicted — clients read it
@@ -126,10 +152,19 @@ pub struct Hunt {
 pub struct Bullet {
     #[wire(i16, scale = 64.0)]
     pub x: f32,
+    /// Muzzle height at spawn, then integrated by `pitch` — the 3D part.
+    /// Truck shots fly flat at barrel height; heli shots descend along
+    /// the nose. Hits require the shot's altitude inside the hog's
+    /// `HOG_H` band, so the pod carries the whole trajectory.
+    #[wire(i16, scale = 64.0)]
+    pub y: f32,
     #[wire(i16, scale = 64.0)]
     pub z: f32,
     #[wire(i16, scale = 10000.0)]
     pub heading: f32,
+    /// Climb angle: dy per unit of travel is `sin(pitch)`. 0 for trucks.
+    #[wire(i16, scale = 10000.0)]
+    pub pitch: f32,
 }
 
 /// A transient replicated FACT (the contact-points pattern): the server
@@ -164,19 +199,30 @@ pub const IMPACT_TTL: f32 = 1.0;
 /// animation; the server just gets a stream of absolute angles.
 #[pm::pod]
 pub struct Drive {
-    pub thrust: f32, // -1..1
-    pub turn: f32,   // -1..1
+    pub thrust: f32, // -1..1 (truck only)
+    pub turn: f32,   // -1..1: steer (truck) / yaw (heli)
     pub fire: f32,   // 0/1: trigger held
-    pub aim: f32,    // turret angle relative to heading, +-AIM_MAX
-    pub boost: f32,  // 0/1: burn heat for speed (1.0 heat = boom)
+    pub aim: f32,    // turret angle relative to heading, +-AIM_MAX (truck only)
+    pub boost: f32,  // 0/1: burn heat for speed (truck only)
     pub bot: f32,    // 0/1: AI controller — its steering lags
+    // Heli axes, dead weight in a truck. ONE continuous channel per
+    // connection is the input doctrine, so the pod is the union of every
+    // vehicle's axes and each step reads its own — the seam input-map
+    // will eventually own (per-vehicle key contexts live client-side).
+    pub pitch: f32, // -1..1: nose down (forward) / up (heli only)
+    pub lift: f32,  // -1..1: collective climb / descend (heli only)
 }
 
-/// Reliable client→server event: "flip me back to my spawn."
+/// Reliable client→server event: respawn as the chosen vehicle (the
+/// server swaps your ENTITY — see the server's respawn task for why a
+/// swap must be a fresh id).
 #[pm::pod]
 pub struct Respawn {
-    pub pad: u32,
+    pub vehicle: u32, // VEH_TRUCK | VEH_HELI
 }
+
+pub const VEH_TRUCK: u32 = 0;
+pub const VEH_HELI: u32 = 1;
 
 // --- tuning ----------------------------------------------------------------
 
@@ -232,6 +278,35 @@ pub const GUN_RANGE: f32 = 45.0;
 pub const BULLET_SPEED: f32 = 70.0;
 /// Turret swing limit either side of straight ahead.
 pub const AIM_MAX: f32 = 2.6;
+/// Hog GAMEPLAY hit ceiling: a shot connects if its altitude is inside
+/// [0, HOG_H] at the hit point. Taller than the drawn hog on purpose —
+/// truck barrels sit at ~1.45 and flat shots must keep connecting (2D
+/// behavior preserved); it's a hitbox, not a silhouette.
+pub const HOG_H: f32 = 1.8;
+
+// --- helicopter tuning -------------------------------------------------------
+
+/// Yaw rate (rad/s) and how hard attitude chases the stick (1/s).
+pub const HELI_YAW: f32 = 1.9;
+pub const HELI_ATT_K: f32 = 5.0;
+/// Attitude limits: pitch tilts up to ~26°, banks up to ~20°.
+pub const HELI_PITCH_MAX: f32 = 0.45;
+pub const HELI_ROLL_MAX: f32 = 0.35;
+/// Horizontal accel at full tilt, and drag (terminal ≈ 28 u/s — faster
+/// than any truck; the heli's edge is speed and impunity, not firepower).
+pub const HELI_ACCEL: f32 = 30.0;
+pub const HELI_HDRAG: f32 = 0.45;
+/// Collective climb accel and vertical drag (auto-hover: vy decays to 0
+/// when the stick centers — arcade, not autorotation).
+pub const HELI_LIFT: f32 = 16.0;
+pub const HELI_VDRAG: f32 = 1.6;
+/// Altitude band: skid height when landed, hard ceiling.
+pub const HELI_GROUND: f32 = 0.6;
+pub const HELI_CEIL: f32 = 45.0;
+/// Hull circle for buildings/bites, and how high a biomod hog can nip —
+/// hover low over the horde at your peril.
+pub const HELI_R: f32 = 1.4;
+pub const HOG_LEAP: f32 = 2.4;
 
 // --- buildings ---------------------------------------------------------------
 
@@ -305,11 +380,65 @@ pub fn building_push(x: f32, z: f32, r: f32) -> (f32, f32, f32, f32) {
     (x, z, nx, nz)
 }
 
+/// `building_push` for something at altitude `y`: only buildings whose
+/// roof is above you shove the hull — above the roofline you overfly.
+/// Same closest-point math so ground-level callers stay byte-identical.
+pub fn building_push_below(x: f32, z: f32, r: f32, y: f32) -> (f32, f32, f32, f32) {
+    let (mut x, mut z) = (x, z);
+    let (mut nx, mut nz) = (0.0, 0.0);
+    for &(bx, bz, hw, hd, bh) in &BUILDINGS {
+        if y >= bh {
+            continue;
+        }
+        let cx = x.clamp(bx - hw, bx + hw);
+        let cz = z.clamp(bz - hd, bz + hd);
+        let (dx, dz) = (x - cx, z - cz);
+        let d2 = dx * dx + dz * dz;
+        if d2 >= r * r {
+            continue;
+        }
+        if d2 > 1e-8 {
+            let d = d2.sqrt();
+            nx = dx / d;
+            nz = dz / d;
+            x = cx + nx * r;
+            z = cz + nz * r;
+        } else {
+            let ex = hw + r - (x - bx).abs();
+            let ez = hd + r - (z - bz).abs();
+            if ex < ez {
+                nx = (x - bx).signum();
+                nz = 0.0;
+                x = bx + nx * (hw + r);
+            } else {
+                nx = 0.0;
+                nz = (z - bz).signum();
+                z = bz + nz * (hd + r);
+            }
+        }
+    }
+    (x, z, nx, nz)
+}
+
+/// Roof height at `(x, z)`: the tallest building whose footprint covers
+/// the point, 0.0 in the open — the bullets' altitude gate for walls.
+pub fn building_top(x: f32, z: f32) -> f32 {
+    BUILDINGS
+        .iter()
+        .filter(|&&(bx, bz, hw, hd, _)| (x - bx).abs() < hw && (z - bz).abs() < hd)
+        .map(|&(_, _, _, _, h)| h)
+        .fold(0.0, f32::max)
+}
+
 // --- THE truck step ----------------------------------------------------------
 
 /// THE step — drive's physics minus drift: bot steering lags (first-order
 /// filter, so the near future is a real prediction), humans steer crisp,
-/// speed-scaled turning, drag, hard arena walls that scrub speed.
+/// speed-scaled turning, drag, hard arena walls that scrub speed. The
+/// math is the proven scalar (heading, speed) model; the ground-vehicle
+/// constraints project it back into the shared `Body` at the end
+/// (pos.y = 0, rot pure yaw, vel exactly along forward — which is what
+/// makes `Truck::speed()` exact).
 pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32) {
     // COMPILE-TIME COVERAGE: an exhaustive destructure (no `..`), so
     // adding a Truck field refuses to compile until it's named here —
@@ -318,17 +447,15 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32) {
     // command. If the server writes it outside this step (damage,
     // pickups), it does NOT belong in Truck — give it its own
     // authoritative pool (that's why hp lives in `Health`). Then cover
-    // the new field in `err_metric` and `truck_lerp` below (the lerp's
-    // exhaustive struct literal breaks on its own; the metric won't).
+    // the new field in `err_metric` and `truck_lerp` below.
     let Truck {
-        x: _,
-        z: _,
-        heading: _,
-        speed: _,
+        body: _,
         steer: _,
         aim: _,
         heat: _,
     } = *t;
+    let mut heading = t.heading();
+    let mut speed = t.speed();
 
     if cmd.bot > 0.5 {
         let k = 1.0 - (-dt / STEER_TAU).exp();
@@ -353,37 +480,136 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32) {
     } else {
         (14.0, VMAX)
     };
-    t.speed = (t.speed + cmd.thrust * accel * dt) * (1.0 - 1.2 * dt);
-    t.speed = t.speed.clamp(-7.0, vmax);
-    let authority = (t.speed.abs() / 6.0).min(1.0);
-    t.heading += t.steer * 2.2 * authority * dt * t.speed.signum();
-    t.x += t.heading.sin() * t.speed * dt;
-    t.z += t.heading.cos() * t.speed * dt;
-    if t.x.abs() > ARENA {
-        t.x = t.x.clamp(-ARENA, ARENA);
-        t.speed *= 0.4;
+    speed = (speed + cmd.thrust * accel * dt) * (1.0 - 1.2 * dt);
+    speed = speed.clamp(-7.0, vmax);
+    let authority = (speed.abs() / 6.0).min(1.0);
+    heading = wrap_angle(heading + t.steer * 2.2 * authority * dt * speed.signum());
+    let (mut x, mut z) = (t.body.pos.x, t.body.pos.z);
+    x += heading.sin() * speed * dt;
+    z += heading.cos() * speed * dt;
+    if x.abs() > ARENA {
+        x = x.clamp(-ARENA, ARENA);
+        speed *= 0.4;
     }
-    if t.z.abs() > ARENA {
-        t.z = t.z.clamp(-ARENA, ARENA);
-        t.speed *= 0.4;
+    if z.abs() > ARENA {
+        z = z.clamp(-ARENA, ARENA);
+        speed *= 0.4;
     }
     // Buildings: same shared step on both sides, so driving into one
     // predicts byte-exact. The truck collides as a circle — close enough
     // at driving speeds, and capsule-vs-box isn't worth the code here.
-    let (px, pz, nx, nz) = building_push(t.x, t.z, TRUCK_R + 0.3);
+    let (px, pz, nx, nz) = building_push(x, z, TRUCK_R + 0.3);
     if nx != 0.0 || nz != 0.0 {
-        t.x = px;
-        t.z = pz;
-        t.speed *= 1.0 - 1.6 * dt; // grinding a wall bleeds speed
+        x = px;
+        z = pz;
+        speed *= 1.0 - 1.6 * dt; // grinding a wall bleeds speed
+    }
+    // Project back into the shared body under the ground constraints.
+    t.body.pos = vec3(x, 0.0, z);
+    t.body.rot = Quat::from_yaw(heading);
+    t.body.vel = vec3(heading.sin() * speed, 0.0, heading.cos() * speed);
+}
+
+// --- THE heli step -----------------------------------------------------------
+
+/// THE heli step — same contract as `truck_step`: shared by the server
+/// and client prediction, so flying is byte-exact under replay. Arcade:
+/// yaw turns, attitude (extract → clamp → rebuild on the quat) chases
+/// the stick, nose-down tilt vectors thrust forward, collective climbs
+/// against vertical drag (auto-hover), skids catch the ground, buildings
+/// shove the hull only below their roofline.
+pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32) {
+    // COMPILE-TIME COVERAGE — the predicted-pod contract, same as
+    // truck_step: every field here is evolved from the command by THIS
+    // function. Cover new fields in `heli_err` and `heli_lerp` too.
+    let Heli { body: _ } = *h;
+    let b = &mut h.body;
+
+    // Attitude on the quat via the constrained-vehicle path: extract,
+    // steer, rebuild. Yaw wraps at the write like every angle; pitch
+    // and roll ease toward the stick (yaw input banks the roll).
+    let (yaw0, pitch0, roll0) = b.rot.to_yaw_pitch_roll();
+    let yaw = wrap_angle(yaw0 + cmd.turn * HELI_YAW * dt);
+    let k = 1.0 - (-HELI_ATT_K * dt).exp();
+    let pitch = pitch0 + (cmd.pitch.clamp(-1.0, 1.0) * HELI_PITCH_MAX - pitch0) * k;
+    let roll = roll0 + (-cmd.turn.clamp(-1.0, 1.0) * HELI_ROLL_MAX - roll0) * k;
+    b.rot = Quat::from_yaw_pitch_roll(yaw, pitch, roll).norm();
+
+    // Nose-down tilt vectors the rotor thrust forward along the yaw;
+    // collective drives the vertical axis. Independent drags: sluggish
+    // horizontally, auto-hover vertically.
+    let a = pitch.sin() * HELI_ACCEL;
+    b.vel.x = (b.vel.x + yaw.sin() * a * dt) * (1.0 - HELI_HDRAG * dt);
+    b.vel.z = (b.vel.z + yaw.cos() * a * dt) * (1.0 - HELI_HDRAG * dt);
+    b.vel.y = (b.vel.y + cmd.lift.clamp(-1.0, 1.0) * HELI_LIFT * dt) * (1.0 - HELI_VDRAG * dt);
+    b.integrate(dt);
+
+    // Altitude band: skids on the deck (extra drag — parked, not
+    // sliding), hard ceiling.
+    if b.pos.y <= HELI_GROUND {
+        b.pos.y = HELI_GROUND;
+        b.vel.y = b.vel.y.max(0.0);
+        b.vel.x *= 1.0 - 3.0 * dt;
+        b.vel.z *= 1.0 - 3.0 * dt;
+    } else if b.pos.y >= HELI_CEIL {
+        b.pos.y = HELI_CEIL;
+        b.vel.y = b.vel.y.min(0.0);
+    }
+    // Arena walls stop you in the air too (biomod containment field).
+    if b.pos.x.abs() > ARENA {
+        b.pos.x = b.pos.x.clamp(-ARENA, ARENA);
+        b.vel.x *= -0.2;
+    }
+    if b.pos.z.abs() > ARENA {
+        b.pos.z = b.pos.z.clamp(-ARENA, ARENA);
+        b.vel.z *= -0.2;
+    }
+    // Buildings shove the hull only below their roofline — clearing the
+    // downtown tower matters, so this can't reuse the trucks' flat
+    // `building_push`.
+    let (px, pz, nx, nz) = building_push_below(b.pos.x, b.pos.z, HELI_R, b.pos.y);
+    if nx != 0.0 || nz != 0.0 {
+        b.pos.x = px;
+        b.pos.z = pz;
+        // Kill the velocity component into the wall; keep the slide.
+        let into = b.vel.x * nx + b.vel.z * nz;
+        if into < 0.0 {
+            b.vel.x -= into * nx;
+            b.vel.z -= into * nz;
+        }
     }
 }
 
-/// Prediction error metric: max caring about position first.
+/// Shared kinematic-chunk error term: position + velocity + attitude
+/// (quat dot → 0 error when aligned; ±q counts as aligned).
+pub fn body_err(a: &Body, b: &Body) -> f32 {
+    (a.pos.x - b.pos.x).abs()
+        + (a.pos.y - b.pos.y).abs()
+        + (a.pos.z - b.pos.z).abs()
+        + (a.vel.x - b.vel.x).abs()
+        + (a.vel.y - b.vel.y).abs()
+        + (a.vel.z - b.vel.z).abs()
+        + (1.0 - a.rot.dot(b.rot).abs()) * 8.0
+}
+
+/// Shared kinematic-chunk lerp: linear pos/vel, short-arc nlerp attitude.
+pub fn body_lerp(a: &Body, b: &Body, t: f32) -> Body {
+    let l = |x: f32, y: f32| x + (y - x) * t;
+    Body {
+        pos: vec3(l(a.pos.x, b.pos.x), l(a.pos.y, b.pos.y), l(a.pos.z, b.pos.z)),
+        vel: vec3(l(a.vel.x, b.vel.x), l(a.vel.y, b.vel.y), l(a.vel.z, b.vel.z)),
+        rot: Quat::nlerp(a.rot, b.rot, t),
+    }
+}
+
+/// Heli prediction error metric — the pod IS a body.
+pub fn heli_err(a: &Heli, b: &Heli) -> f32 {
+    body_err(&a.body, &b.body)
+}
+
+/// Prediction error metric: the shared body term plus the scalars.
 pub fn err_metric(a: &Truck, b: &Truck) -> f32 {
-    (a.x - b.x).abs()
-        + (a.z - b.z).abs()
-        + (a.heading - b.heading).abs()
-        + (a.speed - b.speed).abs()
+    body_err(&a.body, &b.body)
         + (a.steer - b.steer).abs()
         + (a.aim - b.aim).abs()
         + (a.heat - b.heat).abs()
@@ -399,10 +625,7 @@ pub use pm::{lerp_angle, wrap_angle};
 pub fn truck_lerp(a: &Truck, b: &Truck, t: f32) -> Truck {
     let l = |x: f32, y: f32| x + (y - x) * t;
     Truck {
-        x: l(a.x, b.x),
-        z: l(a.z, b.z),
-        heading: lerp_angle(a.heading, b.heading, t),
-        speed: l(a.speed, b.speed),
+        body: body_lerp(&a.body, &b.body, t),
         steer: l(a.steer, b.steer),
         aim: lerp_angle(a.aim, b.aim, t),
         heat: l(a.heat, b.heat),
@@ -414,8 +637,18 @@ pub fn bullet_lerp(a: &Bullet, b: &Bullet, t: f32) -> Bullet {
     let l = |x: f32, y: f32| x + (y - x) * t;
     Bullet {
         x: l(a.x, b.x),
+        y: l(a.y, b.y),
         z: l(a.z, b.z),
         heading: lerp_angle(a.heading, b.heading, t),
+        pitch: lerp_angle(a.pitch, b.pitch, t),
+    }
+}
+
+/// Interpolate two heli samples — the pod is a body, so the shared
+/// body lerp (nlerp attitude) IS the heli lerp.
+pub fn heli_lerp(a: &Heli, b: &Heli, t: f32) -> Heli {
+    Heli {
+        body: body_lerp(&a.body, &b.body, t),
     }
 }
 
@@ -433,8 +666,10 @@ pub fn hog_lerp(a: &Hog, b: &Hog, t: f32) -> Hog {
 
 /// A truck's collision capsule as its two segment endpoints (back, front).
 pub fn truck_seg(t: &Truck) -> ((f32, f32), (f32, f32)) {
-    let (fx, fz) = (t.heading.sin() * TRUCK_HL, t.heading.cos() * TRUCK_HL);
-    ((t.x - fx, t.z - fz), (t.x + fx, t.z + fz))
+    let h = t.heading();
+    let (fx, fz) = (h.sin() * TRUCK_HL, h.cos() * TRUCK_HL);
+    let (x, z) = (t.body.pos.x, t.body.pos.z);
+    ((x - fx, z - fz), (x + fx, z + fz))
 }
 
 /// Distance from point `p` to segment `a`-`b`.
@@ -507,11 +742,24 @@ pub fn peer_color(peer: u8) -> (f32, f32, f32) {
     PCOL[(peer as usize).saturating_sub(1) % PCOL.len()]
 }
 
-/// Spawn slot for a peer: spread along the south wall, facing in.
+/// Spawn slot for a peer: spread along the south wall, facing in
+/// (identity rot = +z = north = into the arena).
 pub fn spawn_truck(peer: u8) -> Truck {
     Truck {
-        x: (peer as f32 - 4.5) * 5.0,
-        z: -ARENA + 6.0,
+        body: Body {
+            pos: vec3((peer as f32 - 4.5) * 5.0, 0.0, -ARENA + 6.0),
+            ..Body::default()
+        },
         ..Truck::default()
+    }
+}
+
+/// Helipad row behind the truck slots, skids down, facing in.
+pub fn spawn_heli(peer: u8) -> Heli {
+    Heli {
+        body: Body {
+            pos: vec3((peer as f32 - 4.5) * 5.0, HELI_GROUND, -ARENA + 2.5),
+            ..Body::default()
+        },
     }
 }

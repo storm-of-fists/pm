@@ -1,13 +1,20 @@
-//! Hogs' 3D player client: chase-cam truck with a mouse-aimed turret,
-//! the horde and the bullet tracers rendered off their interp draw
-//! pools, hit/kill/bite markers straight off the TTL'd synced pool, and
-//! a local aim line under the turret (client-side only feedback).
+//! Hogs' 3D player client: chase-cam truck OR helicopter, the horde and
+//! the bullet tracers rendered off their interp draw pools, hit/kill/
+//! bite markers straight off the TTL'd synced pool, and a local aim
+//! line (client-side only feedback).
 //!
-//! WASD drives; hold RIGHT mouse and move to swing the turret AND the
-//! camera (both ease back to dead ahead on release); LEFT mouse (or
-//! SPACE) fires; SHIFT boosts — watch the heat bar, 1.0 is an
-//! explosion; 1/2/3 switch cameras; P toggles panini; R respawns; Esc
-//! quits.
+//! TRUCK: WASD drives; hold RIGHT mouse to swing the turret AND the
+//! camera (both ease back on release); LEFT mouse (or SPACE) fires;
+//! SHIFT boosts — watch the heat bar, 1.0 is an explosion.
+//! HELI: W/S pitches the nose (nose down = forward), A/D yaws, SPACE
+//! climbs, CTRL descends, LEFT mouse fires the nose gun — dive to
+//! strafe. Hogs can leap at a low hover; climb and they lose you.
+//! H respawns as the heli, T as the truck, R as whatever you are;
+//! 1/2/3 switch cameras; P toggles panini; Esc quits.
+//!
+//! The per-vehicle KEY CONTEXTS below (same keys, different Drive
+//! fields) are hand-rolled — this is the seam the input-map subsystem
+//! will eventually own.
 
 use pm::{
     CamAnchor, CamRig, CamView, Mat4, Pm, Vec3, camera_install, camera_manager, camera_track, vec3,
@@ -24,12 +31,82 @@ use crate::common::*;
 const W: u32 = 1280;
 const H: u32 = 800;
 
-fn truck_model(t: &Truck) -> Mat4 {
-    Mat4::translate(vec3(t.x, 0.0, t.z)) * Mat4::rot_y(t.heading)
-}
-
 fn hog_model(h: &Hog) -> Mat4 {
     Mat4::translate(vec3(h.x, 0.0, h.z)) * Mat4::rot_y(h.heading)
+}
+
+/// A dead hog, tumbling: CLIENT-SIDE presentation physics (GPU/CPU
+/// particle-tier — nothing on the wire). A kill is an entity REMOVAL on
+/// the wire; each client turns that edge into its own ragdoll from the
+/// hog's last replicated state. Clients may disagree on exactly how a
+/// corpse tumbles — cosmetic, so nobody cares; that's the line between
+/// server physics (gameplay) and client physics (feel).
+struct Corpse {
+    x: f32,
+    y: f32,
+    z: f32,
+    vx: f32,
+    vy: f32,
+    vz: f32,
+    yaw: f32,
+    /// Tumble: angle + rate about the horizontal axis across the launch.
+    ang: f32,
+    spin: f32,
+    t: f32,
+}
+
+const CORPSE_LIFE: f32 = 2.6;
+
+impl Corpse {
+    fn from_hog(h: &Hog, rng: &mut pm::Rng) -> Corpse {
+        Corpse {
+            x: h.x,
+            y: 0.45,
+            z: h.z,
+            // Launched along its final run plus a pop upward — reads as
+            // the killing shot bowling it over.
+            vx: h.heading.sin() * h.speed * 0.9 + rng.rfr(-1.5, 1.5),
+            vy: rng.rfr(4.0, 7.0),
+            vz: h.heading.cos() * h.speed * 0.9 + rng.rfr(-1.5, 1.5),
+            yaw: h.heading,
+            ang: 0.0,
+            spin: rng.rfr(5.0, 11.0) * if rng.rf() < 0.5 { -1.0 } else { 1.0 },
+            t: 0.0,
+        }
+    }
+
+    /// Ballistic + damped ground bounces; true while still visible.
+    fn step(&mut self, dt: f32) -> bool {
+        self.t += dt;
+        self.vy -= 22.0 * dt;
+        self.x += self.vx * dt;
+        self.y += self.vy * dt;
+        self.z += self.vz * dt;
+        self.ang += self.spin * dt;
+        if self.y < 0.25 {
+            self.y = 0.25;
+            if self.vy < -1.0 {
+                self.vy = -self.vy * 0.35; // bounce, losing most of it
+                self.vx *= 0.55;
+                self.vz *= 0.55;
+                self.spin *= 0.5;
+            } else {
+                self.vy = 0.0;
+                self.vx *= 0.82;
+                self.vz *= 0.82;
+                self.spin *= 0.8; // settle
+            }
+        }
+        self.t < CORPSE_LIFE
+    }
+
+    fn model(&self) -> Mat4 {
+        // Tumble about the horizontal axis perpendicular to the launch
+        // direction — a forward somersault, not a spinning top.
+        Mat4::translate(vec3(self.x, self.y, self.z))
+            * Mat4::rot_y(self.yaw)
+            * Mat4::rot_x(self.ang)
+    }
 }
 
 /// Faked bold: overdraw at small offsets (gpu3d font is regular-only).
@@ -88,13 +165,42 @@ pub fn run() {
             (1.0, 1.0, 1.0),
         ))
         .expect("barrel");
-    // Bullet tracer: a stretched sliver at gun height.
+    // Bullet tracer: a stretched sliver, centered — bullets carry their
+    // own altitude now, so the height rides the translate.
     let tracer = r3d
         .upload_mesh(&bake(
-            &box_tris(vec3(-0.07, 1.35, -0.65), vec3(0.07, 1.55, 0.65)),
+            &box_tris(vec3(-0.07, -0.1, -0.65), vec3(0.07, 0.1, 0.65)),
             (1.0, 1.0, 1.0),
         ))
         .expect("tracer");
+    // Heli: cabin pod + tail boom + skid plate + one rotor blade (drawn
+    // spinning by tick), authored facing +z, baked white for peer tint.
+    // The full quat attitude arrives via Body::model(), so the whole
+    // airframe pitches into dives and banks into turns.
+    let heli_body = r3d
+        .upload_mesh(&bake(
+            &box_tris(vec3(-0.9, 0.35, -1.3), vec3(0.9, 1.6, 1.6)),
+            (1.0, 1.0, 1.0),
+        ))
+        .expect("heli body");
+    let heli_tail = r3d
+        .upload_mesh(&bake(
+            &box_tris(vec3(-0.16, 0.85, -3.6), vec3(0.16, 1.35, -1.3)),
+            (1.0, 1.0, 1.0),
+        ))
+        .expect("heli tail");
+    let heli_skid = r3d
+        .upload_mesh(&bake(
+            &box_tris(vec3(-1.0, 0.0, -1.3), vec3(1.0, 0.2, 1.4)),
+            (1.0, 1.0, 1.0),
+        ))
+        .expect("heli skid");
+    let heli_rotor = r3d
+        .upload_mesh(&bake(
+            &box_tris(vec3(-3.1, 1.72, -0.16), vec3(3.1, 1.86, 0.16)),
+            (1.0, 1.0, 1.0),
+        ))
+        .expect("heli rotor");
     // ONE white unit cube (base centered on the origin, 1 unit tall)
     // stretched per draw by Mat4::scale_xyz — buildings and walls are
     // all just this box (safe here: axis-aligned scaling keeps an
@@ -136,7 +242,11 @@ pub fn run() {
         let cam_mgr = cam_mgr.clone();
         let respawn = w.respawn.clone();
         let input = w.input.clone();
+        let pred_heli = w.pred_heli.clone();
         move |pm| {
+            // The live predictor answers "am I flying?" — it decides
+            // which KEY CONTEXT fills the (shared) input pod below.
+            let flying = pred_heli.get().state().is_some();
             for ev in pump.poll_iter() {
                 match ev {
                     Event::Quit { .. }
@@ -153,7 +263,19 @@ pub fn run() {
                         scancode: Some(Scancode::R),
                         repeat: false,
                         ..
-                    } => respawn.send(Respawn::default()),
+                    } => respawn.send(Respawn {
+                        vehicle: if flying { VEH_HELI } else { VEH_TRUCK },
+                    }),
+                    Event::KeyDown {
+                        scancode: Some(Scancode::H),
+                        repeat: false,
+                        ..
+                    } => respawn.send(Respawn { vehicle: VEH_HELI }),
+                    Event::KeyDown {
+                        scancode: Some(Scancode::T),
+                        repeat: false,
+                        ..
+                    } => respawn.send(Respawn { vehicle: VEH_TRUCK }),
                     Event::KeyDown {
                         scancode: Some(Scancode::P),
                         repeat: false,
@@ -185,41 +307,73 @@ pub fn run() {
                 }
             }
             let lmb = m.is_mouse_button_pressed(MouseButton::Left) as i32 as f32;
-            input.set(Drive {
-                thrust: held(Scancode::W) - 0.6 * held(Scancode::S),
-                turn: held(Scancode::D) - held(Scancode::A),
-                fire: lmb.max(held(Scancode::Space)),
-                aim,
-                boost: held(Scancode::LShift),
-                bot: 0.0, // human: crisp steering
+            input.set(if flying {
+                Drive {
+                    thrust: 0.0,
+                    turn: held(Scancode::D) - held(Scancode::A),
+                    fire: lmb, // SPACE is the collective up here
+                    aim,
+                    boost: 0.0,
+                    bot: 0.0,
+                    pitch: held(Scancode::W) - held(Scancode::S),
+                    lift: held(Scancode::Space) - held(Scancode::LCtrl),
+                }
+            } else {
+                Drive {
+                    thrust: held(Scancode::W) - 0.6 * held(Scancode::S),
+                    turn: held(Scancode::D) - held(Scancode::A),
+                    fire: lmb.max(held(Scancode::Space)),
+                    aim,
+                    boost: held(Scancode::LShift),
+                    bot: 0.0, // human: crisp steering
+                    pitch: 0.0,
+                    lift: 0.0,
+                }
             });
         }
     });
 
-    // Rig cameras on our truck the moment the server tells us which one
-    // is ours, then retire this task (drive's pattern).
+    // Rig cameras the moment the server tells us which entity is ours,
+    // then retire this task (drive's pattern). The SAMPLER stays alive
+    // and dynamic: a vehicle swap is a fresh entity (new id), so it
+    // re-resolves `mine()` every tick and reads whichever draw pool
+    // holds it — one rack survives every swap.
     pm.task_add("rig_cams", 32.0, 0.0, {
-        let draw = w.truck_draw.clone();
+        let truck_draw = w.truck_draw.clone();
+        let heli_draw = w.heli_draw.clone();
         let net = net.clone();
         move |pm| {
             let Some(id) = net.mine() else {
                 return;
             };
-            let draw = draw.clone();
+            let truck_draw = truck_draw.clone();
+            let heli_draw = heli_draw.clone();
+            let net = net.clone();
             {
                 let mut rack = camera_track(pm, id, move |_pm| {
-                    draw.get_id(id).map(|t| {
+                    let cur = net.mine()?;
+                    if let Some(t) = truck_draw.get_id(cur).map(|t| *t) {
                         // The anchor faces where the TURRET points, not
                         // where the truck drives: holding RMB swings the
                         // camera with the gun (and the ease-back swings
                         // it home), while plain steering under a held
                         // aim no longer drags the view around.
-                        let dir = t.heading + t.aim;
-                        CamAnchor {
-                            pos: vec3(t.x, 0.0, t.z),
+                        let dir = t.heading() + t.aim;
+                        Some(CamAnchor {
+                            pos: t.body.pos,
                             fwd: vec3(dir.sin(), 0.0, dir.cos()),
-                        }
-                    })
+                        })
+                    } else {
+                        // Heli: follow the yaw, level — the airframe
+                        // pitches and banks under a steady camera.
+                        heli_draw.get_id(cur).map(|h| *h).map(|h| {
+                            let yaw = h.body.yaw();
+                            CamAnchor {
+                                pos: h.body.pos,
+                                fwd: vec3(yaw.sin(), 0.0, yaw.cos()),
+                            }
+                        })
+                    }
                 });
                 let chase = rack.mount(CamRig::chase());
                 rack.mount(CamRig::rear());
@@ -233,7 +387,26 @@ pub fn run() {
     pm.task_add("render", 70.0, 0.0, {
         let view = cam_view.clone();
         let net = net.clone();
+        // Death-edge tracking for ragdolls: last tick's raw replicas, so
+        // a removal still has the state to launch a corpse from.
+        let mut prev_hogs: std::collections::HashMap<pm::Id, Hog> = Default::default();
+        let mut corpses: Vec<Corpse> = Vec::new();
         move |pm| {
+            // Spawn corpses off this frame's removals, then step them on
+            // the render clock (client-local physics — cosmetic only).
+            {
+                let now: std::collections::HashMap<pm::Id, Hog> =
+                    w.hog.get().iter().map(|(id, h)| (id, *h)).collect();
+                let mut rng = pm::Rng::new(pm.tick().wrapping_mul(0x2545_F491) | 1);
+                for (id, h) in &prev_hogs {
+                    if !now.contains_key(id) {
+                        corpses.push(Corpse::from_hog(h, &mut rng));
+                    }
+                }
+                prev_hogs = now;
+                let dt = pm.loop_dt();
+                corpses.retain_mut(|c| c.step(dt));
+            }
             let (view_mat, fov, panini_on) = {
                 let v = view.get();
                 if v.ready() {
@@ -283,7 +456,7 @@ pub fn run() {
                     // Tint by controlling player via the replicated
                     // ownership table — id.peer() is recycling, not control.
                     let tint = peer_color(net.owner_of(id).unwrap_or(0));
-                    let model = truck_model(t);
+                    let model = t.body.model();
                     frame.draw(&body, model, tint, true);
                     frame.draw(
                         &cabin,
@@ -293,10 +466,10 @@ pub fn run() {
                     );
                     // Turret: same origin, rotated by heading + aim —
                     // replicated state, so every peer's swing is visible.
-                    let dir = t.heading + t.aim;
+                    let dir = t.heading() + t.aim;
                     frame.draw(
                         &barrel,
-                        Mat4::translate(vec3(t.x, 0.0, t.z)) * Mat4::rot_y(dir),
+                        Mat4::translate(t.body.pos) * Mat4::rot_y(dir),
                         (tint.0 * 0.35, tint.1 * 0.35, tint.2 * 0.35),
                         true,
                     );
@@ -307,7 +480,7 @@ pub fn run() {
                         let (dx, dz) = (dir.sin(), dir.cos());
                         let mut d = 4.0;
                         while d < GUN_RANGE {
-                            let (px, pz) = (t.x + dx * d, t.z + dz * d);
+                            let (px, pz) = (t.body.pos.x + dx * d, t.body.pos.z + dz * d);
                             if in_building(px, pz, 0.0) {
                                 break;
                             }
@@ -323,12 +496,65 @@ pub fn run() {
                     }
                 }
 
-                // Bullets, off their interp pool: hot tracer slivers.
+                // Helis: the full quat attitude rides Body::model(), so
+                // the airframe noses into dives and banks into turns;
+                // the rotor spins in model space on the render clock.
+                let spin = Mat4::rot_y(pm.tick() as f32 * 0.7);
+                for (id, hl) in w.heli_draw.get().iter() {
+                    let tint = peer_color(net.owner_of(id).unwrap_or(0));
+                    let model = hl.body.model();
+                    frame.draw(&heli_body, model, tint, true);
+                    frame.draw(
+                        &heli_tail,
+                        model,
+                        (tint.0 * 0.6, tint.1 * 0.6, tint.2 * 0.6),
+                        true,
+                    );
+                    frame.draw(&heli_skid, model, (0.2, 0.2, 0.22), true);
+                    frame.draw(&heli_rotor, model * spin, (0.25, 0.25, 0.28), true);
+                    // Own heli: breadcrumb the nose gun's ground
+                    // intersection — where a dive is actually aimed.
+                    if mine == Some(id) {
+                        let (yaw, pitch, _) = hl.body.rot.to_yaw_pitch_roll();
+                        if pitch > 0.02 {
+                            let reach = ((hl.body.pos.y - 0.2) / pitch.tan()).min(GUN_RANGE);
+                            let (px, pz) = (
+                                hl.body.pos.x + yaw.sin() * reach,
+                                hl.body.pos.z + yaw.cos() * reach,
+                            );
+                            frame.draw(
+                                &marker,
+                                Mat4::translate(vec3(px, 0.0, pz)) * Mat4::scale(1.2),
+                                tint,
+                                true,
+                            );
+                        }
+                    }
+                }
+
+                // Bullets, off their interp pool: hot tracer slivers
+                // at their own altitude, tipped along the climb.
                 for (_, bl) in w.bullet_draw.get().iter() {
                     frame.draw(
                         &tracer,
-                        Mat4::translate(vec3(bl.x, 0.0, bl.z)) * Mat4::rot_y(bl.heading),
+                        Mat4::translate(vec3(bl.x, bl.y, bl.z))
+                            * Mat4::rot_y(bl.heading)
+                            * Mat4::rot_x(-bl.pitch),
                         (1.0, 0.92, 0.45),
+                        true,
+                    );
+                }
+
+                // Ragdoll corpses (client-local): tumble, fading out.
+                for c in &corpses {
+                    let fade = (1.0 - c.t / CORPSE_LIFE).clamp(0.0, 1.0);
+                    let tint = (0.30 + 0.25 * fade, 0.16 * fade + 0.08, 0.10 * fade + 0.05);
+                    let model = c.model();
+                    frame.draw(&hog_body, model, tint, true);
+                    frame.draw(
+                        &hog_snout,
+                        model,
+                        (tint.0 * 0.7, tint.1 * 0.7, tint.2 * 0.7),
                         true,
                     );
                 }
@@ -404,21 +630,30 @@ pub fn run() {
                         .health
                         .get_id(id)
                         .map_or(0.0, |v| (v.hp / TRUCK_HP).clamp(0.0, 1.0));
-                    let heat = w.pred.get().state().map_or(0.0, |t| t.heat.clamp(0.0, 1.0));
                     let hp_col = (
                         (60.0 + 195.0 * (1.0 - hp)) as u8,
                         (60.0 + 175.0 * hp) as u8,
                         60,
                     );
-                    let heat_col = if heat > 0.75 {
-                        (255, 60, 40) // about to cook off
+                    // Second bar is per-vehicle: boost heat in a truck,
+                    // altitude in the heli (both predicted state — live,
+                    // no round trip).
+                    let (fill, col, label) = if let Some(hl) = w.pred_heli.get().state() {
+                        let alt = (hl.body.pos.y / HELI_CEIL).clamp(0.0, 1.0);
+                        (alt, (120, 190, 235), "alt")
                     } else {
-                        (235, 175, 70)
+                        let heat = w.pred.get().state().map_or(0.0, |t| t.heat.clamp(0.0, 1.0));
+                        let heat_col = if heat > 0.75 {
+                            (255, 60, 40) // about to cook off
+                        } else {
+                            (235, 175, 70)
+                        };
+                        (heat, heat_col, "heat")
                     };
                     let (x, bw, bh) = (24.0, 240.0, 16.0);
                     let y = H as f32 - 76.0;
                     for (row, fill, col, label) in
-                        [(0.0, hp, hp_col, "hp"), (1.0, heat, heat_col, "heat")]
+                        [(0.0, hp, hp_col, "hp"), (1.0, fill, col, label)]
                     {
                         let ry = y + row * (bh + 10.0);
                         frame.rect(x, ry, bw, bh, (12, 14, 12), 0.6);
@@ -428,18 +663,23 @@ pub fn run() {
                 }
             }
             if pm.tick() % 30 == 0 {
+                // Whichever predictor is live provides the speed; the
+                // correction counters just add (the idle one is frozen).
                 let speed = w
                     .pred
                     .get()
                     .state()
-                    .map(|t| t.speed * 3.6 / 1.6)
-                    .unwrap_or(0.0);
+                    .map(|t| t.speed())
+                    .or_else(|| w.pred_heli.get().state().map(|h| h.body.vel.len()))
+                    .unwrap_or(0.0)
+                    * 3.6
+                    / 1.6;
                 let title = format!(
-                    "pm hogs — peer {}  {:.0} mph  rtt {:.0} ms  corrections {}  (wasd + mouse)",
+                    "pm hogs — peer {}  {:.0} mph  rtt {:.0} ms  corrections {}  (h heli / t truck)",
                     net.peer(),
                     speed.abs(),
                     net.rtt_ms(),
-                    w.pred.get().corrections,
+                    w.pred.get().corrections + w.pred_heli.get().corrections,
                 );
                 let _ = window.set_title(&title);
             }

@@ -21,22 +21,28 @@ pub struct ClientWorld {
     pub health: PoolHandle<Health>,
     pub bullet: PoolHandle<Bullet>,
     pub impact: PoolHandle<Impact>,
-    /// Smoothed views rendering should read (predicted own truck wins on
-    /// the truck draw pool; hogs and bullets are pure interp).
+    /// Smoothed views rendering should read (predicted own vehicle wins
+    /// on its draw pool; hogs and bullets are pure interp).
     pub truck_draw: PoolHandle<Truck>,
+    pub heli_draw: PoolHandle<Heli>,
     pub hog_draw: PoolHandle<Hog>,
     pub bullet_draw: PoolHandle<Bullet>,
     /// The co-op scoreboard (server-owned synced single).
     pub hunt: SingleRx<Hunt>,
     pub input: InputTx<Drive>,
     pub respawn: EventTx<Respawn>,
+    /// Both vehicle predictors ride the same input channel; whichever
+    /// pool holds the avatar is live, the other idles with `state() ==
+    /// None` — which is also how game code asks "am I flying?".
     pub pred: SingleHandle<Predictor<Truck, Drive>>,
+    pub pred_heli: SingleHandle<Predictor<Heli, Drive>>,
 }
 
 /// Register the full channel set and install prediction + interpolation.
 /// No connect here — `run` does that once the schema is complete.
 pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     let truck = pm.sync_pool::<Truck>("truck");
+    let heli = pm.sync_pool::<Heli>("heli");
     let health = pm.sync_pool::<Health>("truck.health");
     let hog = pm.wire_pool::<Hog>("hog");
     let bullet = pm.wire_pool::<Bullet>("bullet");
@@ -45,9 +51,12 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     let input = pm.input::<Drive>("drive");
     let respawn = pm.event::<Respawn>("respawn");
 
-    // Local truck: reconcile against the input-seq echo, replay unacked
-    // sends — the same truck_step the server runs makes it byte-exact.
+    // Local vehicle: reconcile against the input-seq echo, replay
+    // unacked sends — the same steps the server runs make it byte-exact.
+    // BOTH vehicles get predictors on the ONE input channel; the one
+    // whose pool holds the avatar runs, the other idles empty.
     let pred = pm.predict_pool(&truck, &input, truck_step, err_metric, 1e-4, FIXED_DT);
+    let pred_heli = pm.predict_pool(&heli, &input, heli_step, heli_err, 1e-4, FIXED_DT);
 
     // Remote smoothing, shared delay contract with the server's shot
     // rewind (see common.rs INTERP_DELAY). Capped extrapolation rides
@@ -57,6 +66,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
         .and_then(|v| v.parse::<f64>().ok())
         .map_or(0.05, |ms| ms / 1000.0);
     let truck_draw = pm.interp_pool(&truck, truck_lerp, interp_delay() as f64, extrap);
+    let heli_draw = pm.interp_pool(&heli, heli_lerp, interp_delay() as f64, extrap);
     let hog_draw = pm.interp_pool(&hog, hog_lerp, interp_delay() as f64, extrap);
     // Bullets too: they live ~0.6 s and cross the map in a straight
     // line — interp (plus the extrapolation cap) is plenty.
@@ -68,12 +78,14 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
         bullet,
         impact,
         truck_draw,
+        heli_draw,
         hog_draw,
         bullet_draw,
         hunt,
         input,
         respawn,
         pred,
+        pred_heli,
     }
 }
 
@@ -87,9 +99,74 @@ pub fn run_bot(n: u32) {
     // not moving, and seconds of back-out left once we give up.
     let mut jam = 0.0f32;
     let mut back = 0.0f32;
+    // Pilot bots: one-shot "give me the heli" request state.
+    let mut asked_heli = false;
 
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;
+
+        // Bots n >= 2 are PILOTS: swap to the heli once spawned, then
+        // fly strafing runs — deliberately exercising the whole 3D path
+        // headlessly (vehicle swap, heli prediction, diving bullets,
+        // low hover inside hog-leap range on sloppy pull-ups).
+        if n >= 2 {
+            if let Some(hl) = w.pred_heli.get().state() {
+                let b = hl.body;
+                let (yaw, _, _) = b.rot.to_yaw_pitch_roll();
+                let target = w
+                    .hog
+                    .get()
+                    .values()
+                    .iter()
+                    .map(|h| {
+                        let (dx, dz) = (h.x - b.pos.x, h.z - b.pos.z);
+                        (*h, (dx * dx + dz * dz).sqrt())
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                let (turn, pitch, fire) = match target {
+                    Some((h, d)) => {
+                        let bearing = (h.x - b.pos.x).atan2(h.z - b.pos.z);
+                        let err = wrap_angle(bearing - yaw);
+                        // Nose over far enough that the gun line meets
+                        // the ground at the hog.
+                        let dive = (b.pos.y / d.max(3.0)).atan();
+                        let aligned = err.abs() < 0.25 && d < GUN_RANGE * 0.9;
+                        (
+                            err.clamp(-1.0, 1.0),
+                            (dive / HELI_PITCH_MAX).clamp(-1.0, 1.0),
+                            aligned as i32 as f32,
+                        )
+                    }
+                    None => ((t * 0.3).sin() * 0.5, 0.15, 0.0),
+                };
+                // Hold a working altitude; drift low on purpose now and
+                // then so leaping hogs get their shot at us.
+                let lift = if b.pos.y < 6.0 + (t * 0.11).sin() * 4.0 {
+                    1.0
+                } else if b.pos.y > 14.0 {
+                    -0.5
+                } else {
+                    0.05
+                };
+                w.input.set(Drive {
+                    thrust: 0.0,
+                    turn,
+                    fire,
+                    aim: 0.0,
+                    boost: 0.0,
+                    bot: 1.0,
+                    pitch,
+                    lift,
+                });
+                return;
+            }
+            if !asked_heli && w.pred.get().state().is_some() {
+                w.respawn.send(Respawn { vehicle: VEH_HELI });
+                asked_heli = true;
+            }
+            // Fall through and drive the truck until the swap lands.
+        }
+
         let Some(me) = w.pred.get().state() else {
             return;
         };
@@ -101,15 +178,25 @@ pub fn run_bot(n: u32) {
             .values()
             .iter()
             .map(|h| {
-                let (dx, dz) = (h.x - me.x, h.z - me.z);
+                let (dx, dz) = (h.x - me.body.pos.x, h.z - me.body.pos.z);
                 (*h, (dx * dx + dz * dz).sqrt())
             })
             .min_by(|a, b| a.1.total_cmp(&b.1));
 
         let (mut turn, mut thrust, mut fire) = match target {
             Some((h, d)) => {
-                let bearing = (h.x - me.x).atan2(h.z - me.z);
-                let err = wrap_angle(bearing - me.heading);
+                // Lead the shot: aim where the hog will be when the
+                // bullet arrives, not where it is — the pod carries its
+                // velocity. (Humans lead by watching tracers; a bot that
+                // insta-aims at the current bearing only ever hits hogs
+                // charging straight down the ray.)
+                let tof = d / BULLET_SPEED;
+                let (lx, lz) = (
+                    h.x + h.heading.sin() * h.speed * tof,
+                    h.z + h.heading.cos() * h.speed * tof,
+                );
+                let bearing = (lx - me.body.pos.x).atan2(lz - me.body.pos.z);
+                let err = wrap_angle(bearing - me.heading());
                 // Only pull the trigger when the hog's body actually
                 // subtends the aim error (with slack) — a fixed gate
                 // either never hits at range or wastes every shot.
@@ -126,10 +213,10 @@ pub fn run_bot(n: u32) {
         };
         // Wall recovery beats everything (drive's lesson: a pure chaser
         // grinds a wall forever).
-        let r = (me.x * me.x + me.z * me.z).sqrt();
+        let r = (me.body.pos.x * me.body.pos.x + me.body.pos.z * me.body.pos.z).sqrt();
         if r > ARENA - 10.0 {
-            let home = (-me.x).atan2(-me.z);
-            turn = wrap_angle(home - me.heading).clamp(-1.0, 1.0);
+            let home = (-me.body.pos.x).atan2(-me.body.pos.z);
+            turn = wrap_angle(home - me.heading()).clamp(-1.0, 1.0);
             thrust = 0.7;
             fire = 0.0;
         }
@@ -142,7 +229,7 @@ pub fn run_bot(n: u32) {
             turn = 1.0;
             fire = 0.0;
         } else {
-            if thrust > 0.2 && me.speed.abs() < 1.0 {
+            if thrust > 0.2 && me.speed().abs() < 1.0 {
                 jam += FIXED_DT;
             } else {
                 jam = 0.0;
@@ -159,6 +246,8 @@ pub fn run_bot(n: u32) {
             aim: 0.0,   // bots shoot over the hood
             boost: 0.0, // and drive responsibly
             bot: 1.0,   // AI: steering lags
+            pitch: 0.0, // bots keep their wheels on the ground
+            lift: 0.0,
         });
     });
 

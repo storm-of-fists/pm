@@ -100,10 +100,23 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld) {
     let bullet = w.bullet.clone();
     let impact = w.impact.clone();
     let pred = w.pred.clone();
-    task!(pm, "sfx", 60.0, [bullet, impact, pred], move |pm| {
+    let pred_heli = w.pred_heli.clone();
+    task!(pm, "sfx", 60.0, [bullet, impact, pred, pred_heli], move |pm| {
         let mut rng = Rng::new(pm.tick() | 1);
-        // Ears at our truck; before spawn, at the arena center.
-        let (ex, ez) = pred.get().state().map_or((0.0, 0.0), |t| (t.x, t.z));
+        // Ears at our vehicle (whichever predictor is live); before
+        // spawn, at the arena center. Ground-plane distance is plenty —
+        // altitude attenuation isn't worth the code yet.
+        let (ex, ez) = pred
+            .get()
+            .state()
+            .map(|t| (t.body.pos.x, t.body.pos.z))
+            .or_else(|| {
+                pred_heli
+                    .get()
+                    .state()
+                    .map(|h| (h.body.pos.x, h.body.pos.z))
+            })
+            .unwrap_or((0.0, 0.0));
         // Inverse-linear falloff with a floor: distant fights stay
         // audible as texture, close ones bark.
         let att = |x: f32, z: f32| {

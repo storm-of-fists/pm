@@ -94,6 +94,20 @@ pub const NET_PRIO: f32 = 5.0;
 /// `PM_LOSS` (0..1 drop fraction) — the simulation knob clients used to
 /// wire by hand around the QUIC endpoint, now read by `serve`/`connect`.
 /// `None` when both are unset or zero.
+/// `PM_NETDBG=1` — the net doctor. Both roles print link vitals every
+/// 5 s: the server reports, per peer, how far its ack cursor trails the
+/// tick (the lag-comp rewind anchor — if this GROWS the peer is being
+/// served stale state), RTT, and quinn's remaining datagram buffer; the
+/// client reports its snapshot apply rate and how fast the applied tick
+/// LABELS advance (labels slower than ticks = stale content, the
+/// invisible failure that broke lag comp for weeks; see the
+/// FIXME(lag-sim) in transport.rs). The history ring also warns when a
+/// rewind clamps past its window instead of clamping silently.
+pub(crate) fn netdbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PM_NETDBG").is_ok_and(|v| v != "0"))
+}
+
 fn link_lag_from_env() -> Option<(std::time::Duration, f32)> {
     let env = |k: &str| {
         std::env::var(k)
@@ -329,8 +343,13 @@ pub(crate) struct ClientInputChan(Option<Rc<dyn InputSend>>);
 /// Per-peer queues of the continuous input channel, shared between an
 /// [`InputRx`] and the erased sink the server net task pushes into.
 struct InputQueues<C: Pod> {
-    queues: HashMap<u8, VecDeque<(u32, C)>>,
-    applied: HashMap<u8, (u32, C)>,
+    /// (seq, cmd, peer's acked snapshot tick when this input ARRIVED).
+    /// The view stamp is captured at arrival because the ack that rode
+    /// alongside the input is what the shooter actually saw — reading
+    /// `acked_tick` later, at consumption, anchors lag-comp a queue's
+    /// worth of ticks too fresh (zero kills under 40 ms lag until this).
+    queues: HashMap<u8, VecDeque<(u32, C, u32)>>,
+    applied: HashMap<u8, (u32, C, u32)>,
 }
 
 impl<C: Pod> Default for InputQueues<C> {
@@ -348,7 +367,7 @@ impl<C: Pod> InputQueues<C> {
     fn held(&self, peer: u8) -> C {
         self.applied
             .get(&peer)
-            .map(|&(_, c)| c)
+            .map(|&(_, c, _)| c)
             .unwrap_or_else(C::zeroed)
     }
 }
@@ -391,6 +410,21 @@ impl<C: Pod + 'static> InputRx<C> {
         sh.held(peer)
     }
 
+    /// The peer's acked snapshot tick as of when the most recently
+    /// consumed input ARRIVED — THE lag-compensation rewind anchor:
+    /// subtract the game's interp ticks and judge that input's shots
+    /// against `history_pool` frames at the result. (`ServerNet::
+    /// acked_tick` read at consumption time is subtly too FRESH: the
+    /// input waited in this queue while newer acks landed.) 0 before
+    /// any input was consumed.
+    pub fn view(&self, peer: u8) -> u32 {
+        self.shared
+            .borrow()
+            .applied
+            .get(&peer)
+            .map_or(0, |&(_, _, v)| v)
+    }
+
     /// Newest-wins consumption: drain to the latest command and hold it.
     /// For games where input is continuous state (held movement keys),
     /// not per-tick command frames.
@@ -410,7 +444,7 @@ impl<C: Pod + 'static> InputRx<C> {
 trait InputSink {
     fn peer_add(&self, peer: u8);
     fn peer_remove(&self, peer: u8);
-    fn push(&self, peer: u8, seq: u32, bytes: &[u8]);
+    fn push(&self, peer: u8, seq: u32, bytes: &[u8], view: u32);
     fn applied_seqs(&self) -> Vec<(u8, u32)>;
 }
 
@@ -429,7 +463,7 @@ impl<C: Pod> InputSink for RxAdapter<C> {
         sh.applied.remove(&peer);
     }
 
-    fn push(&self, peer: u8, seq: u32, bytes: &[u8]) {
+    fn push(&self, peer: u8, seq: u32, bytes: &[u8], view: u32) {
         if bytes.len() != size_of::<C>() {
             return;
         }
@@ -438,7 +472,7 @@ impl<C: Pod> InputSink for RxAdapter<C> {
             .queues
             .entry(peer)
             .or_default()
-            .push_back((seq, bytemuck::pod_read_unaligned(bytes)));
+            .push_back((seq, bytemuck::pod_read_unaligned(bytes), view));
     }
 
     /// Last consumed (peer, seq) pairs — echoed by the net task so clients
@@ -448,7 +482,7 @@ impl<C: Pod> InputSink for RxAdapter<C> {
             .borrow()
             .applied
             .iter()
-            .map(|(&p, &(seq, _))| (p, seq))
+            .map(|(&p, &(seq, _, _))| (p, seq))
             .collect()
     }
 }
@@ -783,12 +817,17 @@ impl PmClient {
         fixed_dt: f32,
     ) -> SingleHandle<Predictor<S, C>> {
         let draw = self.pool::<S>(&format!("{}.draw", auth.name()));
-        let pred = self.single::<Predictor<S, C>>("net.pred");
+        // Per-pool names (same rule as interp_pool's task): a game can
+        // predict SEVERAL pools — e.g. truck AND heli, whichever one the
+        // avatar currently lives in — and a shared "net.pred" name would
+        // panic on the second registration (pools key by name alone).
+        // Each predictor idles while the avatar isn't in its pool.
+        let pred = self.single::<Predictor<S, C>>(&format!("net.pred.{}", auth.name()));
         let status = self.single::<NetStatus>("net.status");
         let applied = self.single::<AppliedLog>("net.applied");
         let shared = input.shared.clone();
         let auth = auth.clone();
-        self.task_add("net.predict", NET_PRIO + 2.0, 0.0, {
+        self.task_add(&format!("net.predict.{}", auth.name()), NET_PRIO + 2.0, 0.0, {
             let pred = pred.clone();
             move |_pm| {
                 let Some(mine) = status.get().avatar else {
@@ -797,28 +836,38 @@ impl PmClient {
                 // One fetch for all of this tick's snapshots — the pool
                 // doesn't change between them (the net task already
                 // applied every snapshot before this task runs).
-                if let Some(auth_s) = auth.get_id(mine).map(|r| *r) {
-                    for a in &applied.get().0 {
-                        pred.get_mut().reconcile(
-                            auth_s,
-                            a.input_seq,
-                            |s, c| step(s, c, fixed_dt),
-                            |a, b| err(a, b),
-                            tolerance,
-                        );
+                let Some(auth_s) = auth.get_id(mine).map(|r| *r) else {
+                    // Avatar isn't in this pool right now (not spawned,
+                    // or currently a different predicted vehicle): idle
+                    // the predictor — otherwise it keeps stepping stale
+                    // state with the other pool's inputs. Emptied, it
+                    // reseeds from authority the moment the avatar is
+                    // back (reconcile's None path), and its state() stays
+                    // None so game code can tell which pool is live.
+                    let mut p = pred.get_mut();
+                    if p.state().is_some() {
+                        *p = Predictor::default();
                     }
+                    return;
+                };
+                for a in &applied.get().0 {
+                    pred.get_mut().reconcile(
+                        auth_s,
+                        a.input_seq,
+                        |s, c| step(s, c, fixed_dt),
+                        |a, b| err(a, b),
+                        tolerance,
+                    );
                 }
                 for &(seq, cmd) in &shared.borrow().sent {
                     pred.get_mut()
                         .predict(seq, cmd, |s, c| step(s, c, fixed_dt));
                 }
-                // Smooth-predicted local avatar into draw, extrapolated by
-                // the in-flight input fraction. Guard on the entity still
-                // existing in `auth` so a despawn can't leave a predicted
-                // ghost behind.
-                if auth.get_id(mine).is_some()
-                    && let Some(mut s) = pred.get().state()
-                {
+                // Smooth-predicted local avatar into draw, extrapolated
+                // by the in-flight input fraction. The avatar is present
+                // in `auth` (checked above), so no ghost outlives a
+                // despawn.
+                if let Some(mut s) = pred.get().state() {
                     let alpha = status.get().input_alpha.min(1.0);
                     step(&mut s, shared.borrow().current, alpha * fixed_dt);
                     draw.get_mut().add(mine, s);
@@ -1185,9 +1234,18 @@ impl NetServer {
                     }
                     pe.left.push(p);
                 }
+                // Acks BEFORE inputs: they rode the same datagrams, and
+                // each input gets stamped with the acked tick as of its
+                // arrival — the shooter's contemporaneous view, i.e. the
+                // lag-comp anchor (`InputRx::view`). Stamping later, at
+                // consumption, reads acks that landed while the input
+                // queued and anchors the rewind too fresh.
+                for (p, tick) in quic.acks_drain() {
+                    net.ack(p, tick);
+                }
                 if let Some(s) = &sink {
                     for (p, seq, bytes) in quic.inputs_drain() {
-                        s.push(p, seq, &bytes);
+                        s.push(p, seq, &bytes, net.acked_tick(p));
                     }
                     // Echo what the sim consumed (last tick — it runs
                     // after this task); clients reconcile against this.
@@ -1195,9 +1253,6 @@ impl NetServer {
                         net.input_processed(p, seq);
                     }
                 }
-            }
-            for (p, tick) in quic.acks_drain() {
-                net.ack(p, tick);
             }
             let plist: Vec<u8> = net.peers().collect();
             {
@@ -1229,6 +1284,16 @@ impl NetServer {
                 }
             }
             net.prune(pm);
+            if netdbg() && pm.tick() % 300 == 0 {
+                for p in net.peers().collect::<Vec<_>>() {
+                    eprintln!(
+                        "[netdbg srv] peer {p}: ack-lag={} ticks  rtt={:.0}ms  dgram-buf-free={}B",
+                        pm.tick().saturating_sub(net.acked_tick(p)),
+                        quic.rtt(p).as_secs_f32() * 1e3,
+                        quic.dgram_space(p),
+                    );
+                }
+            }
         });
     }
 }
@@ -1246,6 +1311,9 @@ impl NetClient {
         let out = pm.single::<Outbox>("net.out");
         let chan = pm.single::<ClientInputChan>("net.input").get().0.clone();
         let mut accum = 0.0f32;
+        // Net-doctor state: (applied count, newest label) at last report.
+        let mut dbg_prev = (0u32, 0u32);
+        let mut dbg_newest = 0u32;
         pm.task_add("net", NET_PRIO, 0.0, move |pm| {
             quic.pump();
             if let Some(err) = quic.error() {
@@ -1266,6 +1334,7 @@ impl NetClient {
                 let Ok(a) = net.apply(pm, &snap) else {
                     continue;
                 };
+                dbg_newest = dbg_newest.max(a.tick);
                 quic.ack_send(a.tick);
                 {
                     // The header table is authoritative as of this
@@ -1308,6 +1377,19 @@ impl NetClient {
                 status.get_mut().input_alpha = accum * input_hz;
             }
             status.get_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
+            if netdbg() && pm.tick() % 300 == 0 {
+                let snaps = status.get().snapshots;
+                // labels+N vs ~300 loop ticks is the STALENESS gauge: at
+                // 60 Hz both should be ~300. applied+ fine while labels+
+                // trails = the server is feeding this client old state.
+                eprintln!(
+                    "[netdbg cli] applied+{}  labels+{}  (per ~300 ticks)  rtt={:.0}ms",
+                    snaps.saturating_sub(dbg_prev.0),
+                    dbg_newest.saturating_sub(dbg_prev.1),
+                    quic.rtt().as_secs_f32() * 1e3,
+                );
+                dbg_prev = (snaps, dbg_newest);
+            }
         });
     }
 }

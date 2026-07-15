@@ -137,7 +137,7 @@ pub use id::Id;
 pub use kernel::{
     EntryMut, IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
 };
-pub use math::{Mat4, Rng, Vec2, Vec3, lerp_angle, vec2, vec3, wrap_angle};
+pub use math::{Body, Mat4, Quat, Rng, Vec2, Vec3, lerp_angle, vec2, vec3, wrap_angle};
 pub use modload::{BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr};
 pub use net::{Applied, Wire};
 /// Derive [`Wire`]: generates the compact `<Name>Wire` repr pod from
