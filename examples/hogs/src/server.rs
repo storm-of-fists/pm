@@ -61,9 +61,9 @@ pub fn run(quiet: bool) {
     // co-op scoreboard as a synced single.
     let truck = pm.sync_pool::<Truck>("truck");
     let health = pm.sync_pool::<Health>("truck.health");
-    let hog = pm.sync_pool::<Hog>("hog");
-    let bullet = pm.sync_pool::<Bullet>("bullet");
-    let impact = pm.sync_pool::<Impact>("impact");
+    let hog = pm.wire_pool::<Hog>("hog");
+    let bullet = pm.wire_pool::<Bullet>("bullet");
+    let impact = pm.wire_pool::<Impact>("impact");
     pm.ttl_pool(&impact, IMPACT_TTL);
     let hunt = pm.sync_single::<Hunt>("hunt");
     // A second of hog history — the rewind memory shots are judged in.
@@ -173,7 +173,9 @@ pub fn run(quiet: bool) {
                 };
                 let turn = wrap_angle(desired - h.heading)
                     .clamp(-HOG_TURN * FIXED_DT, HOG_TURN * FIXED_DT);
-                h.heading += turn;
+                // Wrap at the write: the quantized wire repr saturates
+                // past ±3.27 rad, and += would walk out of range circling.
+                h.heading = wrap_angle(h.heading + turn);
                 h.speed += (target_speed - h.speed) * (3.0 * FIXED_DT).min(1.0);
                 h.x += h.heading.sin() * h.speed * FIXED_DT;
                 h.z += h.heading.cos() * h.speed * FIXED_DT;
@@ -309,7 +311,9 @@ pub fn run(quiet: bool) {
                     Bullet {
                         x: shooter.x + dir.sin() * 1.9,
                         z: shooter.z + dir.cos() * 1.9,
-                        heading: dir,
+                        // heading + aim can exceed ±pi; wrap for the
+                        // quantized wire repr (saturates past ±3.27 rad).
+                        heading: wrap_angle(dir),
                     },
                 );
                 shot.get_mut().add(

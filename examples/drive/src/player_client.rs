@@ -235,7 +235,9 @@ pub fn run() {
                 true,
             );
             for (id, c) in draw_pool.get().iter() {
-                let tint = peer_color(id.peer());
+                // Tint by controlling player via the replicated ownership
+                // table — id.peer() is index recycling, not control.
+                let tint = peer_color(net.owner_of(id).unwrap_or(0));
                 let model = car_model(c);
                 frame.draw(&body, model, tint, true);
                 frame.draw(

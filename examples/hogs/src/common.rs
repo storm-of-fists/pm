@@ -4,7 +4,6 @@
 //! never step them, only interpolate — so `hog` state has no client-side
 //! step function at all, just a lerp.
 
-use bytemuck::{Pod, Zeroable};
 use pm::Id;
 
 pub const ADDR: &str = "127.0.0.1:48223";
@@ -51,8 +50,7 @@ pub const WAVE_GROW: u32 = 15;
 /// Replicated truck state — the PREDICTED substate only, same discipline
 /// as drive's Car: every field is something `truck_step` evolves. Ground
 /// plane: heading 0 faces +z, forward = (sin h, cos h) on (x, z).
-#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
-#[repr(C)]
+#[pm::pod]
 pub struct Truck {
     pub x: f32,
     pub z: f32,
@@ -78,32 +76,39 @@ pub struct Truck {
 /// so predicting it is impossible — and a non-predicted field inside a
 /// Predictor's state pod freezes between corrections. Separate synced
 /// pool, same id as the truck; clients read it raw.
-#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
-#[repr(C)]
+#[pm::pod]
 pub struct Health {
     pub hp: f32,
 }
 
 /// A biomod feral hog: server-owned, never predicted — clients read it
-/// through `interp_pool` only. Kept lean on purpose: at horde scale this
-/// pod IS the bandwidth experiment (~20 B/hog + 4 B id → ~45 entities
-/// per 1200 B snapshot; a 300-hog wave forces the budget to rotate).
-#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
-#[repr(C)]
+/// through `interp_pool` only. At horde scale this pod IS the bandwidth
+/// experiment, so it rides the wire quantized (the `#[wire]` field
+/// attributes make `#[pm::pod]` derive `pm::Wire`; register with
+/// `wire_pool`): 20 B of f32s → a 9 B repr, 13 B/entry with the id →
+/// ~90 entities per 1200 B snapshot instead of ~45. Coords at 1/64 u
+/// (±512 u range — the walls sit at ±ARENA), angles at 1e-4 rad (the
+/// server wraps `heading` to [-pi, pi) at every write — i16 saturates
+/// past ±3.27), hp at 1/200 over its 0..=HOG_HP range.
+#[pm::pod]
 pub struct Hog {
+    #[wire(i16, scale = 64.0)]
     pub x: f32,
+    #[wire(i16, scale = 64.0)]
     pub z: f32,
+    #[wire(i16, scale = 10000.0)]
     pub heading: f32,
+    #[wire(i16, scale = 256.0)]
     pub speed: f32,
     /// 0..HOG_HP; clients tint by it. Dead hogs are REMOVED, not hp==0.
+    #[wire(u8, scale = 200.0)]
     pub hp: f32,
 }
 
 /// Server-owned co-op scoreboard, replicated as a synced single (the
 /// SingleRx path drive never exercised): one shared score, the live hog
 /// count, and the wave number.
-#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
-#[repr(C)]
+#[pm::pod]
 pub struct Hunt {
     pub points: f32,
     pub alive: u32,
@@ -114,24 +119,31 @@ pub struct Hunt {
 /// judges its hits (lag-compensated per shooter, each tick of flight),
 /// and removes it on impact or at max range; clients only interpolate
 /// and draw the tracer. Which peer fired it is server-local state
-/// (`id.peer()` is recycling, not control), so the pod stays lean.
-#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
-#[repr(C)]
+/// (`id.peer()` is recycling, not control), so the pod stays lean —
+/// and quantized like the hogs (bullets are the other every-tick pool;
+/// `heading` is wrapped at spawn and never changes in flight).
+#[pm::pod]
 pub struct Bullet {
+    #[wire(i16, scale = 64.0)]
     pub x: f32,
+    #[wire(i16, scale = 64.0)]
     pub z: f32,
+    #[wire(i16, scale = 10000.0)]
     pub heading: f32,
 }
 
 /// A transient replicated FACT (the contact-points pattern): the server
 /// spawns one on a fresh id where something landed and `ttl_pool`
 /// removes it. Clients render whatever entries exist, clean up nothing.
-#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
-#[repr(C)]
+#[pm::pod]
 pub struct Impact {
+    #[wire(i16, scale = 64.0)]
     pub x: f32,
+    #[wire(i16, scale = 64.0)]
     pub z: f32,
-    /// What happened here — see the `IMPACT_*` constants.
+    /// What happened here — see the `IMPACT_*` constants. Small whole
+    /// numbers, so the u8 roundtrip is exact and `==` still works.
+    #[wire(u8)]
     pub kind: f32,
 }
 
@@ -150,8 +162,7 @@ pub const IMPACT_TTL: f32 = 1.0;
 /// `aim` is the turret angle the client wants THIS frame: the hold-to-aim
 /// accumulation and the smooth snap-back on release are both client-side
 /// animation; the server just gets a stream of absolute angles.
-#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
-#[repr(C)]
+#[pm::pod]
 pub struct Drive {
     pub thrust: f32, // -1..1
     pub turn: f32,   // -1..1
@@ -162,8 +173,7 @@ pub struct Drive {
 }
 
 /// Reliable client→server event: "flip me back to my spawn."
-#[derive(Clone, Copy, Default, Pod, Zeroable)]
-#[repr(C)]
+#[pm::pod]
 pub struct Respawn {
     pub pad: u32,
 }

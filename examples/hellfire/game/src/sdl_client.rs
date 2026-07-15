@@ -177,7 +177,9 @@ pub fn run() {
             if p.alive == 0 {
                 continue;
             }
-            let i = (p.peer.max(1) as usize - 1) % 8;
+            // Sprite/hysteresis slot by controlling player — the header's
+            // ownership table, not a pod field (id.peer() is recycling).
+            let i = (net.owner_of(id).unwrap_or(1).max(1) as usize - 1) % 8;
             // Walking up-screen shows the back sprite; hysteresis
             // kills flicker at the turn point.
             let dy = p.pos.y - prev_y[i];

@@ -9,6 +9,7 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
+pm_derive = { path = "../pm_derive" }
 libloading = "0.9"
 bytes = "1"
 quinn-proto = "0.11"

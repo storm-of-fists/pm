@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/pm",
+    "crates/pm_derive",
     "crates/pm_sdl",
     "examples/demo",
     "examples/drive",

@@ -401,9 +401,36 @@ fn dense_pool_streams_through_a_byte_budget() {
     }
     server.loop_once(DT);
     let quiet = snet.snapshot_budgeted(&server, 1, BUDGET).unwrap();
-    // Header (12: tick + input-seq + avatar) + removal count (4) + section
-    // count (2) + one section header (6) and zero entries.
-    assert_eq!(quiet.len(), 24, "fully-confirmed world should pack empty");
+    // Header (9: tick + input-seq + empty owner table) + removal count (4)
+    // + section count (2) + one section header (6) and zero entries.
+    assert_eq!(quiet.len(), 21, "fully-confirmed world should pack empty");
+}
+
+#[test]
+fn owner_table_rides_every_header() {
+    let (mut server, mut snet, mut client, cnet) = server_client_pair();
+    let id1 = server.id_add();
+    let id2 = server.id_add();
+    server.loop_once(DT);
+
+    // Unsorted input: the wire table comes back sorted by peer.
+    snet.owners_set(vec![(2, id2.0), (1, id1.0)]);
+    let snap = snet.snapshot(&server, 1).unwrap();
+    let applied = cnet.apply(&mut client, &snap).unwrap();
+    assert_eq!(applied.owners, vec![(1, id1), (2, id2)]);
+
+    // The table rides EVERY header, not just the first — a lost snapshot
+    // costs nothing.
+    server.loop_once(DT);
+    let snap = snet.snapshot(&server, 1).unwrap();
+    let applied = cnet.apply(&mut client, &snap).unwrap();
+    assert_eq!(applied.owners, vec![(1, id1), (2, id2)]);
+
+    // A cleared table packs (and parses) empty.
+    snet.owners_set(Vec::new());
+    server.loop_once(DT);
+    let snap = snet.snapshot(&server, 1).unwrap();
+    assert!(cnet.apply(&mut client, &snap).unwrap().owners.is_empty());
 }
 
 /// The pack/apply micro-bench that used to live in the public `bench`
@@ -464,4 +491,98 @@ fn net_bench_pack_apply() {
     time("pack, converged (idle scan)", M as u64, || {
         black_box(net.snapshot_budgeted(&spm, 1, 1200));
     });
+}
+
+// --- wire pools (quantized reprs) ------------------------------------------
+
+/// Manual `Wire` impl mirroring what `#[derive(pm::Wire)]` generates (the
+/// derive's generated code references `::pm`, which doesn't resolve
+/// in-crate — the derive itself is covered in `tests/wire.rs`).
+#[derive(Clone, Copy, PartialEq, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct QPos {
+    x: f32,
+    y: f32,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct QPosWire {
+    x: i16,
+    y: i16,
+}
+
+unsafe impl bytemuck::Zeroable for QPosWire {}
+unsafe impl bytemuck::Pod for QPosWire {}
+
+const QSCALE: f32 = 64.0;
+
+impl crate::net::Wire for QPos {
+    type Repr = QPosWire;
+    fn to_repr(&self) -> QPosWire {
+        QPosWire {
+            x: (self.x * QSCALE).round() as i16,
+            y: (self.y * QSCALE).round() as i16,
+        }
+    }
+    fn from_repr(repr: QPosWire) -> QPos {
+        QPos {
+            x: repr.x as f32 / QSCALE,
+            y: repr.y as f32 / QSCALE,
+        }
+    }
+}
+
+#[test]
+fn wire_pool_replicates_quantized() {
+    let mut server = Pm::new();
+    let s_pos = server.pool::<QPos>("qpos");
+    let mut snet = NetServer::new(&mut server);
+    snet.pool_wire("qpos", &s_pos);
+    snet.peer_add(1);
+
+    let mut client = Pm::new();
+    client.local_peer = 1;
+    let c_pos = client.pool::<QPos>("qpos");
+    let mut cnet = NetClient::new();
+    cnet.pool_wire("qpos", &c_pos);
+
+    // The handshake compares the REPR size (4 B), not the pool's (8 B).
+    assert_eq!(snet.schema(), cnet.schema());
+    assert_eq!(snet.schema()[0].2, size_of::<QPosWire>());
+
+    let id = server.id_add();
+    s_pos.get_mut().add(
+        id,
+        QPos {
+            x: 1.23456,
+            y: -3.14159,
+        },
+    );
+    server.loop_once(DT);
+
+    let snap = snet.snapshot(&server, 1).unwrap();
+    let ack = cnet.apply(&mut client, &snap).unwrap().tick;
+    snet.ack(1, ack);
+
+    // The client sees the quantized-back value: round(v * 64) / 64.
+    let got = *c_pos.get().get(id).unwrap();
+    assert_eq!(got.x, (1.23456f32 * QSCALE).round() / QSCALE);
+    assert_eq!(got.y, (-3.14159f32 * QSCALE).round() / QSCALE);
+    assert!((got.x - 1.23456).abs() < 1.0 / QSCALE);
+
+    // Converged: the next delta carries no entries for this pool.
+    server.loop_once(DT);
+    let quiet = snet.snapshot(&server, 1).unwrap();
+    assert!(quiet.len() < snap.len());
+
+    // Change again: the delta entry is 4 B id + 4 B repr, not 8 B pod.
+    s_pos.get_mut().get_mut(id).unwrap().x = 500.0;
+    server.loop_once(DT);
+    let delta = snet.snapshot(&server, 1).unwrap();
+    assert_eq!(delta.len(), quiet.len() + 4 + size_of::<QPosWire>());
+    let ack = cnet.apply(&mut client, &delta).unwrap().tick;
+    snet.ack(1, ack);
+    // 500 * 64 = 32000 still fits i16; exact after roundtrip.
+    assert_eq!(c_pos.get().get(id).unwrap().x, 500.0);
 }

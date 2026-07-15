@@ -38,9 +38,9 @@ pub struct ClientWorld {
 pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     let truck = pm.sync_pool::<Truck>("truck");
     let health = pm.sync_pool::<Health>("truck.health");
-    let hog = pm.sync_pool::<Hog>("hog");
-    let bullet = pm.sync_pool::<Bullet>("bullet");
-    let impact = pm.sync_pool::<Impact>("impact");
+    let hog = pm.wire_pool::<Hog>("hog");
+    let bullet = pm.wire_pool::<Bullet>("bullet");
+    let impact = pm.wire_pool::<Impact>("impact");
     let hunt = pm.sync_single::<Hunt>("hunt");
     let input = pm.input::<Drive>("drive");
     let respawn = pm.event::<Respawn>("respawn");

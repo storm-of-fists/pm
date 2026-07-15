@@ -280,7 +280,9 @@ pub fn run() {
                 // Trucks: smoothed view (predicted self, interp'd others).
                 let mine = net.mine();
                 for (id, t) in w.truck_draw.get().iter() {
-                    let tint = peer_color(id.peer());
+                    // Tint by controlling player via the replicated
+                    // ownership table — id.peer() is recycling, not control.
+                    let tint = peer_color(net.owner_of(id).unwrap_or(0));
                     let model = truck_model(t);
                     frame.draw(&body, model, tint, true);
                     frame.draw(

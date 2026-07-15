@@ -139,7 +139,18 @@ pub use kernel::{
 };
 pub use math::{Mat4, Rng, Vec2, Vec3, lerp_angle, vec2, vec3, wrap_angle};
 pub use modload::{BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr};
-pub use net::Applied;
+pub use net::{Applied, Wire};
+/// Derive [`Wire`]: generates the compact `<Name>Wire` repr pod from
+/// per-field `#[wire(i16, scale = 64.0)]` quantization attributes, for
+/// pools registered via [`wire_pool`](Pm::wire_pool). Generated
+/// code references `::pm` and `::bytemuck`, so both must be direct
+/// dependencies of the deriving crate.
+pub use pm_derive::Wire;
+/// `#[pm::pod]` — one line instead of the seven-derive pod boilerplate:
+/// expands to `#[repr(C)]` + `Clone, Copy, PartialEq, Debug, Default,
+/// Pod, Zeroable`, and adds [`Wire`] automatically when any field has a
+/// `#[wire(..)]` attribute. See `pm_derive::pod` for the fine print.
+pub use pm_derive::pod;
 pub use netmod::{
     ClientNet, EventRx, EventTx, InputRx, InputTx, NET_PRIO, PmClient, PmServer, PoolHistory,
     ServerNet, SingleRx,

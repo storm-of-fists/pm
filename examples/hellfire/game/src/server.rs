@@ -99,7 +99,6 @@ pub fn run(quiet: bool) {
                     Player {
                         pos: vec2(SPAWN_X[i], SPAWN_Y[i]),
                         hp: PLAYER_HP,
-                        peer: p as u32,
                         alive: 1,
                         color: [c[0], c[1], c[2], 255],
                     },

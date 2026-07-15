@@ -38,10 +38,20 @@
 // `PmClient::interp_pool`, duration as `PmServer::ttl_pool` (transient
 // entries expire) + `PmServer::history_pool` (past-tick ring; rewind to
 // `ServerNet::acked_tick(peer) - interp ticks` = lag-compensated contact
-// resolution, proven in drive's scoring). Still open: replicating the
-// ownership table to every peer (the snapshot header carries only YOUR
-// avatar; a full peer→entity table would let pods drop hand-carried peer
-// fields — see hellfire's Player.peer).
+// resolution, proven in drive's scoring). The ownership table replicates
+// whole in every snapshot header (2026-07-14) — `ClientNet::owner_of`
+// replaced the hand-carried peer fields avatars used to need.
+// TODO(roadmap): recording, playback, and saving (requested 2026-07-15).
+// The machinery is already here, don't invent a second format:
+// - RECORDING: the snapshot stream IS the demo format — a recorder is a
+//   virtual peer with an unbounded budget whose snapshots get written to
+//   disk (tick labels included) instead of a socket; per-peer inputs
+//   alongside give a full replay of causes, not just effects.
+// - PLAYBACK: a client whose net task reads that file on the tick clock
+//   instead of a QUIC endpoint — apply() and interp_pool work unchanged.
+// - SAVING: a world save is "every synced pool + id state at one tick" —
+//   the SyncSet adapters already serialize exactly that (a save is an
+//   unbudgeted keyframe snapshot; loading is apply() into a fresh Pm).
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -99,6 +109,10 @@ impl<'a> Reader<'a> {
         let (head, rest) = self.data.split_at(n);
         self.data = rest;
         Ok(head)
+    }
+
+    fn u8(&mut self) -> Result<u8, NetError> {
+        Ok(self.bytes(1)?[0])
     }
 
     fn u16(&mut self) -> Result<u16, NetError> {
@@ -232,6 +246,99 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
     }
 }
 
+/// A synced pod with a compact wire representation: the pool keeps the
+/// game's ergonomic struct (full-precision `f32` fields); `Repr` is the
+/// small pod that actually rides the wire, converted at the pack/apply
+/// boundary only. Derive it — `#[derive(pm::Wire)]` with per-field
+/// `#[wire(i16, scale = 64.0)]` quantization attributes — and register
+/// with [`wire_pool`](crate::kernel::Pm::wire_pool) instead of
+/// `sync_pool`. Both ends must use `wire_pool`: the handshake schema
+/// carries the REPR size, so a mismatched end is rejected loudly.
+///
+/// Quantization is lossy by design (the client sees `Repr`-precision
+/// values; the server keeps full precision locally), so quantize
+/// server-owned pools — for a *predicted* pool the reconcile threshold
+/// must exceed the quantization step or corrections never settle.
+pub trait Wire: Copy + 'static {
+    /// The pod that rides the wire in place of `Self`.
+    type Repr: Pod;
+    fn to_repr(&self) -> Self::Repr;
+    fn from_repr(repr: Self::Repr) -> Self;
+}
+
+/// [`PoolAdapter`] for `T: Wire` — identical bookkeeping, but entries
+/// cross the wire as `T::Repr` (quantized at pack, dequantized at apply).
+struct WireAdapter<T: Wire> {
+    name: String,
+    pool: Rc<RefCell<Pool<T>>>,
+}
+
+impl<T: Wire> SyncAdapter for WireAdapter<T> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[cfg(test)]
+    fn value_size(&self) -> usize {
+        size_of::<T::Repr>()
+    }
+
+    fn pack_dirty(
+        &self,
+        pp: &mut PeerPool,
+        label: u32,
+        budget: &mut usize,
+        out: &mut Vec<u8>,
+        sent: &mut Vec<SentEntry>,
+        pool_idx: u16,
+    ) -> u32 {
+        let pool = self.pool.borrow();
+        let ids = pool.ids();
+        let values = pool.values();
+        let ticks = pool.changed_ticks();
+        let n = ids.len();
+        if n == 0 {
+            return 0;
+        }
+        let entry_size = 4 + size_of::<T::Repr>();
+        let start = if pp.cursor >= n { 0 } else { pp.cursor };
+        let mut count = 0u32;
+        let mut resume_at = start;
+        for k in 0..n {
+            let i = (start + k) % n;
+            let tick = ticks[i];
+            let slot = ids[i].slot();
+            if tick <= pp.confirmed.get(slot) || tick <= pp.inflight_tick.get(slot) {
+                continue;
+            }
+            if *budget < entry_size {
+                resume_at = i;
+                break;
+            }
+            *budget -= entry_size;
+            out.extend_from_slice(&ids[i].0.to_le_bytes());
+            out.extend_from_slice(bytemuck::bytes_of(&values[i].to_repr()));
+            pp.inflight_tick.set(slot, tick);
+            pp.inflight_label.set(slot, label);
+            sent.push((pool_idx, slot, tick));
+            count += 1;
+        }
+        pp.cursor = resume_at;
+        count
+    }
+
+    fn apply(&self, pm: &mut Pm, count: u32, r: &mut Reader) -> Result<(), NetError> {
+        let mut pool = self.pool.borrow_mut();
+        for _ in 0..count {
+            let id = Id(r.u32()?);
+            let repr: T::Repr = bytemuck::pod_read_unaligned(r.bytes(size_of::<T::Repr>())?);
+            pm.id_sync(id);
+            pool.add(id, T::from_repr(repr));
+        }
+        Ok(())
+    }
+}
+
 /// Stable 16-bit wire identity for a named channel (pool, event, or the
 /// input channel), derived from its name (FNV-1a, folded to 16 bits).
 /// Everything is addressed on the wire by this key, never by registration
@@ -351,6 +458,13 @@ pub(crate) struct SyncSet {
 }
 
 impl SyncSet {
+    pub(crate) fn pool_wire<T: Wire>(&mut self, name: &str, pool: &PoolHandle<T>) {
+        self.adapters.push(Box::new(WireAdapter {
+            name: name.to_string(),
+            pool: pool.rc().clone(),
+        }));
+    }
+
     pub(crate) fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.adapters.push(Box::new(PoolAdapter {
             name: name.to_string(),
@@ -384,7 +498,9 @@ impl SyncSet {
 //
 //   u32 tick label (last completed tick)
 //   u32 input seq echo (last input this peer's sim consumed)
-//   u32 avatar id (this peer's controlled entity; 0 = none)
+//   u8 owner count, then count x [peer u8][entity id u32] — the full
+//     peer→controlled-entity table, same bytes for every peer; riding
+//     every header makes it loss-robust with no reliability machinery
 //   u32 removal count, then count x [id u32]
 //   u16 section count, then per section:
 //     u16 pool key (name hash; see `pool_key`, order-independent)
@@ -398,12 +514,6 @@ const INFLIGHT_EXPIRY_TICKS: u32 = 60;
 struct Peer {
     acked_tick: u32,
     input_seq: u32,
-    /// This peer's controlled entity, shipped in every snapshot header so
-    /// the client always knows which replicated entity is its own — no
-    /// bespoke "here's your id" handshake. 0 = none assigned yet. Set by
-    /// the game via the net module (see `ServerOwn`); 0 stays harmless for
-    /// games that never assign one.
-    avatar: u32,
     pools: Vec<PeerPool>,
     /// What each unacked snapshot carried, oldest first, so an ack can
     /// confirm exactly that snapshot's entries — and declare everything
@@ -431,16 +541,18 @@ impl Peer {
 }
 
 /// What a successfully applied snapshot tells the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     /// Snapshot tick label — the ack to send back.
     pub tick: u32,
     /// Last input sequence the server processed for this peer — the
     /// reconciliation point for client-side prediction.
     pub input_seq: u32,
-    /// This peer's controlled entity id (0 = none). The net module mirrors
-    /// it into the client's net status; games read it via [`ClientNet::mine`](crate::ClientNet::mine).
-    pub avatar: u32,
+    /// The full peer→controlled-entity table, sorted by peer. The net
+    /// module mirrors it into the client's net status; games read it via
+    /// [`ClientNet::mine`](crate::ClientNet::mine) /
+    /// [`owner_of`](crate::ClientNet::owner_of).
+    pub owners: Vec<(u8, Id)>,
 }
 
 /// Server side: owns the peer table, packs per-peer deltas, gates id
@@ -448,6 +560,9 @@ pub struct Applied {
 pub struct NetServer {
     sync: SyncSet,
     peers: BTreeMap<u8, Peer>,
+    /// The peer→controlled-entity table, shipped whole in every snapshot
+    /// header (same bytes for every peer) — see `owners_set`.
+    owners: Vec<(u8, u32)>,
 }
 
 impl NetServer {
@@ -459,6 +574,7 @@ impl NetServer {
         Self {
             sync: SyncSet::default(),
             peers: BTreeMap::new(),
+            owners: Vec::new(),
         }
     }
 
@@ -468,12 +584,18 @@ impl NetServer {
         Self {
             sync,
             peers: BTreeMap::new(),
+            owners: Vec::new(),
         }
     }
 
     #[cfg(test)] // test seam: manual bind path
     pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
+    }
+
+    #[cfg(test)] // test seam: manual bind path
+    pub fn pool_wire<T: Wire>(&mut self, name: &str, pool: &PoolHandle<T>) {
+        self.sync.pool_wire(name, pool);
     }
 
     #[cfg(test)] // test seam: manual bind path
@@ -485,7 +607,6 @@ impl NetServer {
         self.peers.entry(peer).or_insert_with(|| Peer {
             acked_tick: 0,
             input_seq: 0,
-            avatar: 0,
             pools: (0..self.sync.adapters.len())
                 .map(|_| PeerPool::new())
                 .collect(),
@@ -537,14 +658,15 @@ impl NetServer {
         }
     }
 
-    /// Mark `peer`'s controlled entity (`id.0`, or 0 for none). Shipped in
-    /// every snapshot header so the client always knows which replicated
-    /// entity is its own — the built-in replacement for a hand-rolled
-    /// ownership handshake. Idempotent; call it every tick.
-    pub fn set_avatar(&mut self, peer: u8, id: u32) {
-        if let Some(p) = self.peers.get_mut(&peer) {
-            p.avatar = id;
-        }
+    /// Replace the peer→controlled-entity table shipped in every snapshot
+    /// header. One table for all peers: every client sees who controls
+    /// what — its own entry ([`ClientNet::mine`](crate::ClientNet::mine))
+    /// and everyone else's (no hand-carried peer fields in pods).
+    /// Idempotent; call it every tick. Sorted here so the wire bytes are
+    /// deterministic regardless of the caller's map order.
+    pub fn owners_set(&mut self, mut owners: Vec<(u8, u32)>) {
+        owners.sort_unstable();
+        self.owners = owners;
     }
 
     /// Pack everything `peer` hasn't confirmed, without a size cap.
@@ -584,7 +706,11 @@ impl NetServer {
         let mut out = Vec::new();
         out.extend_from_slice(&label.to_le_bytes());
         out.extend_from_slice(&state.input_seq.to_le_bytes());
-        out.extend_from_slice(&state.avatar.to_le_bytes());
+        out.push(self.owners.len() as u8);
+        for &(peer, id) in &self.owners {
+            out.push(peer);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
 
         let removals: Vec<u32> = pm
             .removal_log()
@@ -662,6 +788,11 @@ impl NetClient {
     }
 
     #[cfg(test)] // test seam: manual bind path
+    pub fn pool_wire<T: Wire>(&mut self, name: &str, pool: &PoolHandle<T>) {
+        self.sync.pool_wire(name, pool);
+    }
+
+    #[cfg(test)] // test seam: manual bind path
     pub fn schema(&self) -> Vec<(u8, String, usize)> {
         self.sync.schema()
     }
@@ -672,7 +803,13 @@ impl NetClient {
         let mut r = Reader::new(snapshot);
         let tick = r.u32()?;
         let input_seq = r.u32()?;
-        let avatar = r.u32()?;
+        let owner_count = r.u8()?;
+        let mut owners = Vec::with_capacity(owner_count as usize);
+        for _ in 0..owner_count {
+            let peer = r.u8()?;
+            let id = Id(r.u32()?);
+            owners.push((peer, id));
+        }
 
         let removal_count = r.u32()?;
         for _ in 0..removal_count {
@@ -695,7 +832,7 @@ impl NetClient {
         Ok(Applied {
             tick,
             input_seq,
-            avatar,
+            owners,
         })
     }
 }

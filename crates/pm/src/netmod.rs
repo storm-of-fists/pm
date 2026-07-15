@@ -16,9 +16,10 @@
 //!
 //! Server (`Pm::server(addr)`), everything from the [`PmServer`] wrapper:
 //! - [`net`](PmServer::net) → [`ServerNet`]: who joined/left this tick,
-//!   each peer's controlled entity (`own_set` ships the id in every
-//!   snapshot header — the built-in replacement for a hand-rolled
-//!   "here's your id" event), and per-peer link stats
+//!   each peer's controlled entity (`own_set` ships the whole
+//!   peer→entity table in every snapshot header — the built-in
+//!   replacement for a hand-rolled "here's your id" event AND for
+//!   hand-carried peer fields in avatar pods), and per-peer link stats
 //!   ([`acked_tick`](ServerNet::acked_tick)/[`rtt_ms`](ServerNet::rtt_ms)).
 //!   Ownership auto-clears the tick after a leave: the leave handler
 //!   still sees `own(p)` to despawn by.
@@ -39,7 +40,10 @@
 //! - [`net`](PmClient::net) → [`ClientNet`]: status reads
 //!   ([`mine`](ClientNet::mine), [`rtt_ms`](ClientNet::rtt_ms),
 //!   [`peer`](ClientNet::peer), [`snapshots`](ClientNet::snapshots),
-//!   [`connected`](ClientNet::connected)) and the per-tick
+//!   [`connected`](ClientNet::connected)), the replicated ownership
+//!   table ([`owner_of`](ClientNet::owner_of)/[`own`](ClientNet::own)/
+//!   [`owned`](ClientNet::owned) — who controls what, not just
+//!   [`mine`](ClientNet::mine)), and the per-tick
 //!   [`applied`](ClientNet::applied) snapshot log (each entry carries the
 //!   server's input-seq echo, the reconciliation point).
 //! - [`input`](PmClient::input) → [`InputTx`]: set the continuous input
@@ -74,7 +78,9 @@ use bytemuck::Pod;
 use crate::duration::{HistoryRing, pool_expire};
 use crate::id::Id;
 use crate::kernel::{Pm, PoolHandle, SingleHandle};
-use crate::net::{Applied, NetClient, NetServer, Outbox, SyncSet, WireKind, WireReg, event_tag};
+use crate::net::{
+    Applied, NetClient, NetServer, Outbox, SyncSet, Wire, WireKind, WireReg, event_tag,
+};
 use crate::predict::Predictor;
 use crate::smooth::{InterpBuffer, pool_interp};
 use crate::transport::{QuicClient, QuicServer};
@@ -178,16 +184,28 @@ impl Pm {
     /// the one-call replacement for `pool()` + a separate sync step. The
     /// pool's name is its wire identity (hashed; see `pool_key`), so server
     /// and client may register in any order.
-    //
-    // TODO(roadmap): synced-pod derive macro — the pool IS the wire
-    // format (see lib.rs design decisions), so bandwidth work means
-    // compact pods; a derive with quantization attributes (e.g. i16
-    // positions with a scale) would keep the game's struct ergonomic
-    // while the registered pod stays small. This registration seam is
-    // where the derived type would plug in.
     pub fn sync_pool<T: Pod + 'static>(&mut self, name: &str) -> PoolHandle<T> {
         let pool = self.pool::<T>(name);
         self.sync(&pool);
+        pool
+    }
+
+    /// [`sync_pool`](Self::sync_pool) with a compact wire representation:
+    /// the pool keeps the game's full-precision struct; snapshots carry
+    /// its derived [`Wire::Repr`] (see `#[derive(pm::Wire)]` for the
+    /// quantization attributes). The handshake schema carries the REPR
+    /// size, so an end still registering the pool via `sync_pool` is
+    /// rejected at connect — switch both sides together.
+    pub fn wire_pool<T: Wire>(&mut self, name: &str) -> PoolHandle<T> {
+        let pool = self.pool::<T>(name);
+        self.single::<WireReg>("net.reg").get_mut().register(
+            WireKind::Pool,
+            name,
+            size_of::<T::Repr>(),
+        );
+        self.single::<SyncSet>("net.sync")
+            .get_mut()
+            .pool_wire(name, &pool);
         pool
     }
 
@@ -486,9 +504,38 @@ pub struct ClientNet {
 impl ClientNet {
     /// This peer's controlled entity, as the server marked it — `None`
     /// until the first snapshot that carries one (see
-    /// [`ServerNet::own_set`]).
+    /// [`ServerNet::own_set`]). Sugar for [`own`](ClientNet::own) on our
+    /// own peer id.
     pub fn mine(&self) -> Option<Id> {
         self.status.get().avatar
+    }
+
+    /// `peer`'s controlled entity, if the server marked one — the same
+    /// table the server reads via [`ServerNet::own`], replicated in every
+    /// snapshot header.
+    pub fn own(&self, peer: u8) -> Option<Id> {
+        let st = self.status.get();
+        st.owners
+            .iter()
+            .find(|&&(p, _)| p == peer)
+            .map(|&(_, id)| id)
+    }
+
+    /// Every (peer, controlled entity) pair — the client-side mirror of
+    /// [`ServerNet::owned`].
+    pub fn owned(&self) -> Vec<(u8, Id)> {
+        self.status.get().owners.clone()
+    }
+
+    /// Which peer controls entity `id`, if any — the reverse lookup that
+    /// replaces a hand-carried peer field in an avatar pod (tint by
+    /// player, "is this row me", nameplates).
+    pub fn owner_of(&self, id: Id) -> Option<u8> {
+        let st = self.status.get();
+        st.owners
+            .iter()
+            .find(|&&(_, e)| e == id)
+            .map(|&(p, _)| p)
     }
 
     /// Round-trip time to the server in milliseconds (0 until connected).
@@ -545,20 +592,18 @@ impl ServerNet {
         self.peers.get().left.clone()
     }
 
-    /// Mark `peer`'s controlled entity. The net task ships it in every
-    /// snapshot header, so the client always knows which replicated entity
-    /// is its own ([`ClientNet::mine`]) — the built-in replacement for a
-    /// hand-rolled "here's your id" reliable event, robust to packet loss
+    /// Mark `peer`'s controlled entity. The net task ships the whole
+    /// table in every snapshot header, so every client knows which
+    /// replicated entity is its own ([`ClientNet::mine`]) AND who
+    /// controls everyone else's ([`ClientNet::owner_of`]) — the built-in
+    /// replacement for both a hand-rolled "here's your id" event and
+    /// hand-carried peer fields in avatar pods, robust to packet loss
     /// (it rides every snapshot, not one). Doubles as the server's
     /// peer→entity lookup ([`own`](ServerNet::own)/[`owned`](ServerNet::owned)).
     //
     // TODO(roadmap): ONE entity per peer by design — a second per-peer
     // entity (a roster row, say) is a pool with a peer field, scanned
-    // (fine at ≤8 peers). And the table is server-only: clients see only
-    // their OWN id in the header, so cross-player association still rides
-    // a replicated peer field (hellfire's Player.peer). Replicating this
-    // table to every peer would delete those hand-carried fields — see
-    // the net.rs roadmap block.
+    // (fine at ≤8 peers).
     pub fn own_set(&self, peer: u8, id: Id) {
         self.own.get_mut().set(peer, id);
     }
@@ -574,6 +619,17 @@ impl ServerNet {
     /// tasks want.
     pub fn owned(&self) -> Vec<(u8, Id)> {
         self.own.get().0.iter().map(|(&p, &id)| (p, id)).collect()
+    }
+
+    /// Which peer controls entity `id`, if any — the reverse lookup
+    /// (mirrored client-side as [`ClientNet::owner_of`]).
+    pub fn owner_of(&self, id: Id) -> Option<u8> {
+        self.own
+            .get()
+            .0
+            .iter()
+            .find(|&(_, &e)| e == id)
+            .map(|(&p, _)| p)
     }
 
     /// The newest snapshot tick `peer` has acknowledged (0 until the
@@ -1067,6 +1123,11 @@ pub(crate) struct NetStatus {
     /// [`ServerNet::own_set`]). `None` until the first snapshot that
     /// carries one. [`ClientNet::mine`] is the sugar most game code reads.
     pub avatar: Option<Id>,
+    /// The full peer→controlled-entity table from the newest snapshot
+    /// header, sorted by peer — every player's ownership, not just ours.
+    /// Read through [`ClientNet::owner_of`]/[`own`](ClientNet::own)/
+    /// [`owned`](ClientNet::owned).
+    pub owners: Vec<(u8, Id)>,
     /// Fraction (0..1) of the next fixed input step already accumulated
     /// this tick. The predictor advances in whole `1/input_hz` steps; at
     /// render rates not phase-locked to that, draw the local avatar at
@@ -1157,12 +1218,10 @@ impl NetServer {
                 ev.clear();
                 ev.extend(quic.events_drain());
             }
-            {
-                let own = own.get();
-                for (&p, &id) in &own.0 {
-                    net.set_avatar(p, id.0);
-                }
-            }
+            // Ship the whole peer→entity table in every header (same
+            // bytes for all peers); sorted inside owners_set so the
+            // HashMap's iteration order never reaches the wire.
+            net.owners_set(own.get().0.iter().map(|(&p, &id)| (p, id.0)).collect());
             for p in plist {
                 let budget = quic.snapshot_budget(p);
                 if let Some(snap) = net.snapshot_budgeted(pm, p, budget) {
@@ -1208,8 +1267,19 @@ impl NetClient {
                     continue;
                 };
                 quic.ack_send(a.tick);
-                if a.avatar != 0 {
-                    status.get_mut().avatar = Some(Id(a.avatar));
+                {
+                    // The header table is authoritative as of this
+                    // snapshot: mine() is our own row (peer ids start at
+                    // 1, so a pre-handshake peer of 0 matches nothing and
+                    // the next snapshot fills it in).
+                    let mut st = status.get_mut();
+                    let me = st.peer;
+                    st.avatar = a
+                        .owners
+                        .iter()
+                        .find(|&&(p, _)| p == me)
+                        .map(|&(_, id)| id);
+                    st.owners = a.owners.clone();
                 }
                 applied.get_mut().0.push(a);
                 status.get_mut().snapshots += 1;

@@ -143,7 +143,6 @@ pub const LEVELS: [LevelDef; 5] = [
 pub struct Player {
     pub pos: Vec2,
     pub hp: f32,
-    pub peer: u32,
     pub alive: u32,
     pub color: [u8; 4],
 }
