@@ -935,13 +935,32 @@ impl Drop for Frame3<'_> {
             }
         }
 
-        // 3. HUD: alpha-blend each queued glyph onto present. One compute
-        // pass, one dispatch per glyph (rebinding the glyph texture).
-        if !self.cmds.is_empty() {
+        // 3. HUD: alpha-blend each queued glyph onto present, one dispatch
+        // per glyph (rebinding the glyph texture). Dispatches inside one
+        // compute pass are UNSYNCHRONIZED (SDL_gpu contract), so two quads
+        // touching the same pixels — a bar's fill over its background, faked
+        // bold's overdraw — race their read-modify-write blends and flicker
+        // where they overlap. Batch quads into a pass only while they stay
+        // disjoint; on overlap, end the pass and open the next — the pass
+        // boundary is the barrier that orders the blend.
+        {
             let rw = [StorageTextureReadWriteBinding::new().with_texture(self.present)];
-            if let Ok(cp) = self.device.begin_compute_pass(&commands, &rw, &[]) {
+            let overlap = |a: &[f32; 4], b: &[f32; 4]| {
+                a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+            };
+            let mut i = 0;
+            while i < self.cmds.len() {
+                let Ok(cp) = self.device.begin_compute_pass(&commands, &rw, &[]) else {
+                    break;
+                };
                 cp.bind_compute_pipeline(self.text_pipe);
-                for cmd in &self.cmds {
+                let first = i;
+                while i < self.cmds.len()
+                    && !self.cmds[first..i]
+                        .iter()
+                        .any(|prev| overlap(&prev.rect, &self.cmds[i].rect))
+                {
+                    let cmd = &self.cmds[i];
                     cp.bind_compute_storage_textures(0, std::slice::from_ref(&cmd.tex));
                     commands.push_compute_uniform_data(
                         0,
@@ -951,6 +970,7 @@ impl Drop for Frame3<'_> {
                         },
                     );
                     cp.dispatch(cmd.w.div_ceil(8), cmd.h.div_ceil(8), 1);
+                    i += 1;
                 }
                 self.device.end_compute_pass(cp);
             }

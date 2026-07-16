@@ -349,9 +349,7 @@ pub fn run(quiet: bool) {
                         }
                         continue;
                     }
-                    // Turret muzzle at the barrel tip: flat shot.
-                    let dir = shooter.heading() + shooter.aim;
-                    (x + dir.sin() * 1.9, 1.45, z + dir.cos() * 1.9, dir, 0.0)
+                    truck_muzzle(&shooter)
                 } else if let Some(shooter) = heli.get_id_mut(id).map(|mut hl| {
                     heli_step(&mut hl, cmd, FIXED_DT);
                     *hl
@@ -384,17 +382,7 @@ pub fn run(quiet: bool) {
                         }
                         continue;
                     }
-                    // Nose gun fires where the nose points — dive to
-                    // strafe the horde. Body pitch>0 = nose down, so the
-                    // bullet's climb is its negation.
-                    let (yaw, pitch, _) = b.rot.to_yaw_pitch_roll();
-                    (
-                        b.pos.x + yaw.sin() * 2.3,
-                        (b.pos.y - 0.35).max(0.2),
-                        b.pos.z + yaw.cos() * 2.3,
-                        yaw,
-                        -pitch,
-                    )
+                    heli_muzzle(&shooter)
                 } else {
                     continue;
                 };
@@ -422,6 +410,7 @@ pub fn run(quiet: bool) {
                         // quantized wire repr (saturates past ±3.27 rad).
                         heading: wrap_angle(dir),
                         pitch: wrap_angle(climb),
+                        owner: peer as f32,
                     },
                 );
                 shot.get_mut().add(

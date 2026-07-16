@@ -91,8 +91,11 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
 
 /// Headless bot: hunt the nearest hog — drive at it, shoot when lined
 /// up, wander when the wave is dead.
-pub fn run_bot(n: u32) {
+pub fn run_bot(n: u32, link: (f32, f32)) {
     let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
+    if link != (0.0, 0.0) {
+        pm.link_lag(link.0, link.1);
+    }
     let w = client_setup(&mut pm);
 
     // Building-jam recovery state: seconds spent commanding thrust while

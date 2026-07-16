@@ -116,13 +116,21 @@ fn hud_bold(frame: &mut Frame3, s: &str, x: f32, y: f32, px: f32, col: (u8, u8, 
     }
 }
 
-pub fn run() {
+pub fn run(link: (f32, f32)) {
     let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
+    if link != (0.0, 0.0) {
+        pm.link_lag(link.0, link.1);
+        eprintln!("[hogs] simulated link: {} ms one-way, {:.1}% loss", link.0, link.1 * 100.0);
+    }
     let w = client_setup(&mut pm);
     eprintln!("connecting to {ADDR} ...");
     let net = pm.net();
-    // Sounds ride the same replicated facts the renderer draws — see sfx.rs.
-    crate::sfx::install(&mut pm, &w);
+    // The cosmetic gun's client-LOCAL pool (never synced): your own
+    // shot's tracer + bang at the CLICK; see the input task below.
+    let tracer_local = pm.pool::<Tracer>("tracer.local");
+    // Sounds ride the same replicated facts the renderer draws — plus
+    // the local tracer births for our instant bang. See sfx.rs.
+    crate::sfx::install(&mut pm, &w, &tracer_local);
 
     camera_install(&mut pm);
     let cam_mgr = camera_manager(&mut pm);
@@ -167,7 +175,7 @@ pub fn run() {
         .expect("barrel");
     // Bullet tracer: a stretched sliver, centered — bullets carry their
     // own altitude now, so the height rides the translate.
-    let tracer = r3d
+    let tracer_mesh = r3d
         .upload_mesh(&bake(
             &box_tris(vec3(-0.07, -0.1, -0.65), vec3(0.07, 0.1, 0.65)),
             (1.0, 1.0, 1.0),
@@ -238,11 +246,20 @@ pub fn run() {
     // replays exactly, so prediction never corrects over it.
     let mut aim = 0.0f32;
 
+    // The cosmetic gun: your bang and tracer at the CLICK, from the
+    // PREDICTED muzzle — the authoritative bullet still round-trips for
+    // hits and for everyone else's eyes, and `Bullet::owner` hides our
+    // late twins from the draw. Cooldown mirrors the server's; a tick
+    // of drift is cosmetic-only.
+    let mut gun_cd = 0.0f32;
+
     pm.task_add("input", 4.0, 0.0, {
         let cam_mgr = cam_mgr.clone();
         let respawn = w.respawn.clone();
         let input = w.input.clone();
+        let pred = w.pred.clone();
         let pred_heli = w.pred_heli.clone();
+        let tracer = tracer_local.clone();
         move |pm| {
             // The live predictor answers "am I flying?" — it decides
             // which KEY CONTEXT fills the (shared) input pod below.
@@ -307,7 +324,7 @@ pub fn run() {
                 }
             }
             let lmb = m.is_mouse_button_pressed(MouseButton::Left) as i32 as f32;
-            input.set(if flying {
+            let cmd = if flying {
                 Drive {
                     thrust: 0.0,
                     turn: held(Scancode::D) - held(Scancode::A),
@@ -329,7 +346,54 @@ pub fn run() {
                     pitch: 0.0,
                     lift: 0.0,
                 }
-            });
+            };
+            input.set(cmd);
+            // Cosmetic gun: fire the local tracer the same frame the
+            // trigger reads down. The muzzle comes off whichever
+            // predictor is live — the pose the server will agree with.
+            gun_cd = (gun_cd - pm.loop_dt()).max(0.0);
+            if cmd.fire > 0.5 && gun_cd <= 0.0 {
+                let muzzle = pred
+                    .get()
+                    .state()
+                    .map(|t| truck_muzzle(&t))
+                    .or_else(|| pred_heli.get().state().map(|h| heli_muzzle(&h)));
+                if let Some((x, y, z, heading, pitch)) = muzzle {
+                    gun_cd = GUN_CD;
+                    let id = pm.id_add();
+                    tracer.get_mut().add(
+                        id,
+                        Tracer {
+                            x,
+                            y,
+                            z,
+                            heading,
+                            pitch,
+                            left: GUN_RANGE,
+                        },
+                    );
+                }
+            }
+        }
+    });
+
+    // Fly the local tracers on the render clock; they die on the same
+    // walls the real bullet does (minus hogs — the server's Impact
+    // flash is still the word on hits).
+    pm.task_add("tracer.step", 30.0, 0.0, {
+        let tracer = tracer_local.clone();
+        move |pm| {
+            let dt = pm.loop_dt();
+            let dead: Vec<_> = {
+                let mut trs = tracer.get_mut();
+                let ids: Vec<_> = trs.iter().map(|(id, _)| id).collect();
+                ids.into_iter()
+                    .filter(|&id| trs.get_mut(id).is_some_and(|mut tr| !tracer_step(&mut tr, dt)))
+                    .collect()
+            };
+            for id in dead {
+                pm.id_remove(id);
+            }
         }
     });
 
@@ -387,6 +451,7 @@ pub fn run() {
     pm.task_add("render", 70.0, 0.0, {
         let view = cam_view.clone();
         let net = net.clone();
+        let tracer = tracer_local.clone();
         // Death-edge tracking for ragdolls: last tick's raw replicas, so
         // a removal still has the state to launch a corpse from.
         let mut prev_hogs: std::collections::HashMap<pm::Id, Hog> = Default::default();
@@ -533,13 +598,31 @@ pub fn run() {
                 }
 
                 // Bullets, off their interp pool: hot tracer slivers
-                // at their own altitude, tipped along the climb.
+                // at their own altitude, tipped along the climb. OURS
+                // are skipped — the local cosmetic tracer below already
+                // drew this shot at the click; the replicated twin
+                // arriving ~RTT later would double-draw it.
+                let me = net.peer() as f32;
                 for (_, bl) in w.bullet_draw.get().iter() {
+                    if bl.owner == me {
+                        continue;
+                    }
                     frame.draw(
-                        &tracer,
+                        &tracer_mesh,
                         Mat4::translate(vec3(bl.x, bl.y, bl.z))
                             * Mat4::rot_y(bl.heading)
                             * Mat4::rot_x(-bl.pitch),
+                        (1.0, 0.92, 0.45),
+                        true,
+                    );
+                }
+                // Our own shots: the client-local cosmetic tracers.
+                for (_, tr) in tracer.get().iter() {
+                    frame.draw(
+                        &tracer_mesh,
+                        Mat4::translate(vec3(tr.x, tr.y, tr.z))
+                            * Mat4::rot_y(tr.heading)
+                            * Mat4::rot_x(-tr.pitch),
                         (1.0, 0.92, 0.45),
                         true,
                     );

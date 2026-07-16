@@ -92,8 +92,9 @@ pub const NET_PRIO: f32 = 5.0;
 
 /// Artificial link delay/loss from `PM_LAG_MS` (milliseconds) and
 /// `PM_LOSS` (0..1 drop fraction) — the simulation knob clients used to
-/// wire by hand around the QUIC endpoint, now read by `serve`/`connect`.
-/// `None` when both are unset or zero.
+/// wire by hand around the QUIC endpoint, now read by `connect` ONLY
+/// (one lagged socket per link; see `serve` for why the server must not
+/// stack a second one). `None` when both are unset or zero.
 /// `PM_NETDBG=1` — the net doctor. Both roles print link vitals every
 /// 5 s: the server reports, per peer, how far its ack cursor trails the
 /// tick (the lag-comp rewind anchor — if this GROWS the peer is being
@@ -142,6 +143,7 @@ pub struct PmClient {
     pm: Pm,
     addr: String,
     input_hz: f32,
+    link_lag: Option<(std::time::Duration, f32)>,
 }
 
 impl Deref for PmServer {
@@ -191,6 +193,7 @@ impl Pm {
             pm: Pm::new(),
             addr: addr.to_string(),
             input_hz,
+            link_lag: None,
         }
     }
 
@@ -244,11 +247,15 @@ impl Pm {
     }
 
     /// Bind the server transport and install the net task. Called by `run`.
+    ///
+    /// Deliberately does NOT honor `PM_LAG_MS`/`PM_LOSS` — the CLIENT
+    /// applies the simulated link (see `connect`). When server and client
+    /// share a process (hogs no-arg, tests) they share the env too, and
+    /// lagging both sockets stacks: every packet crossed two delay queues
+    /// (RTT = 4x the knob, not 2x) and rolled loss twice per direction —
+    /// "80 ms / 3%" actually simulated a 320 ms / ~6% link.
     fn serve(&mut self, addr: &str) -> std::io::Result<()> {
-        let mut quic = QuicServer::bind(addr, &self.net_schema())?;
-        if let Some((delay, loss)) = link_lag_from_env() {
-            quic.link_lag_set(delay, loss);
-        }
+        let quic = QuicServer::bind(addr, &self.net_schema())?;
         let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
         self.removal_hold_set(true);
         NetServer::with_sync(sync).serve(self, quic);
@@ -256,9 +263,16 @@ impl Pm {
     }
 
     /// Connect the client transport and install the net task. Called by `run`.
-    fn connect(&mut self, addr: &str, input_hz: f32) -> std::io::Result<()> {
+    /// `link_lag`: an explicit simulated link (one-way delay, loss) wins;
+    /// `None` falls back to the `PM_LAG_MS`/`PM_LOSS` env knob.
+    fn connect(
+        &mut self,
+        addr: &str,
+        input_hz: f32,
+        link_lag: Option<(std::time::Duration, f32)>,
+    ) -> std::io::Result<()> {
         let mut quic = QuicClient::connect(addr, &self.net_schema())?;
-        if let Some((delay, loss)) = link_lag_from_env() {
+        if let Some((delay, loss)) = link_lag.or_else(link_lag_from_env) {
             quic.link_lag_set(delay, loss);
         }
         let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
@@ -912,16 +926,31 @@ impl PmClient {
         ret
     }
 
+    /// Simulate link conditions on this client: one-way `lag_ms` and
+    /// `loss` (0..1 drop fraction), applied in both directions at connect
+    /// (RTT rises by ~2x the lag). The programmatic sibling of the
+    /// `PM_LAG_MS`/`PM_LOSS` env knob — an explicit call wins over the
+    /// env, so games can surface these as CLI arguments (env vars are a
+    /// pain to pass on Windows). Zero/zero means a clean link.
+    pub fn link_lag(&mut self, lag_ms: f32, loss: f32) {
+        self.link_lag = Some((
+            std::time::Duration::from_secs_f32(lag_ms.max(0.0) / 1000.0),
+            loss.clamp(0.0, 1.0),
+        ));
+    }
+
     /// Connect to the server (the schema is complete now) and run the loop.
-    /// Honors `PM_LAG_MS`/`PM_LOSS`; returns when the loop quits, `Err` if
-    /// the connection fails.
+    /// Honors `PM_LAG_MS`/`PM_LOSS` unless [`link_lag`](PmClient::link_lag)
+    /// was called; returns when the loop quits, `Err` if the connection
+    /// fails.
     pub fn run(self) -> std::io::Result<()> {
         let PmClient {
             mut pm,
             addr,
             input_hz,
+            link_lag,
         } = self;
-        pm.connect(&addr, input_hz)?;
+        pm.connect(&addr, input_hz, link_lag)?;
         pm.loop_run();
         Ok(())
     }
@@ -1031,8 +1060,8 @@ impl PmServer {
     }
 
     /// Bind the endpoint (the schema is complete now) and run the loop.
-    /// Honors `PM_LAG_MS`/`PM_LOSS`; returns when the loop quits, `Err` on
-    /// bind failure.
+    /// Returns when the loop quits, `Err` on bind failure. (The simulated
+    /// link is the CLIENT's — see `serve`; the server never lags itself.)
     pub fn run(self) -> std::io::Result<()> {
         let PmServer { mut pm, addr } = self;
         pm.serve(&addr)?;

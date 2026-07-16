@@ -210,7 +210,26 @@ fn transport_config() -> Arc<TransportConfig> {
     // reads random link loss as congestion and collapses the window,
     // throttling 60 Hz snapshots to ~half rate at PM_LOSS=0.02. BBR
     // models bandwidth/RTT instead and shrugs off random loss.
-    tc.congestion_controller_factory(Arc::new(quinn_proto::congestion::BbrConfig::default()));
+    //
+    // PM_CC=cubic-big swaps in Cubic with a 16 MiB initial window — an
+    // experiment knob, not a mode: quinn's pacer meters packets out at
+    // cwnd/sRTT, and our once-per-tick pump turns every pacer hold into
+    // a full 16.7 ms stall (see the lag-sim FIXME below). A huge window
+    // makes the pacer's budget effectively infinite, which isolates
+    // whether pacer-vs-pump is the latency amplifier.
+    match std::env::var("PM_CC").as_deref() {
+        Ok("cubic-big") => {
+            let mut cc = quinn_proto::congestion::CubicConfig::default();
+            cc.initial_window(16 * 1024 * 1024);
+            tc.congestion_controller_factory(Arc::new(cc));
+            eprintln!("[pm net] PM_CC=cubic-big: Cubic, 16 MiB initial window (pacer defused)");
+        }
+        _ => {
+            tc.congestion_controller_factory(Arc::new(
+                quinn_proto::congestion::BbrConfig::default(),
+            ));
+        }
+    }
     Arc::new(tc)
 }
 
@@ -218,16 +237,15 @@ fn transport_config() -> Arc<TransportConfig> {
 /// loss applied in both directions. QUIC sees the conditions as real —
 /// RTT estimates rise, retransmits and redundancy actually earn their keep.
 //
-// FIXME(lag-sim, found 2026-07-15): under PM_LAG_MS=40 the client's
-// acked_tick advances at ~HALF rate and the gap grows without bound
-// (client applies ~170 of 300 snapshots per 5 s; rtt_ms reads ~217 ms on
-// an ~85 ms link) — so lag-comp rewinds clamp to the history ring's
-// oldest frame and hit tests judge second-stale state (hogs: zero kills
-// under lag, fine on a clean link). Predates the 07-14/15 work (bisected
-// to 5c9d37a). The delivery loop below drains all DUE packets per pump
-// (checked); suspects are quinn pacing against the once-per-tick pump
-// under inflated RTT, and these queues only moving on pump/recv. Every
-// latency-dependent test is invalid until this is diagnosed.
+// HISTORY(lag-sim): the 2026-07-15 acked-starvation bug (acked_tick at
+// half rate, gap growing without bound) was the 1 MiB datagram buffer +
+// Cubic-vs-loss — fixed above (16 KiB drop-oldest + BBR). The leftover
+// mystery — rtt_ms ~217 ms on what was believed an ~85 ms link — was no
+// mystery: PM_LAG_MS was applied by BOTH roles' sockets in-process, so
+// the link was really 4x the knob (160 ms) plus pump overhead. The env
+// now lags the client socket only (netmod::serve). Residual overhead on
+// a true link is ~2-4 pump quanta (sim queues release + ACK timers fire
+// only on the per-tick pump); the lag_ab test below measures it.
 struct LagSocket {
     socket: UdpSocket,
     delay: Duration,
@@ -395,12 +413,8 @@ impl QuicServer {
         self.socket.local_addr()
     }
 
-    /// Simulate link conditions: one-way `delay` and packet `loss` (0..1)
-    /// applied in both directions. RTT rises by ~2x delay.
-    pub fn link_lag_set(&mut self, delay: Duration, loss: f32) {
-        self.socket.delay = delay;
-        self.socket.loss = loss.clamp(0.0, 1.0);
-    }
+    // No server-side link_lag_set: the CLIENT lags the link (one lagged
+    // socket per path — see netmod::serve for the stacking footgun).
 
     /// Drive the endpoint: ingest UDP, advance handshakes/timers, collect
     /// acks and events, flush outgoing packets. Call once per tick.
@@ -844,5 +858,160 @@ impl QuicClient {
     pub fn event_send(&mut self, ty: u16, payload: &[u8]) {
         debug_assert!(ty >= EVENT_USER_BASE);
         frame_write(&mut self.stream_out, ty, payload);
+    }
+}
+
+// --- lag-sim A/B -------------------------------------------------------------
+
+/// The transport-vs-sim discriminator, run explicitly with
+///
+/// ```text
+/// cargo test -p pm --release -- --ignored lag_ab --nocapture
+/// ```
+///
+/// Three legs over the same simulated link (one lagged socket: 80 ms
+/// one-way, 3% loss — what `PM_LAG_MS=80 PM_LOSS=0.03` now means) at the
+/// same once-per-tick 60 Hz pump cadence the engine uses:
+///
+/// 1. raw UDP echo straight through a `LagSocket` — the floor the sim +
+///    pump cadence impose, no QUIC anywhere;
+/// 2. the full QUIC transport as shipped (BBR);
+/// 3. the full QUIC transport with `PM_CC=cubic-big` (pacer defused).
+///
+/// If (2) sits near (1) + a few pump quanta, QUIC is innocent and a raw
+/// side-transport would buy nothing. If (2) is far above (1) and (3)
+/// collapses back, the amplifier is quinn's pacer against the per-tick
+/// pump. Run alone: leg 3 flips the process-global `PM_CC`.
+#[cfg(test)]
+mod lag_ab {
+    use super::*;
+
+    const DELAY_MS: u64 = 80;
+    const LOSS: f32 = 0.03;
+    const TICK: Duration = Duration::from_micros(16_667);
+    const SCHEMA: (u8, &str, usize) = (0, "pos", 8);
+
+    fn schema() -> Vec<(u8, String, usize)> {
+        vec![(SCHEMA.0, SCHEMA.1.into(), SCHEMA.2)]
+    }
+
+    fn stats(label: &str, mut ms: Vec<f32>) {
+        assert!(!ms.is_empty(), "{label}: no RTT samples survived");
+        ms.sort_by(f32::total_cmp);
+        let pick = |q: f32| ms[((ms.len() - 1) as f32 * q) as usize];
+        eprintln!(
+            "[lag_ab] {label:>10}: p50 {:6.1} ms  p95 {:6.1} ms  max {:6.1} ms  (n={})",
+            pick(0.5),
+            pick(0.95),
+            ms[ms.len() - 1],
+            ms.len(),
+        );
+    }
+
+    /// Sleep to the loop's next 60 Hz edge and return a fresh `now`.
+    fn tick_edge(t0: Instant, n: u32) -> Instant {
+        let target = t0 + TICK * n;
+        let now = Instant::now();
+        if target > now {
+            std::thread::sleep(target - now);
+        }
+        Instant::now()
+    }
+
+    /// Leg 1: stamped pings from a lagged socket to a plain echo peer,
+    /// both pumped at tick cadence — measures sim + cadence alone.
+    #[test]
+    #[ignore]
+    fn lag_ab_raw_udp() {
+        let bind = || {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_nonblocking(true).unwrap();
+            s
+        };
+        let mut client = LagSocket::new(bind());
+        client.delay = Duration::from_millis(DELAY_MS);
+        client.loss = LOSS;
+        let mut server = LagSocket::new(bind()); // stays plain()
+        let server_addr = server.local_addr().unwrap();
+
+        let t0 = Instant::now();
+        let mut rtts = Vec::new();
+        let mut buf = [0u8; 2048];
+        for n in 1..=(6 * 60) {
+            let now = tick_edge(t0, n);
+            // client: release due sends, harvest echoes, fire this tick's pings
+            client.flush(now);
+            while let Ok((len, _)) = client.recv_from(now, &mut buf) {
+                if len >= 8 {
+                    let sent = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                    rtts.push(((now - t0).as_micros() as u64 - sent) as f32 / 1000.0);
+                }
+            }
+            let mut ping = [0u8; 1200];
+            ping[..8].copy_from_slice(&((now - t0).as_micros() as u64).to_le_bytes());
+            client.send_to(now, &ping, server_addr);
+            client.send_to(now, &ping, server_addr);
+            // server: echo the stamp back, plain passthrough
+            server.flush(now);
+            while let Ok((len, from)) = server.recv_from(now, &mut buf) {
+                if len >= 8 {
+                    server.send_to(now, &buf[..8], from);
+                }
+            }
+        }
+        stats("raw udp", rtts);
+    }
+
+    /// One QUIC leg: handshake, then game-shaped traffic (snapshot down,
+    /// input + ack up, every tick) with the client socket lagged; sample
+    /// quinn's smoothed RTT each tick after warmup.
+    fn quic_leg(label: &str) {
+        let mut server = QuicServer::bind("127.0.0.1:0", &schema()).unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let mut client = QuicClient::connect(&addr, &schema()).unwrap();
+        client.link_lag_set(Duration::from_millis(DELAY_MS), LOSS);
+
+        let t0 = Instant::now();
+        let mut rtts = Vec::new();
+        let mut peers: Vec<u8> = Vec::new();
+        let snapshot = [7u8; 600];
+        for n in 1..=(8 * 60) {
+            let _now = tick_edge(t0, n);
+            server.pump();
+            peers.extend(server.joined_drain());
+            server.acks_drain();
+            server.inputs_drain();
+            for &p in &peers {
+                server.snapshot_send(p, &snapshot);
+            }
+            client.pump();
+            assert!(client.error().is_none(), "client error: {:?}", client.error());
+            if client.handshake_done().is_some() {
+                client.input_send(&[3u8; 16]);
+                let got = client.snapshots_drain().len() as u32;
+                if got > 0 {
+                    client.ack_send(n);
+                }
+                // 2 s warmup: skip handshake transients and sRTT settling.
+                if t0.elapsed() > Duration::from_secs(2) {
+                    rtts.push(client.rtt().as_secs_f32() * 1000.0);
+                }
+            }
+        }
+        assert!(!peers.is_empty(), "{label}: handshake never completed");
+        stats(label, rtts);
+    }
+
+    /// Legs 2 + 3 in one test (they must not run concurrently: the CC
+    /// selection rides the process-global `PM_CC`).
+    #[test]
+    #[ignore]
+    fn lag_ab_quic() {
+        quic_leg("quic bbr");
+        // SAFETY: single-threaded at this point in the test; the var is
+        // read once per endpoint construction inside quic_leg.
+        unsafe { std::env::set_var("PM_CC", "cubic-big") };
+        quic_leg("quic cubic");
+        unsafe { std::env::remove_var("PM_CC") };
     }
 }

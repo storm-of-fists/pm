@@ -8,10 +8,12 @@
 //! anything missing falls back to a synthesized placeholder so the game
 //! makes noise with zero assets. No audio device (headless) = silent.
 //!
-//! Honest limitation (the predicted-spawn item): your OWN shot's bang
-//! arrives with the bullet's replication, ~RTT/2 + interp delay after
-//! the click. Inaudible on LAN; the fix when it matters is a local
-//! cosmetic bang on the fire edge, not a wire change.
+//! Your OWN shot's bang rides the client-local cosmetic tracer pool
+//! (born the frame the trigger reads down — see player_client's
+//! cosmetic gun), NOT the replicated bullet: the replicated twin
+//! arrives ~RTT/2 + interp late and is skipped here by `Bullet::owner`.
+//! Remote players' shots still bang off replication — for them that
+//! delay is just distance.
 
 use pm::{Births, Rng, task};
 use pm_sdl::audio::{Audio, Clip, MIX_HZ};
@@ -86,22 +88,26 @@ fn make_clips() -> [Clip; 5] {
     [shot, hit, kill, bite, boom]
 }
 
-/// Register the sfx task: births off the raw replicas, attenuate by
-/// distance to our truck, jitter the rate so repeats don't machine-gun.
-pub fn install(pm: &mut pm::PmClient, w: &ClientWorld) {
+/// Register the sfx task: births off the raw replicas (plus the local
+/// tracer pool for our own instant bang), attenuate by distance to our
+/// truck, jitter the rate so repeats don't machine-gun.
+pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, tracer: &pm::PoolHandle<Tracer>) {
     let Some(mut audio) = Audio::open() else {
         eprintln!("[sfx] no audio device — running silent");
         return;
     };
     let [shot, hit, kill, bite, boom] = make_clips();
     let mut bullet_births = Births::default();
+    let mut tracer_births = Births::default();
     let mut impact_births = Births::default();
 
     let bullet = w.bullet.clone();
     let impact = w.impact.clone();
     let pred = w.pred.clone();
     let pred_heli = w.pred_heli.clone();
-    task!(pm, "sfx", 60.0, [bullet, impact, pred, pred_heli], move |pm| {
+    let tracer = tracer.clone();
+    let net = pm.net();
+    task!(pm, "sfx", 60.0, [bullet, impact, pred, pred_heli, tracer], move |pm| {
         let mut rng = Rng::new(pm.tick() | 1);
         // Ears at our vehicle (whichever predictor is live); before
         // spawn, at the arena center. Ground-plane distance is plenty —
@@ -124,8 +130,19 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld) {
             (1.0 - d / 160.0).clamp(0.08, 1.0)
         };
 
+        // Our gun: the local tracer IS the click — bang now.
+        for id in tracer_births.drain(&tracer.get()) {
+            if let Some(tr) = tracer.get_id(id) {
+                audio.play(&shot, 0.5 * att(tr.x, tr.z), rng.rfr(0.92, 1.12));
+            }
+        }
+        // Everyone else's guns, off replication; our replicated twins
+        // already banged above, skip them.
+        let me = net.peer() as f32;
         for id in bullet_births.drain(&bullet.get()) {
-            if let Some(b) = bullet.get_id(id) {
+            if let Some(b) = bullet.get_id(id)
+                && b.owner != me
+            {
                 audio.play(&shot, 0.5 * att(b.x, b.z), rng.rfr(0.92, 1.12));
             }
         }
