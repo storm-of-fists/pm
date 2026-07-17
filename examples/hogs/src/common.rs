@@ -855,12 +855,6 @@ pub fn seg_point_dist(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
     (dx * dx + dz * dz).sqrt()
 }
 
-/// Whether a hog (circle) touches a truck (capsule).
-pub fn hog_bites_truck(h: &Hog, t: &Truck) -> bool {
-    let (a, b) = truck_seg(t);
-    seg_point_dist(a, b, (h.x, h.z)) < HOG_R + TRUCK_R
-}
-
 /// Friendly fire: damage a stray shot does to a teammate's vehicle
 /// (gentler than `GUN_DMG` — punish spraying, don't two-shot a buddy),
 /// and the truck hull's bullet height band.
@@ -1068,6 +1062,15 @@ pub struct Contact {
 
 /// A bullet connected.
 pub const KIND_BULLET: u8 = 0;
+/// A hog rammed the owner.
+pub const KIND_BITE: u8 = 1;
+
+/// Whether a hull touches a vertical circle — the bite test: 2D
+/// capsule-vs-circle plus altitude-band overlap ([ylo, yhi] is the
+/// biter's reach; a heli above it is safe however close in plan view).
+pub fn hull_hits_circle(hull: &Hull, cx: f32, cz: f32, r: f32, ylo: f32, yhi: f32) -> bool {
+    hull.y.0 <= yhi && ylo <= hull.y.1 && seg_point_dist(hull.a, hull.b, (cx, cz)) < hull.r + r
+}
 
 // --- presentation helpers --------------------------------------------------
 
@@ -1245,6 +1248,27 @@ mod hull_tests {
         assert!(
             shot(HOG_H + 0.5, HIT_PAD_HELI).is_some(),
             "the heli pad forgives a vertical near-miss"
+        );
+    }
+
+    /// The bite test: capsule-vs-circle in plan view, altitude band as
+    /// the biter's reach — climb and the horde loses you.
+    #[test]
+    fn bite_touches_in_plan_and_band() {
+        let t = Truck::default(); // capsule (0,∓0.8) r 0.9, band 0..1.6
+        let touch = |z| hull_hits_circle(&truck_hull(&t), 0.0, z, HOG_R, 0.0, HOG_LEAP);
+        assert!(touch(TRUCK_HL + TRUCK_R + HOG_R - 0.05), "nose contact bites");
+        assert!(!touch(TRUCK_HL + TRUCK_R + HOG_R + 0.05), "clear of the capsule");
+        let mut h = Heli::default();
+        h.body.pos = vec3(0.0, 10.0, 0.0);
+        assert!(
+            !hull_hits_circle(&heli_hull(&h), 0.0, 0.0, HOG_R, 0.0, HOG_LEAP),
+            "a heli at 10u is out of leaping reach however close in plan"
+        );
+        h.body.pos.y = 2.0;
+        assert!(
+            hull_hits_circle(&heli_hull(&h), 0.0, 0.0, HOG_R, 0.0, HOG_LEAP),
+            "hovering low over the horde gets nipped"
         );
     }
 }

@@ -225,7 +225,7 @@ pub fn run(quiet: bool) {
         pm,
         "hog_ai",
         28.0,
-        [hog, brain, truck, heli, health, impact, hunt, collider],
+        [hog, brain, truck, heli, collider, parts, contact],
         move |pm| {
             let now = pm.tick() as f32 * FIXED_DT;
             let mut rng = Rng::new(pm.tick().wrapping_mul(0x51D7_ACE5) | 1);
@@ -329,44 +329,37 @@ pub fn run(quiet: bool) {
                 }
 
                 // Bite: contact with the nearest target while off
-                // cooldown — trucks as capsules, low helis as circles.
-                let bites = b.bite_cd <= 0.0
-                    && nearest.is_some_and(|(tid, (tx, tz, fly), _)| {
-                        if fly {
-                            let (dx, dz) = (tx - h.x, tz - h.z);
-                            dx * dx + dz * dz < (HOG_R + HELI_R) * (HOG_R + HELI_R)
-                        } else {
-                            truck.get_id(tid).is_some_and(|t| hog_bites_truck(&h, &t))
-                        }
+                // cooldown. The GEOMETRY comes from the target's
+                // collider entry (via the parent→child link) — the
+                // brain knows no vehicle shapes anymore — and the
+                // CONSEQUENCES are the response tasks' business, so it
+                // applies none: a bite is a written fact. What stays
+                // behavioral stays here: the cooldown, the break-off,
+                // and the leap ceiling on the reach band.
+                let bitten = (b.bite_cd <= 0.0)
+                    .then_some(nearest)
+                    .flatten()
+                    .and_then(|(tid, _, _)| {
+                        let pid = parts.get_id(tid).map(|p| *p)?;
+                        let c = cols.get(pid)?;
+                        hull_hits_circle(&c.hull, h.x, h.z, HOG_R, 0.0, HOG_LEAP)
+                            .then(|| (tid, c.part, c.hull.y.0.max(0.0)))
                     });
-                if bites {
-                    let (tid, (_, _, fly), _) = nearest.unwrap();
+                if let Some((tid, part, bite_y)) = bitten {
                     b.bite_cd = BITE_CD;
                     b.flee = HOG_FLEE;
-                    if !fly && let Some(mut tr) = truck.get_id_mut(tid) {
-                        // The hit you feel — but not a pin: turn
-                        // authority scales with speed, so scrubbing
-                        // too hard leaves a swarmed truck unable to
-                        // steer out at all. (Speed lives in the body's
-                        // velocity now; scrubbing the vector is the
-                        // same scrub.)
-                        tr.body.vel = tr.body.vel * 0.65;
-                    }
-                    if let Some(mut v) = health.get_id_mut(tid) {
-                        // Chip the truck; the drive task turns hp 0
-                        // into the explosion (one place owns death).
-                        v.hp -= BITE_DMG;
-                    }
-                    let mut sb = hunt.get_mut();
-                    sb.points = (sb.points - BITE_COST).max(0.0);
-                    drop(sb);
-                    let mid = pm.id_add();
-                    impact.get_mut().add(
-                        mid,
-                        Impact {
+                    let cid = pm.id_add();
+                    contact.get_mut().add(
+                        cid,
+                        Contact {
+                            owner: tid,
+                            part,
+                            kind: KIND_BITE,
+                            source_peer: 0,
                             x: h.x,
+                            y: bite_y,
                             z: h.z,
-                            kind: IMPACT_BITE,
+                            heading: h.heading,
                         },
                     );
                 }
@@ -549,15 +542,27 @@ pub fn run(quiet: bool) {
         [bullet, shot, collider, contact, impact, net],
         move |pm| {
             // Same-tick contract check: the response tasks at 32 drain
-            // every contact the sweep writes. Anything still here means
-            // a response task missed its owner — purge loudly rather
-            // than let a stale fact double-apply.
-            if !contact.get().is_empty() {
+            // every contact each tick writes. A LAST-tick leftover
+            // means a response task missed its owner — purge loudly
+            // rather than let a stale fact double-apply. Same-tick
+            // entries pass untouched: the hog brain writes its bites
+            // at prio 28, before this task runs.
+            let stale: Vec<Id> = {
+                let pool = contact.get();
+                let now = pm.tick();
+                pool.iter()
+                    .filter(|&(cid, _)| pool.changed_tick(cid) != Some(now))
+                    .map(|(cid, _)| cid)
+                    .collect()
+            };
+            if !stale.is_empty() {
                 eprintln!(
                     "[server] {} undrained contacts culled (a response task missed them)",
-                    contact.get().len()
+                    stale.len()
                 );
-                pm.id_remove_all(&contact);
+                for cid in stale {
+                    pm.id_remove(cid);
+                }
             }
             cull_colliders(pm, &collider);
             let step = BULLET_SPEED * FIXED_DT;
@@ -656,7 +661,7 @@ pub fn run(quiet: bool) {
     // check at drain (§3: validate at consumption). Today truck and
     // heli responses are twins; per-part branches (tail hit → yaw kick)
     // are exactly where they'd diverge — stage 4's business.
-    task!(pm, "truck_hits", 32.0, [contact, truck, health, impact, net], move |pm| {
+    task!(pm, "truck_hits", 32.0, [contact, truck, health, hunt, impact, net], move |pm| {
         let now = pm.tick();
         let hits: Vec<(Id, Contact)> = {
             let pool = contact.get();
@@ -669,23 +674,43 @@ pub fn run(quiet: bool) {
         };
         for (cid, c) in hits {
             pm.id_remove(cid); // fact consumed
-            if c.kind != KIND_BULLET {
-                continue; // the only kind a vehicle answers today
+            match c.kind {
+                KIND_BULLET => {
+                    if let Some(mut v) = health.get_id_mut(c.owner) {
+                        v.hp -= FRIENDLY_DMG;
+                    }
+                    if !quiet && let Some(victim) = net.owner_of(c.owner) {
+                        eprintln!(
+                            "[server] friendly fire: peer {} hit peer {victim} (part {} at y {:.1})",
+                            c.source_peer, c.part, c.y
+                        );
+                    }
+                    let mid = pm.id_add();
+                    impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_HIT });
+                }
+                KIND_BITE => {
+                    // The hit you feel — but not a pin: turn authority
+                    // scales with speed, so scrubbing too hard leaves
+                    // a swarmed truck unable to steer out at all.
+                    if let Some(mut tr) = truck.get_id_mut(c.owner) {
+                        tr.body.vel = tr.body.vel * 0.65;
+                    }
+                    // Chip the truck; the drive task turns hp 0 into
+                    // the explosion (one place owns death).
+                    if let Some(mut v) = health.get_id_mut(c.owner) {
+                        v.hp -= BITE_DMG;
+                    }
+                    let mut sb = hunt.get_mut();
+                    sb.points = (sb.points - BITE_COST).max(0.0);
+                    drop(sb);
+                    let mid = pm.id_add();
+                    impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_BITE });
+                }
+                _ => {}
             }
-            if let Some(mut v) = health.get_id_mut(c.owner) {
-                v.hp -= FRIENDLY_DMG;
-            }
-            if !quiet && let Some(victim) = net.owner_of(c.owner) {
-                eprintln!(
-                    "[server] friendly fire: peer {} hit peer {victim} (part {} at y {:.1})",
-                    c.source_peer, c.part, c.y
-                );
-            }
-            let mid = pm.id_add();
-            impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_HIT });
         }
     });
-    task!(pm, "heli_hits", 32.0, [contact, heli, health, impact, net], move |pm| {
+    task!(pm, "heli_hits", 32.0, [contact, heli, health, hunt, impact, net], move |pm| {
         let now = pm.tick();
         let hits: Vec<(Id, Contact)> = {
             let pool = contact.get();
@@ -698,20 +723,34 @@ pub fn run(quiet: bool) {
         };
         for (cid, c) in hits {
             pm.id_remove(cid);
-            if c.kind != KIND_BULLET {
-                continue;
+            match c.kind {
+                KIND_BULLET => {
+                    if let Some(mut v) = health.get_id_mut(c.owner) {
+                        v.hp -= FRIENDLY_DMG;
+                    }
+                    if !quiet && let Some(victim) = net.owner_of(c.owner) {
+                        eprintln!(
+                            "[server] friendly fire: peer {} hit peer {victim} (part {} at y {:.1})",
+                            c.source_peer, c.part, c.y
+                        );
+                    }
+                    let mid = pm.id_add();
+                    impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_HIT });
+                }
+                KIND_BITE => {
+                    // No velocity scrub — a nipped heli keeps flying;
+                    // the chip is the cost of hovering in reach.
+                    if let Some(mut v) = health.get_id_mut(c.owner) {
+                        v.hp -= BITE_DMG;
+                    }
+                    let mut sb = hunt.get_mut();
+                    sb.points = (sb.points - BITE_COST).max(0.0);
+                    drop(sb);
+                    let mid = pm.id_add();
+                    impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_BITE });
+                }
+                _ => {}
             }
-            if let Some(mut v) = health.get_id_mut(c.owner) {
-                v.hp -= FRIENDLY_DMG;
-            }
-            if !quiet && let Some(victim) = net.owner_of(c.owner) {
-                eprintln!(
-                    "[server] friendly fire: peer {} hit peer {victim} (part {} at y {:.1})",
-                    c.source_peer, c.part, c.y
-                );
-            }
-            let mid = pm.id_add();
-            impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_HIT });
         }
     });
     // The hogs' response: damage in the PRESENT (the frame only judged

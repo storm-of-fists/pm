@@ -52,8 +52,8 @@ Why this shape? Three reasons that compound:
 > (the kernel-decomposition experiment; the borrow ceremony ate the
 > ergonomics).
 
-Where to look: `crates/pm/src/kernel.rs` (the loop), `pool.rs` (the
-sparse set), and the crate-level doc in `crates/pm/src/lib.rs`.
+Where to look: `crates/pm-world/src/kernel.rs` (the loop), `pool.rs` (the
+sparse set), and the crate-level doc in `crates/pm-world/src/lib.rs`.
 
 **Try this:** in `examples/hogs/src/server.rs`, add a task at priority
 99 that prints `hog.get().len()` once a second (`if pm.tick() % 60 == 0`).
@@ -79,7 +79,7 @@ One thing that will bite you if you forget it: **`id.peer()` tells you
 which peer's index space the id was allocated in — recycling, not
 control.** "Whose truck is this?" is answered by the replicated
 ownership table (`net.owner_of(id)`), never by the id's bits. See the
-comment on `owner_of` in `crates/pm/src/netmod.rs`.
+comment on `owner_of` in `crates/pm-world/src/netmod.rs`.
 
 **Try this:** in the hogs server's wave task, print a few spawned hog
 ids with `{:?}`. Kill a wave, let the next spawn, print again — watch
@@ -149,7 +149,7 @@ The role split is explicit in the API: `Pm::server(addr)` gives a
 `history_pool`), `Pm::client(addr, hz)` gives a `PmClient` (owns
 `input() → InputTx`, `predict_pool`, `interp_pool`). Everything the
 wire touches goes through these role handles; the raw transport
-(`QuicClient`/`QuicServer`, `crates/pm/src/transport.rs`) is
+(`QuicClient`/`QuicServer`, `crates/pm-world/src/transport.rs`) is
 `pub(crate)` — games *cannot* reach the socket.
 
 Why QUIC underneath? Datagrams for state (unreliable, unordered —
@@ -158,7 +158,43 @@ for free, and one port. We measured the alternative (chapter 12): raw
 UDP through the same conditions performed identically. The transport
 was never the bottleneck; the config was.
 
-Where to look: `crates/pm/src/netmod.rs` — the module doc is the
+**Sidebar: what Unreal does (checked 2026-07-16, current docs).** We
+re-litigated this doctrine against the engine most people learn from,
+because "shouldn't input just be reliable events?" is the natural
+question. Verdict: every Unreal movement/physics system agrees with
+the doctrine, including their newest.
+
+- *Enhanced Input is local.* Keys → mapping contexts → named actions,
+  all on the client, nothing replicated. pm's equivalent is the key
+  contexts filling `Drive` in `player_client.rs` — and note what that
+  means: the pod on the wire is already **intent** ("collective at
+  0.8, thruster on"), never keycodes. The force the thruster applies
+  is computed in the shared step on both sides. Forces never cross
+  the wire — a replayed input through a deterministic step *is* the
+  force, and that's precisely what makes replay/rollback possible.
+- *CharacterMovementComponent* sends moves as an explicitly
+  **unreliable** RPC — Epic's docs say reliable ones "could overflow
+  the buffer" — and covers loss by resubmitting unacked `SavedMoves`
+  redundantly until the server acks. Reliability from **redundancy**,
+  not transport. pm's `input_send` (transport.rs) is the same trick:
+  every datagram carries the last several input frames, so loss costs
+  nothing and nothing is ever retransmitted late.
+- *Chaos Networked Physics* (`UNetworkPhysicsComponent`) and *Mover*,
+  the next generation: you define an **input struct** — intent-level,
+  it can literally be "thruster on" — which is networked with history
+  and **re-applied during resimulation**. Mover's docs require inputs
+  "combined into a single input command for the movement simulation
+  tick." That sentence is the `Drive` pod.
+
+Why not reliable transport for the stream? A dropped input frame is
+*stale* — the next frame supersedes it. Reliable delivery would
+retransmit it anyway, arriving late in a burst, blocking fresher data
+behind it (head-of-line), exactly when feel matters most. Reliable
+events are for facts that stay true (`Respawn`); the stick position
+is a fact that expires every 16 ms. Two channel kinds because there
+are two kinds of truth.
+
+Where to look: `crates/pm-world/src/netmod.rs` — the module doc is the
 doctrine written down.
 
 ---
@@ -204,7 +240,7 @@ Without prediction, pressing W does nothing for a round trip. With it,
 the client applies its own input to a local copy *immediately*, and the
 server's authoritative answer arrives later to check the work.
 
-Mechanics (`crates/pm/src/predict.rs`, used via
+Mechanics (`crates/pm-world/src/predict.rs`, used via
 `pm.predict_pool(...)`): the client keeps a ring of the command frames
 it sent. When a snapshot arrives carrying the server's state for *your*
 entity at input-sequence N, the predictor rewinds to that state and
@@ -259,36 +295,41 @@ But drawing the past creates an aiming injustice: you shoot at where
 you *see* a hog, which is where it *was*. **Lag compensation**
 (`history_pool` server-side + the bullet sweep in
 `examples/hogs/src/server.rs`) repays it: the server keeps a ring of
-recent hog frames, and when your bullet flies, each tick of its flight
-is tested against the frame your view actually showed when you pulled
-the trigger — anchored to the *fire input's arrival ack*, then advanced
-one frame per flight tick (steady timeline; re-reading the live ack
-each tick made hits flicker with ack burstiness — the comment on `Shot`
-tells that story). Damage lands on the present hog; only the *hit test*
-rewinds.
+recent COLLIDER frames, and when your bullet flies, each tick of its
+flight is tested against the frame your view actually showed when you
+pulled the trigger — anchored to the *fire input's arrival ack*, then
+advanced one frame per flight tick (steady timeline; re-reading the
+live ack each tick made hits flicker with ack burstiness — the comment
+on `Shot` tells that story). Damage lands on the present entity; only
+the *hit test* rewinds.
 
-Source engine players know this trade: it's "favor the shooter",
-scaled to a PvE game where the hogs don't file complaints.
+Source engine players know this trade: it's "favor the shooter" — and
+because the collider pool holds teammates too, a friendly-fire round
+is judged in the same rewound frame as a hog: one timeline per shot,
+chosen deliberately (docs/collisions.md §4), scaled to a PvE game
+where the hogs don't file complaints.
 
 Two later layers ride the same sweep and are worth contrasting:
 
-- **Hit forgiveness** is per-shooter: each bullet carries a hit-circle
-  pad (`HIT_PAD_TRUCK` / `HIT_PAD_HELI` — the heli's is bigger, it
-  fires on the move from altitude). The pad lives in the server-only
-  `Shot` pool next to the rewind anchor, so retuning feel never
-  touches the wire.
-- **Friendly fire** tests teammates' vehicles in *present* time, not
-  the rewound frame — vehicles aren't in the history ring, and at
-  vehicle speeds rewind buys little. One bullet, two clocks: the hog
-  check plays back the shooter's past; the teammate check reads the
-  server's now. The shapes are generalized behind `Hull` (common.rs):
-  every vehicle reduces to a ground capsule + altitude band, one
-  sampled sweep (`ray_hits_hull`) judges them all, and each side keeps
-  a one-line-per-vehicle registry (server `hulls`,
-  `ClientWorld::hulls`) — a jet or dirtbike is a `*_hull` fn and two
-  registry lines, no sweep changes. Bots grew trigger discipline off
-  the same hulls (hold when a buddy crosses the line of fire —
-  `line_clear` in bot_client.rs, grown hulls so they err polite).
+- **Hit forgiveness** is per-shooter: each bullet carries a pad
+  (`HIT_PAD_TRUCK` / `HIT_PAD_HELI` — the heli's is bigger, it fires
+  on the move from altitude) that grows every tested hull QUERY-side —
+  a collider doesn't know who's shooting at it. The pad lives in the
+  server-only `Shot` pool next to the rewind anchor, so retuning feel
+  never touches the wire.
+- **Detection is data; response is the owner's** (docs/collisions.md —
+  the shape a five-engine survey found everyone converging on):
+  everything hittable registers a posed `Collider` entry — a hog is
+  its own single part, a vehicle's parts are child entities — and ONE
+  sweep tests bullets against the pool by category mask, nearest hit
+  winning (a hog can shield a truck), writing `Contact` facts that the
+  struck entity's own response task drains the same tick. A jet or
+  dirtbike is a spawn that registers its part; the sweep never
+  changes. The hog's bite went through the same door: the brain reads
+  its target's collider entry and writes `Contact { kind: BITE }`; the
+  truck/heli tasks own the damage. Bots' trigger discipline still
+  runs on the client-side `Hull` approximation (`ClientWorld::hulls`,
+  grown so they err polite) — a courtesy heuristic, not a judge.
 
 **Try this:** `hogs interp=200 lag=80 loss=0.03`. The world turns to
 soup, but shots still land — lag comp rewinds deeper. Now `interp=8`:
@@ -462,7 +503,7 @@ placeholders with zero code.
 
 You cannot feel-test netcode on localhost. The tooling:
 
-- **`LagSocket`** (`crates/pm/src/transport.rs`): wraps the UDP socket,
+- **`LagSocket`** (`crates/pm-world/src/transport.rs`): wraps the UDP socket,
   applies one-way delay + loss in both directions *inside the client
   process*. QUIC experiences it as real.
 - **Args, not envs** (Windows shortcuts can't set envs):
@@ -565,7 +606,11 @@ The standing order of work, with reasons:
 5. **Netcode science, background thread:** the rtt A/B above;
    staleness measurement (the residual kill-rate gap under lag);
    input-map when bindings outgrow the union pod; recordings.
-6. **Content, only after look/feel:** hog variants, pickups,
+6. **Collisions as data:** the collider/contact pool design —
+   detection decoupled from response, parts as child entities, pm's
+   first real entity relationships. Designed, not built:
+   [docs/collisions.md](collisions.md).
+7. **Content, only after look/feel:** hog variants, pickups,
    objectives — new things must *read* on screen before they're worth
    adding.
 
