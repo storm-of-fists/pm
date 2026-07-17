@@ -977,6 +977,116 @@ pub fn ray_hits_hull(
     None
 }
 
+// --- the collider pool (docs/collisions.md) ----------------------------------
+
+/// One collidable PART, registered into the server's collider pool by
+/// its owner: detection is data the sweep iterates, never functions
+/// that know a vehicle kind (docs/collisions.md §2). The entry is
+/// keyed by the part's OWN id — a vehicle's parts are child entities
+/// (`id_add` per part, the parent→child link lives in the server's
+/// `parts` pool); a single-part swarm entity may be its own part,
+/// keyed by its owner id, which makes its cleanup free. Owners
+/// re-pose `hull` every tick (the heli-rotor-matrix habit applied to
+/// shapes); the sweep never looks up a pose.
+#[derive(Clone, Copy)]
+pub struct Collider {
+    /// The entity this part belongs to — response is ITS business.
+    pub owner: Id,
+    /// Owner-private part tag (`PART_*`); the sweep carries it through
+    /// to the contact untouched and never interprets it.
+    pub part: u8,
+    /// Category bits — what this entry IS. Sweeps bring their own mask
+    /// of what they TEST (the `MASK_SHOT` pattern, doc §9).
+    pub cat: u8,
+    /// World-space shape, pre-posed by the owner every tick.
+    pub hull: Hull,
+}
+
+/// The only part tag so far: the whole body as one hull. Tags are
+/// meaningful only to the owner's own response code.
+pub const PART_BODY: u8 = 0;
+
+/// Category bits. Add sparingly — a bit is a vocabulary word.
+pub const CAT_VEHICLE: u8 = 1 << 0;
+
+/// A hit the sweep found: who was struck, where, and how far along the
+/// travel — `frac` is what orders competing hits (nearest wins).
+#[derive(Clone, Copy)]
+pub struct SweepHit {
+    pub owner: Id,
+    pub part: u8,
+    pub frac: f32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// THE collisions sweep: one shot's travel against every collider
+/// entry matching `mask`, nearest hit along the path winning (not
+/// registry order — a hog can shield a teammate). `skip` drops the
+/// shooter's own vehicle (bullets are born at its muzzle); `pad`
+/// grows each tested hull QUERY-side (doc §8: the pad is the shot's
+/// forgiveness — a collider doesn't know who's shooting at it).
+pub fn sweep_colliders(
+    x: f32,
+    z: f32,
+    y: f32,
+    heading: f32,
+    reach: f32,
+    dy: f32,
+    pad: f32,
+    mask: u8,
+    skip: Option<Id>,
+    colliders: &[(Id, Collider)],
+) -> Option<SweepHit> {
+    let mut best: Option<SweepHit> = None;
+    for (_, c) in colliders {
+        if c.cat & mask == 0 || skip == Some(c.owner) {
+            continue;
+        }
+        let Some((hx, hz)) = ray_hits_hull(x, z, y, heading, reach, dy, &c.hull.grow(pad))
+        else {
+            continue;
+        };
+        let (dx, dz) = (hx - x, hz - z);
+        let frac = (dx * dx + dz * dz).sqrt() / reach.max(1e-6);
+        if best.is_none_or(|b| frac < b.frac) {
+            best = Some(SweepHit {
+                owner: c.owner,
+                part: c.part,
+                frac,
+                x: hx,
+                y: y + dy * frac,
+                z: hz,
+            });
+        }
+    }
+    best
+}
+
+/// A detected touch — written by the sweep on a fresh id, drained the
+/// SAME tick by the struck entity's response task (sweep at prio 31,
+/// responses at 32): transient facts as pool entries, the
+/// contact-points rule. The sweep applies nothing; whoever owns
+/// `owner` owns every consequence (docs/collisions.md §2).
+#[derive(Clone, Copy)]
+pub struct Contact {
+    pub owner: Id,
+    pub part: u8,
+    /// What touched — `KIND_*`.
+    pub kind: u8,
+    /// Acting peer (the shooter); 0 for NPC causes.
+    pub source_peer: u8,
+    /// World hit point. `y` matters: a rotor strike at altitude is not
+    /// a ground splash.
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// A bullet connected.
+pub const KIND_BULLET: u8 = 0;
+
 // --- presentation helpers --------------------------------------------------
 
 /// Per-peer truck tints (peer ids start at 1; index peer-1).
@@ -1069,6 +1179,60 @@ mod hull_tests {
         assert!(
             graze(&truck_hull(&t).grow(0.5)).is_some(),
             "the grown gate holds fire on the same pass"
+        );
+    }
+
+    /// Two trucks on the same firing line, entered far-first: the sweep
+    /// must order by travel, honor the category mask, and drop the
+    /// shooter's own vehicle.
+    #[test]
+    fn sweep_orders_masks_and_skips() {
+        let near = Truck::default(); // origin
+        let mut far = Truck::default();
+        far.body.pos = vec3(6.0, 0.0, 0.0);
+        let (nid, fid) = (Id::new(0, 0, 1), Id::new(0, 0, 2));
+        let part = |owner, t: &Truck| Collider {
+            owner,
+            part: PART_BODY,
+            cat: CAT_VEHICLE,
+            hull: truck_hull(t),
+        };
+        let cols = vec![(fid, part(fid, &far)), (nid, part(nid, &near))];
+        let shot = |mask, skip| {
+            sweep_colliders(-5.0, 0.0, 1.0, FRAC_PI_2, 15.0, 0.0, 0.0, mask, skip, &cols)
+        };
+        let hit = shot(CAT_VEHICLE, None).expect("two hulls on the line");
+        assert_eq!(hit.owner, nid, "nearest along the ray wins, not list order");
+        assert!(hit.frac < 0.5, "the near truck sits in the first half");
+        assert!(shot(0, None).is_none(), "an empty mask tests nothing");
+        let hit = shot(CAT_VEHICLE, Some(nid)).expect("far truck still there");
+        assert_eq!(hit.owner, fid, "the shooter's own vehicle is invisible");
+    }
+
+    /// The pad grows the QUERY, not the collider (doc §8) — and the hit
+    /// altitude rides the climb.
+    #[test]
+    fn sweep_pad_is_query_side() {
+        let t = Truck::default();
+        let id = Id::new(0, 0, 1);
+        let cols = vec![(
+            id,
+            Collider {
+                owner: id,
+                part: PART_BODY,
+                cat: CAT_VEHICLE,
+                hull: truck_hull(&t),
+            },
+        )];
+        let graze = |pad| {
+            sweep_colliders(-5.0, 2.0, 1.0, FRAC_PI_2, 10.0, 0.0, pad, CAT_VEHICLE, None, &cols)
+        };
+        assert!(graze(0.0).is_none(), "1.2u off the capsule misses unpadded");
+        let hit = graze(0.5).expect("this shot's forgiveness connects it");
+        assert!(
+            (hit.y - 1.0).abs() < 1e-4,
+            "flat shot reports its own altitude, got {}",
+            hit.y
         );
     }
 }

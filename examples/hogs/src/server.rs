@@ -60,6 +60,50 @@ struct Shot {
     pad: f32,
 }
 
+/// Cull-and-collect (docs/collisions.md §3): one walk over the collider
+/// pool per tick drops entries whose owner id died — the janitor half of
+/// the parent→child convention, `pm.id_alive` being the generation
+/// check that answers "is this id current" without knowing pools — and
+/// gathers the live entries into `out` for this tick's sweeps. A part
+/// spends at most one tick as a ghost, and the live list never carries
+/// one.
+fn live_colliders(pm: &mut Pm, collider: &pm::PoolHandle<Collider>, out: &mut Vec<(Id, Collider)>) {
+    out.clear();
+    for (cid, c) in collider.get().iter() {
+        if pm.id_alive(c.owner) {
+            out.push((cid, *c));
+        } else {
+            pm.id_remove(cid); // deferred; the pool entry goes with the id
+        }
+    }
+}
+
+/// Register a vehicle's single body part (docs/collisions.md stage 1):
+/// a child entity in the collider pool plus the parent→child link in
+/// `parts` (vehicle id → part id — keyed by the VEHICLE, so entity
+/// removal cleans the link and the janitor above reaps the orphaned
+/// part). The hull is re-posed by the drive task every tick; spawn just
+/// needs it sane.
+fn part_add(
+    pm: &mut Pm,
+    collider: &pm::PoolHandle<Collider>,
+    parts: &pm::PoolHandle<Id>,
+    owner: Id,
+    hull: Hull,
+) {
+    let pid = pm.id_add();
+    collider.get_mut().add(
+        pid,
+        Collider {
+            owner,
+            part: PART_BODY,
+            cat: CAT_VEHICLE,
+            hull,
+        },
+    );
+    parts.get_mut().add(owner, pid);
+}
+
 /// A roam destination: anywhere in the arena that isn't inside a
 /// building (bounded retries; the fallback mid-map is never inside one).
 fn roam_goal(rng: &mut Rng) -> (f32, f32) {
@@ -94,6 +138,15 @@ pub fn run(quiet: bool) {
     let brain = pm.pool::<HogBrain>("hog.brain");
     let gun = pm.pool::<f32>("truck.gun");
     let shot = pm.pool::<Shot>("bullet.shot");
+    // The collider pool (docs/collisions.md): one entry per PART, keyed
+    // by the part's own id, posed by its owner every tick, swept by the
+    // bullets task. `parts` is the parent→child link (vehicle id → its
+    // single part id, for now) so the step task can find its entries.
+    // Contacts are the sweep's OUTPUT — facts on fresh ids, written at
+    // prio 31, drained by the response tasks at 32 the same tick.
+    let collider = pm.pool::<Collider>("collider");
+    let contact = pm.pool::<Contact>("contact");
+    let parts = pm.pool::<Id>("vehicle.part");
 
     if !quiet {
         eprintln!("hogs server on {ADDR} [{}]", pm::BUILD_ID);
@@ -102,13 +155,16 @@ pub fn run(quiet: bool) {
     let inputs = pm.input::<Drive>("drive");
     let respawns = pm.event::<Respawn>("respawn");
 
-    // Joins and leaves: a truck (with health and gun) per peer.
-    task!(pm, "roster", 10.0, [truck, health, gun, net], move |pm| {
+    // Joins and leaves: a truck (with health, gun, and body part) per
+    // peer.
+    task!(pm, "roster", 10.0, [truck, health, gun, collider, parts, net], move |pm| {
         for p in net.joined() {
             let id = pm.id_add();
-            truck.get_mut().add(id, spawn_truck(p));
+            let t = spawn_truck(p);
+            truck.get_mut().add(id, t);
             health.get_mut().add(id, Health { hp: TRUCK_HP });
             gun.get_mut().add(id, 0.0);
+            part_add(pm, &collider, &parts, id, truck_hull(&t));
             net.own_set(p, id);
             if !quiet {
                 eprintln!("[server] peer {p} joined");
@@ -132,17 +188,24 @@ pub fn run(quiet: bool) {
     // membership — swap the entity, and the removal log plus the
     // ownership table tell every client the whole story. (`respawns`
     // isn't in the capture list: not a shared handle, just moved in.)
-    task!(pm, "respawn", 11.0, [truck, heli, health, gun, net], move |pm| {
+    task!(pm, "respawn", 11.0, [truck, heli, health, gun, collider, parts, net], move |pm| {
         for (peer, ev) in respawns.drain() {
             let Some(old) = net.own(peer) else {
                 continue;
             };
-            pm.id_remove(old); // truck/heli + health + gun entries go with it
+            // The old vehicle's part outlives this removal by one tick
+            // (it has its OWN id) — the janitor in the bullets task
+            // reaps it once `id_alive(owner)` fails.
+            pm.id_remove(old); // truck/heli + health + gun + parts link go with it
             let id = pm.id_add();
             if ev.vehicle == VEH_HELI {
-                heli.get_mut().add(id, spawn_heli(peer));
+                let h = spawn_heli(peer);
+                heli.get_mut().add(id, h);
+                part_add(pm, &collider, &parts, id, heli_hull(&h));
             } else {
-                truck.get_mut().add(id, spawn_truck(peer));
+                let t = spawn_truck(peer);
+                truck.get_mut().add(id, t);
+                part_add(pm, &collider, &parts, id, truck_hull(&t));
             }
             health.get_mut().add(id, Health { hp: TRUCK_HP });
             gun.get_mut().add(id, 0.0);
@@ -315,8 +378,18 @@ pub fn run(quiet: bool) {
         pm,
         "drive",
         30.0,
-        [truck, heli, health, bullet, gun, shot, impact, hunt, net],
+        [truck, heli, health, bullet, gun, shot, impact, hunt, collider, parts, net],
         move |pm| {
+            // Owners keep their parts current (docs/collisions.md §2):
+            // every exit from the step below re-poses the vehicle's
+            // collider hull, so the sweep at 31 never looks up a pose.
+            let pose = |id: Id, hull: Hull| {
+                if let Some(pid) = parts.get_id(id).map(|p| *p)
+                    && let Some(mut c) = collider.get_id_mut(pid)
+                {
+                    c.hull = hull;
+                }
+            };
             for (peer, id) in net.owned() {
                 let cmd = inputs.pop(peer);
 
@@ -335,9 +408,11 @@ pub fn run(quiet: bool) {
                     let dead =
                         shooter.heat >= 1.0 || health.get_id(id).is_some_and(|v| v.hp <= 0.0);
                     if dead {
+                        let fresh = spawn_truck(peer);
                         if let Some(mut t) = truck.get_id_mut(id) {
-                            *t = spawn_truck(peer);
+                            *t = fresh;
                         }
+                        pose(id, truck_hull(&fresh));
                         if let Some(mut v) = health.get_id_mut(id) {
                             v.hp = TRUCK_HP;
                         }
@@ -351,6 +426,7 @@ pub fn run(quiet: bool) {
                         }
                         continue;
                     }
+                    pose(id, truck_hull(&shooter));
                     (truck_muzzle(&shooter), HIT_PAD_TRUCK)
                 } else if let Some(shooter) = heli.get_id_mut(id).map(|mut hl| {
                     heli_step(&mut hl, cmd, FIXED_DT);
@@ -358,9 +434,11 @@ pub fn run(quiet: bool) {
                 }) {
                     let b = shooter.body;
                     if health.get_id(id).is_some_and(|v| v.hp <= 0.0) {
+                        let fresh = spawn_heli(peer);
                         if let Some(mut hl) = heli.get_id_mut(id) {
-                            *hl = spawn_heli(peer);
+                            *hl = fresh;
                         }
+                        pose(id, heli_hull(&fresh));
                         if let Some(mut v) = health.get_id_mut(id) {
                             v.hp = TRUCK_HP;
                         }
@@ -384,6 +462,7 @@ pub fn run(quiet: bool) {
                         }
                         continue;
                     }
+                    pose(id, heli_hull(&shooter));
                     (heli_muzzle(&shooter), HIT_PAD_HELI)
                 } else {
                     continue;
@@ -441,26 +520,31 @@ pub fn run(quiet: bool) {
     // per-tick lag comp, so leading a hog is never required at sane
     // latencies. Damage still lands on the PRESENT hog; buildings and
     // arena walls stop bullets in present time (they don't move).
-    // The friendly-fire registry: one probe per vehicle pool, mapping an
-    // entity id to its collision Hull. The sweep below walks this list —
-    // a NEW VEHICLE (jet, dirtbike...) is its `*_hull` fn in common.rs
-    // plus one probe here; the sweep never changes.
-    let hulls: Vec<Box<dyn Fn(pm::Id) -> Option<Hull>>> = vec![
-        Box::new({
-            let truck = truck.clone();
-            move |id| truck.get_id(id).map(|t| truck_hull(&t))
-        }),
-        Box::new({
-            let heli = heli.clone();
-            move |id| heli.get_id(id).map(|h| heli_hull(&h))
-        }),
-    ];
+    // Vehicles are COLLIDER ENTRIES now (docs/collisions.md stage 1):
+    // the sweep iterates the pool — a new vehicle registers its part
+    // and is swept without this task changing — writes Contact facts,
+    // and applies nothing; the response tasks below own consequences.
+    // The Vec is the sweep's tick-local live view (cull-and-collect),
+    // living out here so its allocation does too.
+    let mut live: Vec<(Id, Collider)> = Vec::new();
     task!(
         pm,
         "bullets",
         31.0,
-        [bullet, shot, hog, brain, health, impact, hunt, net],
+        [bullet, shot, hog, brain, collider, contact, impact, hunt, net],
         move |pm| {
+            // Same-tick contract check: the response tasks at 32 drain
+            // every contact the sweep writes. Anything still here means
+            // a response task missed its owner — purge loudly rather
+            // than let a stale fact double-apply.
+            if !contact.get().is_empty() {
+                eprintln!(
+                    "[server] {} undrained contacts culled (a response task missed them)",
+                    contact.get().len()
+                );
+                pm.id_remove_all(&contact);
+            }
+            live_colliders(pm, &collider, &mut live);
             let step = BULLET_SPEED * FIXED_DT;
             let mut bullets = bullet.get_mut();
             let mut shots = shot.get_mut();
@@ -478,34 +562,32 @@ pub fn run(quiet: bool) {
                 // altitude at the hit point is inside the hog's band.
                 let hstep = b.pitch.cos() * step;
                 let dy = b.pitch.sin() * step;
-                // Friendly fire, PRESENT time (no rewind — teammates
-                // aren't in the history ring, and they're slow enough
-                // that it wouldn't buy much): a buddy between you and
-                // the horde eats the round. The shooter's own vehicle
-                // is skipped — bullets are born at its muzzle.
-                for (peer, vid) in net.owned() {
-                    if peer as f32 == b.owner {
-                        continue;
-                    }
-                    let ff = hulls.iter().find_map(|probe| {
-                        probe(vid)
-                            .and_then(|h| ray_hits_hull(b.x, b.z, b.y, b.heading, hstep, dy, &h))
-                    });
-                    if let Some((fx, fz)) = ff {
-                        pm.id_remove(id);
-                        if let Some(mut v) = health.get_id_mut(vid) {
-                            v.hp -= FRIENDLY_DMG;
-                        }
-                        if !quiet {
-                            eprintln!(
-                                "[server] friendly fire: peer {} hit peer {peer}",
-                                b.owner as u8
-                            );
-                        }
-                        let mid = pm.id_add();
-                        impact.get_mut().add(mid, Impact { x: fx, z: fz, kind: IMPACT_HIT });
-                        return;
-                    }
+                // Friendly fire, PRESENT time until the collider pool
+                // enters the history ring (stage 2): a buddy between
+                // you and the horde eats the round. The sweep is the
+                // collider pool now — mask picks vehicles, `skip` drops
+                // the shooter's own (bullets are born at its muzzle),
+                // and a hit is a written FACT, not applied damage: the
+                // vehicle's own response task at prio 32 owns that.
+                let skip = net.own(b.owner as u8);
+                if let Some(hit) = sweep_colliders(
+                    b.x, b.z, b.y, b.heading, hstep, dy, 0.0, CAT_VEHICLE, skip, &live,
+                ) {
+                    pm.id_remove(id);
+                    let cid = pm.id_add();
+                    contact.get_mut().add(
+                        cid,
+                        Contact {
+                            owner: hit.owner,
+                            part: hit.part,
+                            kind: KIND_BULLET,
+                            source_peer: b.owner as u8,
+                            x: hit.x,
+                            y: hit.y,
+                            z: hit.z,
+                        },
+                    );
+                    return;
                 }
                 let hit = hist.frame(view).and_then(|f| {
                     ray_hit_hog(b.x, b.z, b.heading, hstep, s.pad, &f).and_then(|(k, hx, hz)| {
@@ -578,6 +660,74 @@ pub fn run(quiet: bool) {
             });
         }
     );
+
+    // Response tasks (prio 32, right after the sweep): each vehicle
+    // kind drains the contacts addressed to ITS entities and owns every
+    // consequence — detection and response never meet in a function
+    // again (docs/collisions.md §2). The changed-tick filter keeps a
+    // response to THIS tick's facts (anything older is the sweep's
+    // loud-purge path), and the owner lookup doubles as the liveness
+    // check at drain (§3: validate at consumption). Today truck and
+    // heli responses are twins; per-part branches (tail hit → yaw kick)
+    // are exactly where they'd diverge — stage 4's business.
+    task!(pm, "truck_hits", 32.0, [contact, truck, health, impact, net], move |pm| {
+        let now = pm.tick();
+        let hits: Vec<(Id, Contact)> = {
+            let pool = contact.get();
+            pool.iter()
+                .filter(|&(cid, c)| {
+                    pool.changed_tick(cid) == Some(now) && truck.get_id(c.owner).is_some()
+                })
+                .map(|(cid, c)| (cid, *c))
+                .collect()
+        };
+        for (cid, c) in hits {
+            pm.id_remove(cid); // fact consumed
+            if c.kind != KIND_BULLET {
+                continue; // the only kind a vehicle answers today
+            }
+            if let Some(mut v) = health.get_id_mut(c.owner) {
+                v.hp -= FRIENDLY_DMG;
+            }
+            if !quiet && let Some(victim) = net.owner_of(c.owner) {
+                eprintln!(
+                    "[server] friendly fire: peer {} hit peer {victim} (part {} at y {:.1})",
+                    c.source_peer, c.part, c.y
+                );
+            }
+            let mid = pm.id_add();
+            impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_HIT });
+        }
+    });
+    task!(pm, "heli_hits", 32.0, [contact, heli, health, impact, net], move |pm| {
+        let now = pm.tick();
+        let hits: Vec<(Id, Contact)> = {
+            let pool = contact.get();
+            pool.iter()
+                .filter(|&(cid, c)| {
+                    pool.changed_tick(cid) == Some(now) && heli.get_id(c.owner).is_some()
+                })
+                .map(|(cid, c)| (cid, *c))
+                .collect()
+        };
+        for (cid, c) in hits {
+            pm.id_remove(cid);
+            if c.kind != KIND_BULLET {
+                continue;
+            }
+            if let Some(mut v) = health.get_id_mut(c.owner) {
+                v.hp -= FRIENDLY_DMG;
+            }
+            if !quiet && let Some(victim) = net.owner_of(c.owner) {
+                eprintln!(
+                    "[server] friendly fire: peer {} hit peer {victim} (part {} at y {:.1})",
+                    c.source_peer, c.part, c.y
+                );
+            }
+            let mid = pm.id_add();
+            impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_HIT });
+        }
+    });
 
     // Waves (prio 33): when the horde is dead, spawn a bigger one along
     // the far walls. Also keeps the scoreboard's live counters fresh.
@@ -688,4 +838,47 @@ pub fn run(quiet: bool) {
         eprintln!("(a previous hogs may still be running: pkill -x hogs)");
         std::process::exit(1);
     });
+}
+
+/// The parent→child lifecycle convention, pinned (docs/collisions.md
+/// §3): a part has its OWN id, so removing the owner leaves a ghost
+/// for exactly one flush — the janitor must filter it from the live
+/// list immediately and free it next tick.
+#[cfg(test)]
+mod collider_tests {
+    use super::*;
+
+    const DT: f32 = 1.0 / 60.0;
+
+    #[test]
+    fn janitor_culls_ghost_parts() {
+        let mut pm = Pm::new();
+        let collider = pm.pool::<Collider>("collider");
+        let owner = pm.id_add();
+        let part = pm.id_add();
+        collider.get_mut().add(
+            part,
+            Collider {
+                owner,
+                part: PART_BODY,
+                cat: CAT_VEHICLE,
+                hull: truck_hull(&Truck::default()),
+            },
+        );
+        let mut live = Vec::new();
+        live_colliders(&mut pm, &collider, &mut live);
+        assert_eq!(live.len(), 1, "a live owner's part sweeps");
+
+        pm.id_remove(owner);
+        pm.loop_once(DT); // flush: the owner dies, the part survives it
+        assert!(
+            collider.get().contains(part),
+            "the part has its own id — the owner's removal can't reach it"
+        );
+        live_colliders(&mut pm, &collider, &mut live);
+        assert!(live.is_empty(), "the ghost never enters the live list");
+        pm.loop_once(DT); // flush the janitor's id_remove
+        assert!(!collider.get().contains(part), "the janitor freed the entry");
+        assert!(!pm.id_alive(part), "and the id itself");
+    }
 }
