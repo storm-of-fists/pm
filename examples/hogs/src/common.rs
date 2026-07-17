@@ -861,40 +861,6 @@ pub fn hog_bites_truck(h: &Hog, t: &Truck) -> bool {
     seg_point_dist(a, b, (h.x, h.z)) < HOG_R + TRUCK_R
 }
 
-/// Ray from `(x, z)` along `heading` against hog circles: the nearest
-/// hog whose body the ray crosses within `range`, as `(index into hogs,
-/// hit x, hit z)`. Each hog's hit circle is `HOG_R + pad` — the pad is
-/// the shooter's forgiveness (`HIT_PAD_*`). The server sweeps each
-/// bullet's per-tick travel with it, against a REWOUND frame (the
-/// shooter's view) — which is the whole lag-comp trick.
-pub fn ray_hit_hog(
-    x: f32,
-    z: f32,
-    heading: f32,
-    range: f32,
-    pad: f32,
-    hogs: &[(Id, Hog)],
-) -> Option<(usize, f32, f32)> {
-    let (dx, dz) = (heading.sin(), heading.cos());
-    let r = HOG_R + pad;
-    let mut best: Option<(usize, f32)> = None;
-    for (k, (_, h)) in hogs.iter().enumerate() {
-        let (ox, oz) = (h.x - x, h.z - z);
-        let t = ox * dx + oz * dz; // along-ray distance to closest approach
-        if !(0.0..=range).contains(&t) {
-            continue;
-        }
-        let (cx, cz) = (ox - dx * t, oz - dz * t);
-        if cx * cx + cz * cz > r * r {
-            continue;
-        }
-        if best.is_none_or(|(_, bt)| t < bt) {
-            best = Some((k, t));
-        }
-    }
-    best.map(|(k, t)| (k, x + dx * t, z + dz * t))
-}
-
 /// Friendly fire: damage a stray shot does to a teammate's vehicle
 /// (gentler than `GUN_DMG` — punish spraying, don't two-shot a buddy),
 /// and the truck hull's bullet height band.
@@ -943,6 +909,19 @@ pub fn heli_hull(h: &Heli) -> Hull {
         b: (p.x, p.z),
         r: HELI_R,
         y: (p.y - HELI_R, p.y + HELI_R),
+    }
+}
+
+/// A hog is a ground cylinder: its round body over the gameplay hit
+/// band [0, `HOG_H`] (taller than the drawn hog on purpose — see
+/// `HOG_H`). The shooter's forgiveness is NOT in here: `Shot::pad`
+/// grows the query, never the collider (docs/collisions.md §8).
+pub fn hog_hull(h: &Hog) -> Hull {
+    Hull {
+        a: (h.x, h.z),
+        b: (h.x, h.z),
+        r: HOG_R,
+        y: (0.0, HOG_H),
     }
 }
 
@@ -1008,6 +987,7 @@ pub const PART_BODY: u8 = 0;
 
 /// Category bits. Add sparingly — a bit is a vocabulary word.
 pub const CAT_VEHICLE: u8 = 1 << 0;
+pub const CAT_HOG: u8 = 1 << 1;
 
 /// A hit the sweep found: who was struck, where, and how far along the
 /// travel — `frac` is what orders competing hits (nearest wins).
@@ -1082,6 +1062,8 @@ pub struct Contact {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+    /// The causer's travel direction — knockback reads it.
+    pub heading: f32,
 }
 
 /// A bullet connected.
@@ -1233,6 +1215,36 @@ mod hull_tests {
             (hit.y - 1.0).abs() < 1e-4,
             "flat shot reports its own altitude, got {}",
             hit.y
+        );
+    }
+
+    /// A hog collider sweeps like everything else, and the pad grows
+    /// radius AND altitude band (from a heli most near-misses are
+    /// vertical) — both query-side.
+    #[test]
+    fn sweep_pads_hog_radius_and_band() {
+        let h = Hog {
+            hp: 1.0,
+            ..Hog::default()
+        };
+        let id = Id::new(0, 0, 3);
+        let cols = vec![(
+            id,
+            Collider {
+                owner: id,
+                part: PART_BODY,
+                cat: CAT_HOG,
+                hull: hog_hull(&h),
+            },
+        )];
+        let shot = |y, pad| {
+            sweep_colliders(-5.0, 0.0, y, FRAC_PI_2, 10.0, 0.0, pad, CAT_HOG, None, &cols)
+        };
+        assert!(shot(1.0, 0.0).is_some(), "flat shot through the body connects");
+        assert!(shot(HOG_H + 0.5, 0.0).is_none(), "overflight misses the band");
+        assert!(
+            shot(HOG_H + 0.5, HIT_PAD_HELI).is_some(),
+            "the heli pad forgives a vertical near-miss"
         );
     }
 }

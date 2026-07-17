@@ -3,9 +3,12 @@
 //! interpolate them. Bullets are real server-owned projectiles (a synced
 //! pool clients render as tracers), and every tick of a bullet's flight
 //! is lag-compensated the way drive's scoring is: the hit test runs
-//! against the hog frame the SHOOTER was looking at (`acked_tick −
-//! interp_ticks`, rewound through the hog pool's history ring), while
-//! damage lands in the present.
+//! against the COLLIDER frame the SHOOTER was looking at (`acked_tick −
+//! interp_ticks`, rewound through the collider pool's history ring —
+//! hogs and teammates alike, favor-the-shooter), while damage lands in
+//! the present. Collision is the docs/collisions.md architecture:
+//! owners register posed collider parts, ONE sweep writes contact
+//! facts, response tasks own every consequence.
 //!
 //! Deliberate simplicities (this example is the replication stress lab,
 //! not an AI showcase): hogs don't avoid each other (no separation
@@ -60,19 +63,17 @@ struct Shot {
     pad: f32,
 }
 
-/// Cull-and-collect (docs/collisions.md §3): one walk over the collider
-/// pool per tick drops entries whose owner id died — the janitor half of
-/// the parent→child convention, `pm.id_alive` being the generation
-/// check that answers "is this id current" without knowing pools — and
-/// gathers the live entries into `out` for this tick's sweeps. A part
-/// spends at most one tick as a ghost, and the live list never carries
-/// one.
-fn live_colliders(pm: &mut Pm, collider: &pm::PoolHandle<Collider>, out: &mut Vec<(Id, Collider)>) {
-    out.clear();
+/// The janitor (docs/collisions.md §3): one walk over the collider pool
+/// per tick removes entries whose owner id died — the cull half of the
+/// parent→child convention, `pm.id_alive` being the generation check
+/// that answers "is this id current" without knowing pools. A part
+/// spends at most one tick as a ghost (and one historical frame; a
+/// rewound hit on it is discarded at contact-write by the same
+/// `id_alive` check). Self-keyed entries (hogs) never appear here —
+/// their entry dies with their entity.
+fn cull_colliders(pm: &mut Pm, collider: &pm::PoolHandle<Collider>) {
     for (cid, c) in collider.get().iter() {
-        if pm.id_alive(c.owner) {
-            out.push((cid, *c));
-        } else {
+        if !pm.id_alive(c.owner) {
             pm.id_remove(cid); // deferred; the pool entry goes with the id
         }
     }
@@ -130,8 +131,6 @@ pub fn run(quiet: bool) {
     let impact = pm.wire_pool::<Impact>("impact");
     pm.ttl_pool(&impact, IMPACT_TTL);
     let hunt = pm.sync_single::<Hunt>("hunt");
-    // A second of hog history — the rewind memory shots are judged in.
-    let hist = pm.history_pool(&hog, 1.0);
     // Server-only state: per-hog brains, per-truck gun cooldowns,
     // per-bullet shooter info. Keyed by the same ids as their synced
     // siblings; entity removal cleans them up with everything else.
@@ -147,6 +146,10 @@ pub fn run(quiet: bool) {
     let collider = pm.pool::<Collider>("collider");
     let contact = pm.pool::<Contact>("contact");
     let parts = pm.pool::<Id>("vehicle.part");
+    // A second of COLLIDER history — the rewind memory every shot is
+    // judged in (docs/collisions.md §4): hogs and vehicles in one
+    // uniform ring, favor-the-shooter, decided 2026-07-17.
+    let hist = pm.history_pool(&collider, 1.0);
 
     if !quiet {
         eprintln!("hogs server on {ADDR} [{}]", pm::BUILD_ID);
@@ -222,7 +225,7 @@ pub fn run(quiet: bool) {
         pm,
         "hog_ai",
         28.0,
-        [hog, brain, truck, heli, health, impact, hunt],
+        [hog, brain, truck, heli, health, impact, hunt, collider],
         move |pm| {
             let now = pm.tick() as f32 * FIXED_DT;
             let mut rng = Rng::new(pm.tick().wrapping_mul(0x51D7_ACE5) | 1);
@@ -242,11 +245,12 @@ pub fn run(quiet: bool) {
                 .collect();
             let mut hogs = hog.get_mut();
             let mut brains = brain.get_mut();
+            let mut cols = collider.get_mut();
             // each_with is the hog<->brain join; bite consequences apply
             // INLINE because they only touch OTHER pools (fine while hogs
             // is borrowed) and id_add/id_remove never borrow pools at all
             // (removal is deferred to end of tick by the kernel).
-            hogs.each_with(&mut brains, |_id, mut h, mut b| {
+            hogs.each_with(&mut brains, |id, mut h, mut b| {
                 b.bite_cd = (b.bite_cd - FIXED_DT).max(0.0);
                 b.flee = (b.flee - FIXED_DT).max(0.0);
 
@@ -366,6 +370,20 @@ pub fn run(quiet: bool) {
                         },
                     );
                 }
+                // Pose the collider (docs/collisions.md §2): a hog is
+                // its own single part — the entry is keyed by the hog's
+                // OWN id, so death cleans it with the entity and the
+                // janitor never has work here. Upsert every tick, the
+                // pool is local — no wire cost to the change-density.
+                cols.add(
+                    id,
+                    Collider {
+                        owner: id,
+                        part: PART_BODY,
+                        cat: CAT_HOG,
+                        hull: hog_hull(&h),
+                    },
+                );
             });
         }
     );
@@ -514,24 +532,21 @@ pub fn run(quiet: bool) {
         }
     );
 
-    // Bullets (prio 31, right after the guns fire): sweep each bullet's
-    // per-tick travel against the hog frame its SHOOTER was looking at
-    // (acked tick minus their interp delay, out of the history ring) —
-    // per-tick lag comp, so leading a hog is never required at sane
-    // latencies. Damage still lands on the PRESENT hog; buildings and
-    // arena walls stop bullets in present time (they don't move).
-    // Vehicles are COLLIDER ENTRIES now (docs/collisions.md stage 1):
-    // the sweep iterates the pool — a new vehicle registers its part
-    // and is swept without this task changing — writes Contact facts,
-    // and applies nothing; the response tasks below own consequences.
-    // The Vec is the sweep's tick-local live view (cull-and-collect),
-    // living out here so its allocation does too.
-    let mut live: Vec<(Id, Collider)> = Vec::new();
+    // Bullets (prio 31, right after the guns fire): THE collisions
+    // sweep (docs/collisions.md). Each bullet's per-tick travel is
+    // judged in the collider frame its SHOOTER was looking at (acked
+    // tick minus their interp delay, out of the history ring) — hogs
+    // AND teammates in the same rewound frame, favor-the-shooter, one
+    // timeline per shot. The sweep iterates collider entries — a new
+    // vehicle registers its part and is swept without this task
+    // changing — writes Contact facts, and applies NOTHING; the
+    // response tasks below own every consequence. Buildings and arena
+    // walls stop bullets in present time (they don't move).
     task!(
         pm,
         "bullets",
         31.0,
-        [bullet, shot, hog, brain, collider, contact, impact, hunt, net],
+        [bullet, shot, collider, contact, impact, net],
         move |pm| {
             // Same-tick contract check: the response tasks at 32 drain
             // every contact the sweep writes. Anything still here means
@@ -544,7 +559,7 @@ pub fn run(quiet: bool) {
                 );
                 pm.id_remove_all(&contact);
             }
-            live_colliders(pm, &collider, &mut live);
+            cull_colliders(pm, &collider);
             let step = BULLET_SPEED * FIXED_DT;
             let mut bullets = bullet.get_mut();
             let mut shots = shot.get_mut();
@@ -562,77 +577,48 @@ pub fn run(quiet: bool) {
                 // altitude at the hit point is inside the hog's band.
                 let hstep = b.pitch.cos() * step;
                 let dy = b.pitch.sin() * step;
-                // Friendly fire, PRESENT time until the collider pool
-                // enters the history ring (stage 2): a buddy between
-                // you and the horde eats the round. The sweep is the
-                // collider pool now — mask picks vehicles, `skip` drops
-                // the shooter's own (bullets are born at its muzzle),
-                // and a hit is a written FACT, not applied damage: the
-                // vehicle's own response task at prio 32 owns that.
+                // THE sweep (docs/collisions.md §4): the shot is judged
+                // in its shooter's rewound collider frame — hogs AND
+                // teammates, one timeline, favor-the-shooter. Two
+                // passes because the pad differs (hog forgiveness never
+                // fattens a teammate); nearest hit along the travel
+                // wins, so a hog can shield a truck and vice versa.
                 let skip = net.own(b.owner as u8);
-                if let Some(hit) = sweep_colliders(
-                    b.x, b.z, b.y, b.heading, hstep, dy, 0.0, CAT_VEHICLE, skip, &live,
-                ) {
-                    pm.id_remove(id);
-                    let cid = pm.id_add();
-                    contact.get_mut().add(
-                        cid,
-                        Contact {
-                            owner: hit.owner,
-                            part: hit.part,
-                            kind: KIND_BULLET,
-                            source_peer: b.owner as u8,
-                            x: hit.x,
-                            y: hit.y,
-                            z: hit.z,
-                        },
-                    );
-                    return;
-                }
                 let hit = hist.frame(view).and_then(|f| {
-                    ray_hit_hog(b.x, b.z, b.heading, hstep, s.pad, &f).and_then(|(k, hx, hz)| {
-                        let (ox, oz) = (hx - b.x, hz - b.z);
-                        let frac = (ox * ox + oz * oz).sqrt() / hstep.max(1e-6);
-                        let yh = b.y + dy * frac;
-                        // The altitude band is padded too — from a heli
-                        // most near-misses are vertical.
-                        (-s.pad..=HOG_H + s.pad).contains(&yh).then(|| (f[k].0, hx, hz))
-                    })
-                });
-                if let Some((hid, hx, hz)) = hit {
-                    pm.id_remove(id); // shot entry goes with it
-                    // The rewound hog may have died since that frame —
-                    // or THIS tick, to an earlier bullet (hp already 0,
-                    // removal pending): a corpse absorbs no damage and
-                    // pays no double kill points.
-                    let killed = match hog.get_id_mut(hid) {
-                        Some(mut h) if h.hp > 0.0 => {
-                            h.hp -= GUN_DMG;
-                            h.hp <= 0.0
-                        }
-                        _ => return,
-                    };
-                    // Survivors stagger away from the shot (the ragdoll
-                    // for the dead is client-side; see player_client).
-                    if !killed && let Some(mut br) = brain.get_id_mut(hid) {
-                        br.shove = (b.heading.sin() * KNOCK, b.heading.cos() * KNOCK);
-                    }
-                    if killed {
-                        pm.id_remove(hid); // brain entry goes with it
-                        hunt.get_mut().points += KILL_POINTS;
-                        if !quiet {
-                            eprintln!("[server] hog down at ({hx:.1},{hz:.1}) now={}", pm.tick());
-                        }
-                    }
-                    let mid = pm.id_add();
-                    impact.get_mut().add(
-                        mid,
-                        Impact {
-                            x: hx,
-                            z: hz,
-                            kind: if killed { IMPACT_KILL } else { IMPACT_HIT },
-                        },
+                    let ff = sweep_colliders(
+                        b.x, b.z, b.y, b.heading, hstep, dy, 0.0, CAT_VEHICLE, skip, &f,
                     );
+                    let hg = sweep_colliders(
+                        b.x, b.z, b.y, b.heading, hstep, dy, s.pad, CAT_HOG, None, &f,
+                    );
+                    [ff, hg]
+                        .into_iter()
+                        .flatten()
+                        .min_by(|a, b| a.frac.total_cmp(&b.frac))
+                });
+                if let Some(hit) = hit {
+                    pm.id_remove(id); // the shot ends either way
+                    // A ghost in an old frame (it died since that view)
+                    // eats the round — the shooter SAW it there — but
+                    // hurts nothing: stale ids fail the gen check, and
+                    // no contact means no response. Damage stays in the
+                    // PRESENT; the response tasks re-check at drain.
+                    if pm.id_alive(hit.owner) {
+                        let cid = pm.id_add();
+                        contact.get_mut().add(
+                            cid,
+                            Contact {
+                                owner: hit.owner,
+                                part: hit.part,
+                                kind: KIND_BULLET,
+                                source_peer: b.owner as u8,
+                                x: hit.x,
+                                y: hit.y,
+                                z: hit.z,
+                                heading: b.heading,
+                            },
+                        );
+                    }
                     return;
                 }
                 b.x += b.heading.sin() * hstep;
@@ -726,6 +712,59 @@ pub fn run(quiet: bool) {
             }
             let mid = pm.id_add();
             impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_HIT });
+        }
+    });
+    // The hogs' response: damage in the PRESENT (the frame only judged
+    // the hit), the corpse guard against same-tick double kills, the
+    // knockback shove, kill points, and the flash — everything the
+    // bullets task used to apply inline, now behind the contact seam.
+    task!(pm, "hog_hits", 32.0, [contact, hog, brain, hunt, impact], move |pm| {
+        let now = pm.tick();
+        let hits: Vec<(Id, Contact)> = {
+            let pool = contact.get();
+            pool.iter()
+                .filter(|&(cid, c)| {
+                    pool.changed_tick(cid) == Some(now) && hog.get_id(c.owner).is_some()
+                })
+                .map(|(cid, c)| (cid, *c))
+                .collect()
+        };
+        for (cid, c) in hits {
+            pm.id_remove(cid); // fact consumed
+            if c.kind != KIND_BULLET {
+                continue;
+            }
+            // The hog may have died THIS tick to an earlier bullet (hp
+            // already 0, removal pending): a corpse absorbs no damage
+            // and pays no double kill points — and gets no flash.
+            let killed = match hog.get_id_mut(c.owner) {
+                Some(mut h) if h.hp > 0.0 => {
+                    h.hp -= GUN_DMG;
+                    h.hp <= 0.0
+                }
+                _ => continue,
+            };
+            // Survivors stagger away from the shot (the ragdoll for
+            // the dead is client-side; see player_client).
+            if !killed && let Some(mut br) = brain.get_id_mut(c.owner) {
+                br.shove = (c.heading.sin() * KNOCK, c.heading.cos() * KNOCK);
+            }
+            if killed {
+                pm.id_remove(c.owner); // brain + collider entries go with it
+                hunt.get_mut().points += KILL_POINTS;
+                if !quiet {
+                    eprintln!("[server] hog down at ({:.1},{:.1}) now={now}", c.x, c.z);
+                }
+            }
+            let mid = pm.id_add();
+            impact.get_mut().add(
+                mid,
+                Impact {
+                    x: c.x,
+                    z: c.z,
+                    kind: if killed { IMPACT_KILL } else { IMPACT_HIT },
+                },
+            );
         }
     });
 
@@ -865,9 +904,9 @@ mod collider_tests {
                 hull: truck_hull(&Truck::default()),
             },
         );
-        let mut live = Vec::new();
-        live_colliders(&mut pm, &collider, &mut live);
-        assert_eq!(live.len(), 1, "a live owner's part sweeps");
+        cull_colliders(&mut pm, &collider);
+        pm.loop_once(DT);
+        assert!(collider.get().contains(part), "a live owner's part stays");
 
         pm.id_remove(owner);
         pm.loop_once(DT); // flush: the owner dies, the part survives it
@@ -875,8 +914,8 @@ mod collider_tests {
             collider.get().contains(part),
             "the part has its own id — the owner's removal can't reach it"
         );
-        live_colliders(&mut pm, &collider, &mut live);
-        assert!(live.is_empty(), "the ghost never enters the live list");
+        assert!(!pm.id_alive(owner), "the sweep's contact-write guard fails here");
+        cull_colliders(&mut pm, &collider);
         pm.loop_once(DT); // flush the janitor's id_remove
         assert!(!collider.get().contains(part), "the janitor freed the entry");
         assert!(!pm.id_alive(part), "and the id itself");
