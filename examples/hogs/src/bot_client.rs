@@ -31,6 +31,13 @@ pub struct ClientWorld {
     pub hunt: SingleRx<Hunt>,
     pub input: InputTx<Drive>,
     pub respawn: EventTx<Respawn>,
+    /// Reliable param writes (telemetry knobs → server clamp).
+    pub param_set: EventTx<ParamSet>,
+    /// The server's tuning set, replicated (docs/params.md stage 2):
+    /// the predictors' steps read it (shared-step constants), and any
+    /// client read of a tunable — bot gates, cosmetic gun cadence, aim
+    /// line reach — comes off this replica, never a const.
+    pub params: SingleRx<Params>,
     /// Both vehicle predictors ride the same input channel; whichever
     /// pool holds the avatar is live, the other idles with `state() ==
     /// None` — which is also how game code asks "am I flying?".
@@ -61,15 +68,42 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     let bullet = pm.wire_pool::<Bullet>("bullet");
     let impact = pm.wire_pool::<Impact>("impact");
     let hunt = pm.sync_single::<Hunt>("hunt");
+    // The server's tuning set (docs/params.md), stage 2 live: the
+    // predictor step closures below capture this replica, so the same
+    // numbers drive both ends — a live change mispredicts for one
+    // snapshot interval and reconciles (the documented blip). The write
+    // path is `param_set` below.
+    let params = pm.sync_single::<Params>("params");
     let input = pm.input::<Drive>("drive");
     let respawn = pm.event::<Respawn>("respawn");
+    let param_set = pm.event::<ParamSet>("param.set");
 
     // Local vehicle: reconcile against the input-seq echo, replay
     // unacked sends — the same steps the server runs make it byte-exact.
     // BOTH vehicles get predictors on the ONE input channel; the one
     // whose pool holds the avatar runs, the other idles empty.
-    let pred = pm.predict_pool(&truck, &input, truck_step, err_metric, 1e-4, FIXED_DT);
-    let pred_heli = pm.predict_pool(&heli, &input, heli_step, heli_err, 1e-4, FIXED_DT);
+    let pred = pm.predict_pool(
+        &truck,
+        &input,
+        {
+            let params = params.clone();
+            move |s, c, dt| truck_step(s, c, dt, &params.get())
+        },
+        err_metric,
+        1e-4,
+        FIXED_DT,
+    );
+    let pred_heli = pm.predict_pool(
+        &heli,
+        &input,
+        {
+            let params = params.clone();
+            move |s, c, dt| heli_step(s, c, dt, &params.get())
+        },
+        heli_err,
+        1e-4,
+        FIXED_DT,
+    );
 
     // Remote smoothing, shared delay contract with the server's shot
     // rewind (see common.rs INTERP_DELAY). Capped extrapolation rides
@@ -86,6 +120,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     let bullet_draw = pm.interp_pool(&bullet, bullet_lerp, interp_delay() as f64, extrap);
 
     ClientWorld {
+        params,
         hog,
         health,
         bullet,
@@ -97,6 +132,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
         hunt,
         input,
         respawn,
+        param_set,
         pred,
         pred_heli,
     }
@@ -111,6 +147,10 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
     }
     let w = client_setup(&mut pm);
     let net = pm.net();
+    // Predictor handles for the prof task below (`w` moves into the bot
+    // task first).
+    let w2_pred = w.pred.clone();
+    let w2_pred_heli = w.pred_heli.clone();
 
     // Building-jam recovery state: seconds spent commanding thrust while
     // not moving, and seconds of back-out left once we give up.
@@ -123,6 +163,7 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
 
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;
+        let p = w.params.get();
 
         // Trigger discipline — friendly fire is live: hold when a
         // teammate's (grown) hull crosses the line of fire. Same hulls
@@ -164,7 +205,7 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
                         // the ground at the hog.
                         let dive = (b.pos.y / d.max(3.0)).atan();
                         let aligned = err.abs() < 0.25
-                            && d < GUN_RANGE * 0.9
+                            && d < p.gun_range * 0.9
                             && line_clear(b.pos.x, b.pos.y, b.pos.z, bearing, -dive, d);
                         (
                             err.clamp(-1.0, 1.0),
@@ -225,7 +266,7 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
                 // velocity. (Humans lead by watching tracers; a bot that
                 // insta-aims at the current bearing only ever hits hogs
                 // charging straight down the ray.)
-                let tof = d / BULLET_SPEED;
+                let tof = d / p.bullet_speed;
                 let (lx, lz) = (
                     h.x + h.heading.sin() * h.speed * tof,
                     h.z + h.heading.cos() * h.speed * tof,
@@ -246,7 +287,7 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
                 // Standoff at 12u: outside a bite lunge, inside easy
                 // gun range — and full reverse when a charge closes
                 // (soak data: parking at spit distance = death by bite).
-                let mut want = ((d - 12.0) * 0.9).clamp(-7.0, VMAX);
+                let mut want = ((d - 12.0) * 0.9).clamp(-7.0, p.vmax);
                 if err.abs() > 0.9 {
                     want = want.min(7.0);
                 }
@@ -254,7 +295,7 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
                     err.clamp(-1.0, 1.0),
                     ((want - me.speed()) * 0.4).clamp(-1.0, 1.0),
                     (aligned
-                        && d < GUN_RANGE * 0.95
+                        && d < p.gun_range * 0.95
                         && line_clear(me.body.pos.x, 1.45, me.body.pos.z, bearing, 0.0, d))
                         as i32 as f32,
                 )
@@ -307,11 +348,19 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
     });
 
     // PM_PROF=1: where a CLIENT's tick goes (prediction, the two interp
-    // pools riding the horde) — bot 0 only, so the dumps don't interleave.
+    // pools riding the horde) — bot 0 only, so the dumps don't
+    // interleave. The corrections line is the PREDICTION health gauge:
+    // it should stay flat while driving; a live shared-step param write
+    // (docs/params.md stage 2) may step it once, never stream.
     if n == 0 && std::env::var("PM_PROF").is_ok() {
         let mut prev: std::collections::HashMap<String, pm::TaskStat> = Default::default();
+        let pred = w2_pred.clone();
+        let pred_heli = w2_pred_heli.clone();
         pm::task!(pm, "prof", 91.0, 5.0, [], move |pm| {
-            eprintln!("-- bot0 task stats (last 5s) --");
+            eprintln!(
+                "-- bot0 task stats (last 5s) --  corrections={}",
+                pred.get().corrections + pred_heli.get().corrections
+            );
             let mut tick_total = 0.0f32;
             for (name, s) in pm.task_stats() {
                 let p = prev.get(&name).cloned().unwrap_or_default();

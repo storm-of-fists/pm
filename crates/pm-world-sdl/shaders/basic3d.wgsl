@@ -82,6 +82,42 @@ fn vs_main(in: VsIn) -> VsOut {
     return out;
 }
 
+// Instanced variant: the MODEL matrix and tint arrive as per-instance
+// vertex attributes (buffer slot 1, instance step rate — locations 3..7
+// are the matrix columns then the tint), and `u.mv` holds the VIEW
+// matrix alone. One draw call moves a whole horde; `itint.w` is the
+// per-instance emissive flag, so lit bodies and emissive blob shadows
+// both batch. Same VsOut, same fs_main.
+struct VsInstIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+    @location(3) m0: vec4<f32>,
+    @location(4) m1: vec4<f32>,
+    @location(5) m2: vec4<f32>,
+    @location(6) m3: vec4<f32>,
+    @location(7) itint: vec4<f32>,
+}
+
+@vertex
+fn vs_inst(in: VsInstIn) -> VsOut {
+    var out: VsOut;
+    let model = mat4x4<f32>(in.m0, in.m1, in.m2, in.m3);
+    let world = model * vec4<f32>(in.pos, 1.0);
+    let vpos = (u.mv * world).xyz;
+    out.clip = vec4<f32>(
+        vpos.x * u.proj.x,
+        vpos.y * u.proj.y,
+        u.proj.z * vpos.z + u.proj.w,
+        vpos.z,
+    );
+    out.vpos = vpos;
+    out.normal = (u.mv * (model * vec4<f32>(in.normal, 0.0))).xyz;
+    out.color = in.color * u.tint.rgb * in.itint.rgb;
+    out.emissive = in.itint.w;
+    return out;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);

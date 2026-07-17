@@ -9,6 +9,7 @@ fn main() {
             "shaders/basic3d.wgsl",
             &[
                 ("vs_main", naga::ShaderStage::Vertex),
+                ("vs_inst", naga::ShaderStage::Vertex),
                 ("fs_main", naga::ShaderStage::Fragment),
             ],
         ),

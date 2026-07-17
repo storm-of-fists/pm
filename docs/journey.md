@@ -203,13 +203,40 @@ doctrine written down.
 
 Every tick, the server builds each peer a snapshot: for every synced
 pool, the entries that changed since that peer's last **ack**, packed
-into ≤1200-byte datagrams. The client acks the tick it applied; the
-server tracks unacked entries per peer per pool and *resends them* in
-later snapshots until acked. This is the crucial subtlety: **pool sync
-is already reliable** — not because packets can't be lost, but because
+into ≤1200-byte datagrams. The client acks each snapshot it applies —
+`(tick, seq)`, because one tick may send several; the server tracks
+unacked entries per peer per pool and *resends them* in later
+snapshots until acked. This is the crucial subtlety: **pool sync is
+already reliable** — not because packets can't be lost, but because
 state convergence retries content until acknowledged. It's a
 convergence protocol, not a change stream. (That's why there is no
 "reliable pool" modifier — it would be redundant.)
+
+The datagram itself can never grow (QUIC keeps each one atomic in a
+single UDP packet — fragments compound loss), so when one tick's
+changes outweigh one datagram the server sends a **flight** of them
+(2026-07-17): keep packing until the backlog drains, the per-peer
+budget is spent, or the congestion controller's send buffer pushes
+back. Each send carries its own sequence so acks stay unambiguous, and
+under real congestion the flight shrinks back toward one datagram —
+at which point smallest-dirty-first (below) decides who stays fresh.
+The budget rides the `net_kbps` param (`set hogs params.net_kbps 500`
+in pm-watch to feel a strangled link), and `hogs.snaps` counts applied
+snapshots — above 60/s means flights are extending.
+
+Within one snapshot, pools pack **smallest-dirty-first**: whoever wants
+the fewest bytes goes first, and the change-dense horde takes whatever
+is left (its per-entity rate degrades; nothing else does). This
+discipline has a war story (2026-07-17): pools used to pack in
+registration order, and at 200 hogs the hog pool's dirty set outweighed
+the whole datagram every tick — so `bullet`, `impact`, and the `hunt`
+scoreboard, registered after it, got **zero bytes forever**. Frozen
+wave counter, invisible gunner-hog fire. The fix is in
+`snapshot_budgeted` (`crates/pm-world/src/net.rs`), and
+`net_tests::dense_pool_does_not_starve_pools_registered_after_it` keeps
+it fixed. Watch it live: `hogs.bullets` in pm-watch is the client's
+replica bullet count — the canary that pools behind the horde still
+flow.
 
 Bandwidth is a budget you spend per *entry*, and `#[pm::pod]` with
 `#[wire(...)]` attributes is the knife: the `Hog` pod is 20 bytes of
@@ -462,6 +489,17 @@ it has opinions worth knowing:
   - Per-pixel matters for one concrete reason: the arena ground is a
     handful of huge triangles, and a Gouraud headlight pool between
     vertices simply vanishes.
+- **Instancing** (2026-07-17) is the one crowd escalation: the horde
+  used to be three draw calls *per hog* — a uniform push and a draw
+  each for shadow, body, snout — and at 200 hogs the frame cost 31 ms
+  on WSLg. Now the render task stages `Instance3` structs (model
+  matrix + tint, emissive flag included) with `r3d.instances(...)`
+  BEFORE `frame()` — they upload in one copy pass ahead of the render
+  pass — and draws each mesh once with `frame.draw_instanced`: hogs,
+  corpses, and tracers are four draw calls *total*. Measured: 31 →
+  17.5 ms at 200 hogs, and a 1000-hog wave renders at ~21 ms (try
+  `set hogs params.wave_base 1000`). Trucks and helis stay on plain
+  `draw` — a handful of anything isn't worth batching.
 - **Time-of-day** (hogs render task) is a pure function of the tick —
   sun color, hemisphere, and horizon all derive from one angle, so it
   costs zero bytes of wire and every session opens at dawn.

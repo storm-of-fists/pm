@@ -28,7 +28,10 @@ use quinn_proto::{
     Event, IdleTimeout, ServerConfig, StreamEvent, StreamId, TransportConfig,
 };
 
-const ALPN: &[u8] = b"pm/1";
+// Bump on any dgram/header format change: cross-version connects then
+// fail the TLS handshake loudly instead of misparsing each other.
+// (pm/2: snapshots carry a per-send seq, acks echo (tick, seq).)
+const ALPN: &[u8] = b"pm/2";
 const FRAME_HELLO: u16 = 0;
 /// User event types must be >= this; lower values are protocol-reserved.
 pub const EVENT_USER_BASE: u16 = 16;
@@ -361,7 +364,7 @@ pub struct QuicServer {
     schema: Vec<u8>,
     joined: Vec<u8>,
     left: Vec<u8>,
-    acks: Vec<(u8, u32)>,
+    acks: Vec<(u8, u32, u32)>,
     inputs: Vec<(u8, u32, Vec<u8>)>,
     events: Vec<(u8, u16, Vec<u8>)>,
     /// Snapshots dropped for exceeding the datagram size (see README).
@@ -497,9 +500,12 @@ impl QuicServer {
             }
             while let Some(d) = st.conn.datagrams().recv() {
                 match d.first() {
-                    Some(&DGRAM_ACK) if d.len() >= 5 => {
-                        self.acks
-                            .push((st.peer, u32::from_le_bytes(d[1..5].try_into().unwrap())));
+                    Some(&DGRAM_ACK) if d.len() >= 9 => {
+                        self.acks.push((
+                            st.peer,
+                            u32::from_le_bytes(d[1..5].try_into().unwrap()),
+                            u32::from_le_bytes(d[5..9].try_into().unwrap()),
+                        ));
                     }
                     Some(&DGRAM_INPUT) => {
                         inputs_parse(&d[1..], st.peer, &mut st.last_input_seq, &mut self.inputs);
@@ -544,7 +550,9 @@ impl QuicServer {
         std::mem::take(&mut self.left)
     }
 
-    pub fn acks_drain(&mut self) -> Vec<(u8, u32)> {
+    /// Acks received since the last drain: (peer, tick, send seq) — feed
+    /// each to `NetServer::ack`.
+    pub fn acks_drain(&mut self) -> Vec<(u8, u32, u32)> {
         std::mem::take(&mut self.acks)
     }
 
@@ -823,12 +831,14 @@ impl QuicClient {
         std::mem::take(&mut self.snapshots)
     }
 
-    /// Ack a snapshot tick (unreliable datagram; loss just delays the
-    /// cursor, the next ack supersedes).
-    pub fn ack_send(&mut self, tick: u32) {
-        let mut d = Vec::with_capacity(5);
+    /// Ack a snapshot's (tick, send seq) as an unreliable datagram (loss
+    /// just means the server declares that send lost off a later ack and
+    /// resends — idempotent upserts make the redundancy harmless).
+    pub fn ack_send(&mut self, tick: u32, seq: u32) {
+        let mut d = Vec::with_capacity(9);
         d.push(DGRAM_ACK);
         d.extend_from_slice(&tick.to_le_bytes());
+        d.extend_from_slice(&seq.to_le_bytes());
         let _ = self.conn.datagrams().send(d.into(), true);
     }
 
@@ -990,7 +1000,7 @@ mod lag_ab {
                 client.input_send(&[3u8; 16]);
                 let got = client.snapshots_drain().len() as u32;
                 if got > 0 {
-                    client.ack_send(n);
+                    client.ack_send(n, n);
                 }
                 // 2 s warmup: skip handshake transients and sRTT settling.
                 if t0.elapsed() > Duration::from_secs(2) {

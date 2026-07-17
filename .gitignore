@@ -42,3 +42,6 @@ src_rust/target/
 *.d
 
 target/
+
+# Local game tuning (docs/params.md) — defaults live in PARAM_SPECS
+hogs.params

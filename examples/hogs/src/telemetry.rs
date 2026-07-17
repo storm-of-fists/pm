@@ -1,8 +1,11 @@
 //! The hogs telemetry node: pm-control signals broadcast from the PLAYER
 //! CLIENT so a `pm-mon` (TUI) or `pm-watch` (headless) on the segment can
-//! watch the session live — and TUNE it: the link sim (`lag_ms`/`loss`),
-//! and the day length are writable knobs (Ctrl-U in pm-mon, `set` in
-//! pm-watch); their initial values come from the CLI flags.
+//! watch the session live — and TUNE it: the link sim (`lag_ms`/`loss`)
+//! and the day length are writable knobs seeded from the CLI flags
+//! (Ctrl-U in pm-mon, `set` in pm-watch), and the game params ride along
+//! as `params.*` knobs seeded from the params file — those go to the
+//! SERVER over the reliable "param.set" event, `params.save` persists
+//! them (docs/params.md).
 //!
 //! NOTE on `lock` semantics (verified live 2026-07-16): a monitor write
 //! lands in the signal's one value cell, and the game only ever READS
@@ -27,7 +30,7 @@ use std::time::Instant;
 
 use pm_control_core::signal::Stamp;
 use pm_control_core::{
-    NetworkManager, PmF32, PmFault, PmProf, SegmentPort, clock, pm_group,
+    NetworkManager, PmF32, PmFault, PmProf, Register, Registrar, SegmentPort, clock, pm_group,
 };
 
 use crate::bot_client::ClientWorld;
@@ -41,6 +44,39 @@ pub const TELE_BIND: &str = "0.0.0.0:42501";
 /// Default monitor address (pm-watch / pm-mon bind this).
 pub const TELE_MON: &str = "127.0.0.1:42500";
 
+/// One knob signal per [`PARAM_SPECS`] entry, plus the save button —
+/// built FROM the table (the documented Vec-of-signals `Register`
+/// escape hatch), so a new param is a spec line + a `Params` field and
+/// the monitor picks it up untouched. Signals register as
+/// `params.<name>` (`set hogs params.wave_base 300` in pm-watch);
+/// `params.save` is a button: any write ≥ 0.5 asks the SERVER to
+/// persist its file (edge-detected — set it back to 0 to press again).
+struct ParamKnobs {
+    sigs: Vec<PmF32>,
+    save: PmF32,
+}
+
+impl ParamKnobs {
+    fn from_specs() -> ParamKnobs {
+        ParamKnobs {
+            sigs: PARAM_SPECS
+                .iter()
+                .map(|s| PmF32::new().range(s.min, s.max))
+                .collect(),
+            save: PmF32::new().range(0.0, 1.0),
+        }
+    }
+}
+
+impl Register for ParamKnobs {
+    fn register(&self, r: &mut Registrar) {
+        for (sig, spec) in self.sigs.iter().zip(&PARAM_SPECS) {
+            r.child(spec.name, sig);
+        }
+        r.child("save", &self.save);
+    }
+}
+
 pm_group! {
     struct Tele {
         // --- knobs (unlock-writable from the monitor) ---------------
@@ -50,6 +86,9 @@ pm_group! {
         link_loss: PmF32 = PmF32::new().range(0.0, 0.5),
         /// Day-night cycle length (render-side, cosmetic).
         day_secs: PmF32 = PmF32::new().range(10.0, 3600.0),
+        /// The server's game params (docs/params.md), writable here,
+        /// applied via the reliable "param.set" event.
+        params: ParamKnobs = ParamKnobs::from_specs(),
         // --- metrics -------------------------------------------------
         /// Interp delay in force (creation-frozen; report-only).
         interp_ms: PmF32,
@@ -59,6 +98,15 @@ pm_group! {
         wave: PmF32,
         hogs_alive: PmF32,
         points: PmF32,
+        /// Live bullets in the CLIENT's replica pool — the canary for
+        /// "pools registered after the horde still replicate" (the
+        /// 200-hog starvation bug of 2026-07-17 zeroed exactly this).
+        bullets: PmF32,
+        /// Snapshots applied, cumulative — the flight gauge: rising
+        /// faster than 60/s means multi-datagram flights are extending
+        /// (the horde outweighs one datagram); pinned at 60/s the
+        /// backlog fits the classic cadence.
+        snaps: PmF32,
         /// Frame time (last/avg/max µs) off the render-thread loop dt.
         frame: PmProf,
         // --- faults --------------------------------------------------
@@ -124,6 +172,12 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
     tele.link_loss.set(flags.link.1);
     tele.day_secs.set(flags.day);
     tele.interp_ms.set(flags.interp_ms);
+    // Param knobs seed from the file `main` loaded — the same values the
+    // server seeded its single from (an in-process session, so they
+    // agree; docs/params.md flags the remote-server display caveat).
+    for (sig, &v) in tele.params.sigs.iter().zip(flags.params.as_array()) {
+        sig.set(v);
+    }
 
     let mut net_mgr = NetworkManager::new();
     net_mgr.publish_health();
@@ -137,8 +191,12 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
     let pred = w.pred.clone();
     let pred_heli = w.pred_heli.clone();
     let hunt = w.hunt.clone();
+    let bullet = w.bullet.clone();
+    let param_tx = w.param_set.clone();
     // Last knob values we applied to the game (change-detect).
     let mut applied = (flags.link.0, flags.link.1, flags.day);
+    let mut applied_params = *flags.params.as_array();
+    let mut save_was = tele.params.save.val();
     let mut clock_ms = 0.0f64;
 
     pm.task_add("telemetry", 95.0, 0.0, move |pm| {
@@ -166,6 +224,22 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
         }
         applied = knobs;
 
+        // Param knobs → reliable events; the server is the clamp of
+        // record and replicates the applied value back to everyone.
+        for (i, sig) in tele.params.sigs.iter().enumerate() {
+            let v = sig.val();
+            if v != applied_params[i] {
+                param_tx.send(ParamSet { idx: i as u32, value: v });
+                applied_params[i] = v;
+            }
+        }
+        // The save button: rising past 0.5 asks the server to persist.
+        let save_now = tele.params.save.val();
+        if save_now >= 0.5 && save_was < 0.5 {
+            param_tx.send(ParamSet { idx: PARAM_SAVE, value: 0.0 });
+        }
+        save_was = save_now;
+
         // Game → metrics.
         let dt = pm.loop_dt();
         tele.frame.record_us((dt * 1e6) as u64);
@@ -184,6 +258,8 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
         tele.wave.set(sb.wave as f32);
         tele.hogs_alive.set(sb.alive as f32);
         tele.points.set(sb.points);
+        tele.bullets.set(bullet.get().len() as f32);
+        tele.snaps.set(net.snapshots() as f32);
 
         net_mgr.end_cycle(&mut port);
     });

@@ -98,7 +98,9 @@ pub const NET_PRIO: f32 = 5.0;
 /// `PM_NETDBG=1` — the net doctor. Both roles print link vitals every
 /// 5 s: the server reports, per peer, how far its ack cursor trails the
 /// tick (the lag-comp rewind anchor — if this GROWS the peer is being
-/// served stale state), RTT, and quinn's remaining datagram buffer; the
+/// served stale state), RTT, this tick's snapshot flight size (datagrams
+/// sent — pinned at 1 when the backlog fits, shrinking back toward 1
+/// under congestion), and quinn's remaining datagram buffer; the
 /// client reports its snapshot apply rate and how fast the applied tick
 /// LABELS advance (labels slower than ticks = stale content, the
 /// invisible failure that broke lag comp for weeks; see the
@@ -1008,6 +1010,17 @@ impl PmServer {
         }
     }
 
+    /// Handle to the LIVE per-peer send-budget tune ([`SendTune`]): how
+    /// many kilobits/sec of snapshot flight each peer may receive
+    /// (default [`SEND_KBPS_DEFAULT`]). Write it any time — a game param
+    /// task, a debug console — and the net task reads it on its next
+    /// tick. One datagram per tick per peer always goes regardless, so a
+    /// low value degrades to the classic single-datagram cadence, never
+    /// below it. The server-side sibling of [`PmClient::link_tune`].
+    pub fn send_tune(&mut self) -> SingleHandle<SendTune> {
+        self.pm.single::<SendTune>("net.sendtune")
+    }
+
     /// Give `pool`'s entries a lifetime: any entry not written for `secs`
     /// is removed (entity and all — see [`pool_expire`]), and the removal
     /// replicates like any other. This is what makes **transient facts
@@ -1212,6 +1225,40 @@ pub struct LinkTune {
     pub seq: u32,
 }
 
+/// Default per-peer flight budget, kilobits/sec: ~250 KB/s ≈ 3–4 full
+/// datagrams per tick at 60 Hz — drains a 200-hog fully-dirty set with
+/// headroom while staying small next to any real link.
+pub const SEND_KBPS_DEFAULT: f32 = 2000.0;
+
+/// Live server send-budget tune (the `"net.sendtune"` single, see
+/// [`PmServer::send_tune`]): per-peer snapshot bandwidth in
+/// kilobits/sec, read by the net task every tick. The first datagram of
+/// each tick is unconditional (the classic cadence — no value can
+/// starve the link below the pre-flight baseline); the budget governs
+/// how far the multi-datagram flight may extend past it.
+#[derive(Clone, Copy)]
+pub struct SendTune {
+    pub kbps: f32,
+}
+
+impl Default for SendTune {
+    fn default() -> Self {
+        SendTune {
+            kbps: SEND_KBPS_DEFAULT,
+        }
+    }
+}
+
+/// Hard per-tick flight rail regardless of budget: 8 datagrams ≈
+/// 5.6 Mbit/s at 60 Hz — a runaway-knob backstop, not a tuning surface.
+const FLIGHT_MAX: u32 = 8;
+
+/// Stop extending a flight when quinn's outgoing datagram buffer can't
+/// take one more full datagram plus slack: the buffer filling up is BBR
+/// saying the link isn't draining what's already queued, and the 16 KB
+/// drop-oldest policy would evict flight members we just paid to pack.
+const FLIGHT_SPACE_SLACK: usize = 256;
+
 /// Connection status (client, `"net.status"`). Internal plumbing the net
 /// task fills; games read it through the [`ClientNet`] handle
 /// ([`PmClient::net`]).
@@ -1258,6 +1305,7 @@ impl NetServer {
         let events = pm.single::<ServerEvents>("net.events");
         let own = pm.single::<ServerOwn>("net.own");
         let stats = pm.single::<PeerStats>("net.peerstat");
+        let tune = pm.single::<SendTune>("net.sendtune");
         let sink = pm.single::<ServerInputChan>("net.input").get().0.clone();
         pm.task_add("net", NET_PRIO, 0.0, move |pm| {
             quic.pump();
@@ -1294,8 +1342,8 @@ impl NetServer {
                 // lag-comp anchor (`InputRx::view`). Stamping later, at
                 // consumption, reads acks that landed while the input
                 // queued and anchors the rewind too fresh.
-                for (p, tick) in quic.acks_drain() {
-                    net.ack(p, tick);
+                for (p, tick, seq) in quic.acks_drain() {
+                    net.ack(p, tick, seq);
                 }
                 if let Some(s) = &sink {
                     for (p, seq, bytes) in quic.inputs_drain() {
@@ -1331,17 +1379,49 @@ impl NetServer {
             // bytes for all peers); sorted inside owners_set so the
             // HashMap's iteration order never reaches the wire.
             net.owners_set(own.get().0.iter().map(|(&p, &id)| (p, id.0)).collect());
+            // Multi-datagram flights (roadmap 2026-07-17): the datagram
+            // is atomic in one UDP packet, so per-tick freshness scales
+            // by COUNT, not size. The first send is unconditional (the
+            // classic cadence: keepalive, input echo, owner table,
+            // removals); while entries didn't fit, more datagrams extend
+            // the flight until the backlog drains, the kbps budget or
+            // hard rail is spent, or the send buffer says the link isn't
+            // draining (under congestion BBR shrinks the flight back
+            // toward one datagram — and smallest-dirty-first fairness is
+            // what keeps sparse pools fresh while the horde degrades).
+            // Convergence never depends on the flight: what doesn't fit
+            // stays unconfirmed and rotates, exactly as before.
+            let per_tick =
+                (tune.get().kbps.max(0.0) * 125.0 / pm.loop_rate.max(1) as f32) as usize;
+            let mut flights: Vec<(u8, u32)> = Vec::new();
             for p in plist {
-                let budget = quic.snapshot_budget(p);
-                if let Some(snap) = net.snapshot_budgeted(pm, p, budget) {
-                    quic.snapshot_send(p, &snap);
+                let mut allowance = per_tick;
+                let mut sends = 0u32;
+                loop {
+                    let dgram = quic.snapshot_budget(p);
+                    let budget = if sends == 0 { dgram } else { dgram.min(allowance) };
+                    let Some(snap) = net.snapshot_budgeted(pm, p, budget) else {
+                        break;
+                    };
+                    quic.snapshot_send(p, &snap.bytes);
+                    allowance = allowance.saturating_sub(snap.bytes.len());
+                    sends += 1;
+                    if !snap.more
+                        || snap.entries == 0
+                        || sends >= FLIGHT_MAX
+                        || allowance == 0
+                        || quic.dgram_space(p) < dgram + FLIGHT_SPACE_SLACK
+                    {
+                        break;
+                    }
                 }
+                flights.push((p, sends));
             }
             net.prune(pm);
             if netdbg() && pm.tick() % 300 == 0 {
-                for p in net.peers().collect::<Vec<_>>() {
+                for (p, sends) in flights {
                     eprintln!(
-                        "[netdbg srv] peer {p}: ack-lag={} ticks  rtt={:.0}ms  dgram-buf-free={}B",
+                        "[netdbg srv] peer {p}: ack-lag={} ticks  rtt={:.0}ms  flight={sends}  dgram-buf-free={}B",
                         pm.tick().saturating_sub(net.acked_tick(p)),
                         quic.rtt(p).as_secs_f32() * 1e3,
                         quic.dgram_space(p),
@@ -1397,12 +1477,20 @@ impl NetClient {
                 ch.frame_begin();
             }
             applied.get_mut().0.clear();
-            for snap in quic.snapshots_drain() {
+            let mut snaps = quic.snapshots_drain();
+            // A flight arrives as back-to-back datagrams UDP may reorder;
+            // apply in send order (the seq at header bytes 4..8) so a
+            // straggler can't overwrite newer state with older.
+            snaps.sort_by_key(|s| {
+                s.get(4..8)
+                    .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+            });
+            for snap in snaps {
                 let Ok(a) = net.apply(pm, &snap) else {
                     continue;
                 };
                 dbg_newest = dbg_newest.max(a.tick);
-                quic.ack_send(a.tick);
+                quic.ack_send(a.tick, a.seq);
                 {
                     // The header table is authoritative as of this
                     // snapshot: mine() is our own row (peer ids start at

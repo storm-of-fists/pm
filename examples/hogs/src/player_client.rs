@@ -19,7 +19,7 @@
 use pm::{
     CamAnchor, CamRig, CamView, Mat4, Pm, Vec3, camera_install, camera_manager, camera_track, vec3,
 };
-use pm_sdl::gpu3d::{Frame3, Renderer3d, bake, box_tris, checker_ground, panini_for_fov};
+use pm_sdl::gpu3d::{Frame3, Instance3, Renderer3d, bake, box_tris, checker_ground, panini_for_fov};
 use pm_sdl::sdl3;
 use sdl3::event::Event;
 use sdl3::keyboard::Scancode;
@@ -291,6 +291,7 @@ pub fn run(flags: Flags) {
         let pred = w.pred.clone();
         let pred_heli = w.pred_heli.clone();
         let tracer = tracer_local.clone();
+        let params = w.params.clone();
         move |pm| {
             // The live predictor answers "am I flying?" — it decides
             // which KEY CONTEXT fills the (shared) input pod below.
@@ -390,7 +391,7 @@ pub fn run(flags: Flags) {
                     .map(|t| truck_muzzle(&t))
                     .or_else(|| pred_heli.get().state().map(|h| heli_muzzle(&h)));
                 if let Some((x, y, z, heading, pitch)) = muzzle {
-                    gun_cd = GUN_CD;
+                    gun_cd = params.get().gun_cd;
                     let id = pm.id_add();
                     tracer.get_mut().add(
                         id,
@@ -400,7 +401,7 @@ pub fn run(flags: Flags) {
                             z,
                             heading,
                             pitch,
-                            left: GUN_RANGE,
+                            left: params.get().gun_range,
                         },
                     );
                 }
@@ -413,13 +414,17 @@ pub fn run(flags: Flags) {
     // flash is still the word on hits).
     pm.task_add("tracer.step", 30.0, 0.0, {
         let tracer = tracer_local.clone();
+        let params = w.params.clone();
         move |pm| {
             let dt = pm.loop_dt();
+            let spd = params.get().bullet_speed;
             let dead: Vec<_> = {
                 let mut trs = tracer.get_mut();
                 let ids: Vec<_> = trs.iter().map(|(id, _)| id).collect();
                 ids.into_iter()
-                    .filter(|&id| trs.get_mut(id).is_some_and(|mut tr| !tracer_step(&mut tr, dt)))
+                    .filter(|&id| {
+                        trs.get_mut(id).is_some_and(|mut tr| !tracer_step(&mut tr, dt, spd))
+                    })
                     .collect()
             };
             for id in dead {
@@ -626,6 +631,70 @@ pub fn run(flags: Flags) {
                 r3d.point_light(p, (0.75, 0.70, 0.55), 15.0);
             }
 
+            // The horde, corpses, and tracers as INSTANCE batches — one
+            // draw call each inside the frame, instead of three uniform
+            // pushes per hog (the measured 32 ms @ 200 hogs cliff).
+            // Staged before frame(): instance data uploads in a copy
+            // pass ahead of the render pass.
+            let gun_range = w.params.get().gun_range;
+            let mut hog_shadows: Vec<Instance3> = Vec::new();
+            let mut hog_bodies: Vec<Instance3> = Vec::new();
+            let mut hog_snouts: Vec<Instance3> = Vec::new();
+            for (_, h) in w.hog_draw.get().iter() {
+                // Biomod green fades to livid red as hp drops.
+                let hp = (h.hp / HOG_HP).clamp(0.0, 1.0);
+                let tint = (0.45 + 0.4 * (1.0 - hp), 0.42 * hp + 0.10, 0.28 * hp + 0.06);
+                let model = hog_model(h);
+                hog_shadows.push(Instance3::emissive(
+                    Mat4::translate(vec3(h.x, 0.02, h.z)) * Mat4::scale(0.95),
+                    (0.035, 0.04, 0.035),
+                ));
+                hog_bodies.push(Instance3::new(model, tint));
+                hog_snouts.push(Instance3::new(
+                    model,
+                    (tint.0 * 0.7, tint.1 * 0.7, tint.2 * 0.7),
+                ));
+            }
+            // Ragdoll corpses ride the same meshes — same batches,
+            // their own fading tints.
+            for c in &corpses {
+                let fade = (1.0 - c.t / CORPSE_LIFE).clamp(0.0, 1.0);
+                let tint = (0.30 + 0.25 * fade, 0.16 * fade + 0.08, 0.10 * fade + 0.05);
+                let model = c.model();
+                hog_bodies.push(Instance3::new(model, tint));
+                hog_snouts.push(Instance3::new(
+                    model,
+                    (tint.0 * 0.7, tint.1 * 0.7, tint.2 * 0.7),
+                ));
+            }
+            // Tracers: everyone else's bullets (ours are hidden — the
+            // local cosmetic pool drew them at the click) plus the local
+            // pool, one emissive batch.
+            let mut tracer_inst: Vec<Instance3> = Vec::new();
+            for (_, bl) in w.bullet_draw.get().iter() {
+                if bl.owner == me {
+                    continue;
+                }
+                tracer_inst.push(Instance3::emissive(
+                    Mat4::translate(vec3(bl.x, bl.y, bl.z))
+                        * Mat4::rot_y(bl.heading)
+                        * Mat4::rot_x(-bl.pitch),
+                    (1.0, 0.92, 0.45),
+                ));
+            }
+            for (_, tr) in tracer.get().iter() {
+                tracer_inst.push(Instance3::emissive(
+                    Mat4::translate(vec3(tr.x, tr.y, tr.z))
+                        * Mat4::rot_y(tr.heading)
+                        * Mat4::rot_x(-tr.pitch),
+                    (1.0, 0.92, 0.45),
+                ));
+            }
+            let hog_shadow_b = r3d.instances(&hog_shadows);
+            let hog_body_b = r3d.instances(&hog_bodies);
+            let hog_snout_b = r3d.instances(&hog_snouts);
+            let tracer_b = r3d.instances(&tracer_inst);
+
             if let Some(mut frame) = r3d.frame(&window, view_mat, sun_dir) {
                 let white = (1.0, 1.0, 1.0);
                 frame.draw(&ground, Mat4::IDENTITY, white, true);
@@ -690,12 +759,12 @@ pub fn run(flags: Flags) {
                     if mine == Some(id) {
                         let (dx, dz) = (dir.sin(), dir.cos());
                         let mut d = 4.0;
-                        while d < GUN_RANGE {
+                        while d < gun_range {
                             let (px, pz) = (t.body.pos.x + dx * d, t.body.pos.z + dz * d);
                             if in_building(px, pz, 0.0) {
                                 break;
                             }
-                            let fade = 1.0 - d / GUN_RANGE;
+                            let fade = 1.0 - d / gun_range;
                             frame.draw(
                                 &marker,
                                 Mat4::translate(vec3(px, 0.0, pz)) * Mat4::scale(0.7),
@@ -738,7 +807,7 @@ pub fn run(flags: Flags) {
                     if mine == Some(id) {
                         let (yaw, pitch, _) = hl.body.rot.to_yaw_pitch_roll();
                         if pitch > 0.02 {
-                            let reach = ((hl.body.pos.y - 0.2) / pitch.tan()).min(GUN_RANGE);
+                            let reach = ((hl.body.pos.y - 0.2) / pitch.tan()).min(gun_range);
                             let (px, pz) = (
                                 hl.body.pos.x + yaw.sin() * reach,
                                 hl.body.pos.z + yaw.cos() * reach,
@@ -753,71 +822,13 @@ pub fn run(flags: Flags) {
                     }
                 }
 
-                // Bullets, off their interp pool: hot tracer slivers
-                // at their own altitude, tipped along the climb. OURS
-                // are skipped — the local cosmetic tracer below already
-                // drew this shot at the click; the replicated twin
-                // arriving ~RTT later would double-draw it.
-                let me = net.peer() as f32;
-                for (_, bl) in w.bullet_draw.get().iter() {
-                    if bl.owner == me {
-                        continue;
-                    }
-                    frame.draw_emissive(
-                        &tracer_mesh,
-                        Mat4::translate(vec3(bl.x, bl.y, bl.z))
-                            * Mat4::rot_y(bl.heading)
-                            * Mat4::rot_x(-bl.pitch),
-                        (1.0, 0.92, 0.45),
-                        true,
-                    );
-                }
-                // Our own shots: the client-local cosmetic tracers.
-                for (_, tr) in tracer.get().iter() {
-                    frame.draw_emissive(
-                        &tracer_mesh,
-                        Mat4::translate(vec3(tr.x, tr.y, tr.z))
-                            * Mat4::rot_y(tr.heading)
-                            * Mat4::rot_x(-tr.pitch),
-                        (1.0, 0.92, 0.45),
-                        true,
-                    );
-                }
-
-                // Ragdoll corpses (client-local): tumble, fading out.
-                for c in &corpses {
-                    let fade = (1.0 - c.t / CORPSE_LIFE).clamp(0.0, 1.0);
-                    let tint = (0.30 + 0.25 * fade, 0.16 * fade + 0.08, 0.10 * fade + 0.05);
-                    let model = c.model();
-                    frame.draw(&hog_body, model, tint, true);
-                    frame.draw(
-                        &hog_snout,
-                        model,
-                        (tint.0 * 0.7, tint.1 * 0.7, tint.2 * 0.7),
-                        true,
-                    );
-                }
-
-                // The horde, off its interp pool; biomod green fades to
-                // livid red as hp drops.
-                for (_, h) in w.hog_draw.get().iter() {
-                    let hp = (h.hp / HOG_HP).clamp(0.0, 1.0);
-                    let tint = (0.45 + 0.4 * (1.0 - hp), 0.42 * hp + 0.10, 0.28 * hp + 0.06);
-                    let model = hog_model(h);
-                    frame.draw_emissive(
-                        &shadow,
-                        Mat4::translate(vec3(h.x, 0.02, h.z)) * Mat4::scale(0.95),
-                        (0.035, 0.04, 0.035),
-                        false,
-                    );
-                    frame.draw(&hog_body, model, tint, true);
-                    frame.draw(
-                        &hog_snout,
-                        model,
-                        (tint.0 * 0.7, tint.1 * 0.7, tint.2 * 0.7),
-                        true,
-                    );
-                }
+                // Tracers, corpses, and the horde: the instance batches
+                // staged above frame() — four draw calls for the whole
+                // crowd (tint/emissive ride per instance).
+                frame.draw_instanced(&tracer_mesh, tracer_b, true);
+                frame.draw_instanced(&shadow, hog_shadow_b, false);
+                frame.draw_instanced(&hog_body, hog_body_b, true);
+                frame.draw_instanced(&hog_snout, hog_snout_b, true);
 
                 // Impact facts off the TTL'd pool: existence == recency.
                 for (_, c) in w.impact.get().iter() {

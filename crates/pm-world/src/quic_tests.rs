@@ -70,8 +70,8 @@ fn quic_loopback_full_stack() {
         for p in squic.left_drain() {
             snet.peer_remove(p);
         }
-        for (p, t) in squic.acks_drain() {
-            snet.ack(p, t);
+        for (p, t, sq) in squic.acks_drain() {
+            snet.ack(p, t, sq);
         }
         for (p, seq, payload) in squic.inputs_drain() {
             assert_eq!(payload, b"drv", "input payload corrupted");
@@ -107,7 +107,7 @@ fn quic_loopback_full_stack() {
         }
         for snap in cquic.snapshots_drain() {
             let applied = cnet.apply(&mut cpm, &snap).expect("apply");
-            cquic.ack_send(applied.tick);
+            cquic.ack_send(applied.tick, applied.seq);
             input_echo = applied.input_seq;
         }
         cpm.loop_once(DT);
@@ -216,8 +216,8 @@ fn converges_under_lag_and_loss() {
         for p in squic.joined_drain() {
             snet.peer_add(p);
         }
-        for (p, t) in squic.acks_drain() {
-            snet.ack(p, t);
+        for (p, t, sq) in squic.acks_drain() {
+            snet.ack(p, t, sq);
         }
         spm.loop_once(DT);
         let peers: Vec<u8> = snet.peers().collect();
@@ -231,7 +231,7 @@ fn converges_under_lag_and_loss() {
         cquic.pump();
         for snap in cquic.snapshots_drain() {
             if let Ok(applied) = cnet.apply(&mut cpm, &snap) {
-                cquic.ack_send(applied.tick);
+                cquic.ack_send(applied.tick, applied.seq);
             }
         }
         cpm.loop_once(DT);

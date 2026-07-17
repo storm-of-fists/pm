@@ -39,10 +39,17 @@ struct HogBrain {
     /// reaches clients through the hog's replicated position like any
     /// other movement.
     shove: (f32, f32),
+    /// The last think's steering decision (desired heading + target
+    /// speed): hogs THINK every `ai_stride`th tick (the target scan and
+    /// goal trig), MOVE every tick toward this cached decision — a ≤3-
+    /// tick-stale chase heading is invisible on a charging pig, and the
+    /// horde stays change-dense on the wire (the workload this example
+    /// exists to produce).
+    desired: f32,
+    target_speed: f32,
 }
 
-/// Bullet-hit knockback speed (u/s) and its decay rate (1/s).
-const KNOCK: f32 = 9.0;
+/// Bullet-hit knockback decay rate (1/s); the speed is `Params::knock`.
 const KNOCK_DECAY: f32 = 6.0;
 
 /// Server-local per-bullet state: how much travel is left, and the
@@ -130,7 +137,7 @@ fn roam_goal(rng: &mut Rng) -> (f32, f32) {
     (0.0, 0.0)
 }
 
-pub fn run(quiet: bool) {
+pub fn run(quiet: bool, init: Params, params_path: String) {
     let mut pm = Pm::server(ADDR);
     // Replicated pools: trucks (predicted client-side), hogs (interp'd
     // client-side), impact markers (TTL'd transient facts). Plus the
@@ -143,6 +150,12 @@ pub fn run(quiet: bool) {
     let impact = pm.wire_pool::<Impact>("impact");
     pm.ttl_pool(&impact, IMPACT_TTL);
     let hunt = pm.sync_single::<Hunt>("hunt");
+    // The tuning set (docs/params.md): seeded from the params file the
+    // caller loaded, replicated to every client, written by the
+    // "param.set" event task below. Server tasks read it where the old
+    // consts used to be.
+    let params = pm.sync_single::<Params>("params");
+    *params.get_mut() = init;
     // Server-only state: per-hog brains, per-truck gun cooldowns,
     // per-bullet shooter info. Keyed by the same ids as their synced
     // siblings; entity removal cleans them up with everything else.
@@ -174,6 +187,7 @@ pub fn run(quiet: bool) {
     let net = pm.net();
     let inputs = pm.input::<Drive>("drive");
     let respawns = pm.event::<Respawn>("respawn");
+    let param_evs = pm.event::<ParamSet>("param.set");
 
     // Joins and leaves: a truck (with health, gun, and body part) per
     // peer.
@@ -233,18 +247,69 @@ pub fn run(quiet: bool) {
         }
     });
 
+    // Param writes (docs/params.md): any client's telemetry knobs ride
+    // the reliable "param.set" event; the server is the clamp of record.
+    // The PARAM_SAVE sentinel persists the CURRENT set to this server's
+    // params file instead. (`param_evs`, the path, and the send-tune
+    // handle are moved in, like `respawns` above.)
+    let sendtune = pm.send_tune();
+    task!(pm, "params", 12.0, [params], move |_pm| {
+        for (_peer, ev) in param_evs.drain() {
+            if ev.idx == PARAM_SAVE {
+                match params_save(&params_path, &params.get()) {
+                    Ok(()) => {
+                        if !quiet {
+                            eprintln!("[server] params saved to {params_path}");
+                        }
+                    }
+                    Err(e) => eprintln!("[server] params save FAILED ({params_path}): {e}"),
+                }
+                continue;
+            }
+            let Some(spec) = PARAM_SPECS.get(ev.idx as usize) else {
+                continue; // stale schema on the sender: drop, don't die
+            };
+            let v = ev.value.clamp(spec.min, spec.max);
+            let mut p = params.get_mut();
+            // Write-gated single: only a real change stamps (and ships).
+            if p.as_array()[ev.idx as usize] != v {
+                p.as_array_mut()[ev.idx as usize] = v;
+                if !quiet {
+                    eprintln!("[server] param {} = {v}", spec.name);
+                }
+            }
+        }
+        // Bridge net_kbps into the engine's flight budget every tick
+        // (write-gated) — this covers both the file-seeded init value
+        // and live knob writes with one compare.
+        let kbps = params.get().net_kbps;
+        if sendtune.get().kbps != kbps {
+            sendtune.get_mut().kbps = kbps;
+        }
+    });
+
     // The horde (prio 28, before the trucks move): wander until a truck
     // is in aggro range, charge it, bite on contact, break off after a
-    // bite. Every hog is written every tick — deliberately: at horde
-    // scale that makes the hog pool change-dense, which is exactly the
-    // byte-budget-rotation workload this example exists to produce.
+    // bite. Every hog MOVES every tick — deliberately: at horde scale
+    // that makes the hog pool change-dense, which is exactly the
+    // byte-budget-rotation workload this example exists to produce. But
+    // hogs only THINK (target scan, steering trig, bite check) every
+    // `ai_stride`th tick, in slot-staggered cohorts — the expensive
+    // decision work drops to 1/stride per tick while the motion stays
+    // 60 Hz smooth (this task is the sim's biggest; see the roadmap's
+    // single-core watch item).
     task!(
         pm,
         "hog_ai",
         28.0,
-        [hog, brain, truck, heli, collider, parts, contact],
+        [hog, brain, truck, heli, collider, parts, contact, params],
         move |pm| {
             let now = pm.tick() as f32 * FIXED_DT;
+            let p = *params.get(); // copy out: the each_with closure below borrows pools
+            let stride = (p.ai_stride.round() as u32).clamp(1, 8);
+            let phase = pm.tick() % stride;
+            // Decisions cover the whole gap between thinks.
+            let think_dt = stride as f32 * FIXED_DT;
             let mut rng = Rng::new(pm.tick().wrapping_mul(0x51D7_ACE5) | 1);
             // Everything a hog can chase and bite: trucks always, helis
             // only while they hover inside leaping range — climb and the
@@ -256,7 +321,7 @@ pub fn run(quiet: bool) {
                 .chain(
                     heli.get()
                         .iter()
-                        .filter(|(_, hl)| hl.body.pos.y < HOG_LEAP)
+                        .filter(|(_, hl)| hl.body.pos.y < p.hog_leap)
                         .map(|(id, hl)| (id, hl.body.pos.x, hl.body.pos.z, true)),
                 )
                 .collect();
@@ -271,42 +336,91 @@ pub fn run(quiet: bool) {
                 b.bite_cd = (b.bite_cd - FIXED_DT).max(0.0);
                 b.flee = (b.flee - FIXED_DT).max(0.0);
 
-                let nearest = targets
-                    .iter()
-                    .map(|&(tid, tx, tz, fly)| {
-                        let (dx, dz) = (tx - h.x, tz - h.z);
-                        (tid, (tx, tz, fly), (dx * dx + dz * dz).sqrt())
-                    })
-                    .min_by(|a, b| a.2.total_cmp(&b.2));
+                // THINK (this hog's cohort tick only): scan targets,
+                // decide where to go and how fast, and check the bite.
+                // The decision lands in the brain; the per-tick motion
+                // below chases it.
+                if id.index() % stride == phase {
+                    let nearest = targets
+                        .iter()
+                        .map(|&(tid, tx, tz, fly)| {
+                            let (dx, dz) = (tx - h.x, tz - h.z);
+                            (tid, (tx, tz, fly), (dx * dx + dz * dz).sqrt())
+                        })
+                        .min_by(|a, b| a.2.total_cmp(&b.2));
 
-                // Pick a desired heading and speed.
-                let (desired, target_speed) = match nearest {
-                    Some((_, (tx, tz, _), _)) if b.flee > 0.0 => {
-                        ((h.x - tx).atan2(h.z - tz), HOG_FAST)
-                    }
-                    Some((_, (tx, tz, _), d)) if d < HOG_AGGRO => {
-                        ((tx - h.x).atan2(tz - h.z), HOG_FAST)
-                    }
-                    // Roaming: walk to a goal point, pick a fresh one
-                    // on arrival or timeout — the horde spreads over
-                    // the whole map instead of milling in place. The
-                    // sine wobble stays so the walk reads organic.
-                    _ => {
-                        b.repick -= FIXED_DT;
-                        let (gx, gz) = (b.goal.0 - h.x, b.goal.1 - h.z);
-                        if b.repick <= 0.0 || gx * gx + gz * gz < 9.0 {
-                            b.goal = roam_goal(&mut rng);
-                            b.repick = rng.rfr(0.5, 1.0) * ROAM_REPICK;
+                    // Pick a desired heading and speed.
+                    let (desired, target_speed) = match nearest {
+                        Some((_, (tx, tz, _), _)) if b.flee > 0.0 => {
+                            ((h.x - tx).atan2(h.z - tz), p.hog_fast)
                         }
-                        (gx.atan2(gz) + (now * 0.7 + b.seed).sin() * 0.4, HOG_ROAM)
+                        Some((_, (tx, tz, _), d)) if d < p.hog_aggro => {
+                            ((tx - h.x).atan2(tz - h.z), p.hog_fast)
+                        }
+                        // Roaming: walk to a goal point, pick a fresh one
+                        // on arrival or timeout — the horde spreads over
+                        // the whole map instead of milling in place. The
+                        // sine wobble stays so the walk reads organic.
+                        _ => {
+                            b.repick -= think_dt;
+                            let (gx, gz) = (b.goal.0 - h.x, b.goal.1 - h.z);
+                            if b.repick <= 0.0 || gx * gx + gz * gz < 9.0 {
+                                b.goal = roam_goal(&mut rng);
+                                b.repick = rng.rfr(0.5, 1.0) * ROAM_REPICK;
+                            }
+                            (gx.atan2(gz) + (now * 0.7 + b.seed).sin() * 0.4, p.hog_roam)
+                        }
+                    };
+                    b.desired = desired;
+                    b.target_speed = target_speed;
+
+                    // Bite: contact with the nearest target while off
+                    // cooldown. The GEOMETRY comes from the target's
+                    // collider entry (via the parent→child link) — the
+                    // brain knows no vehicle shapes anymore — and the
+                    // CONSEQUENCES are the response tasks' business, so
+                    // it applies none: a bite is a written fact. What
+                    // stays behavioral stays here: the cooldown, the
+                    // break-off, and the leap ceiling on the reach band.
+                    // Think-cadence checking delays a bite ≤ stride-1
+                    // ticks — noise next to BITE_CD.
+                    let bitten = (b.bite_cd <= 0.0)
+                        .then_some(nearest)
+                        .flatten()
+                        .and_then(|(tid, _, _)| {
+                            let pid = parts.get_id(tid).map(|p| p.ids[0])?;
+                            let c = cols.get(pid)?;
+                            hull_hits_circle(&c.hull, h.x, h.z, HOG_R, 0.0, p.hog_leap)
+                                .then(|| (tid, c.part, c.hull.y.0.max(0.0)))
+                        });
+                    if let Some((tid, part, bite_y)) = bitten {
+                        b.bite_cd = p.bite_cd;
+                        b.flee = p.hog_flee;
+                        let cid = pm.id_add();
+                        contact.get_mut().add(
+                            cid,
+                            Contact {
+                                owner: tid,
+                                part,
+                                kind: KIND_BITE,
+                                source_peer: 0,
+                                x: h.x,
+                                y: bite_y,
+                                z: h.z,
+                                heading: h.heading,
+                            },
+                        );
                     }
-                };
-                let turn = wrap_angle(desired - h.heading)
+                }
+
+                // MOVE (every tick): steer toward the cached decision at
+                // full per-tick turn authority, then integrate.
+                let turn = wrap_angle(b.desired - h.heading)
                     .clamp(-HOG_TURN * FIXED_DT, HOG_TURN * FIXED_DT);
                 // Wrap at the write: the quantized wire repr saturates
                 // past ±3.27 rad, and += would walk out of range circling.
                 h.heading = wrap_angle(h.heading + turn);
-                h.speed += (target_speed - h.speed) * (3.0 * FIXED_DT).min(1.0);
+                h.speed += (b.target_speed - h.speed) * (3.0 * FIXED_DT).min(1.0);
                 h.x += h.heading.sin() * h.speed * FIXED_DT;
                 h.z += h.heading.cos() * h.speed * FIXED_DT;
                 // Knockback rides on top of locomotion and decays fast —
@@ -345,41 +459,6 @@ pub fn run(quiet: bool) {
                     }
                 }
 
-                // Bite: contact with the nearest target while off
-                // cooldown. The GEOMETRY comes from the target's
-                // collider entry (via the parent→child link) — the
-                // brain knows no vehicle shapes anymore — and the
-                // CONSEQUENCES are the response tasks' business, so it
-                // applies none: a bite is a written fact. What stays
-                // behavioral stays here: the cooldown, the break-off,
-                // and the leap ceiling on the reach band.
-                let bitten = (b.bite_cd <= 0.0)
-                    .then_some(nearest)
-                    .flatten()
-                    .and_then(|(tid, _, _)| {
-                        let pid = parts.get_id(tid).map(|p| p.ids[0])?;
-                        let c = cols.get(pid)?;
-                        hull_hits_circle(&c.hull, h.x, h.z, HOG_R, 0.0, HOG_LEAP)
-                            .then(|| (tid, c.part, c.hull.y.0.max(0.0)))
-                    });
-                if let Some((tid, part, bite_y)) = bitten {
-                    b.bite_cd = BITE_CD;
-                    b.flee = HOG_FLEE;
-                    let cid = pm.id_add();
-                    contact.get_mut().add(
-                        cid,
-                        Contact {
-                            owner: tid,
-                            part,
-                            kind: KIND_BITE,
-                            source_peer: 0,
-                            x: h.x,
-                            y: bite_y,
-                            z: h.z,
-                            heading: h.heading,
-                        },
-                    );
-                }
                 // Pose the collider (docs/collisions.md §2): a hog is
                 // its own single part — the entry is keyed by the hog's
                 // OWN id, so death cleans it with the entity and the
@@ -408,7 +487,8 @@ pub fn run(quiet: bool) {
     // ride PRESENT-time frames — `view` starts at the current tick, so
     // the per-tick advance tracks the newest frame; a server-side
     // shooter has no lag to compensate.
-    task!(pm, "hog_guns", 29.0, [hog, gunner, truck, heli, bullet, shot], move |pm| {
+    task!(pm, "hog_guns", 29.0, [hog, gunner, truck, heli, bullet, shot, params], move |pm| {
+        let p = *params.get();
         let targets: Vec<(f32, f32, f32)> = truck
             .get()
             .iter()
@@ -438,7 +518,7 @@ pub fn run(quiet: bool) {
             let Some(((tx, ty, tz), dist)) = near else {
                 continue;
             };
-            if dist > HOGGUN_RANGE {
+            if dist > p.hoggun_range {
                 continue;
             }
             let (heading, pitch) = hog_aim(mx, my, mz, tx, ty, tz);
@@ -463,7 +543,7 @@ pub fn run(quiet: bool) {
                     mask: CAT_VEHICLE,
                 },
             );
-            *cd = HOGGUN_CD * rng.rfr(0.75, 1.35);
+            *cd = p.hoggun_cd * rng.rfr(0.75, 1.35);
         }
     });
 
@@ -475,8 +555,9 @@ pub fn run(quiet: bool) {
         pm,
         "drive",
         30.0,
-        [truck, heli, health, bullet, gun, shot, impact, hunt, collider, parts, net],
+        [truck, heli, health, bullet, gun, shot, impact, hunt, collider, parts, net, params],
         move |pm| {
+            let p = *params.get();
             // Owners keep their parts current (docs/collisions.md §2):
             // every exit from the step below re-poses the vehicle's
             // collider hulls, so the sweep at 31 never looks up a pose.
@@ -505,7 +586,7 @@ pub fn run(quiet: bool) {
                 // spawn slot; prediction snaps the owner home.
                 let ((mx, my, mz, dir, climb), pad) = if let Some(shooter) =
                     truck.get_id_mut(id).map(|mut t| {
-                        truck_step(&mut t, cmd, FIXED_DT);
+                        truck_step(&mut t, cmd, FIXED_DT, &p);
                         *t
                     }) {
                     let (x, z) = (shooter.body.pos.x, shooter.body.pos.z);
@@ -521,7 +602,7 @@ pub fn run(quiet: bool) {
                             v.hp = TRUCK_HP;
                         }
                         let mut sb = hunt.get_mut();
-                        sb.points = (sb.points - DEATH_COST).max(0.0);
+                        sb.points = (sb.points - p.death_cost).max(0.0);
                         drop(sb);
                         let mid = pm.id_add();
                         impact.get_mut().add(mid, Impact { x, z, kind: IMPACT_BOOM });
@@ -531,9 +612,9 @@ pub fn run(quiet: bool) {
                         continue;
                     }
                     pose(id, &[(PART_BODY, truck_hull(&shooter))]);
-                    (truck_muzzle(&shooter), HIT_PAD_TRUCK)
+                    (truck_muzzle(&shooter), p.hit_pad_truck)
                 } else if let Some(shooter) = heli.get_id_mut(id).map(|mut hl| {
-                    heli_step(&mut hl, cmd, FIXED_DT);
+                    heli_step(&mut hl, cmd, FIXED_DT, &p);
                     *hl
                 }) {
                     let b = shooter.body;
@@ -547,7 +628,7 @@ pub fn run(quiet: bool) {
                             v.hp = TRUCK_HP;
                         }
                         let mut sb = hunt.get_mut();
-                        sb.points = (sb.points - DEATH_COST).max(0.0);
+                        sb.points = (sb.points - p.death_cost).max(0.0);
                         drop(sb);
                         let mid = pm.id_add();
                         impact.get_mut().add(
@@ -567,7 +648,7 @@ pub fn run(quiet: bool) {
                         continue;
                     }
                     pose(id, &heli_hulls(&shooter));
-                    (heli_muzzle(&shooter), HIT_PAD_HELI)
+                    (heli_muzzle(&shooter), p.hit_pad_heli)
                 } else {
                     continue;
                 };
@@ -576,7 +657,7 @@ pub fn run(quiet: bool) {
                     *g = (*g - FIXED_DT).max(0.0);
                     let ready = cmd.fire > 0.5 && *g <= 0.0;
                     if ready {
-                        *g = GUN_CD;
+                        *g = p.gun_cd;
                     }
                     ready
                 });
@@ -601,7 +682,7 @@ pub fn run(quiet: bool) {
                 shot.get_mut().add(
                     bid,
                     Shot {
-                        left: GUN_RANGE,
+                        left: p.gun_range,
                         mask: CAT_VEHICLE | CAT_HOG,
                         // The shooter's view when the trigger pulled —
                         // this bullet's whole flight is judged along the
@@ -633,7 +714,7 @@ pub fn run(quiet: bool) {
         pm,
         "bullets",
         31.0,
-        [bullet, shot, collider, contact, impact, net],
+        [bullet, shot, collider, contact, impact, net, params],
         move |pm| {
             // Same-tick contract check: the response tasks at 32 drain
             // every contact each tick writes. A LAST-tick leftover
@@ -659,7 +740,7 @@ pub fn run(quiet: bool) {
                 }
             }
             cull_colliders(pm, &collider);
-            let step = BULLET_SPEED * FIXED_DT;
+            let step = params.get().bullet_speed * FIXED_DT;
             let mut bullets = bullet.get_mut();
             let mut shots = shot.get_mut();
             // Everything applies inline mid-iteration: id_remove is
@@ -763,8 +844,9 @@ pub fn run(quiet: bool) {
     // check at drain (§3: validate at consumption). Today truck and
     // heli responses are twins; per-part branches (tail hit → yaw kick)
     // are exactly where they'd diverge — stage 4's business.
-    task!(pm, "truck_hits", 32.0, [contact, truck, health, hunt, impact, net], move |pm| {
+    task!(pm, "truck_hits", 32.0, [contact, truck, health, hunt, impact, net, params], move |pm| {
         let now = pm.tick();
+        let p = *params.get();
         let hits: Vec<(Id, Contact)> = {
             let pool = contact.get();
             pool.iter()
@@ -781,7 +863,7 @@ pub fn run(quiet: bool) {
                     // Gunner-hog rounds (source_peer 0) chip lighter
                     // than a teammate's cannon; only player fire earns
                     // the FF log.
-                    let dmg = if c.source_peer == 0 { HOGGUN_DMG } else { FRIENDLY_DMG };
+                    let dmg = if c.source_peer == 0 { p.hoggun_dmg } else { p.friendly_dmg };
                     if let Some(mut v) = health.get_id_mut(c.owner) {
                         v.hp -= dmg;
                     }
@@ -807,10 +889,10 @@ pub fn run(quiet: bool) {
                     // Chip the truck; the drive task turns hp 0 into
                     // the explosion (one place owns death).
                     if let Some(mut v) = health.get_id_mut(c.owner) {
-                        v.hp -= BITE_DMG;
+                        v.hp -= p.bite_dmg;
                     }
                     let mut sb = hunt.get_mut();
-                    sb.points = (sb.points - BITE_COST).max(0.0);
+                    sb.points = (sb.points - p.bite_cost).max(0.0);
                     drop(sb);
                     let mid = pm.id_add();
                     impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_BITE });
@@ -819,8 +901,9 @@ pub fn run(quiet: bool) {
             }
         }
     });
-    task!(pm, "heli_hits", 32.0, [contact, heli, health, hunt, impact, net], move |pm| {
+    task!(pm, "heli_hits", 32.0, [contact, heli, health, hunt, impact, net, params], move |pm| {
         let now = pm.tick();
+        let p = *params.get();
         let hits: Vec<(Id, Contact)> = {
             let pool = contact.get();
             pool.iter()
@@ -837,7 +920,7 @@ pub fn run(quiet: bool) {
                     // Stage 4 pays off: the part tag picks the story.
                     // Rotor strikes double the damage; boom hits
                     // glance (half) but kick the nose around.
-                    let base = if c.source_peer == 0 { HOGGUN_DMG } else { FRIENDLY_DMG };
+                    let base = if c.source_peer == 0 { p.hoggun_dmg } else { p.friendly_dmg };
                     let dmg = match c.part {
                         PART_ROTOR => base * 2.0,
                         PART_TAIL => base * 0.5,
@@ -853,7 +936,7 @@ pub fn run(quiet: bool) {
                     if c.part == PART_TAIL && let Some(mut hl) = heli.get_id_mut(c.owner) {
                         let b = &mut hl.body;
                         let (yaw, pitch, roll) = b.rot.to_yaw_pitch_roll();
-                        let kick = HELI_TAIL_KICK * (yaw - c.heading).sin();
+                        let kick = p.heli_tail_kick * (yaw - c.heading).sin();
                         b.rot = pm::Quat::from_yaw_pitch_roll(wrap_angle(yaw + kick), pitch, roll)
                             .norm();
                     }
@@ -873,10 +956,10 @@ pub fn run(quiet: bool) {
                     // No velocity scrub — a nipped heli keeps flying;
                     // the chip is the cost of hovering in reach.
                     if let Some(mut v) = health.get_id_mut(c.owner) {
-                        v.hp -= BITE_DMG;
+                        v.hp -= p.bite_dmg;
                     }
                     let mut sb = hunt.get_mut();
-                    sb.points = (sb.points - BITE_COST).max(0.0);
+                    sb.points = (sb.points - p.bite_cost).max(0.0);
                     drop(sb);
                     let mid = pm.id_add();
                     impact.get_mut().add(mid, Impact { x: c.x, z: c.z, kind: IMPACT_BITE });
@@ -889,8 +972,9 @@ pub fn run(quiet: bool) {
     // the hit), the corpse guard against same-tick double kills, the
     // knockback shove, kill points, and the flash — everything the
     // bullets task used to apply inline, now behind the contact seam.
-    task!(pm, "hog_hits", 32.0, [contact, hog, brain, hunt, impact], move |pm| {
+    task!(pm, "hog_hits", 32.0, [contact, hog, brain, hunt, impact, params], move |pm| {
         let now = pm.tick();
+        let p = *params.get();
         let hits: Vec<(Id, Contact)> = {
             let pool = contact.get();
             pool.iter()
@@ -910,7 +994,7 @@ pub fn run(quiet: bool) {
             // and pays no double kill points — and gets no flash.
             let killed = match hog.get_id_mut(c.owner) {
                 Some(mut h) if h.hp > 0.0 => {
-                    h.hp -= GUN_DMG;
+                    h.hp -= p.gun_dmg;
                     h.hp <= 0.0
                 }
                 _ => continue,
@@ -918,11 +1002,11 @@ pub fn run(quiet: bool) {
             // Survivors stagger away from the shot (the ragdoll for
             // the dead is client-side; see player_client).
             if !killed && let Some(mut br) = brain.get_id_mut(c.owner) {
-                br.shove = (c.heading.sin() * KNOCK, c.heading.cos() * KNOCK);
+                br.shove = (c.heading.sin() * p.knock, c.heading.cos() * p.knock);
             }
             if killed {
                 pm.id_remove(c.owner); // brain + collider entries go with it
-                hunt.get_mut().points += KILL_POINTS;
+                hunt.get_mut().points += p.kill_points;
                 if !quiet {
                     eprintln!("[server] hog down at ({:.1},{:.1}) now={now}", c.x, c.z);
                 }
@@ -941,10 +1025,11 @@ pub fn run(quiet: bool) {
 
     // Waves (prio 33): when the horde is dead, spawn a bigger one along
     // the far walls. Also keeps the scoreboard's live counters fresh.
-    task!(pm, "wave", 33.0, [hog, brain, gunner, hunt], move |pm| {
+    task!(pm, "wave", 33.0, [hog, brain, gunner, hunt, params], move |pm| {
         if hog.get().is_empty() {
+            let p = *params.get();
             let wave = hunt.get().wave + 1;
-            let count = wave_base() + (wave - 1) * WAVE_GROW;
+            let count = (p.wave_base + (wave - 1) as f32 * p.wave_grow).round() as u32;
             let mut rng = Rng::new(pm.tick().wrapping_mul(0x9E37_79B9) | 1);
             let mut armed = 0u32;
             for _ in 0..count {
@@ -962,7 +1047,7 @@ pub fn run(quiet: bool) {
                         x,
                         z,
                         heading: (-x).atan2(-z),
-                        speed: HOG_ROAM,
+                        speed: p.hog_roam,
                         hp: HOG_HP,
                     },
                 );
@@ -972,6 +1057,9 @@ pub fn run(quiet: bool) {
                         seed: rng.rfr(0.0, std::f32::consts::TAU),
                         goal: roam_goal(&mut rng),
                         repick: rng.rfr(0.2, 1.0) * ROAM_REPICK,
+                        // Match the spawn pose until the first think.
+                        desired: (-x).atan2(-z),
+                        target_speed: p.hog_roam,
                         ..HogBrain::default()
                     },
                 );
@@ -979,8 +1067,8 @@ pub fn run(quiet: bool) {
                 // program escalates): a gunner entry with a randomized
                 // first cooldown so a fresh wave never opens with a
                 // synchronized volley.
-                if rng.rfr(0.0, 1.0) < GUNNER_FRAC {
-                    gunner.get_mut().add(id, rng.rfr(0.0, HOGGUN_CD));
+                if rng.rfr(0.0, 1.0) < p.gunner_frac {
+                    gunner.get_mut().add(id, rng.rfr(0.0, p.hoggun_cd));
                     armed += 1;
                 }
             }

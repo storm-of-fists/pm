@@ -9,6 +9,8 @@ just points you at them. Design docs for things not yet built live in
 [docs/](docs/) as plain markdown — a design doc *leads* the code, so
 anti-drift is the wrong guarantee for it; when a design lands, its
 durable parts move onto the types and the markdown keeps the rationale.
+Queued work and known scaling cliffs live in
+[docs/roadmap.md](docs/roadmap.md).
 
 ```bash
 cargo doc -p pm-world --open   # the docs: API tour, design, netcode, 3D, mods

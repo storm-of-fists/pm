@@ -6,6 +6,14 @@
 //! uniforms. A game that outgrows it brings its own pipeline and keeps
 //! using the device.
 //!
+//! For crowds there is ONE escalation: [`Renderer3d::instances`] +
+//! [`Frame3::draw_instanced`] — per-instance model/tint ride a second
+//! vertex buffer at instance step rate, so a 300-hog horde is one draw
+//! call instead of 300 uniform pushes (the 2026-07-17 measured cliff:
+//! 32 ms frames at 200 hogs, one call per hog). Stage instances BEFORE
+//! `frame()` (they upload in a copy pass ahead of the render pass),
+//! then draw the batch inside it.
+//!
 //! ```ignore
 //! let mut r3d = Renderer3d::new(&window)?;
 //! let mesh = r3d.upload_mesh(&bake(&tris, (0.4, 0.6, 0.9)))?;
@@ -53,10 +61,10 @@ use sdl3::gpu::{
     ColorTargetInfo, CommandBuffer, CompareOp, ComputePipeline, CullMode, DepthStencilState,
     DepthStencilTargetInfo, Device, FillMode, Filter, FrontFace, GraphicsPipeline,
     GraphicsPipelineTargetInfo, LoadOp, PrimitiveType, RasterizerState, RenderPass, SampleCount,
-    ShaderFormat, ShaderStage, StorageTextureReadWriteBinding, StoreOp, Texture, TextureCreateInfo,
-    TextureFormat, TextureRegion, TextureTransferInfo, TextureType, TextureUsage,
-    TransferBufferLocation, TransferBufferUsage, VertexAttribute, VertexBufferDescription,
-    VertexElementFormat, VertexInputRate, VertexInputState,
+    Shader, ShaderFormat, ShaderStage, StorageTextureReadWriteBinding, StoreOp, Texture,
+    TextureCreateInfo, TextureFormat, TextureRegion, TextureTransferInfo, TextureType,
+    TextureUsage, TransferBuffer, TransferBufferLocation, TransferBufferUsage, VertexAttribute,
+    VertexBufferDescription, VertexElementFormat, VertexInputRate, VertexInputState,
 };
 use sdl3::pixels::Color;
 use sdl3::video::Window;
@@ -70,6 +78,44 @@ pub struct Vertex3 {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+}
+
+/// Per-instance data for [`Frame3::draw_instanced`]: a full model matrix
+/// plus rgb tint, with the emissive flag in `tint[3]` (same meaning as
+/// the draw/draw_emissive split — per-instance here, so lit hog bodies
+/// and emissive blob shadows both batch).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Instance3 {
+    pub model: [f32; 16],
+    pub tint: [f32; 4],
+}
+
+impl Instance3 {
+    /// A lit instance (the [`Frame3::draw`] sibling).
+    pub fn new(model: Mat4, tint: (f32, f32, f32)) -> Instance3 {
+        Instance3 {
+            model: model.0,
+            tint: [tint.0, tint.1, tint.2, 0.0],
+        }
+    }
+
+    /// An unlit instance (the [`Frame3::draw_emissive`] sibling).
+    pub fn emissive(model: Mat4, tint: (f32, f32, f32)) -> Instance3 {
+        Instance3 {
+            model: model.0,
+            tint: [tint.0, tint.1, tint.2, 1.0],
+        }
+    }
+}
+
+/// Handle to a range staged by [`Renderer3d::instances`] — plain
+/// indices, freely copyable, valid for the NEXT `frame()` only (the
+/// frame uploads and clears the staging it points into).
+#[derive(Clone, Copy)]
+pub struct InstBatch {
+    first: u32,
+    count: u32,
 }
 
 /// Per-draw uniform block — must match `Uniforms` in basic3d.wgsl.
@@ -263,10 +309,19 @@ pub struct Renderer3d {
     device: Device,
     pipe_cull: GraphicsPipeline,
     pipe_nocull: GraphicsPipeline,
+    pipe_inst_cull: GraphicsPipeline,
+    pipe_inst_nocull: GraphicsPipeline,
     pipe_post: ComputePipeline,
     pipe_text: ComputePipeline,
     depth: Texture<'static>,
     scene: Option<SceneTarget>,
+    /// Instanced-draw plumbing: batches staged since the last frame
+    /// ([`instances`](Self::instances)), and the persistent growable GPU
+    /// buffer + transfer pair they upload through when `frame()` begins.
+    inst_staging: Vec<Instance3>,
+    inst_buffer: Option<Buffer>,
+    inst_transfer: Option<TransferBuffer>,
+    inst_cap: u32,
     /// Screen-sized final image: every frame resolves here (the panini
     /// warp's target, or the scene's direct target when panini is off),
     /// the text pass composites onto it, then it blits to the swapchain.
@@ -335,17 +390,23 @@ impl Renderer3d {
             .with_window(window)
             .map_err(|e| e.to_string())?;
 
-        let vert = device
-            .create_shader()
-            .with_code(
-                ShaderFormat::SPIRV,
-                include_bytes!(concat!(env!("OUT_DIR"), "/vs_main.spv")),
-                ShaderStage::Vertex,
-            )
-            .with_entrypoint(c"vs_main")
-            .with_uniform_buffers(1)
-            .build()
-            .map_err(|e| e.to_string())?;
+        let vshader = |code: &'static [u8], entry: &'static std::ffi::CStr| {
+            device
+                .create_shader()
+                .with_code(ShaderFormat::SPIRV, code, ShaderStage::Vertex)
+                .with_entrypoint(entry)
+                .with_uniform_buffers(1)
+                .build()
+                .map_err(|e| e.to_string())
+        };
+        let vert = vshader(
+            include_bytes!(concat!(env!("OUT_DIR"), "/vs_main.spv")),
+            c"vs_main",
+        )?;
+        let vert_inst = vshader(
+            include_bytes!(concat!(env!("OUT_DIR"), "/vs_inst.spv")),
+            c"vs_inst",
+        )?;
         let frag = device
             .create_shader()
             .with_code(
@@ -358,35 +419,48 @@ impl Renderer3d {
             .build()
             .map_err(|e| e.to_string())?;
 
-        let build = |cull: bool| {
+        // The per-vertex attributes (slot 0), plus — for the instanced
+        // pair — the per-INSTANCE slot 1: four matrix columns and the
+        // tint, advancing once per instance (see vs_inst in the shader).
+        let build = |vs: &Shader, instanced: bool, cull: bool| {
+            let attr = |loc, slot, fmt, off| {
+                VertexAttribute::new()
+                    .with_location(loc)
+                    .with_buffer_slot(slot)
+                    .with_format(fmt)
+                    .with_offset(off)
+            };
+            let mut descs = vec![
+                VertexBufferDescription::new()
+                    .with_slot(0)
+                    .with_pitch(size_of::<Vertex3>() as u32)
+                    .with_input_rate(VertexInputRate::Vertex),
+            ];
+            let mut attrs = vec![
+                attr(0, 0, VertexElementFormat::Float3, 0),
+                attr(1, 0, VertexElementFormat::Float3, 12),
+                attr(2, 0, VertexElementFormat::Float3, 24),
+            ];
+            if instanced {
+                descs.push(
+                    VertexBufferDescription::new()
+                        .with_slot(1)
+                        .with_pitch(size_of::<Instance3>() as u32)
+                        .with_input_rate(VertexInputRate::Instance),
+                );
+                for i in 0..5u32 {
+                    attrs.push(attr(3 + i, 1, VertexElementFormat::Float4, i * 16));
+                }
+            }
             device
                 .create_graphics_pipeline()
                 .with_primitive_type(PrimitiveType::TriangleList)
-                .with_vertex_shader(&vert)
+                .with_vertex_shader(vs)
                 .with_fragment_shader(&frag)
                 .with_vertex_input_state(
                     VertexInputState::new()
-                        .with_vertex_buffer_descriptions(&[VertexBufferDescription::new()
-                            .with_slot(0)
-                            .with_pitch(size_of::<Vertex3>() as u32)
-                            .with_input_rate(VertexInputRate::Vertex)])
-                        .with_vertex_attributes(&[
-                            VertexAttribute::new()
-                                .with_location(0)
-                                .with_buffer_slot(0)
-                                .with_format(VertexElementFormat::Float3)
-                                .with_offset(0),
-                            VertexAttribute::new()
-                                .with_location(1)
-                                .with_buffer_slot(0)
-                                .with_format(VertexElementFormat::Float3)
-                                .with_offset(12),
-                            VertexAttribute::new()
-                                .with_location(2)
-                                .with_buffer_slot(0)
-                                .with_format(VertexElementFormat::Float3)
-                                .with_offset(24),
-                        ]),
+                        .with_vertex_buffer_descriptions(&descs)
+                        .with_vertex_attributes(&attrs),
                 )
                 .with_rasterizer_state(
                     RasterizerState::new()
@@ -412,9 +486,12 @@ impl Renderer3d {
                 .build()
                 .map_err(|e| e.to_string())
         };
-        let pipe_cull = build(true)?;
-        let pipe_nocull = build(false)?;
+        let pipe_cull = build(&vert, false, true)?;
+        let pipe_nocull = build(&vert, false, false)?;
+        let pipe_inst_cull = build(&vert_inst, true, true)?;
+        let pipe_inst_nocull = build(&vert_inst, true, false)?;
         drop(vert);
+        drop(vert_inst);
         drop(frag);
 
         // The panini post pass is a COMPUTE pipeline: read the scene
@@ -477,10 +554,16 @@ impl Renderer3d {
             device,
             pipe_cull,
             pipe_nocull,
+            pipe_inst_cull,
+            pipe_inst_nocull,
             pipe_post,
             pipe_text,
             depth,
             scene: None,
+            inst_staging: Vec::new(),
+            inst_buffer: None,
+            inst_transfer: None,
+            inst_cap: 0,
             present: None,
             text: TextCache {
                 white: None,
@@ -519,6 +602,18 @@ impl Renderer3d {
             color: [0.0; 3],
         };
         let mesh = self.upload_mesh(&[v, v, v]).ok()?;
+        // One identity instance so the INSTANCED pipelines draw too —
+        // same deferred-PSO tax, same startup bill.
+        let mut ident = [0.0f32; 16];
+        for i in 0..4 {
+            ident[i * 5] = 1.0;
+        }
+        let inst = self
+            .upload_vertex_buffer(&[Instance3 {
+                model: ident,
+                tint: [1.0; 4],
+            }])
+            .ok()?;
         let tex = |format, usage| {
             self.device
                 .create_texture(
@@ -559,14 +654,10 @@ impl Renderer3d {
             .device
             .begin_render_pass(&commands, &color_targets, Some(&depth_target))
             .ok()?;
-        let mut id = [0.0f32; 16];
-        for i in 0..4 {
-            id[i * 5] = 1.0;
-        }
         commands.push_vertex_uniform_data(
             0,
             &Uniforms {
-                mv: id,
+                mv: ident,
                 proj: [1.0, -1.0, 1.0, 0.0],
                 tint: [1.0; 4],
             },
@@ -589,6 +680,17 @@ impl Renderer3d {
             pass.bind_vertex_buffers(
                 0,
                 &[BufferBinding::new().with_buffer(&mesh.buffer).with_offset(0)],
+            );
+            pass.draw_primitives(3, 1, 0, 0);
+        }
+        for pipe in [&self.pipe_inst_cull, &self.pipe_inst_nocull] {
+            pass.bind_graphics_pipeline(pipe);
+            pass.bind_vertex_buffers(
+                0,
+                &[
+                    BufferBinding::new().with_buffer(&mesh.buffer).with_offset(0),
+                    BufferBinding::new().with_buffer(&inst).with_offset(0),
+                ],
             );
             pass.draw_primitives(3, 1, 0, 0);
         }
@@ -730,9 +832,12 @@ impl Renderer3d {
         [sx, sy, far / (far - near), -near * far / (far - near)]
     }
 
-    /// Upload a static mesh (transfer buffer + copy pass).
-    pub fn upload_mesh(&self, vertices: &[Vertex3]) -> Result<Mesh3, String> {
-        let bytes = std::mem::size_of_val(vertices);
+    /// Upload a slice into a fresh GPU vertex buffer (transfer buffer +
+    /// copy pass on its own command buffer) — the static-data path
+    /// behind [`upload_mesh`](Self::upload_mesh) and the warmup's
+    /// instance buffer.
+    fn upload_vertex_buffer<T: Copy>(&self, data: &[T]) -> Result<Buffer, String> {
+        let bytes = std::mem::size_of_val(data);
         let buffer = self
             .device
             .create_buffer()
@@ -747,8 +852,8 @@ impl Renderer3d {
             .with_usage(TransferBufferUsage::UPLOAD)
             .build()
             .map_err(|e| e.to_string())?;
-        let mut map = transfer.map::<Vertex3>(&self.device, true);
-        map.mem_mut()[..vertices.len()].copy_from_slice(vertices);
+        let mut map = transfer.map::<T>(&self.device, true);
+        map.mem_mut()[..data.len()].copy_from_slice(data);
         map.unmap();
         let commands = self
             .device
@@ -770,10 +875,31 @@ impl Renderer3d {
         );
         self.device.end_copy_pass(copy);
         commands.submit().map_err(|e| e.to_string())?;
+        Ok(buffer)
+    }
+
+    /// Upload a static mesh (transfer buffer + copy pass).
+    pub fn upload_mesh(&self, vertices: &[Vertex3]) -> Result<Mesh3, String> {
         Ok(Mesh3 {
-            buffer,
+            buffer: self.upload_vertex_buffer(vertices)?,
             count: vertices.len() as u32,
         })
+    }
+
+    /// Stage per-instance transforms for this frame's instanced draws
+    /// and return the handle [`Frame3::draw_instanced`] consumes. Call
+    /// BEFORE [`frame`](Self::frame): instance data rides a copy pass
+    /// recorded ahead of the render pass, so everything staged when the
+    /// frame begins uploads in one go (and the staging clears). Batches
+    /// accumulate — one call per mesh you'll draw instanced. An empty
+    /// slice yields a batch that draws nothing.
+    pub fn instances(&mut self, data: &[Instance3]) -> InstBatch {
+        let first = self.inst_staging.len() as u32;
+        self.inst_staging.extend_from_slice(data);
+        InstBatch {
+            first,
+            count: data.len() as u32,
+        }
     }
 
     /// Begin a frame: clear color + depth, ready to draw. Returns None
@@ -796,6 +922,61 @@ impl Renderer3d {
             self.ensure_scene()?;
         }
         let commands = self.device.acquire_command_buffer().ok()?;
+        // Upload this frame's staged instances in a copy pass recorded
+        // AHEAD of the render pass (passes can't contain transfers).
+        // Both buffers cycle, so a previous frame still reading never
+        // blocks or tears; capacity doubles as hordes grow. On any
+        // failure the staging still clears and the frame's instanced
+        // draws just skip — next frame retries.
+        let mut inst_uploaded = 0u32;
+        let want = self.inst_staging.len() as u32;
+        if want > 0 {
+            if self.inst_cap < want {
+                let cap = want.next_power_of_two().max(256);
+                let bytes = cap * size_of::<Instance3>() as u32;
+                self.inst_buffer = self
+                    .device
+                    .create_buffer()
+                    .with_size(bytes)
+                    .with_usage(BufferUsageFlags::VERTEX)
+                    .build()
+                    .ok();
+                self.inst_transfer = self
+                    .device
+                    .create_transfer_buffer()
+                    .with_size(bytes)
+                    .with_usage(TransferBufferUsage::UPLOAD)
+                    .build()
+                    .ok();
+                self.inst_cap = if self.inst_buffer.is_some() && self.inst_transfer.is_some() {
+                    cap
+                } else {
+                    0
+                };
+            }
+            if let (Some(buffer), Some(transfer)) = (&self.inst_buffer, &self.inst_transfer)
+                && self.inst_cap >= want
+            {
+                let mut map = transfer.map::<Instance3>(&self.device, true);
+                map.mem_mut()[..self.inst_staging.len()].copy_from_slice(&self.inst_staging);
+                map.unmap();
+                if let Ok(copy) = self.device.begin_copy_pass(&commands) {
+                    copy.upload_to_gpu_buffer(
+                        TransferBufferLocation::new()
+                            .with_offset(0)
+                            .with_transfer_buffer(transfer),
+                        BufferRegion::new()
+                            .with_offset(0)
+                            .with_size(want * size_of::<Instance3>() as u32)
+                            .with_buffer(buffer),
+                        true,
+                    );
+                    self.device.end_copy_pass(copy);
+                    inst_uploaded = want;
+                }
+            }
+            self.inst_staging.clear();
+        }
         let (r, g, b) = self.clear_color;
         let clear = Color::RGB((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
         let depth_part = |t: DepthStencilTargetInfo| {
@@ -897,11 +1078,18 @@ impl Renderer3d {
             device: &self.device,
             pipe_cull: &self.pipe_cull,
             pipe_nocull: &self.pipe_nocull,
+            pipe_inst_cull: &self.pipe_inst_cull,
+            pipe_inst_nocull: &self.pipe_inst_nocull,
+            inst: if inst_uploaded > 0 {
+                self.inst_buffer.as_ref().map(|b| (b, inst_uploaded))
+            } else {
+                None
+            },
             commands: Some(commands),
             pass: Some(pass),
             view,
             proj,
-            bound_cull: None,
+            bound_pipe: None,
             present: self.present.as_ref().unwrap(),
             warp,
             text_pipe: &self.pipe_text,
@@ -919,11 +1107,17 @@ pub struct Frame3<'a> {
     device: &'a Device,
     pipe_cull: &'a GraphicsPipeline,
     pipe_nocull: &'a GraphicsPipeline,
+    pipe_inst_cull: &'a GraphicsPipeline,
+    pipe_inst_nocull: &'a GraphicsPipeline,
+    /// This frame's uploaded instance buffer and how many instances it
+    /// holds (None when nothing was staged — instanced draws skip).
+    inst: Option<(&'a Buffer, u32)>,
     commands: Option<CommandBuffer>,
     pass: Option<RenderPass>,
     view: Mat4,
     proj: [f32; 4],
-    bound_cull: Option<bool>,
+    /// (cull, instanced) of the currently bound pipeline.
+    bound_pipe: Option<(bool, bool)>,
     /// The screen-sized image everything resolves into before the blit.
     present: &'a Texture<'static>,
     /// The panini warp inputs, present only when panini is on.
@@ -971,13 +1165,13 @@ impl Frame3<'_> {
         let (Some(commands), Some(pass)) = (&self.commands, &self.pass) else {
             return;
         };
-        if self.bound_cull != Some(cull) {
+        if self.bound_pipe != Some((cull, false)) {
             pass.bind_graphics_pipeline(if cull {
                 self.pipe_cull
             } else {
                 self.pipe_nocull
             });
-            self.bound_cull = Some(cull);
+            self.bound_pipe = Some((cull, false));
         }
         let mv = self.view * model;
         let u = Uniforms {
@@ -993,6 +1187,50 @@ impl Frame3<'_> {
                 .with_offset(0)],
         );
         pass.draw_primitives(mesh.count as usize, 1, 0, 0);
+    }
+
+    /// Draw `mesh` once per instance in `batch` — ONE draw call for a
+    /// whole horde. Each instance carries its own model matrix and
+    /// tint/emissive ([`Instance3`], staged via
+    /// [`Renderer3d::instances`] before the frame began); `cull` picks
+    /// the pipeline exactly like [`draw`](Self::draw). A batch staged
+    /// after `frame()` (or one whose upload failed) draws nothing.
+    pub fn draw_instanced(&mut self, mesh: &Mesh3, batch: InstBatch, cull: bool) {
+        let (Some(commands), Some(pass)) = (&self.commands, &self.pass) else {
+            return;
+        };
+        let Some((ibuf, uploaded)) = self.inst else {
+            return;
+        };
+        if batch.count == 0 || batch.first + batch.count > uploaded {
+            return;
+        }
+        if self.bound_pipe != Some((cull, true)) {
+            pass.bind_graphics_pipeline(if cull {
+                self.pipe_inst_cull
+            } else {
+                self.pipe_inst_nocull
+            });
+            self.bound_pipe = Some((cull, true));
+        }
+        // The instanced vertex stage reads u.mv as the VIEW matrix (the
+        // model rides per-instance) and u.tint as a global multiplier.
+        let u = Uniforms {
+            mv: self.view.0,
+            proj: self.proj,
+            tint: [1.0, 1.0, 1.0, 0.0],
+        };
+        commands.push_vertex_uniform_data(0, &u);
+        pass.bind_vertex_buffers(
+            0,
+            &[
+                BufferBinding::new().with_buffer(&mesh.buffer).with_offset(0),
+                BufferBinding::new()
+                    .with_buffer(ibuf)
+                    .with_offset(batch.first * size_of::<Instance3>() as u32),
+            ],
+        );
+        pass.draw_primitives(mesh.count as usize, batch.count as usize, 0, 0);
     }
 
     /// Queue a line of screen-space HUD text with its top-left at (x, y),
