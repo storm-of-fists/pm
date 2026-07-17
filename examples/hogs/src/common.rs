@@ -346,6 +346,13 @@ pub const AIM_MAX: f32 = 2.6;
 /// truck barrels sit at ~1.45 and flat shots must keep connecting (2D
 /// behavior preserved); it's a hitbox, not a silhouette.
 pub const HOG_H: f32 = 1.8;
+/// Extra hit-circle padding on top of `HOG_R`, per shooter platform —
+/// forgiveness tuning, not simulation. The heli gets more: it fires on
+/// the move from altitude, so near-misses that FEEL on target should
+/// connect. Server-only (lives in the Shot pool), so retuning it never
+/// touches the wire.
+pub const HIT_PAD_TRUCK: f32 = 0.35;
+pub const HIT_PAD_HELI: f32 = 0.8;
 
 // --- helicopter tuning -------------------------------------------------------
 
@@ -856,17 +863,20 @@ pub fn hog_bites_truck(h: &Hog, t: &Truck) -> bool {
 
 /// Ray from `(x, z)` along `heading` against hog circles: the nearest
 /// hog whose body the ray crosses within `range`, as `(index into hogs,
-/// hit x, hit z)`. The server sweeps each bullet's per-tick travel with
-/// it, against a REWOUND frame (the shooter's view) — which is the whole
-/// lag-comp trick.
+/// hit x, hit z)`. Each hog's hit circle is `HOG_R + pad` — the pad is
+/// the shooter's forgiveness (`HIT_PAD_*`). The server sweeps each
+/// bullet's per-tick travel with it, against a REWOUND frame (the
+/// shooter's view) — which is the whole lag-comp trick.
 pub fn ray_hit_hog(
     x: f32,
     z: f32,
     heading: f32,
     range: f32,
+    pad: f32,
     hogs: &[(Id, Hog)],
 ) -> Option<(usize, f32, f32)> {
     let (dx, dz) = (heading.sin(), heading.cos());
+    let r = HOG_R + pad;
     let mut best: Option<(usize, f32)> = None;
     for (k, (_, h)) in hogs.iter().enumerate() {
         let (ox, oz) = (h.x - x, h.z - z);
@@ -875,7 +885,7 @@ pub fn ray_hit_hog(
             continue;
         }
         let (cx, cz) = (ox - dx * t, oz - dz * t);
-        if cx * cx + cz * cz > HOG_R * HOG_R {
+        if cx * cx + cz * cz > r * r {
             continue;
         }
         if best.is_none_or(|(_, bt)| t < bt) {
@@ -883,6 +893,88 @@ pub fn ray_hit_hog(
         }
     }
     best.map(|(k, t)| (k, x + dx * t, z + dz * t))
+}
+
+/// Friendly fire: damage a stray shot does to a teammate's vehicle
+/// (gentler than `GUN_DMG` — punish spraying, don't two-shot a buddy),
+/// and the truck hull's bullet height band.
+pub const FRIENDLY_DMG: f32 = 0.25;
+pub const TRUCK_HULL_H: f32 = 1.6;
+
+/// A vehicle's bullet-collision shape, decoupled from which pool the
+/// vehicle lives in: a ground-plane capsule (equal endpoints = a
+/// cylinder) plus an altitude band. Every "does a shot touch this
+/// vehicle" question — the server's friendly-fire sweep, the bots'
+/// hold-fire gate — goes through [`ray_hits_hull`]; a NEW VEHICLE adds
+/// its `*_hull` fn here and one registry line per side (the server's
+/// `hulls` list, `ClientWorld::hulls`), and the sweep code never
+/// changes.
+#[derive(Clone, Copy)]
+pub struct Hull {
+    /// Capsule segment endpoints on the ground plane.
+    pub a: (f32, f32),
+    pub b: (f32, f32),
+    pub r: f32,
+    /// Altitude band (lo, hi) a shot must be inside at the hit point.
+    pub y: (f32, f32),
+}
+
+impl Hull {
+    /// The hull padded by `m` on every surface — hold-fire gates use a
+    /// grown hull so bots err toward not shooting a buddy.
+    pub fn grow(self, m: f32) -> Hull {
+        Hull {
+            r: self.r + m,
+            y: (self.y.0 - m, self.y.1 + m),
+            ..self
+        }
+    }
+}
+
+pub fn truck_hull(t: &Truck) -> Hull {
+    let (a, b) = truck_seg(t);
+    Hull { a, b, r: TRUCK_R, y: (0.0, TRUCK_HULL_H) }
+}
+
+pub fn heli_hull(h: &Heli) -> Hull {
+    let p = h.body.pos;
+    Hull {
+        a: (p.x, p.z),
+        b: (p.x, p.z),
+        r: HELI_R,
+        y: (p.y - HELI_R, p.y + HELI_R),
+    }
+}
+
+/// A shot's travel — `reach` along `heading` on the ground plane, `dy`
+/// total altitude change over it — against one hull, in PRESENT time
+/// (vehicles aren't in the history ring; they're slow enough that
+/// rewind buys little). SAMPLED, not solved: the step size rides the
+/// hull radius (≤ 80% of it), so nothing tunnels whether `reach` is a
+/// bullet's per-tick travel or a bot's whole line of fire. Returns the
+/// hit point.
+pub fn ray_hits_hull(
+    x: f32,
+    z: f32,
+    y: f32,
+    heading: f32,
+    reach: f32,
+    dy: f32,
+    hull: &Hull,
+) -> Option<(f32, f32)> {
+    let (sx, sz) = (heading.sin(), heading.cos());
+    let n = (reach / (hull.r * 0.8).max(0.05)).ceil().max(1.0) as usize;
+    for i in 0..n {
+        let frac = (i as f32 + 0.5) / n as f32;
+        let (px, pz) = (x + sx * reach * frac, z + sz * reach * frac);
+        let py = y + dy * frac;
+        if (hull.y.0..=hull.y.1).contains(&py)
+            && seg_point_dist(hull.a, hull.b, (px, pz)) < hull.r
+        {
+            return Some((px, pz));
+        }
+    }
+    None
 }
 
 // --- presentation helpers --------------------------------------------------
@@ -930,6 +1022,57 @@ pub fn spawn_heli(peer: u8) -> Heli {
 /// The force model's invariants, pinned so a tuning pass can't silently
 /// break them: grip actually bleeds lateral momentum, the FBW trim
 /// actually hovers, tilt actually goes places (and not past the cap).
+#[cfg(test)]
+mod hull_tests {
+    use super::*;
+    use std::f32::consts::FRAC_PI_2;
+
+    // Truck at the origin facing +z: capsule (0,∓0.8) r 0.9, band 0..1.6.
+    // Shots travel +x (heading = π/2).
+
+    #[test]
+    fn sweep_hits_a_crossing_truck() {
+        let t = Truck::default();
+        let hit = ray_hits_hull(-5.0, 0.0, 1.0, FRAC_PI_2, 10.0, 0.0, &truck_hull(&t));
+        assert!(hit.is_some(), "flat shot through the hull must connect");
+    }
+
+    #[test]
+    fn altitude_band_rejects_overflight() {
+        let t = Truck::default();
+        let hit = ray_hits_hull(-5.0, 0.0, 5.0, FRAC_PI_2, 10.0, 0.0, &truck_hull(&t));
+        assert!(hit.is_none(), "a shot 5u up overflies a 1.6u hull");
+        let mut h = Heli::default();
+        h.body.pos = vec3(0.0, 10.0, 0.0);
+        let under = ray_hits_hull(-5.0, 0.0, 1.0, FRAC_PI_2, 10.0, 0.0, &heli_hull(&h));
+        assert!(under.is_none(), "a flat shot passes under a heli at 10u");
+        let level = ray_hits_hull(-5.0, 0.0, 10.0, FRAC_PI_2, 10.0, 0.0, &heli_hull(&h));
+        assert!(level.is_some(), "a shot at its altitude hits it");
+    }
+
+    #[test]
+    fn long_reach_cannot_tunnel() {
+        // A bot's whole line of fire (GUN_RANGE), heli mid-way: the
+        // sampling must scale with reach or this skips right over it.
+        let mut h = Heli::default();
+        h.body.pos = vec3(30.0, 8.0, 0.0);
+        let dy = 8.0 / 30.0 * GUN_RANGE; // climb that crosses its altitude there
+        let hit = ray_hits_hull(0.0, 0.0, 0.0, FRAC_PI_2, GUN_RANGE, dy, &heli_hull(&h));
+        assert!(hit.is_some(), "45u sweep must still sample densely enough");
+    }
+
+    #[test]
+    fn grow_pads_the_hold_fire_gate() {
+        let t = Truck::default();
+        let graze = |hull: &Hull| ray_hits_hull(-5.0, 2.0, 1.0, FRAC_PI_2, 10.0, 0.0, hull);
+        assert!(graze(&truck_hull(&t)).is_none(), "1.2u off the capsule misses");
+        assert!(
+            graze(&truck_hull(&t).grow(0.5)).is_some(),
+            "the grown gate holds fire on the same pass"
+        );
+    }
+}
+
 #[cfg(test)]
 mod physics_tests {
     use super::*;

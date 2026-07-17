@@ -33,6 +33,24 @@ fn main() {
         })
         .unwrap_or_else(|| "unknown".into());
 
+    // The repo commit, for window titles and startup logs ("is this exe
+    // stale?"). HEAD moves on checkout and the ref file it names moves
+    // on commit — watching both re-runs this script when either does.
+    // `--dirty=+` marks uncommitted trees (best-effort: edits that don't
+    // touch HEAD only refresh the flag when pm rebuilds anyway) and
+    // `--exclude=*` keeps future tags from changing the format.
+    if let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={dir}/HEAD");
+        if let Ok(head) = std::fs::read_to_string(format!("{dir}/HEAD"))
+            && let Some(r) = head.strip_prefix("ref: ")
+        {
+            println!("cargo:rerun-if-changed={dir}/{}", r.trim());
+        }
+    }
+    let commit = git(&["describe", "--always", "--exclude=*", "--dirty=+"])
+        .unwrap_or_else(|| "nogit".into());
+    println!("cargo:rustc-env=PM_GIT={commit}");
+
     println!("cargo:rustc-env=PM_RUSTC_VERSION={rustc_version}");
     println!(
         "cargo:rustc-env=PM_PROFILE={}",
@@ -42,6 +60,17 @@ fn main() {
         "cargo:rustc-env=PM_TARGET={}",
         std::env::var("TARGET").unwrap_or_default()
     );
+}
+
+/// Run git with `args`, returning trimmed stdout on success.
+fn git(args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
 }
 
 /// First line starting with `key`, returning the remainder trimmed.

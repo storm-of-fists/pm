@@ -148,7 +148,7 @@ pub fn run(flags: Flags) {
     let cam_view = pm.single::<CamView>("cam.view");
 
     let (mut window, mut pump, refresh) = pm_sdl::window(
-        "pm hogs — wasd drives, rmb aims, lmb fires, 1-3 cams, r respawn, esc",
+        &format!("pm hogs [{}] — wasd drives, rmb aims, lmb fires, 1-3 cams, r respawn, esc", pm::BUILD_ID),
         W,
         H,
     );
@@ -920,8 +920,11 @@ pub fn run(flags: Flags) {
                     .unwrap_or(0.0)
                     * 3.6
                     / 1.6;
+                // BUILD_ID in the title: a staged/copied exe that's out
+                // of date says so on sight (dirty builds carry a `+`).
                 let title = format!(
-                    "pm hogs — peer {}  {:.0} mph  rtt {:.0} ms  corrections {}  (h heli / t truck)",
+                    "pm hogs [{}] — peer {}  {:.0} mph  rtt {:.0} ms  corrections {}  (h heli / t truck)",
+                    pm::BUILD_ID,
                     net.peer(),
                     speed.abs(),
                     net.rtt_ms(),

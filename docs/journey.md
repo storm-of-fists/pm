@@ -270,6 +270,26 @@ rewinds.
 Source engine players know this trade: it's "favor the shooter",
 scaled to a PvE game where the hogs don't file complaints.
 
+Two later layers ride the same sweep and are worth contrasting:
+
+- **Hit forgiveness** is per-shooter: each bullet carries a hit-circle
+  pad (`HIT_PAD_TRUCK` / `HIT_PAD_HELI` — the heli's is bigger, it
+  fires on the move from altitude). The pad lives in the server-only
+  `Shot` pool next to the rewind anchor, so retuning feel never
+  touches the wire.
+- **Friendly fire** tests teammates' vehicles in *present* time, not
+  the rewound frame — vehicles aren't in the history ring, and at
+  vehicle speeds rewind buys little. One bullet, two clocks: the hog
+  check plays back the shooter's past; the teammate check reads the
+  server's now. The shapes are generalized behind `Hull` (common.rs):
+  every vehicle reduces to a ground capsule + altitude band, one
+  sampled sweep (`ray_hits_hull`) judges them all, and each side keeps
+  a one-line-per-vehicle registry (server `hulls`,
+  `ClientWorld::hulls`) — a jet or dirtbike is a `*_hull` fn and two
+  registry lines, no sweep changes. Bots grew trigger discipline off
+  the same hulls (hold when a buddy crosses the line of fire —
+  `line_clear` in bot_client.rs, grown hulls so they err polite).
+
 **Try this:** `hogs interp=200 lag=80 loss=0.03`. The world turns to
 soup, but shots still land — lag comp rewinds deeper. Now `interp=8`:
 fresh but strobing under loss. 33 is a *choice*, not a law.
@@ -375,6 +395,13 @@ it has opinions worth knowing:
      flickered on D3D12 (WSLg's Vulkan happened to serialize them).
      The fix batches quads into a pass until one overlaps, then splits
      — the pass boundary is the barrier.
+  3. D3D12 defers real pipeline work past `create_graphics_pipeline`
+     until a pipeline first **draws** — measured as a one-time ~290 ms
+     frame hitch on the first shot of a session (native Windows;
+     WSLg's Vulkan masks it, the recurring lesson: test native).
+     `Renderer3d::new` now ends with a throwaway 8×8 offscreen pass
+     that binds and draws both pipelines, so the cost lands inside
+     startup where nobody can feel it.
 - **Panini projection** is the house look: render rectilinear
   oversized, warp in a compute post-pass. Wide FOV without the
   peripheral smear; verticals stay straight. `P` toggles it live.

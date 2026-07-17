@@ -5,7 +5,7 @@
 //! interesting one: at 300 hogs the byte budget rotates and the interp
 //! delay is what rides the multi-tick gaps between a hog's updates.
 
-use pm::{EventTx, InputTx, Pm, PmClient, PoolHandle, Predictor, SingleHandle, SingleRx};
+use pm::{EventTx, Id, InputTx, Pm, PmClient, PoolHandle, Predictor, SingleHandle, SingleRx};
 
 use crate::common::*;
 
@@ -36,6 +36,19 @@ pub struct ClientWorld {
     /// None` — which is also how game code asks "am I flying?".
     pub pred: SingleHandle<Predictor<Truck, Drive>>,
     pub pred_heli: SingleHandle<Predictor<Heli, Drive>>,
+}
+
+impl ClientWorld {
+    /// Every vehicle's collision [`Hull`] with its id, off the smoothed
+    /// draw pools — the client-side mirror of the server's friendly-fire
+    /// registry (see server.rs `hulls`). The bots' hold-fire gate walks
+    /// this; a NEW VEHICLE is one `extend` line here.
+    pub fn hulls(&self) -> Vec<(Id, Hull)> {
+        let mut v: Vec<(Id, Hull)> = Vec::new();
+        v.extend(self.truck_draw.get().iter().map(|(id, t)| (id, truck_hull(t))));
+        v.extend(self.heli_draw.get().iter().map(|(id, h)| (id, heli_hull(h))));
+        v
+    }
 }
 
 /// Register the full channel set and install prediction + interpolation.
@@ -97,16 +110,33 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
         pm.link_lag(link.0, link.1);
     }
     let w = client_setup(&mut pm);
+    let net = pm.net();
 
     // Building-jam recovery state: seconds spent commanding thrust while
     // not moving, and seconds of back-out left once we give up.
     let mut jam = 0.0f32;
     let mut back = 0.0f32;
+    // Which way the back-out drives: opposite whatever was jammed.
+    let mut back_dir = -1.0f32;
     // Pilot bots: one-shot "give me the heli" request state.
     let mut asked_heli = false;
 
     pm.task_add("bot", 4.0, 0.0, move |pm| {
         let t = pm.tick() as f32 / 60.0 + n as f32 * 1.7;
+
+        // Trigger discipline — friendly fire is live: hold when a
+        // teammate's (grown) hull crosses the line of fire. Same hulls
+        // and sweep the server judges with, generous margin: a held
+        // shot costs a quarter second, a connected one costs a quarter
+        // of a buddy's hp.
+        let line_clear = |x: f32, y: f32, z: f32, bearing: f32, pitch: f32, reach: f32| {
+            let mine = net.mine();
+            let dy = pitch.tan() * reach;
+            !w.hulls().iter().any(|(id, h)| {
+                mine != Some(*id)
+                    && ray_hits_hull(x, z, y, bearing, reach, dy, &h.grow(0.5)).is_some()
+            })
+        };
 
         // Bots n >= 2 are PILOTS: swap to the heli once spawned, then
         // fly strafing runs — deliberately exercising the whole 3D path
@@ -133,7 +163,9 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
                         // Nose over far enough that the gun line meets
                         // the ground at the hog.
                         let dive = (b.pos.y / d.max(3.0)).atan();
-                        let aligned = err.abs() < 0.25 && d < GUN_RANGE * 0.9;
+                        let aligned = err.abs() < 0.25
+                            && d < GUN_RANGE * 0.9
+                            && line_clear(b.pos.x, b.pos.y, b.pos.z, bearing, -dive, d);
                         (
                             err.clamp(-1.0, 1.0),
                             (dive / HELI_PITCH_MAX).clamp(-1.0, 1.0),
@@ -204,11 +236,27 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
                 // subtends the aim error (with slack) — a fixed gate
                 // either never hits at range or wastes every shot.
                 let aligned = err.abs() < (HOG_R / d.max(2.0)).atan() * 2.0;
+                // GRIP-PHYSICS throttle: momentum carries now, so the
+                // old two-speed throttle glided into every close hog
+                // and ate the bite. Chase a TARGET SPEED instead —
+                // proportional standoff close in (backing up point
+                // blank), full chase far out — and slow to turn: a big
+                // bearing error caps the target so the chassis rotates
+                // ahead of the momentum instead of orbiting the hog.
+                // Standoff at 12u: outside a bite lunge, inside easy
+                // gun range — and full reverse when a charge closes
+                // (soak data: parking at spit distance = death by bite).
+                let mut want = ((d - 12.0) * 0.9).clamp(-7.0, VMAX);
+                if err.abs() > 0.9 {
+                    want = want.min(7.0);
+                }
                 (
                     err.clamp(-1.0, 1.0),
-                    // Bear down on far hogs, hold off point-blank ones.
-                    if d > 14.0 { 0.85 } else { 0.35 },
-                    (aligned && d < GUN_RANGE * 0.95) as i32 as f32,
+                    ((want - me.speed()) * 0.4).clamp(-1.0, 1.0),
+                    (aligned
+                        && d < GUN_RANGE * 0.95
+                        && line_clear(me.body.pos.x, 1.45, me.body.pos.z, bearing, 0.0, d))
+                        as i32 as f32,
                 )
             }
             // Wave's dead: lazy sine wander until the next one lands.
@@ -228,11 +276,14 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
         // resume the chase from the new angle.
         if back > 0.0 {
             back -= FIXED_DT;
-            thrust = -0.7;
+            thrust = 0.7 * back_dir;
             turn = 1.0;
             fire = 0.0;
         } else {
-            if thrust > 0.2 && me.speed().abs() < 1.0 {
+            // Standoff drives REVERSE now too — a wall can eat either
+            // direction, so jam on commanded thrust of any sign and
+            // back out the opposite way.
+            if thrust.abs() > 0.2 && me.speed().abs() < 1.0 {
                 jam += FIXED_DT;
             } else {
                 jam = 0.0;
@@ -240,6 +291,7 @@ pub fn run_bot(n: u32, link: (f32, f32)) {
             if jam > 0.8 {
                 jam = 0.0;
                 back = 1.2;
+                back_dir = -thrust.signum();
             }
         }
         w.input.set(Drive {

@@ -473,7 +473,7 @@ impl Renderer3d {
         let font = Font::load_default()?;
 
         let fov_deg = 100.0;
-        Ok(Renderer3d {
+        let r3d = Renderer3d {
             device,
             pipe_cull,
             pipe_nocull,
@@ -499,7 +499,102 @@ impl Renderer3d {
             ambient_sky: (0.35, 0.35, 0.35),
             ambient_ground: (0.35, 0.35, 0.35),
             lights: Vec::new(),
-        })
+        };
+        r3d.warmup(window);
+        Ok(r3d)
+    }
+
+    /// One throwaway offscreen pass that BINDS AND DRAWS both graphics
+    /// pipelines. `create_graphics_pipeline` returns fast on D3D12 —
+    /// the driver defers the real PSO work until a pipeline first
+    /// draws, which surfaced as a ~290 ms frame hitch the first time a
+    /// tracer appeared on native Windows (WSLg's Vulkan path masks it).
+    /// Pay that cost here, inside startup, where nobody can feel it.
+    /// Best-effort: any failure just skips the warm-up.
+    fn warmup(&self, window: &Window) -> Option<()> {
+        // A degenerate triangle: rasterizes nothing, compiles everything.
+        let v = Vertex3 {
+            pos: [0.0; 3],
+            normal: [0.0, 1.0, 0.0],
+            color: [0.0; 3],
+        };
+        let mesh = self.upload_mesh(&[v, v, v]).ok()?;
+        let tex = |format, usage| {
+            self.device
+                .create_texture(
+                    TextureCreateInfo::new()
+                        .with_type(TextureType::_2D)
+                        .with_width(8)
+                        .with_height(8)
+                        .with_layer_count_or_depth(1)
+                        .with_num_levels(1)
+                        .with_sample_count(SampleCount::NoMultiSampling)
+                        .with_format(format)
+                        .with_usage(usage),
+                )
+                .ok()
+        };
+        // The color target must be SWAPCHAIN-formatted — same format
+        // key the real frames use, so the driver can't defer again.
+        let color = tex(
+            self.device.get_swapchain_texture_format(window),
+            TextureUsage::COLOR_TARGET,
+        )?;
+        let mut depth = tex(TextureFormat::D16Unorm, TextureUsage::DEPTH_STENCIL_TARGET)?;
+        let commands = self.device.acquire_command_buffer().ok()?;
+        let color_targets = [ColorTargetInfo::default()
+            .with_texture(&color)
+            .with_load_op(LoadOp::CLEAR)
+            .with_store_op(StoreOp::STORE)
+            .with_clear_color(Color::RGB(0, 0, 0))];
+        let depth_target = DepthStencilTargetInfo::new()
+            .with_cycle(true)
+            .with_clear_depth(1.0)
+            .with_load_op(LoadOp::CLEAR)
+            .with_store_op(StoreOp::DONT_CARE)
+            .with_stencil_load_op(LoadOp::DONT_CARE)
+            .with_stencil_store_op(StoreOp::DONT_CARE)
+            .with_texture(&mut depth);
+        let pass = self
+            .device
+            .begin_render_pass(&commands, &color_targets, Some(&depth_target))
+            .ok()?;
+        let mut id = [0.0f32; 16];
+        for i in 0..4 {
+            id[i * 5] = 1.0;
+        }
+        commands.push_vertex_uniform_data(
+            0,
+            &Uniforms {
+                mv: id,
+                proj: [1.0, -1.0, 1.0, 0.0],
+                tint: [1.0; 4],
+            },
+        );
+        commands.push_fragment_uniform_data(
+            0,
+            &LightU {
+                sun_dir: [0.0; 4],
+                sun_color: [0.0; 4],
+                sky: [0.0; 4],
+                ground: [0.0; 4],
+                up: [0.0, 1.0, 0.0, 0.0],
+                fog_color: [0.0; 4],
+                lights: [[0.0; 4]; MAX_LIGHTS * 2],
+                counts: [0.0; 4],
+            },
+        );
+        for pipe in [&self.pipe_cull, &self.pipe_nocull] {
+            pass.bind_graphics_pipeline(pipe);
+            pass.bind_vertex_buffers(
+                0,
+                &[BufferBinding::new().with_buffer(&mesh.buffer).with_offset(0)],
+            );
+            pass.draw_primitives(3, 1, 0, 0);
+        }
+        self.device.end_render_pass(pass);
+        commands.submit().ok()?;
+        Some(())
     }
 
     /// Queue a point light for the next [`frame`](Self::frame): world

@@ -56,6 +56,8 @@ const KNOCK_DECAY: f32 = 6.0;
 struct Shot {
     left: f32,
     view: u32,
+    /// Hit-circle padding for this shot (`HIT_PAD_*` by shooter platform).
+    pad: f32,
 }
 
 /// A roam destination: anywhere in the arena that isn't inside a
@@ -94,7 +96,7 @@ pub fn run(quiet: bool) {
     let shot = pm.pool::<Shot>("bullet.shot");
 
     if !quiet {
-        eprintln!("hogs server on {ADDR}");
+        eprintln!("hogs server on {ADDR} [{}]", pm::BUILD_ID);
     }
     let net = pm.net();
     let inputs = pm.input::<Drive>("drive");
@@ -324,7 +326,7 @@ pub fn run(quiet: bool) {
                 // state, never predicted: bitten to 0 hp (both), or
                 // boosted to 1.0 heat (trucks). Fresh vehicle at the
                 // spawn slot; prediction snaps the owner home.
-                let (mx, my, mz, dir, climb) = if let Some(shooter) =
+                let ((mx, my, mz, dir, climb), pad) = if let Some(shooter) =
                     truck.get_id_mut(id).map(|mut t| {
                         truck_step(&mut t, cmd, FIXED_DT);
                         *t
@@ -349,7 +351,7 @@ pub fn run(quiet: bool) {
                         }
                         continue;
                     }
-                    truck_muzzle(&shooter)
+                    (truck_muzzle(&shooter), HIT_PAD_TRUCK)
                 } else if let Some(shooter) = heli.get_id_mut(id).map(|mut hl| {
                     heli_step(&mut hl, cmd, FIXED_DT);
                     *hl
@@ -382,7 +384,7 @@ pub fn run(quiet: bool) {
                         }
                         continue;
                     }
-                    heli_muzzle(&shooter)
+                    (heli_muzzle(&shooter), HIT_PAD_HELI)
                 } else {
                     continue;
                 };
@@ -426,6 +428,7 @@ pub fn run(quiet: bool) {
                         // a few ticks fresh, which is a clean miss on a
                         // charging hog.
                         view: inputs.view(peer).saturating_sub(interp_ticks()),
+                        pad,
                     },
                 );
             }
@@ -438,11 +441,25 @@ pub fn run(quiet: bool) {
     // per-tick lag comp, so leading a hog is never required at sane
     // latencies. Damage still lands on the PRESENT hog; buildings and
     // arena walls stop bullets in present time (they don't move).
+    // The friendly-fire registry: one probe per vehicle pool, mapping an
+    // entity id to its collision Hull. The sweep below walks this list —
+    // a NEW VEHICLE (jet, dirtbike...) is its `*_hull` fn in common.rs
+    // plus one probe here; the sweep never changes.
+    let hulls: Vec<Box<dyn Fn(pm::Id) -> Option<Hull>>> = vec![
+        Box::new({
+            let truck = truck.clone();
+            move |id| truck.get_id(id).map(|t| truck_hull(&t))
+        }),
+        Box::new({
+            let heli = heli.clone();
+            move |id| heli.get_id(id).map(|h| heli_hull(&h))
+        }),
+    ];
     task!(
         pm,
         "bullets",
         31.0,
-        [bullet, shot, hog, brain, impact, hunt, net],
+        [bullet, shot, hog, brain, health, impact, hunt, net],
         move |pm| {
             let step = BULLET_SPEED * FIXED_DT;
             let mut bullets = bullet.get_mut();
@@ -461,12 +478,43 @@ pub fn run(quiet: bool) {
                 // altitude at the hit point is inside the hog's band.
                 let hstep = b.pitch.cos() * step;
                 let dy = b.pitch.sin() * step;
+                // Friendly fire, PRESENT time (no rewind — teammates
+                // aren't in the history ring, and they're slow enough
+                // that it wouldn't buy much): a buddy between you and
+                // the horde eats the round. The shooter's own vehicle
+                // is skipped — bullets are born at its muzzle.
+                for (peer, vid) in net.owned() {
+                    if peer as f32 == b.owner {
+                        continue;
+                    }
+                    let ff = hulls.iter().find_map(|probe| {
+                        probe(vid)
+                            .and_then(|h| ray_hits_hull(b.x, b.z, b.y, b.heading, hstep, dy, &h))
+                    });
+                    if let Some((fx, fz)) = ff {
+                        pm.id_remove(id);
+                        if let Some(mut v) = health.get_id_mut(vid) {
+                            v.hp -= FRIENDLY_DMG;
+                        }
+                        if !quiet {
+                            eprintln!(
+                                "[server] friendly fire: peer {} hit peer {peer}",
+                                b.owner as u8
+                            );
+                        }
+                        let mid = pm.id_add();
+                        impact.get_mut().add(mid, Impact { x: fx, z: fz, kind: IMPACT_HIT });
+                        return;
+                    }
+                }
                 let hit = hist.frame(view).and_then(|f| {
-                    ray_hit_hog(b.x, b.z, b.heading, hstep, &f).and_then(|(k, hx, hz)| {
+                    ray_hit_hog(b.x, b.z, b.heading, hstep, s.pad, &f).and_then(|(k, hx, hz)| {
                         let (ox, oz) = (hx - b.x, hz - b.z);
                         let frac = (ox * ox + oz * oz).sqrt() / hstep.max(1e-6);
                         let yh = b.y + dy * frac;
-                        (0.0..=HOG_H).contains(&yh).then(|| (f[k].0, hx, hz))
+                        // The altitude band is padded too — from a heli
+                        // most near-misses are vertical.
+                        (-s.pad..=HOG_H + s.pad).contains(&yh).then(|| (f[k].0, hx, hz))
                     })
                 });
                 if let Some((hid, hx, hz)) = hit {

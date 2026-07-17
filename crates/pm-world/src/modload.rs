@@ -74,6 +74,12 @@ pub fn mod_abi() -> u64 {
     MOD_ABI ^ h.finish()
 }
 
+/// Short commit (plus `+` when the tree was dirty) of the repo this `pm`
+/// was built from — put it in a window title or a server's startup line
+/// so a stale exe identifies itself on sight. Baked by `build.rs`;
+/// `"nogit"` when built outside a git checkout.
+pub const BUILD_ID: &str = env!("PM_GIT");
+
 /// Human-readable record of the toolchain/profile/target that compiled
 /// this `pm`, newline-joined `key=value` lines. Baked by `build.rs`. The
 /// ABI hash is the gate; this is the diagnosis printed when it fails —
@@ -91,6 +97,9 @@ pub const BUILD_MANIFEST: &str = concat!(
     "\n",
     "pm=",
     env!("CARGO_PKG_VERSION"),
+    "\n",
+    "git=",
+    env!("PM_GIT"),
 );
 
 /// [`BUILD_MANIFEST`] with a trailing NUL so its pointer is a valid C
@@ -108,6 +117,9 @@ const BUILD_MANIFEST_NUL: &str = concat!(
     "\n",
     "pm=",
     env!("CARGO_PKG_VERSION"),
+    "\n",
+    "git=",
+    env!("PM_GIT"),
     "\0",
 );
 

@@ -4,6 +4,12 @@
 //! and the day length are writable knobs (Ctrl-U in pm-mon, `set` in
 //! pm-watch); their initial values come from the CLI flags.
 //!
+//! NOTE on `lock` semantics (verified live 2026-07-16): a monitor write
+//! lands in the signal's one value cell, and the game only ever READS
+//! these knobs — so `lock` hands a knob back holding its LAST commanded
+//! value. To undo an experiment, `set` the old value back, then `lock`
+//! (e.g. `set hogs link_lag_ms 0` before locking).
+//!
 //! ONE node per process, and it lives on the client thread: pm-control
 //! signals are `Rc` (not `Send`) and the scan clock is a process-global
 //! frozen-per-scan cell — two nodes on two threads is UB by contract.

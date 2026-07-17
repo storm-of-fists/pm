@@ -33,7 +33,13 @@
       "Bash(timeout 3 ./target/release/pm-watch --bind 127.0.0.1:42599 127.0.0.1:42598)",
       "Bash(echo \"exit=$?\")",
       "Bash(awk '{print $1}')",
-      "Bash(awk ' *)"
+      "Bash(awk ' *)",
+      "Bash(git -C /home/clatham/pm status --short)",
+      "Bash(git -C /home/clatham/pm log --oneline -3)",
+      "Bash(bash /tmp/claude-1000/-home-clatham-pm/fd9e1056-d383-4bba-8d89-3d6726ab88cd/scratchpad/watch_test.sh)",
+      "Bash(pkill -x hogs)",
+      "Bash(pkill -x pm-watch)",
+      "Bash(git -C /home/clatham/pm diff --stat)"
     ],
     "defaultMode": "bypassPermissions"
   }
