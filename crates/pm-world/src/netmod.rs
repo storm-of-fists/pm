@@ -937,6 +937,21 @@ impl PmClient {
             std::time::Duration::from_secs_f32(lag_ms.max(0.0) / 1000.0),
             loss.clamp(0.0, 1.0),
         ));
+        // Seed the live-tune single so dashboards see the initial values
+        // (seq stays 0 — connect applies the initial itself).
+        let tune = self.pm.single::<LinkTune>("net.linktune");
+        let mut t = tune.get_mut();
+        t.lag_ms = lag_ms.max(0.0);
+        t.loss = loss.clamp(0.0, 1.0);
+    }
+
+    /// Handle to the LIVE link-sim tune: bump `seq` after writing
+    /// `lag_ms`/`loss` and the net task re-applies them to the transport
+    /// on its next pump — the runtime sibling of
+    /// [`link_lag`](PmClient::link_lag), for telemetry knobs and debug
+    /// consoles. Untouched (seq 0) it costs one comparison per tick.
+    pub fn link_tune(&mut self) -> SingleHandle<LinkTune> {
+        self.pm.single::<LinkTune>("net.linktune")
     }
 
     /// Connect to the server (the schema is complete now) and run the loop.
@@ -1188,10 +1203,20 @@ impl ServerOwn {
     }
 }
 
+/// Live client link-sim tuning (see [`PmClient::link_tune`]): the net
+/// task applies `lag_ms`/`loss` to the transport whenever `seq` changes.
+#[derive(Clone, Copy, Default)]
+pub struct LinkTune {
+    pub lag_ms: f32,
+    pub loss: f32,
+    pub seq: u32,
+}
+
 /// Connection status (client, `"net.status"`). Internal plumbing the net
 /// task fills; games read it through the [`ClientNet`] handle
 /// ([`PmClient::net`]).
 #[derive(Default)]
+
 pub(crate) struct NetStatus {
     pub peer: u8,
     pub rtt_ms: f32,
@@ -1339,11 +1364,24 @@ impl NetClient {
         let applied = pm.single::<AppliedLog>("net.applied");
         let out = pm.single::<Outbox>("net.out");
         let chan = pm.single::<ClientInputChan>("net.input").get().0.clone();
+        let tune = pm.single::<LinkTune>("net.linktune");
+        let mut tune_seq = 0u32;
         let mut accum = 0.0f32;
         // Net-doctor state: (applied count, newest label) at last report.
         let mut dbg_prev = (0u32, 0u32);
         let mut dbg_newest = 0u32;
         pm.task_add("net", NET_PRIO, 0.0, move |pm| {
+            // Live link-sim retune (telemetry knobs): seq bump = apply.
+            {
+                let t = tune.get();
+                if t.seq != tune_seq {
+                    tune_seq = t.seq;
+                    quic.link_lag_set(
+                        std::time::Duration::from_secs_f32(t.lag_ms.max(0.0) / 1000.0),
+                        t.loss.clamp(0.0, 1.0),
+                    );
+                }
+            }
             quic.pump();
             if let Some(err) = quic.error() {
                 eprintln!("[net] disconnected: {err}");

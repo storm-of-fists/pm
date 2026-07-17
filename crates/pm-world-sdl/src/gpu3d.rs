@@ -77,10 +77,26 @@ pub struct Vertex3 {
 #[derive(Clone, Copy)]
 struct Uniforms {
     mv: [f32; 16],
-    proj: [f32; 4],  // sx, sy (negative: y-flip), depth A, depth B
-    light: [f32; 4], // xyz dir (view space), w = fog distance
-    tint: [f32; 4],
+    proj: [f32; 4], // sx, sy (negative: y-flip), depth A, depth B
+    tint: [f32; 4], // rgb tint; w = emissive flag (1.0 skips lighting)
+}
+
+/// How many point lights a frame can carry (must match basic3d.wgsl).
+pub const MAX_LIGHTS: usize = 8;
+
+/// Per-frame fragment uniform block — must match `LightU` in
+/// basic3d.wgsl. Everything is VIEW space; built once in `frame()`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightU {
+    sun_dir: [f32; 4],   // xyz view-space dir; w = fog distance (0 = off)
+    sun_color: [f32; 4],
+    sky: [f32; 4],
+    ground: [f32; 4],
+    up: [f32; 4],        // world up in view space
     fog_color: [f32; 4],
+    lights: [[f32; 4]; MAX_LIGHTS * 2], // [pos, radius], [color, _] pairs
+    counts: [f32; 4],    // x: live light count
 }
 
 /// Post-pass uniform block — must match `PostU` in post3d.wgsl.
@@ -273,6 +289,19 @@ pub struct Renderer3d {
     pub fog_distance: f32,
     /// Clear / fog color (rgb 0..1).
     pub clear_color: (f32, f32, f32),
+    /// Sun color (rgb, linear-ish 0..~1.5). The sun's DIRECTION is the
+    /// `light_world` argument to [`frame`](Self::frame). Default 0.65
+    /// white — with the default ambient this reproduces the pre-lighting
+    /// look exactly, so games that never touch these see no change.
+    pub sun_color: (f32, f32, f32),
+    /// Hemisphere ambient: light falling from the sky (surfaces facing
+    /// up) and bouncing off the ground (surfaces facing down). Equal
+    /// values = the old flat ambient. Default 0.35 white each.
+    pub ambient_sky: (f32, f32, f32),
+    pub ambient_ground: (f32, f32, f32),
+    /// Point lights queued for the NEXT `frame()` call (world space);
+    /// cleared every frame. Push via [`point_light`](Self::point_light).
+    lights: Vec<([f32; 4], [f32; 4])>,
 }
 
 /// The house fov→panini coupling: d = 0.3 at 60° FOV rising to 0.9 at
@@ -325,6 +354,7 @@ impl Renderer3d {
                 ShaderStage::Fragment,
             )
             .with_entrypoint(c"fs_main")
+            .with_uniform_buffers(1)
             .build()
             .map_err(|e| e.to_string())?;
 
@@ -465,7 +495,26 @@ impl Renderer3d {
             panini_squeeze: 1.0,
             fog_distance: 80.0,
             clear_color: (0.051, 0.059, 0.078),
+            sun_color: (0.65, 0.65, 0.65),
+            ambient_sky: (0.35, 0.35, 0.35),
+            ambient_ground: (0.35, 0.35, 0.35),
+            lights: Vec::new(),
         })
+    }
+
+    /// Queue a point light for the next [`frame`](Self::frame): world
+    /// `pos`, rgb `color` (its brightness — go past 1.0 for a flash),
+    /// and `radius`, the hard falloff edge in world units (quadratic-ish
+    /// inside). At most [`MAX_LIGHTS`] per frame; extras are dropped
+    /// silently, so push the important ones first (sort by distance to
+    /// the camera if you have more). Cleared every frame.
+    pub fn point_light(&mut self, pos: Vec3, color: (f32, f32, f32), radius: f32) {
+        if self.lights.len() < MAX_LIGHTS {
+            self.lights.push((
+                [pos.x, pos.y, pos.z, radius],
+                [color.0, color.1, color.2, 0.0],
+            ));
+        }
     }
 
     /// Allocate the screen-sized `present` image once. It is a color
@@ -723,7 +772,32 @@ impl Renderer3d {
         } else {
             None
         };
+        // The frame's lighting, converted to view space and pushed ONCE —
+        // fragment uniform state rides the command buffer across every
+        // draw. Point lights were queued in world space; drain them.
         let light_view = view.transform_dir(light_world.norm());
+        let up_view = view.transform_dir(Vec3::UP);
+        let mut lu = LightU {
+            sun_dir: [light_view.x, light_view.y, light_view.z, self.fog_distance],
+            sun_color: [self.sun_color.0, self.sun_color.1, self.sun_color.2, 0.0],
+            sky: [self.ambient_sky.0, self.ambient_sky.1, self.ambient_sky.2, 0.0],
+            ground: [
+                self.ambient_ground.0,
+                self.ambient_ground.1,
+                self.ambient_ground.2,
+                0.0,
+            ],
+            up: [up_view.x, up_view.y, up_view.z, 0.0],
+            fog_color: [r, g, b, 1.0],
+            lights: [[0.0; 4]; MAX_LIGHTS * 2],
+            counts: [self.lights.len() as f32, 0.0, 0.0, 0.0],
+        };
+        for (i, (p, c)) in self.lights.drain(..).enumerate() {
+            let pv = view.transform_point(vec3(p[0], p[1], p[2]));
+            lu.lights[i * 2] = [pv.x, pv.y, pv.z, p[3]];
+            lu.lights[i * 2 + 1] = c;
+        }
+        commands.push_fragment_uniform_data(0, &lu);
         Some(Frame3 {
             device: &self.device,
             pipe_cull: &self.pipe_cull,
@@ -732,8 +806,6 @@ impl Renderer3d {
             pass: Some(pass),
             view,
             proj,
-            light: [light_view.x, light_view.y, light_view.z, self.fog_distance],
-            fog_color: [r, g, b, 1.0],
             bound_cull: None,
             present: self.present.as_ref().unwrap(),
             warp,
@@ -756,8 +828,6 @@ pub struct Frame3<'a> {
     pass: Option<RenderPass>,
     view: Mat4,
     proj: [f32; 4],
-    light: [f32; 4],
-    fog_color: [f32; 4],
     bound_cull: Option<bool>,
     /// The screen-sized image everything resolves into before the blit.
     present: &'a Texture<'static>,
@@ -784,6 +854,25 @@ impl Frame3<'_> {
     /// (rgb; pass white for none). `cull = false` for open surfaces
     /// that must be visible from both sides.
     pub fn draw(&mut self, mesh: &Mesh3, model: Mat4, tint: (f32, f32, f32), cull: bool) {
+        self.draw_flagged(mesh, model, tint, cull, 0.0);
+    }
+
+    /// [`draw`](Self::draw), skipping lighting: the mesh shows its raw
+    /// vertex color × tint regardless of sun/ambient/points — tracers,
+    /// muzzle flashes, blob shadows (a *dark* emissive: constant dark no
+    /// matter what light falls on it). Fog still applies.
+    pub fn draw_emissive(&mut self, mesh: &Mesh3, model: Mat4, tint: (f32, f32, f32), cull: bool) {
+        self.draw_flagged(mesh, model, tint, cull, 1.0);
+    }
+
+    fn draw_flagged(
+        &mut self,
+        mesh: &Mesh3,
+        model: Mat4,
+        tint: (f32, f32, f32),
+        cull: bool,
+        emissive: f32,
+    ) {
         let (Some(commands), Some(pass)) = (&self.commands, &self.pass) else {
             return;
         };
@@ -799,9 +888,7 @@ impl Frame3<'_> {
         let u = Uniforms {
             mv: mv.0,
             proj: self.proj,
-            light: self.light,
-            tint: [tint.0, tint.1, tint.2, 1.0],
-            fog_color: self.fog_color,
+            tint: [tint.0, tint.1, tint.2, emissive],
         };
         commands.push_vertex_uniform_data(0, &u);
         pass.bind_vertex_buffers(

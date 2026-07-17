@@ -16,14 +16,17 @@
 //! bots); a dedicated server never lags itself. `interp=MS` A/B's the
 //! interpolation delay (default 50 — lower trades remote smoothness
 //! under loss for freshness; in split server/client runs pass the SAME
-//! value to both, it also sets the server's lag-comp rewind). Stress
-//! knob: PM_HOGS=300 sets the first-wave horde size.
+//! value to both, it also sets the server's lag-comp rewind). `day=SECS`
+//! sets the day-night cycle length (default 480; try day=60 to preview
+//! a full day fast). Stress knob: PM_HOGS=300 sets the first-wave horde
+//! size.
 
 mod bot_client;
 mod common;
 mod player_client;
 mod server;
 mod sfx;
+mod telemetry;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,6 +36,29 @@ fn main() {
             .find_map(|a| a.strip_prefix(key).and_then(|v| v.parse::<f32>().ok()))
     };
     let link = (kv("lag=").unwrap_or(0.0), kv("loss=").unwrap_or(0.0));
+    let flags = common::Flags {
+        link,
+        // Day-night cycle length, seconds (render-only; each client may
+        // differ — it's cosmetic time, not shared time). Live-tunable
+        // via telemetry after launch.
+        day: kv("day=").unwrap_or(480.0).max(10.0),
+        // Effective interp delay (for the telemetry report): the flag,
+        // else the env, else the shipped 50 ms default.
+        interp_ms: kv("interp=")
+            .or_else(|| {
+                std::env::var("PM_INTERP_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(50.0),
+        // Telemetry monitor address (pm-watch/pm-mon bind this; when
+        // the game runs on Windows and the monitor in WSL, pass the
+        // WSL IP: mon=172.x.x.x:42500).
+        mon: args
+            .iter()
+            .find_map(|a| a.strip_prefix("mon=").map(String::from))
+            .unwrap_or_else(|| telemetry::TELE_MON.to_string()),
+    };
     if let Some(ms) = kv("interp=") {
         // The interp delay is a shared const with a PM_INTERP_MS env
         // override read at startup (client render delay AND server
@@ -48,14 +74,14 @@ fn main() {
             let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
             bot_client::run_bot(n, link);
         }
-        Some("client") => player_client::run(link),
+        Some("client") => player_client::run(flags),
         None => {
             let server = std::thread::spawn(|| server::run(true));
             std::thread::sleep(std::time::Duration::from_millis(300));
             for n in 0..2 {
                 std::thread::spawn(move || bot_client::run_bot(n, link));
             }
-            player_client::run(link);
+            player_client::run(flags);
             drop(server); // window closed: process exit tears the rest down
         }
         Some(other) => {

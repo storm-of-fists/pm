@@ -5,5 +5,9 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
-pm = { path = "../../crates/pm" }
-pm_sdl = { path = "../../crates/pm_sdl" }
+pm-world = { path = "../../crates/pm-world" }
+pm-world-sdl = { path = "../../crates/pm-world-sdl" }
+# Telemetry node: signals/faults broadcast to pm-mon / pm-watch. Core
+# only (no_std) — the UDP port is 20 lines in telemetry.rs, so the
+# game doesn't inherit the host crate's TUI deps.
+pm-control-core = { path = "../../crates/pm-control-core" }

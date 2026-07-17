@@ -1,0 +1,7 @@
+[package]
+name = "pm-control-core"
+version.workspace = true
+edition.workspace = true
+
+# no_std + alloc — stays dependency-free.
+[dependencies]

@@ -8,4 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hellfire_core = { path = "../core" }
-pm = { path = "../../../crates/pm" }
+pm-world = { path = "../../../crates/pm-world" }

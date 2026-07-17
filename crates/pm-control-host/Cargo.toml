@@ -1,0 +1,9 @@
+[package]
+name = "pm-control-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pm-control-core = { path = "../pm-control-core" }
+crossterm = "0.28"
+regex-lite = "0.1"

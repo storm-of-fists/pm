@@ -8,7 +8,12 @@ mods are built in, not bolted on. The reference lives in the crate docs
 just points you at them.
 
 ```bash
-cargo doc -p pm --open    # the docs: API tour, design, netcode, 3D, mods
+cargo doc -p pm-world --open   # the docs: API tour, design, netcode, 3D, mods
 cargo test --workspace    # all tests, incl. doctests + QUIC loopback
 cargo run --release -p hellfire   # the flagship example (try -p demo / drive / solids)
 ```
+
+New here (or want the whole system explained start to finish)? Read
+[docs/journey.md](docs/journey.md) — the guided tour: pools → tasks →
+replication → prediction → lag comp → cosmetics → physics → rendering →
+audio → the lag lab, each chapter with a hands-on experiment.

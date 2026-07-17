@@ -15,7 +15,23 @@
       "Bash(rustup target *)",
       "Bash(x86_64-w64-mingw32-gcc --version)",
       "Bash(x86_64-w64-mingw32-objdump -p /home/clatham/pm/target/x86_64-pc-windows-gnu/release/hogs.exe)",
-      "Bash(cargo check *)"
+      "Bash(cargo check *)",
+      "Read(//home/clatham/pm-control/**)",
+      "Read(//home/clatham/pm-control/pm-control-core/**)",
+      "Read(//home/clatham/pm-control/pm-control-core/src/**)",
+      "Read(//home/clatham/pm-control/pm-control-host/src/bin/**)",
+      "Read(//home/clatham/pm-control/pm-control-host/src/**)",
+      "Bash(awk -F: '{s+=$2} END {print \"pm:: references in examples+pm_sdl: \" s}')",
+      "Bash(cp -r ~/pm-control/pm-control-core /home/clatham/pm/crates/pm-control-core)",
+      "Bash(cp -r ~/pm-control/pm-control-host /home/clatham/pm/crates/pm-control-host)",
+      "Bash(find /home/clatham/pm-control -type f -name \"*.rs\" | head -100; echo \"---TREE---\"; ls -R /home/clatham/pm-control 2>/dev/null | head -80)",
+      "Bash(grep -rn \"static \\\\|thread_local\\\\|OnceLock\\\\|unsafe impl\\\\|Sync for\\\\|lazy_static\\\\|AtomicU\" /home/clatham/pm-control/pm-control-core/src /home/clatham/pm-control/pm-control-host/src)",
+      "Bash(cargo run *)",
+      "Bash(echo \"=== loopback exit: $?\")",
+      "Bash(timeout 3 cargo run --release -p pm-control-host --bin pm-watch -- --bind 127.0.0.1:42599 127.0.0.1:42598)",
+      "Bash(echo \"exit=$? \\(124 = ran until timeout, good\\)\")",
+      "Bash(timeout 3 ./target/release/pm-watch --bind 127.0.0.1:42599 127.0.0.1:42598)",
+      "Bash(echo \"exit=$?\")"
     ],
     "defaultMode": "bypassPermissions"
   }

@@ -1,7 +1,13 @@
 [package]
-name = "pm"
+name = "pm-world"
 version = "0.1.0"
 edition = "2024"
+
+# The PACKAGE is pm-world (cargo -p pm-world); the LIB stays `pm`, so
+# code keeps `use pm::` and `#[pm::pod]` — and pm_derive's emitted
+# `::pm::` paths keep resolving. Same pattern in -derive and -sdl.
+[lib]
+name = "pm"
 
 # Deliberately ZERO cargo features: a mod dylib must link the exact same
 # compiled pm as its host (TypeId equality), and features change crate
@@ -9,7 +15,7 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
-pm_derive = { path = "../pm_derive" }
+pm-world-derive = { path = "../pm-world-derive" }
 libloading = "0.9"
 bytes = "1"
 quinn-proto = "0.11"

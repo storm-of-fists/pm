@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 #   hellfire_core = "0.1"
 # The pinned rust-toolchain.toml (workspace root) is what makes an
 # out-of-tree build resolve the same compiler the host used.
-pm = { path = "../../../crates/pm" }
+pm-world = { path = "../../../crates/pm-world" }
 hellfire_core = { path = "../core" }
 
 # Match the host's profile, or the ABI gate refuses the load: a mod built

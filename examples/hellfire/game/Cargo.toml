@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 bytemuck = "1"
 hellfire_core = { path = "../core" }
-pm = { path = "../../../crates/pm" }
-pm_sdl = { path = "../../../crates/pm_sdl" }
+pm-world = { path = "../../../crates/pm-world" }
+pm-world-sdl = { path = "../../../crates/pm-world-sdl" }

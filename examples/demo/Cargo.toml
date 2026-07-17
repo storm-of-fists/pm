@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 bytemuck = "1"
-pm = { path = "../../crates/pm" }
+pm-world = { path = "../../crates/pm-world" }

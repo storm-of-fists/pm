@@ -45,6 +45,34 @@ pub fn wave_base() -> u32 {
 /// Extra hogs per wave past the first.
 pub const WAVE_GROW: u32 = 15;
 
+/// Parsed CLI flags every client run cares about (see main.rs header
+/// for the grammar). One struct so signatures stop growing a parameter
+/// per knob.
+#[derive(Clone)]
+pub struct Flags {
+    /// (one-way lag ms, loss fraction) — the simulated link.
+    pub link: (f32, f32),
+    /// Day-night cycle length, seconds.
+    pub day: f32,
+    /// Interp delay in force, ms (report-only; frozen at creation).
+    pub interp_ms: f32,
+    /// Telemetry monitor address (`mon=IP:PORT`).
+    pub mon: String,
+}
+
+/// Live-tunable client knobs, bridged from the telemetry node's signals
+/// into a pm single (`"hogs.tune"`) that game tasks read each frame.
+#[derive(Clone, Copy)]
+pub struct Tune {
+    pub day_secs: f32,
+}
+
+impl Default for Tune {
+    fn default() -> Self {
+        Tune { day_secs: 480.0 }
+    }
+}
+
 // --- replicated pods -----------------------------------------------------
 
 /// Replicated truck state — the PREDICTED substate only, same discipline

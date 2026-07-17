@@ -1,9 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/pm",
-    "crates/pm_derive",
-    "crates/pm_sdl",
+    "crates/pm-world",
+    "crates/pm-world-derive",
+    "crates/pm-world-sdl",
+    "crates/pm-control-core",
+    "crates/pm-control-host",
     "examples/demo",
     "examples/drive",
     "examples/hellfire/game",
@@ -13,6 +15,11 @@ members = [
     "examples/hogs",
     "examples/solids",
 ]
+
+# pm-control crates inherit these (version.workspace = true).
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
 
 # Optimized but debuggable (the old C++ RelWithDebInfo default).
 [profile.release]

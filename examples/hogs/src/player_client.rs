@@ -116,15 +116,26 @@ fn hud_bold(frame: &mut Frame3, s: &str, x: f32, y: f32, px: f32, col: (u8, u8, 
     }
 }
 
-pub fn run(link: (f32, f32)) {
+pub fn run(flags: Flags) {
     let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
-    if link != (0.0, 0.0) {
-        pm.link_lag(link.0, link.1);
-        eprintln!("[hogs] simulated link: {} ms one-way, {:.1}% loss", link.0, link.1 * 100.0);
+    if flags.link != (0.0, 0.0) {
+        pm.link_lag(flags.link.0, flags.link.1);
+        eprintln!(
+            "[hogs] simulated link: {} ms one-way, {:.1}% loss",
+            flags.link.0,
+            flags.link.1 * 100.0
+        );
     }
     let w = client_setup(&mut pm);
     eprintln!("connecting to {ADDR} ...");
     let net = pm.net();
+    // Live-tunable knobs (day length today) — seeded from flags here,
+    // written by the telemetry node when a monitor turns the dial.
+    let tune = pm.single::<Tune>("hogs.tune");
+    tune.get_mut().day_secs = flags.day;
+    // The telemetry node: watch (and tune) this session from pm-watch
+    // or pm-mon. See telemetry.rs.
+    crate::telemetry::install(&mut pm, &w, &flags);
     // The cosmetic gun's client-LOCAL pool (never synced): your own
     // shot's tracer + bang at the CLICK; see the input task below.
     let tracer_local = pm.pool::<Tracer>("tracer.local");
@@ -239,6 +250,26 @@ pub fn run(link: (f32, f32)) {
             (1.0, 1.0, 1.0),
         ))
         .expect("marker");
+    // Blob shadow: a unit disc, drawn EMISSIVE dark so no light can wash
+    // it out — on a flat arena this is 80% of what real shadows buy:
+    // things stop floating. Scaled per entity; the heli's shrinks with
+    // altitude.
+    let shadow = {
+        let n = 14;
+        let tris: Vec<[Vec3; 3]> = (0..n)
+            .map(|i| {
+                let t = std::f32::consts::TAU;
+                let a = i as f32 / n as f32 * t;
+                let b = (i + 1) as f32 / n as f32 * t;
+                [
+                    vec3(0.0, 0.0, 0.0),
+                    vec3(a.cos(), 0.0, a.sin()),
+                    vec3(b.cos(), 0.0, b.sin()),
+                ]
+            })
+            .collect();
+        r3d.upload_mesh(&bake(&tris, (1.0, 1.0, 1.0))).expect("shadow")
+    };
 
     // Turret angle is CLIENT state: holding RMB accumulates mouse-x into
     // it, releasing eases it back to dead ahead. The server only ever
@@ -452,10 +483,18 @@ pub fn run(link: (f32, f32)) {
         let view = cam_view.clone();
         let net = net.clone();
         let tracer = tracer_local.clone();
+        let tune = tune.clone();
         // Death-edge tracking for ragdolls: last tick's raw replicas, so
         // a removal still has the state to launch a corpse from.
         let mut prev_hogs: std::collections::HashMap<pm::Id, Hog> = Default::default();
         let mut corpses: Vec<Corpse> = Vec::new();
+        // Muzzle flashes / explosions as short-lived point lights:
+        // births on the local tracer pool (our click, 0 ms), remote
+        // bullets, and boom impacts. (pos, seconds left, radius, color).
+        let mut flash_tracer = pm::Births::default();
+        let mut flash_bullet = pm::Births::default();
+        let mut flash_boom = pm::Births::default();
+        let mut flashes: Vec<(Vec3, f32, f32, (f32, f32, f32))> = Vec::new();
         move |pm| {
             // Spawn corpses off this frame's removals, then step them on
             // the render clock (client-local physics — cosmetic only).
@@ -486,7 +525,108 @@ pub fn run(link: (f32, f32)) {
             };
             r3d.fov_deg = fov;
             r3d.panini = if panini_on { panini_for_fov(fov) } else { 0.0 };
-            if let Some(mut frame) = r3d.frame(&window, view_mat, vec3(0.45, 1.0, 0.35)) {
+
+            // --- time of day: the sun is a pure function of the tick —
+            // zero wire cost, and every session opens at dawn. One full
+            // cycle every `day=` seconds (480 default; live-tunable via
+            // the telemetry day_secs knob), biased sine keeps night
+            // short.
+            let tau = std::f32::consts::TAU;
+            let day_secs = tune.get().day_secs.max(10.0);
+            let ang = (pm.tick() as f32 * FIXED_DT / day_secs).fract() * tau;
+            let elev = ang.sin() * 0.9 + 0.35; // -0.55 deep night .. 1.25 noon
+            let lift = elev.clamp(0.0, 1.0);
+            let up_ramp = (elev / 0.12).clamp(0.0, 1.0); // dawn/dusk ramp
+            let warm = (1.0 - lift) * (1.0 - lift); // horizon redness while up
+            let sun_str = 0.75 * up_ramp;
+            r3d.sun_color = (
+                sun_str * (0.95 + 0.05 * lift),
+                sun_str * (0.62 + 0.33 * lift),
+                sun_str * (0.42 + 0.53 * lift),
+            );
+            // Hemisphere ambient: blue-grey day; a moonlit floor at
+            // night so the horde stays readable (playability > realism).
+            let l = |night: f32, day: f32| night + (day - night) * up_ramp;
+            r3d.ambient_sky = (l(0.10, 0.34), l(0.12, 0.38), l(0.20, 0.46));
+            r3d.ambient_ground = (l(0.055, 0.30), l(0.06, 0.27), l(0.10, 0.24));
+            // The horizon (clear + fog color) follows: day blue, dusk
+            // ember, night near-black.
+            r3d.clear_color = (
+                l(0.015, 0.30 + 0.25 * warm),
+                l(0.02, 0.38 - 0.08 * warm),
+                l(0.05, 0.50 - 0.20 * warm),
+            );
+            let az = ang * 0.6 + 0.8; // lazy azimuth drift — aesthetics only
+            let sun_dir = vec3(az.cos(), (elev + 0.1).max(0.06), az.sin());
+
+            // --- point lights. Flashes first (they're the drama and
+            // they're brief), then headlights nearest-first — the engine
+            // keeps the first MAX_LIGHTS pushes and drops the rest.
+            let me = net.peer() as f32;
+            for id in flash_tracer.drain(&tracer.get()) {
+                if let Some(tr) = tracer.get_id(id) {
+                    flashes.push((vec3(tr.x, tr.y, tr.z), 0.07, 11.0, (1.3, 1.0, 0.55)));
+                }
+            }
+            for id in flash_bullet.drain(&w.bullet.get()) {
+                if let Some(b) = w.bullet.get_id(id)
+                    && b.owner != me
+                {
+                    flashes.push((vec3(b.x, b.y, b.z), 0.07, 11.0, (1.3, 1.0, 0.55)));
+                }
+            }
+            for id in flash_boom.drain(&w.impact.get()) {
+                if let Some(c) = w.impact.get_id(id)
+                    && c.kind == IMPACT_BOOM
+                {
+                    flashes.push((vec3(c.x, 1.2, c.z), 0.22, 26.0, (1.6, 0.7, 0.25)));
+                }
+            }
+            {
+                let dt = pm.loop_dt();
+                flashes.retain_mut(|f| {
+                    f.1 -= dt;
+                    f.1 > 0.0
+                });
+            }
+            for &(p, _, radius, color) in &flashes {
+                r3d.point_light(p, color, radius);
+            }
+            // Headlights: a warm pool ahead of every truck's bumper, a
+            // work light on every heli nose. Invisible by day (the sun
+            // swamps them), free drama at dusk. Nearest trucks first so
+            // they win what's left of the light budget.
+            let (ex, ez) = w
+                .pred
+                .get()
+                .state()
+                .map(|t| (t.body.pos.x, t.body.pos.z))
+                .or_else(|| {
+                    w.pred_heli
+                        .get()
+                        .state()
+                        .map(|h| (h.body.pos.x, h.body.pos.z))
+                })
+                .unwrap_or((0.0, 0.0));
+            let mut lamps: Vec<(f32, Vec3)> = Vec::new();
+            for (_, t) in w.truck_draw.get().iter() {
+                let f = t.body.fwd();
+                let p = t.body.pos + f * 4.2;
+                let d2 = (p.x - ex) * (p.x - ex) + (p.z - ez) * (p.z - ez);
+                lamps.push((d2, vec3(p.x, 0.5, p.z)));
+            }
+            for (_, hl) in w.heli_draw.get().iter() {
+                let f = hl.body.fwd();
+                let p = hl.body.pos + f * 2.5;
+                let d2 = (p.x - ex) * (p.x - ex) + (p.z - ez) * (p.z - ez);
+                lamps.push((d2, vec3(p.x, (p.y - 0.4).max(0.4), p.z)));
+            }
+            lamps.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, p) in lamps {
+                r3d.point_light(p, (0.75, 0.70, 0.55), 15.0);
+            }
+
+            if let Some(mut frame) = r3d.frame(&window, view_mat, sun_dir) {
                 let white = (1.0, 1.0, 1.0);
                 frame.draw(&ground, Mat4::IDENTITY, white, true);
                 // Walls and buildings: the unit cube, stretched. Walls
@@ -522,6 +662,12 @@ pub fn run(link: (f32, f32)) {
                     // ownership table — id.peer() is recycling, not control.
                     let tint = peer_color(net.owner_of(id).unwrap_or(0));
                     let model = t.body.model();
+                    frame.draw_emissive(
+                        &shadow,
+                        Mat4::translate(vec3(t.body.pos.x, 0.02, t.body.pos.z)) * Mat4::scale(1.7),
+                        (0.035, 0.04, 0.035),
+                        false,
+                    );
                     frame.draw(&body, model, tint, true);
                     frame.draw(
                         &cabin,
@@ -568,6 +714,16 @@ pub fn run(link: (f32, f32)) {
                 for (id, hl) in w.heli_draw.get().iter() {
                     let tint = peer_color(net.owner_of(id).unwrap_or(0));
                     let model = hl.body.model();
+                    // Shadow shrinks and stays put as the heli climbs —
+                    // the cheap read on "how high am I".
+                    let s = 1.9 * (1.0 - hl.body.pos.y / (HELI_CEIL * 1.7)).max(0.2);
+                    frame.draw_emissive(
+                        &shadow,
+                        Mat4::translate(vec3(hl.body.pos.x, 0.03, hl.body.pos.z))
+                            * Mat4::scale(s),
+                        (0.035, 0.04, 0.035),
+                        false,
+                    );
                     frame.draw(&heli_body, model, tint, true);
                     frame.draw(
                         &heli_tail,
@@ -607,7 +763,7 @@ pub fn run(link: (f32, f32)) {
                     if bl.owner == me {
                         continue;
                     }
-                    frame.draw(
+                    frame.draw_emissive(
                         &tracer_mesh,
                         Mat4::translate(vec3(bl.x, bl.y, bl.z))
                             * Mat4::rot_y(bl.heading)
@@ -618,7 +774,7 @@ pub fn run(link: (f32, f32)) {
                 }
                 // Our own shots: the client-local cosmetic tracers.
                 for (_, tr) in tracer.get().iter() {
-                    frame.draw(
+                    frame.draw_emissive(
                         &tracer_mesh,
                         Mat4::translate(vec3(tr.x, tr.y, tr.z))
                             * Mat4::rot_y(tr.heading)
@@ -648,6 +804,12 @@ pub fn run(link: (f32, f32)) {
                     let hp = (h.hp / HOG_HP).clamp(0.0, 1.0);
                     let tint = (0.45 + 0.4 * (1.0 - hp), 0.42 * hp + 0.10, 0.28 * hp + 0.06);
                     let model = hog_model(h);
+                    frame.draw_emissive(
+                        &shadow,
+                        Mat4::translate(vec3(h.x, 0.02, h.z)) * Mat4::scale(0.95),
+                        (0.035, 0.04, 0.035),
+                        false,
+                    );
                     frame.draw(&hog_body, model, tint, true);
                     frame.draw(
                         &hog_snout,
@@ -668,7 +830,8 @@ pub fn run(link: (f32, f32)) {
                     } else {
                         (1.4, (1.0, 0.55, 0.10))
                     };
-                    frame.draw(
+                    // Emissive: a flash is light, not a lit thing.
+                    frame.draw_emissive(
                         &marker,
                         Mat4::translate(vec3(c.x, 0.0, c.z)) * Mat4::scale(scale),
                         col,

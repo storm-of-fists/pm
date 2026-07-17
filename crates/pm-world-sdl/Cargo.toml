@@ -1,10 +1,13 @@
 [package]
-name = "pm_sdl"
+name = "pm-world-sdl"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "pm_sdl"
+
 [dependencies]
-pm = { path = "../pm" }
+pm-world = { path = "../pm-world" }
 sdl3 = { version = "0.18", features = ["build-from-source", "static-link", "unsafe_textures"] }
 png = "0.18"
 fontdue = "0.9"

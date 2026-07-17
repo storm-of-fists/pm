@@ -1,9 +1,10 @@
 [package]
-name = "pm_derive"
+name = "pm-world-derive"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
+name = "pm_derive"
 proc-macro = true
 
 [dependencies]
