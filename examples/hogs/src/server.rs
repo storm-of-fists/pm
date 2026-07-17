@@ -61,6 +61,19 @@ struct Shot {
     view: u32,
     /// Hit-circle padding for this shot (`HIT_PAD_*` by shooter platform).
     pad: f32,
+    /// Category bits this shot tests (the query carries its filter —
+    /// docs/collisions.md §2): player rounds sweep vehicles AND hogs;
+    /// gunner-hog rounds sweep vehicles only (no hog-on-hog carnage).
+    mask: u8,
+}
+
+/// A vehicle's registered part ids, in registration order — `ids[0]`
+/// is the body part (bites test it by convention). Fixed capacity;
+/// filler slots repeat the owner id and sit past `n`.
+#[derive(Clone, Copy)]
+struct Parts {
+    ids: [Id; 4],
+    n: u8,
 }
 
 /// The janitor (docs/collisions.md §3): one walk over the collider pool
@@ -79,30 +92,29 @@ fn cull_colliders(pm: &mut Pm, collider: &pm::PoolHandle<Collider>) {
     }
 }
 
-/// Register a vehicle's single body part (docs/collisions.md stage 1):
-/// a child entity in the collider pool plus the parent→child link in
-/// `parts` (vehicle id → part id — keyed by the VEHICLE, so entity
+/// Register a vehicle's parts (docs/collisions.md stages 1+4): child
+/// entities in the collider pool plus the parent→child link in
+/// `parts` (vehicle id → part ids — keyed by the VEHICLE, so entity
 /// removal cleans the link and the janitor above reaps the orphaned
-/// part). The hull is re-posed by the drive task every tick; spawn just
-/// needs it sane.
-fn part_add(
+/// parts). Hulls are re-posed by the drive task every tick; spawn
+/// just needs them sane. A truck is one BODY entry; the heli is
+/// three (stage 4 was data entry, as promised).
+fn parts_add(
     pm: &mut Pm,
     collider: &pm::PoolHandle<Collider>,
-    parts: &pm::PoolHandle<Id>,
+    parts: &pm::PoolHandle<Parts>,
     owner: Id,
-    hull: Hull,
+    cat: u8,
+    hulls: &[(u8, Hull)],
 ) {
-    let pid = pm.id_add();
-    collider.get_mut().add(
-        pid,
-        Collider {
-            owner,
-            part: PART_BODY,
-            cat: CAT_VEHICLE,
-            hull,
-        },
-    );
-    parts.get_mut().add(owner, pid);
+    let mut p = Parts { ids: [owner; 4], n: 0 };
+    for &(part, hull) in hulls {
+        let pid = pm.id_add();
+        collider.get_mut().add(pid, Collider { owner, part, cat, hull });
+        p.ids[p.n as usize] = pid;
+        p.n += 1;
+    }
+    parts.get_mut().add(owner, p);
 }
 
 /// A roam destination: anywhere in the arena that isn't inside a
@@ -140,12 +152,17 @@ pub fn run(quiet: bool) {
     // The collider pool (docs/collisions.md): one entry per PART, keyed
     // by the part's own id, posed by its owner every tick, swept by the
     // bullets task. `parts` is the parent→child link (vehicle id → its
-    // single part id, for now) so the step task can find its entries.
-    // Contacts are the sweep's OUTPUT — facts on fresh ids, written at
-    // prio 31, drained by the response tasks at 32 the same tick.
+    // part ids: one for a truck, three for a heli) so the step task can
+    // find its entries. Contacts are each tick's OUTPUT — facts on
+    // fresh ids, written at prios 28 (bites) and 31 (the sweep),
+    // drained by the response tasks at 32 the same tick.
     let collider = pm.pool::<Collider>("collider");
     let contact = pm.pool::<Contact>("contact");
-    let parts = pm.pool::<Id>("vehicle.part");
+    let parts = pm.pool::<Parts>("vehicle.part");
+    // Sparse gunner pool: membership IS the "armed" flag (the pm idiom
+    // for "some hogs have guns"), value = refire cooldown. Keyed by the
+    // hog id, so death disarms with everything else.
+    let gunner = pm.pool::<f32>("hog.gunner");
     // A second of COLLIDER history — the rewind memory every shot is
     // judged in (docs/collisions.md §4): hogs and vehicles in one
     // uniform ring, favor-the-shooter, decided 2026-07-17.
@@ -167,7 +184,7 @@ pub fn run(quiet: bool) {
             truck.get_mut().add(id, t);
             health.get_mut().add(id, Health { hp: TRUCK_HP });
             gun.get_mut().add(id, 0.0);
-            part_add(pm, &collider, &parts, id, truck_hull(&t));
+            parts_add(pm, &collider, &parts, id, CAT_VEHICLE, &[(PART_BODY, truck_hull(&t))]);
             net.own_set(p, id);
             if !quiet {
                 eprintln!("[server] peer {p} joined");
@@ -204,11 +221,11 @@ pub fn run(quiet: bool) {
             if ev.vehicle == VEH_HELI {
                 let h = spawn_heli(peer);
                 heli.get_mut().add(id, h);
-                part_add(pm, &collider, &parts, id, heli_hull(&h));
+                parts_add(pm, &collider, &parts, id, CAT_VEHICLE, &heli_hulls(&h));
             } else {
                 let t = spawn_truck(peer);
                 truck.get_mut().add(id, t);
-                part_add(pm, &collider, &parts, id, truck_hull(&t));
+                parts_add(pm, &collider, &parts, id, CAT_VEHICLE, &[(PART_BODY, truck_hull(&t))]);
             }
             health.get_mut().add(id, Health { hp: TRUCK_HP });
             gun.get_mut().add(id, 0.0);
@@ -340,7 +357,7 @@ pub fn run(quiet: bool) {
                     .then_some(nearest)
                     .flatten()
                     .and_then(|(tid, _, _)| {
-                        let pid = parts.get_id(tid).map(|p| *p)?;
+                        let pid = parts.get_id(tid).map(|p| p.ids[0])?;
                         let c = cols.get(pid)?;
                         hull_hits_circle(&c.hull, h.x, h.z, HOG_R, 0.0, HOG_LEAP)
                             .then(|| (tid, c.part, c.hull.y.0.max(0.0)))
@@ -381,6 +398,75 @@ pub fn run(quiet: bool) {
         }
     );
 
+    // Gunner hogs (prio 29, after the brains have moved): each armed
+    // hog fires a REAL bullet — same pool as the players', so tracers,
+    // bangs, building hits, and the collider sweep all come free — at
+    // the nearest vehicle inside its 3D envelope. Bad shots by design
+    // (no lead, angular spread); the danger is volume: on the deck a
+    // heli is inside a dozen envelopes at once, at altitude it's
+    // inside none. Their rounds sweep vehicles only (`Shot::mask`) and
+    // ride PRESENT-time frames — `view` starts at the current tick, so
+    // the per-tick advance tracks the newest frame; a server-side
+    // shooter has no lag to compensate.
+    task!(pm, "hog_guns", 29.0, [hog, gunner, truck, heli, bullet, shot], move |pm| {
+        let targets: Vec<(f32, f32, f32)> = truck
+            .get()
+            .iter()
+            .map(|(_, t)| (t.body.pos.x, TRUCK_AIM_Y, t.body.pos.z))
+            .chain(heli.get().iter().map(|(_, hl)| {
+                let p = hl.body.pos;
+                (p.x, p.y, p.z)
+            }))
+            .collect();
+        let mut rng = Rng::new(pm.tick().wrapping_mul(0xC0FF_EE01) | 1);
+        let hogs = hog.get();
+        let mut guns = gunner.get_mut();
+        for (id, mut cd) in guns.iter_mut() {
+            *cd = (*cd - FIXED_DT).max(0.0);
+            if *cd > 0.0 {
+                continue;
+            }
+            let Some(h) = hogs.get(id) else { continue };
+            let (mx, my, mz) = (h.x, HOGGUN_Y, h.z);
+            let near = targets
+                .iter()
+                .map(|&(tx, ty, tz)| {
+                    let (dx, dy, dz) = (tx - mx, ty - my, tz - mz);
+                    ((tx, ty, tz), (dx * dx + dy * dy + dz * dz).sqrt())
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            let Some(((tx, ty, tz), dist)) = near else {
+                continue;
+            };
+            if dist > HOGGUN_RANGE {
+                continue;
+            }
+            let (heading, pitch) = hog_aim(mx, my, mz, tx, ty, tz);
+            let bid = pm.id_add();
+            bullet.get_mut().add(
+                bid,
+                Bullet {
+                    x: mx,
+                    y: my,
+                    z: mz,
+                    heading: wrap_angle(heading + rng.rfr(-HOGGUN_SPREAD, HOGGUN_SPREAD)),
+                    pitch: wrap_angle(pitch + rng.rfr(-HOGGUN_SPREAD, HOGGUN_SPREAD)),
+                    owner: 0.0, // peer 0 = the server's own trigger finger
+                },
+            );
+            shot.get_mut().add(
+                bid,
+                Shot {
+                    left: HOGGUN_TRAVEL,
+                    view: pm.tick(),
+                    pad: 0.0,
+                    mask: CAT_VEHICLE,
+                },
+            );
+            *cd = HOGGUN_CD * rng.rfr(0.75, 1.35);
+        }
+    });
+
     // Trucks + guns (prio 30): command-frame input, THE shared step, the
     // death check, and the turret. Firing just spawns a bullet at the
     // muzzle — the flight and the (lag-compensated) hit test live in the
@@ -393,12 +479,19 @@ pub fn run(quiet: bool) {
         move |pm| {
             // Owners keep their parts current (docs/collisions.md §2):
             // every exit from the step below re-poses the vehicle's
-            // collider hull, so the sweep at 31 never looks up a pose.
-            let pose = |id: Id, hull: Hull| {
-                if let Some(pid) = parts.get_id(id).map(|p| *p)
-                    && let Some(mut c) = collider.get_id_mut(pid)
-                {
-                    c.hull = hull;
+            // collider hulls, so the sweep at 31 never looks up a pose.
+            // Each registered part finds its hull by tag — stage 4's
+            // multi-part heli and the one-part truck share the loop.
+            let pose = |id: Id, hulls: &[(u8, Hull)]| {
+                let Some(p) = parts.get_id(id).map(|p| *p) else {
+                    return;
+                };
+                for pid in &p.ids[..p.n as usize] {
+                    if let Some(mut c) = collider.get_id_mut(*pid)
+                        && let Some(&(_, hull)) = hulls.iter().find(|&&(tag, _)| tag == c.part)
+                    {
+                        c.hull = hull;
+                    }
                 }
             };
             for (peer, id) in net.owned() {
@@ -423,7 +516,7 @@ pub fn run(quiet: bool) {
                         if let Some(mut t) = truck.get_id_mut(id) {
                             *t = fresh;
                         }
-                        pose(id, truck_hull(&fresh));
+                        pose(id, &[(PART_BODY, truck_hull(&fresh))]);
                         if let Some(mut v) = health.get_id_mut(id) {
                             v.hp = TRUCK_HP;
                         }
@@ -437,7 +530,7 @@ pub fn run(quiet: bool) {
                         }
                         continue;
                     }
-                    pose(id, truck_hull(&shooter));
+                    pose(id, &[(PART_BODY, truck_hull(&shooter))]);
                     (truck_muzzle(&shooter), HIT_PAD_TRUCK)
                 } else if let Some(shooter) = heli.get_id_mut(id).map(|mut hl| {
                     heli_step(&mut hl, cmd, FIXED_DT);
@@ -449,7 +542,7 @@ pub fn run(quiet: bool) {
                         if let Some(mut hl) = heli.get_id_mut(id) {
                             *hl = fresh;
                         }
-                        pose(id, heli_hull(&fresh));
+                        pose(id, &heli_hulls(&fresh));
                         if let Some(mut v) = health.get_id_mut(id) {
                             v.hp = TRUCK_HP;
                         }
@@ -473,7 +566,7 @@ pub fn run(quiet: bool) {
                         }
                         continue;
                     }
-                    pose(id, heli_hull(&shooter));
+                    pose(id, &heli_hulls(&shooter));
                     (heli_muzzle(&shooter), HIT_PAD_HELI)
                 } else {
                     continue;
@@ -509,6 +602,7 @@ pub fn run(quiet: bool) {
                     bid,
                     Shot {
                         left: GUN_RANGE,
+                        mask: CAT_VEHICLE | CAT_HOG,
                         // The shooter's view when the trigger pulled —
                         // this bullet's whole flight is judged along the
                         // timeline that starts here (see Shot). The
@@ -590,12 +684,20 @@ pub fn run(quiet: bool) {
                 // wins, so a hog can shield a truck and vice versa.
                 let skip = net.own(b.owner as u8);
                 let hit = hist.frame(view).and_then(|f| {
-                    let ff = sweep_colliders(
-                        b.x, b.z, b.y, b.heading, hstep, dy, 0.0, CAT_VEHICLE, skip, &f,
-                    );
-                    let hg = sweep_colliders(
-                        b.x, b.z, b.y, b.heading, hstep, dy, s.pad, CAT_HOG, None, &f,
-                    );
+                    let ff = (s.mask & CAT_VEHICLE != 0)
+                        .then(|| {
+                            sweep_colliders(
+                                b.x, b.z, b.y, b.heading, hstep, dy, 0.0, CAT_VEHICLE, skip, &f,
+                            )
+                        })
+                        .flatten();
+                    let hg = (s.mask & CAT_HOG != 0)
+                        .then(|| {
+                            sweep_colliders(
+                                b.x, b.z, b.y, b.heading, hstep, dy, s.pad, CAT_HOG, None, &f,
+                            )
+                        })
+                        .flatten();
                     [ff, hg]
                         .into_iter()
                         .flatten()
@@ -676,10 +778,17 @@ pub fn run(quiet: bool) {
             pm.id_remove(cid); // fact consumed
             match c.kind {
                 KIND_BULLET => {
+                    // Gunner-hog rounds (source_peer 0) chip lighter
+                    // than a teammate's cannon; only player fire earns
+                    // the FF log.
+                    let dmg = if c.source_peer == 0 { HOGGUN_DMG } else { FRIENDLY_DMG };
                     if let Some(mut v) = health.get_id_mut(c.owner) {
-                        v.hp -= FRIENDLY_DMG;
+                        v.hp -= dmg;
                     }
-                    if !quiet && let Some(victim) = net.owner_of(c.owner) {
+                    if !quiet
+                        && c.source_peer != 0
+                        && let Some(victim) = net.owner_of(c.owner)
+                    {
                         eprintln!(
                             "[server] friendly fire: peer {} hit peer {victim} (part {} at y {:.1})",
                             c.source_peer, c.part, c.y
@@ -725,10 +834,33 @@ pub fn run(quiet: bool) {
             pm.id_remove(cid);
             match c.kind {
                 KIND_BULLET => {
+                    // Stage 4 pays off: the part tag picks the story.
+                    // Rotor strikes double the damage; boom hits
+                    // glance (half) but kick the nose around.
+                    let base = if c.source_peer == 0 { HOGGUN_DMG } else { FRIENDLY_DMG };
+                    let dmg = match c.part {
+                        PART_ROTOR => base * 2.0,
+                        PART_TAIL => base * 0.5,
+                        _ => base,
+                    };
                     if let Some(mut v) = health.get_id_mut(c.owner) {
-                        v.hp -= FRIENDLY_DMG;
+                        v.hp -= dmg;
                     }
-                    if !quiet && let Some(victim) = net.owner_of(c.owner) {
+                    // Tail kick: torque scales with obliquity (a shot
+                    // down the boom's axis barely turns it). A
+                    // server-side write to a predicted pod — the owner
+                    // reconciles, the same seam as the bite scrub.
+                    if c.part == PART_TAIL && let Some(mut hl) = heli.get_id_mut(c.owner) {
+                        let b = &mut hl.body;
+                        let (yaw, pitch, roll) = b.rot.to_yaw_pitch_roll();
+                        let kick = HELI_TAIL_KICK * (yaw - c.heading).sin();
+                        b.rot = pm::Quat::from_yaw_pitch_roll(wrap_angle(yaw + kick), pitch, roll)
+                            .norm();
+                    }
+                    if !quiet
+                        && c.source_peer != 0
+                        && let Some(victim) = net.owner_of(c.owner)
+                    {
                         eprintln!(
                             "[server] friendly fire: peer {} hit peer {victim} (part {} at y {:.1})",
                             c.source_peer, c.part, c.y
@@ -809,11 +941,12 @@ pub fn run(quiet: bool) {
 
     // Waves (prio 33): when the horde is dead, spawn a bigger one along
     // the far walls. Also keeps the scoreboard's live counters fresh.
-    task!(pm, "wave", 33.0, [hog, brain, hunt], move |pm| {
+    task!(pm, "wave", 33.0, [hog, brain, gunner, hunt], move |pm| {
         if hog.get().is_empty() {
             let wave = hunt.get().wave + 1;
             let count = wave_base() + (wave - 1) * WAVE_GROW;
             let mut rng = Rng::new(pm.tick().wrapping_mul(0x9E37_79B9) | 1);
+            let mut armed = 0u32;
             for _ in 0..count {
                 // North, east, or west wall — never the truck spawns.
                 let along = rng.rfr(-ARENA + 3.0, ARENA - 3.0);
@@ -842,10 +975,18 @@ pub fn run(quiet: bool) {
                         ..HogBrain::default()
                     },
                 );
+                // A fraction of the wave spawns armed (the biomod
+                // program escalates): a gunner entry with a randomized
+                // first cooldown so a fresh wave never opens with a
+                // synchronized volley.
+                if rng.rfr(0.0, 1.0) < GUNNER_FRAC {
+                    gunner.get_mut().add(id, rng.rfr(0.0, HOGGUN_CD));
+                    armed += 1;
+                }
             }
             hunt.get_mut().wave = wave;
             if !quiet {
-                eprintln!("[server] wave {wave}: {count} hogs");
+                eprintln!("[server] wave {wave}: {count} hogs ({armed} armed)");
             }
         }
         // Write-gated single: reading `alive` through the guard is

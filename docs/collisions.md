@@ -1,10 +1,12 @@
 # Collisions: from hit tests to a collider pool
 
-Status: **built through stage 3** (2026-07-17, the same day the
+Status: **built, all four stages** (2026-07-17, the same day the
 survey folded in): collider + contact pools carry friendly fire, hog
-hits, and bites; the probe registries, `ray_hit_hog`, and the brain's
-shape-by-name code are gone. §11 records the as-built deltas; stage 4
-(multi-part content) stays open — data entry now, not engineering.
+hits, bites, and the heli's cabin/tail/rotor parts; the probe
+registries, `ray_hit_hog`, and the brain's shape-by-name code are
+gone. Stage 4 proved itself as data entry, and the first NPC shooter
+(gunner hogs) rode the same seam in the same commit. §11 records the
+as-built deltas.
 
 This documents where the hit-testing code was, where it went, and the
 questions the trip had to answer. The destination was set 2026-07-16,
@@ -212,8 +214,11 @@ conversation about a synced subset — have it then, not now.
    under the §4 decision (favor the shooter).
 3. **Bites join** (§5) — **landed 2026-07-17.** The last
    shape-by-name code leaves the brain.
-4. **Multi-part content** — tail/rotor hits, snout armor — only once
-   1–3 are boring, because by then it's data entry, not engineering.
+4. **Multi-part content** — **landed 2026-07-17, same day.** The heli
+   grew cabin/tail/rotor parts (data entry, as promised: three hull
+   computations and a part-tag match in its response task). Hogs and
+   trucks stay single-part — §4's ring-cost warning holds at horde
+   scale, and a truck has no story to tell per panel yet.
 
 Each stage left the game playable and the tests green (soaked under
 `lag=80 loss=0.03` per stage); none of them touched the wire.
@@ -344,3 +349,37 @@ design, each in its spirit:
   ran before the hog test, so a teammate could eat a round a hog
   between the muzzles should have caught. One frame, two masks
   (vehicle pad 0, hog pad `Shot::pad`), min by travel now.
+
+Stage 4 landed the same day, and brought the first NPC shooter with
+it — the two proved each other:
+
+- **The heli is three parts** (`heli_hulls`: cabin ball, tail-boom
+  capsule posed by yaw, rotor disc above), registered through the same
+  `parts_add`, posed by the same drive-task loop. Its response task
+  branches on the tag: rotor doubles damage, tail glances for half but
+  kicks the nose (`HELI_TAIL_KICK`, scaled by hit obliquity — a
+  server-side write to the predicted pod, reconciled like the bite
+  scrub). Part-level nearest-along-ray means the boom shields the
+  cabin from astern. The client's hold-fire ball (`heli_hull`) is
+  unchanged — §6's approximation doctrine.
+- **`Shot` carries `mask`** — the query-carries-its-filter pattern
+  (§2) taken literally: player rounds test `VEHICLE|HOG`, gunner-hog
+  rounds test `VEHICLE` only (no hog-on-hog carnage). The sweep gates
+  its two passes on the shot's own bits; adding a shooter type is a
+  mask, not a branch.
+- **Gunner hogs** (`GUNNER_FRAC` of each wave, sparse `hog.gunner`
+  pool — membership is the armed flag, value is the cooldown) fire
+  REAL `Bullet` entities: tracers, bangs, building hits, and the
+  collider sweep all came free, which is the whole architecture
+  demonstrating itself — an NPC shooter is a task that writes into
+  pools the pipeline already understands. Their `Shot::view` starts at
+  the current tick, so the per-tick advance rides the newest frame: a
+  server-side shooter has no lag to compensate, and the sweep needed
+  zero special cases. Bad aim is `hog_aim` (no lead) plus
+  `HOGGUN_SPREAD`; the danger is volume — on the deck a heli sits in
+  a dozen `HOGGUN_RANGE` envelopes, at altitude in none.
+- **`parts` became a small array** (`Parts { ids: [Id; 4], n }`),
+  `ids[0]` = the body part by convention (bites test it). Soak:
+  27% of a wave armed, vehicle deaths went from zero to nine in 90 s,
+  zero undrained contacts with bite + player + gunner facts all in
+  flight.

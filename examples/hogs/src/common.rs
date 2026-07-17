@@ -354,6 +354,33 @@ pub const HOG_H: f32 = 1.8;
 pub const HIT_PAD_TRUCK: f32 = 0.35;
 pub const HIT_PAD_HELI: f32 = 0.8;
 
+// --- gunner hogs -------------------------------------------------------------
+
+/// Biomod gunner hogs: a fraction of every wave spawns with a
+/// shoulder gun and fires REAL bullets (same `Bullet` pool — tracers,
+/// bangs, building hits, and the collider sweep all come free) at the
+/// nearest vehicle in 3D range. They are deliberately bad shots —
+/// angular spread, no target leading — but a low helicopter is in
+/// range of many at once, and that's the point: altitude is safety,
+/// the deck gets you fried.
+pub const GUNNER_FRAC: f32 = 0.25;
+/// Refire period (jittered per shot so the horde never volleys).
+pub const HOGGUN_CD: f32 = 1.6;
+/// 3D engagement range — a heli above ~28 u is out of everyone's
+/// reach; on the deck it's inside a dozen envelopes.
+pub const HOGGUN_RANGE: f32 = 28.0;
+/// Max bullet travel (a touch past range so edge shots complete).
+pub const HOGGUN_TRAVEL: f32 = 32.0;
+/// Aim error, ± radians on heading AND climb: "kinda bad". At 20 u
+/// that's a ~±2.8 u miss cone vs a ~1 u cabin.
+pub const HOGGUN_SPREAD: f32 = 0.14;
+/// Damage per hit, before part multipliers (rotor doubles it) —
+/// gentler than a player gun; volume is the threat.
+pub const HOGGUN_DMG: f32 = 0.12;
+/// Muzzle height (shoulder-mounted) and where they aim on a truck.
+pub const HOGGUN_Y: f32 = 0.6;
+pub const TRUCK_AIM_Y: f32 = 1.0;
+
 // --- helicopter tuning -------------------------------------------------------
 
 /// Tail-rotor yaw rate (rad/s) and how hard the cyclic chases the stick
@@ -387,6 +414,22 @@ pub const HELI_CEIL: f32 = 45.0;
 /// hover low over the horde at your peril.
 pub const HELI_R: f32 = 1.4;
 pub const HOG_LEAP: f32 = 2.4;
+/// Stage-4 part geometry (docs/collisions.md §7.4): cabin ball, tail
+/// boom capsule behind it, rotor disc above. The old single ball
+/// (`HELI_R`, `heli_hull`) stays as the CLIENT's hold-fire
+/// approximation — a courtesy heuristic, not a judge.
+pub const HELI_CABIN_R: f32 = 1.0;
+pub const HELI_TAIL_R: f32 = 0.45;
+/// Tail boom near/far distance behind the cabin center.
+pub const HELI_TAIL_A: f32 = 1.2;
+pub const HELI_TAIL_B: f32 = 2.8;
+pub const HELI_ROTOR_R: f32 = 1.7;
+/// Rotor disc altitude band, relative to the body center.
+pub const HELI_ROTOR_LO: f32 = 0.6;
+pub const HELI_ROTOR_HI: f32 = 1.1;
+/// Tail-hit yaw kick (rad, scaled by hit obliquity): light damage,
+/// heavy attitude insult.
+pub const HELI_TAIL_KICK: f32 = 0.5;
 
 // --- buildings ---------------------------------------------------------------
 
@@ -919,6 +962,55 @@ pub fn hog_hull(h: &Hog) -> Hull {
     }
 }
 
+/// The heli's stage-4 parts, posed from the body: `[0]` is the cabin
+/// (the BODY part — bites test `ids[0]` by convention), then the tail
+/// boom, then the rotor disc. Yaw poses the boom; pitch/roll are
+/// ignored by hulls (altitude bands stay vertical — an approximation
+/// the shot pads already forgive).
+pub fn heli_hulls(h: &Heli) -> [(u8, Hull); 3] {
+    let b = h.body;
+    let (x, y, z) = (b.pos.x, b.pos.y, b.pos.z);
+    let yaw = b.yaw();
+    let (fx, fz) = (yaw.sin(), yaw.cos());
+    [
+        (
+            PART_BODY,
+            Hull {
+                a: (x, z),
+                b: (x, z),
+                r: HELI_CABIN_R,
+                y: (y - HELI_CABIN_R, y + HELI_CABIN_R),
+            },
+        ),
+        (
+            PART_TAIL,
+            Hull {
+                a: (x - fx * HELI_TAIL_A, z - fz * HELI_TAIL_A),
+                b: (x - fx * HELI_TAIL_B, z - fz * HELI_TAIL_B),
+                r: HELI_TAIL_R,
+                y: (y - HELI_TAIL_R, y + HELI_TAIL_R),
+            },
+        ),
+        (
+            PART_ROTOR,
+            Hull {
+                a: (x, z),
+                b: (x, z),
+                r: HELI_ROTOR_R,
+                y: (y + HELI_ROTOR_LO, y + HELI_ROTOR_HI),
+            },
+        ),
+    ]
+}
+
+/// Where a gunner points to hit `(tx, ty, tz)` from its muzzle:
+/// `(heading, climb)`. No lead — hogs shoot at where you ARE, which
+/// is most of why they're bad at it (`HOGGUN_SPREAD` is the rest).
+pub fn hog_aim(x: f32, y: f32, z: f32, tx: f32, ty: f32, tz: f32) -> (f32, f32) {
+    let (dx, dy, dz) = (tx - x, ty - y, tz - z);
+    (dx.atan2(dz), dy.atan2((dx * dx + dz * dz).sqrt()))
+}
+
 /// A shot's travel — `reach` along `heading` on the ground plane, `dy`
 /// total altitude change over it — against one hull, in PRESENT time
 /// (vehicles aren't in the history ring; they're slow enough that
@@ -975,9 +1067,12 @@ pub struct Collider {
     pub hull: Hull,
 }
 
-/// The only part tag so far: the whole body as one hull. Tags are
-/// meaningful only to the owner's own response code.
+/// Part tags — meaningful only to the owner's own response code.
+/// Everything single-part is a BODY; the heli is the first multi-part
+/// owner (stage 4): cabin (its body), tail boom, rotor disc.
 pub const PART_BODY: u8 = 0;
+pub const PART_TAIL: u8 = 1;
+pub const PART_ROTOR: u8 = 2;
 
 /// Category bits. Add sparingly — a bit is a vocabulary word.
 pub const CAT_VEHICLE: u8 = 1 << 0;
@@ -1248,6 +1343,56 @@ mod hull_tests {
         assert!(
             shot(HOG_H + 0.5, HIT_PAD_HELI).is_some(),
             "the heli pad forgives a vertical near-miss"
+        );
+    }
+
+    /// Stage-4 heli parts: cabin first (the bite convention), boom
+    /// behind, rotor above — and part-level nearest-along-ray means
+    /// the boom shields the cabin from astern and the disc catches
+    /// overflying fire.
+    #[test]
+    fn heli_parts_pose_and_shield() {
+        let mut h = Heli::default();
+        h.body.pos = vec3(0.0, 10.0, 0.0); // facing +z (identity rot)
+        let parts = heli_hulls(&h);
+        assert_eq!(parts[0].0, PART_BODY, "ids[0] convention: cabin first");
+        let (_, tail) = parts[1];
+        assert!(
+            tail.a.1 < 0.0 && tail.b.1 < tail.a.1,
+            "boom extends behind a +z-facing heli"
+        );
+        let id = Id::new(0, 0, 7);
+        let cols: Vec<(Id, Collider)> = parts
+            .iter()
+            .map(|&(part, hull)| {
+                (id, Collider { owner: id, part, cat: CAT_VEHICLE, hull })
+            })
+            .collect();
+        let flank = |y| {
+            sweep_colliders(-6.0, 0.0, y, FRAC_PI_2, 12.0, 0.0, 0.0, CAT_VEHICLE, None, &cols)
+                .map(|hit| hit.part)
+        };
+        assert_eq!(flank(10.0), Some(PART_BODY), "cabin-height shot hits the cabin");
+        assert_eq!(
+            flank(10.0 + HELI_CABIN_R + 0.05),
+            Some(PART_ROTOR),
+            "just over the cabin, into the disc"
+        );
+        let astern =
+            sweep_colliders(0.0, -6.0, 10.0, 0.0, 12.0, 0.0, 0.0, CAT_VEHICLE, None, &cols)
+                .map(|hit| hit.part);
+        assert_eq!(astern, Some(PART_TAIL), "from astern the boom eats it first");
+    }
+
+    /// Gunner ballistics: the aim solution points up at an elevated
+    /// target (the whole reason helis fear the deck).
+    #[test]
+    fn hog_aim_points_up_at_a_heli() {
+        let (heading, pitch) = hog_aim(0.0, HOGGUN_Y, 0.0, 10.0, HOGGUN_Y + 10.0, 0.0);
+        assert!((heading - FRAC_PI_2).abs() < 1e-4, "target due +x");
+        assert!(
+            (pitch - std::f32::consts::FRAC_PI_4).abs() < 1e-3,
+            "10 up over 10 out = 45°, got {pitch}"
         );
     }
 
