@@ -31,7 +31,9 @@
       "Bash(timeout 3 cargo run --release -p pm-control-host --bin pm-watch -- --bind 127.0.0.1:42599 127.0.0.1:42598)",
       "Bash(echo \"exit=$? \\(124 = ran until timeout, good\\)\")",
       "Bash(timeout 3 ./target/release/pm-watch --bind 127.0.0.1:42599 127.0.0.1:42598)",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "Bash(awk '{print $1}')",
+      "Bash(awk ' *)"
     ],
     "defaultMode": "bypassPermissions"
   }

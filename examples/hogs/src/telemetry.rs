@@ -28,7 +28,10 @@ use crate::bot_client::ClientWorld;
 use crate::common::*;
 
 /// Where the node's own socket binds (the monitor sends unlocks here).
-pub const TELE_BIND: &str = "127.0.0.1:42501";
+/// All interfaces, not loopback: the game on Windows must reach a
+/// monitor in WSL, and a loopback-bound socket can neither send off-box
+/// nor hear the monitor's subscribe/unlock leases coming back.
+pub const TELE_BIND: &str = "0.0.0.0:42501";
 /// Default monitor address (pm-watch / pm-mon bind this).
 pub const TELE_MON: &str = "127.0.0.1:42500";
 

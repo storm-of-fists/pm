@@ -473,7 +473,57 @@ loss=0.03` and read the doctor's output against this chapter.
 
 ---
 
-## 13. Where this goes next
+## 13. Telemetry: the glass cockpit
+
+The `pm-control` crates (merged into `crates/` from their own repo)
+are a second, older lineage living beside the game engine: an
+industrial-control signals framework — dotted-path **signals** declared
+with `pm_group!`, **faults** with debounce/latch semantics, a wire
+protocol with discovery, and a **Monitor** that shadows any node it
+hears. Naming note while we're here: the *packages* are `pm-world`,
+`pm-world-derive`, `pm-world-sdl` (what you type after `cargo -p`),
+but the *libs* keep their short names — code still says `use pm::` and
+`#[pm::pod]`.
+
+The hogs client embeds a telemetry **node**
+(`examples/hogs/src/telemetry.rs`): a task at priority 95 that copies
+game truth into signals each tick (`rtt_ms`, `corrections`, `frame`
+prof, wave/horde/points off the replicated `Hunt`), raises an
+`overrun_flt` fault when frames sustain past 40 ms — and reads
+**knobs** back: `link_lag_ms`, `link_loss`, and `day_secs` are
+writable from a monitor, seeded from the CLI flags. A knob write flows
+through the same seams the flags used: the engine's `LinkTune` single
+(the net task re-applies the link sim when its `seq` bumps) and the
+game's `Tune` single (the render task reads day length every frame).
+Live-tuning the simulated link *while you drive* is the whole point:
+feel 80 ms become 160 ms without restarting.
+
+One hard rule, learned from the core's design: **one node, one
+thread.** Signals are `Rc` (not `Send`) and the scan clock is a
+process-global cell that's only sound single-threaded — that's why the
+node lives in the player client and *publishes the server's story via
+replicated state* instead of a second node on the server thread.
+
+Two windows onto it:
+
+- `cargo run -p pm-control-host --bin pm-mon` — the TUI. Regex search,
+  pin signals, **Ctrl-U** to unlock-and-tune (leases renew while held;
+  Ctrl-U again releases), Tab for the fault page.
+- `cargo run -p pm-control-host --bin pm-watch -- --bind
+  127.0.0.1:42500 127.0.0.1:42501` — the headless sibling: one summary
+  line per second, fault edges as they stamp, and `set hogs day_secs
+  60` / `lock hogs day_secs` on stdin. Built so a second pair of eyes
+  (human or agent) can watch a session from a plain terminal and tune
+  it mid-flight.
+
+**Try this:** start hogs, start pm-watch, then `set hogs link_lag_ms
+150` while driving. Feel the gun stay instant (chapter 8) while the
+world goes soupy (chapter 7) — every netcode lesson in this document,
+now with a dial.
+
+---
+
+## 14. Where this goes next
 
 The standing order of work, with reasons:
 
