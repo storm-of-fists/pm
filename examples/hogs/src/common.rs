@@ -6,7 +6,15 @@
 
 use pm::{Body, Id, Quat, vec3};
 
+// (`addr=` + `password=` landed 2026-07-20 — menu Join field, CLI args,
+// and the deploy/ box all dial anywhere now.)
+// TODO(ship): reconnect-in-place — real sessions have drops, and a drop
+// currently costs your vehicle. Join-in-progress is the same seam (a
+// late peer is a reconnect with no history).
 pub const ADDR: &str = "127.0.0.1:48223";
+/// What the menu's HOST verb binds: every interface, so friends can
+/// dial the host's IP while the host itself joins over loopback.
+pub const HOST_BIND: &str = "0.0.0.0:48223";
 /// Fixed simulation step on both sides (prediction replays it).
 pub const FIXED_DT: f32 = 1.0 / 60.0;
 /// Half-extent of the square arena (walls at +-ARENA on x and z).
@@ -18,8 +26,14 @@ pub const ARENA: f32 = 100.0;
 /// as drive: the client hands it to `interp_pool` (trucks AND hogs), the
 /// server subtracts it (in ticks) from a peer's acked tick to judge that
 /// peer's shots against the world they were aiming at. `PM_INTERP_MS`
-/// overrides for feel A/B's.
-pub const INTERP_DELAY: f32 = 0.05;
+/// overrides for feel A/B's. 33 ms is the played-in default (picked
+/// 2026-07-18 after the lag=80/loss=3% sessions: "fixed nearly
+/// everything" vs 50 — fresher remotes, and loss bursts still hide
+/// inside the extrapolation cap). Try `interp=200 lag=80 loss=0.03`:
+/// the world turns to soup but shots still land — lag comp rewinds
+/// deeper. Now `interp=8`: fresh but strobing under loss. 33 is a
+/// *choice*, not a law.
+pub const INTERP_DELAY: f32 = 0.033;
 
 /// [`INTERP_DELAY`] with the `PM_INTERP_MS` override applied.
 pub fn interp_delay() -> f32 {
@@ -35,243 +49,211 @@ pub fn interp_ticks() -> u32 {
     (interp_delay() / FIXED_DT).round() as u32
 }
 
-// --- game params (docs/params.md) ----------------------------------------
+// --- game params ----------------------------------------------------------
+//
+// The design record (2026-07-17). A param is a
+// SERVER-OWNED TUNING SCALAR: a number a designer wants to move while
+// the game runs, whose meaning survives the change. Everything else
+// stays a Rust const:
+//
+// - STRUCTURAL constants — wire quantization scales, geometry tables
+//   (`BUILDINGS`), part/category ids, colors, `ADDR`, `FIXED_DT`.
+//   Changing these mid-run is meaningless or breaks contracts (a wire
+//   scale is a handshake fact, not a feel knob).
+// - CLIENT-COSMETIC knobs — day length, link sim. Live-tunable per
+//   client via the telemetry node; per-client state, not shared truth.
+// - CREATION-FROZEN config — the interp delay: baked into pool
+//   registration at connect. A param must be hot-readable; interp
+//   needs a reconnect story first.
+// - SHARED-STEP constants (`vmax`, grips, heli thrust…) ARE params:
+//   the steps take `&Params` and each end reads its copy.
+//
+// The flow (doctrine unchanged — clients send channels, the server
+// replicates state):
+//
+//   hogs.params file ─(load, clamp)→ server Params single ─sync→ every client
+//        ^                                 ^    └ reads: server tasks;
+//        └─(save event: server rewrites)   |      shared steps via replica
+//   pm-watch `set` → telemetry knobs ─diff→ ParamSet event (reliable)
+//
+// Why not env vars / CLI flags: no live path, no save path, a second
+// source of truth next to the file. Why not TOML: the codec is 20
+// lines and pm-control already defined the line shape — one format
+// across the platform beats a second parser. Why not a client-owned
+// file: the server is the authority; a remote client could neither
+// seed wave 1 in time nor save the server's truth. The save file
+// belongs to the process that owns the values — a dedicated server
+// saves ITS file; an in-process session saves the one `main` loaded.
+//
+// TODO(roadmap): params stage 3, queued — startup echo of non-default
+// params; range-corner invariant soaks; a host-only param gate the day
+// public servers exist; a dedicated pm-mon panel (ranges,
+// dirty-vs-file markers). Unscheduled ideas: autosave-with-debounce as
+// an opt-in knob; per-map param files; a file header with a schema
+// version if params ever need migrations.
 
-/// One tunable's contract: its file/signal name, live range, and shipped
-/// default. The table drives everything — the file codec, the server's
-/// clamp, and the telemetry knobs — so adding a param is one line here
-/// plus one field on [`Params`].
-pub struct ParamSpec {
-    pub name: &'static str,
-    pub default: f32,
-    pub min: f32,
-    pub max: f32,
-}
-
-/// Spec order IS [`Params`] field order. The count is pinned at compile
-/// time by `Params::as_array`'s `must_cast`; the name↔field pairing is
-/// pinned by the `params_spec_matches_fields` test below.
-pub const PARAM_SPECS: [ParamSpec; 36] = [
-    // Stage-1 pilot set. Spec order IS field order (the as_array cast),
-    // so new params APPEND — a reshuffle must touch struct and table
-    // together or the cast pairs values with the wrong fields.
-    ParamSpec { name: "wave_base", default: 40.0, min: 1.0, max: 1000.0 },
-    ParamSpec { name: "wave_grow", default: 15.0, min: 0.0, max: 200.0 },
-    ParamSpec { name: "gunner_frac", default: 0.25, min: 0.0, max: 1.0 },
-    ParamSpec { name: "friendly_dmg", default: 0.25, min: 0.0, max: 1.0 },
-    ParamSpec { name: "gun_dmg", default: 0.5, min: 0.01, max: 1.0 },
-    ParamSpec { name: "bite_dmg", default: 0.25, min: 0.0, max: 1.0 },
-    ParamSpec { name: "hog_fast", default: 11.0, min: 1.0, max: 30.0 },
-    ParamSpec { name: "net_kbps", default: 2000.0, min: 64.0, max: 6000.0 },
-    ParamSpec { name: "ai_stride", default: 4.0, min: 1.0, max: 8.0 },
-    // Stage 2a (2026-07-17): the remaining server-read tuning consts.
-    ParamSpec { name: "hog_aggro", default: 26.0, min: 5.0, max: 80.0 },
-    ParamSpec { name: "hog_roam", default: 4.5, min: 0.5, max: 15.0 },
-    ParamSpec { name: "hog_flee", default: 1.5, min: 0.0, max: 6.0 },
-    ParamSpec { name: "bite_cd", default: 1.0, min: 0.1, max: 5.0 },
-    ParamSpec { name: "bite_cost", default: 15.0, min: 0.0, max: 100.0 },
-    ParamSpec { name: "kill_points", default: 10.0, min: 0.0, max: 100.0 },
-    ParamSpec { name: "death_cost", default: 30.0, min: 0.0, max: 200.0 },
-    ParamSpec { name: "knock", default: 9.0, min: 0.0, max: 30.0 },
-    ParamSpec { name: "gun_cd", default: 0.25, min: 0.05, max: 2.0 },
-    ParamSpec { name: "gun_range", default: 45.0, min: 10.0, max: 120.0 },
-    ParamSpec { name: "bullet_speed", default: 70.0, min: 20.0, max: 200.0 },
-    ParamSpec { name: "hit_pad_truck", default: 0.35, min: 0.0, max: 2.0 },
-    ParamSpec { name: "hit_pad_heli", default: 0.8, min: 0.0, max: 2.0 },
-    ParamSpec { name: "hoggun_cd", default: 1.6, min: 0.2, max: 6.0 },
-    ParamSpec { name: "hoggun_range", default: 28.0, min: 5.0, max: 80.0 },
-    ParamSpec { name: "hoggun_dmg", default: 0.12, min: 0.0, max: 1.0 },
-    ParamSpec { name: "heli_tail_kick", default: 0.5, min: 0.0, max: 2.0 },
-    ParamSpec { name: "hog_leap", default: 2.4, min: 0.5, max: 8.0 },
-    // Stage 2b (2026-07-17): SHARED-STEP constants. The client
-    // predictors replay these, so they read the replicated single —
-    // a live change mispredicts for one snapshot interval (a single
-    // correction blip) and converges; soak-verified at lag=80/loss=3%.
-    ParamSpec { name: "vmax", default: 18.0, min: 5.0, max: 40.0 },
-    ParamSpec { name: "boost_vmax", default: 30.0, min: 10.0, max: 60.0 },
-    ParamSpec { name: "truck_grip", default: 8.0, min: 0.5, max: 20.0 },
-    ParamSpec { name: "truck_grip_boost", default: 3.2, min: 0.5, max: 20.0 },
-    ParamSpec { name: "heat_rate", default: 0.4, min: 0.05, max: 2.0 },
-    ParamSpec { name: "heat_cool", default: 0.25, min: 0.05, max: 2.0 },
-    ParamSpec { name: "heli_lift", default: 16.0, min: 4.0, max: 40.0 },
-    ParamSpec { name: "heli_t_max", default: 34.0, min: 10.0, max: 80.0 },
-    ParamSpec { name: "heli_yaw", default: 1.9, min: 0.5, max: 5.0 },
-];
-
-/// Server-owned tuning scalars (docs/params.md): seeded from the params
-/// file at startup, live-writable through the `"param.set"` event, and
-/// replicated to every client as the `"params"` synced single. Server
-/// tasks read these where the old consts used to be.
-///
-/// The derived `Default` is bytemuck's ZEROS — use [`Params::from_specs`]
-/// for the shipped values (the replica single is zeros for the instant
-/// before the first snapshot lands; nothing reads it that early).
-#[pm::pod]
-pub struct Params {
-    /// First-wave horde size (was the `PM_HOGS` env knob).
-    pub wave_base: f32,
-    /// Extra hogs per wave past the first.
-    pub wave_grow: f32,
-    /// Fraction of each wave that spawns with a shoulder gun.
-    pub gunner_frac: f32,
-    /// Friendly-fire chip per cannon hit (gentler than `gun_dmg` —
-    /// punish spraying, don't two-shot a buddy).
-    pub friendly_dmg: f32,
-    /// Cannon damage per hit on a hog (hp scale is 1.0).
-    pub gun_dmg: f32,
-    /// Truck/heli chip per hog bite.
-    pub bite_dmg: f32,
-    /// Hog chase/flee speed, u/s (roam speed stays `HOG_ROAM`).
-    pub hog_fast: f32,
-    /// Per-peer snapshot bandwidth, kilobits/sec — feeds the engine's
-    /// send tune (`PmServer::send_tune`): how far the multi-datagram
-    /// flight may extend past the always-sent first datagram. Low
-    /// values degrade to the classic one-datagram cadence (~64 at the
-    /// floor), never below it.
-    pub net_kbps: f32,
-    /// Hog think cadence: each hog re-decides (target scan, steering
-    /// goal, bite) every Nth tick, staggered across the horde so cohorts
-    /// alternate; movement integrates every tick regardless, so the
-    /// horde stays change-dense on the wire.
-    pub ai_stride: f32,
-
-    // --- stage 2a: server-read tuning ---------------------------------
-    /// A vehicle inside this range gets charged.
-    pub hog_aggro: f32,
-    /// Roam speed, u/s (charge/flee speed is `hog_fast`).
-    pub hog_roam: f32,
-    /// After a bite the hog breaks off for this long (seconds).
-    pub hog_flee: f32,
-    /// Per-hog re-bite lockout (seconds) — debounces overlap flicker.
-    pub bite_cd: f32,
-    /// Points a bite costs the team.
-    pub bite_cost: f32,
-    /// Points a kill earns the team.
-    pub kill_points: f32,
-    /// Points an exploded/downed vehicle costs the team (on top of the
-    /// bites that probably caused it).
-    pub death_cost: f32,
-    /// Bullet-hit knockback speed on a surviving hog (u/s; the decay
-    /// rate stays the paired `KNOCK_DECAY` const).
-    pub knock: f32,
-    /// Turret refire period (seconds). The client's cosmetic gun reads
-    /// the replica so the click-tracer cadence matches the server's.
-    pub gun_cd: f32,
-    /// Bullet max travel (also the client aim line's reach).
-    pub gun_range: f32,
-    /// Bullet speed, u/s (also flies the client's cosmetic tracers and
-    /// the bots' lead arithmetic).
-    pub bullet_speed: f32,
-    /// Friendly-fire hit-circle padding by victim platform: forgiveness
-    /// for shots that would graze a teammate (heli > truck — the heli
-    /// is the one you sweep past at speed).
-    pub hit_pad_truck: f32,
-    pub hit_pad_heli: f32,
-    /// Gunner-hog refire period (seconds; each hog randomizes ±35%).
-    pub hoggun_cd: f32,
-    /// Gunner-hog engagement range.
-    pub hoggun_range: f32,
-    /// Gunner-hog chip per hit (lighter than a teammate's cannon).
-    pub hoggun_dmg: f32,
-    /// Tail-boom hit: yaw kick scale (torque scales with obliquity).
-    pub heli_tail_kick: f32,
-    /// Hog reach ceiling: bites and aggro only reach a heli hovering
-    /// below this altitude — climb and the horde loses you.
-    pub hog_leap: f32,
-
-    // --- stage 2b: SHARED-STEP constants -------------------------------
-    // The predictors replay these (truck_step / heli_step read them), so
-    // clients read the REPLICA — server and client values agree except
-    // for the one snapshot interval after a live change (one correction
-    // blip, converges).
-    /// Truck top speed (forward), and boosted.
-    pub vmax: f32,
-    pub boost_vmax: f32,
-    /// Tire grip: how fast LATERAL velocity bleeds (1/s exponential
-    /// rate). This is the whole "physics" of the truck — steering turns
-    /// the chassis, grip drags the momentum around after it. High =
-    /// rails; low = ice. Boosting loosens the rear (powerslide).
-    pub truck_grip: f32,
-    pub truck_grip_boost: f32,
-    /// Heat per second while boosting / cooling per second while not.
-    pub heat_rate: f32,
-    pub heat_cool: f32,
-    /// Collective authority above/below hover trim (m/s^2-ish), and the
-    /// total thrust ceiling.
-    pub heli_lift: f32,
-    pub heli_t_max: f32,
-    /// Tail-rotor yaw rate (rad/s).
-    pub heli_yaw: f32,
-}
-
-impl Params {
-    pub fn from_specs() -> Params {
-        let mut p = Params::default();
-        for (i, s) in PARAM_SPECS.iter().enumerate() {
-            p.as_array_mut()[i] = s.default;
-        }
-        p
-    }
-
-    /// The fields as the spec-ordered array the codec/event path indexes.
-    /// `must_cast` fails to COMPILE if the field count drifts off the
-    /// spec table.
-    pub fn as_array(&self) -> &[f32; PARAM_SPECS.len()] {
-        bytemuck::must_cast_ref(self)
-    }
-
-    pub fn as_array_mut(&mut self) -> &mut [f32; PARAM_SPECS.len()] {
-        bytemuck::must_cast_mut(self)
+pm_control_core::pm_params! {
+    /// Server-owned tuning scalars (design record in the section
+    /// comment above): seeded from the params file at startup,
+    /// live-writable through the `"param.set"` event, and replicated to
+    /// every client as the `"params"` synced single. Server tasks read
+    /// these where the old consts used to be; client reads (bot gates,
+    /// the cosmetic gun, the aim line) come off the replica
+    /// (`ClientWorld::params`) — never a const. `Default` IS the
+    /// shipped set — a replica is sane even before its first snapshot.
+    ///
+    /// One line per param — name (the field ident), default, live range,
+    /// doc — and `pm_params!` generates everything else: the wire pod,
+    /// `SPECS`, clamped indexed writes, save-set text, and the monitor
+    /// knobs ([`ParamKnobs`], save button included). The last nine are
+    /// SHARED-STEP constants: `truck_step`/`heli_step` read them, so the
+    /// server passes its single and the predictors read the replica — a
+    /// live change mispredicts only for the inputs in flight (one
+    /// correction blip; soak-verified at lag=80/loss=3%).
+    pub struct Params knobs ParamKnobs {
+        /// First-wave horde size (was the `PM_HOGS` env knob).
+        pub wave_base: 40.0 in 1.0..1000.0,
+        /// Extra hogs per wave past the first.
+        pub wave_grow: 15.0 in 0.0..200.0,
+        /// Fraction of each wave that spawns with a shoulder gun.
+        pub gunner_frac: 0.25 in 0.0..1.0,
+        /// Friendly-fire chip per cannon hit (gentler than `gun_dmg` —
+        /// punish spraying, don't two-shot a buddy).
+        pub friendly_dmg: 0.25 in 0.0..1.0,
+        /// Cannon damage per hit on a hog (hp scale is 1.0).
+        pub gun_dmg: 0.5 in 0.01..1.0,
+        /// Truck/heli chip per hog bite.
+        pub bite_dmg: 0.25 in 0.0..1.0,
+        /// Hog chase/flee speed, u/s (roam speed is `hog_roam`).
+        pub hog_fast: 11.0 in 1.0..30.0,
+        /// Per-peer snapshot bandwidth, kilobits/sec — feeds the
+        /// engine's send tune (`PmServer::send_tune`): how far the
+        /// multi-datagram flight extends past the always-sent first
+        /// datagram (~64 = the classic one-datagram cadence).
+        pub net_kbps: 2000.0 in 64.0..6000.0,
+        /// Hog think cadence: each hog re-decides every Nth tick in
+        /// slot-staggered cohorts; movement integrates every tick.
+        pub ai_stride: 4.0 in 1.0..8.0,
+        /// A vehicle inside this range gets charged.
+        pub hog_aggro: 26.0 in 5.0..80.0,
+        /// Roam speed, u/s (charge/flee speed is `hog_fast`).
+        pub hog_roam: 4.5 in 0.5..15.0,
+        /// After a bite the hog breaks off for this long (seconds).
+        pub hog_flee: 1.5 in 0.0..6.0,
+        /// Per-hog re-bite lockout (seconds) — debounces overlap flicker.
+        pub bite_cd: 1.0 in 0.1..5.0,
+        /// Points a bite costs the team.
+        pub bite_cost: 15.0 in 0.0..100.0,
+        /// Points a kill earns the team.
+        pub kill_points: 10.0 in 0.0..100.0,
+        /// Points an exploded/downed vehicle costs the team (on top of
+        /// the bites that probably caused it).
+        pub death_cost: 30.0 in 0.0..200.0,
+        /// Bullet-hit knockback speed on a surviving hog (u/s; the decay
+        /// rate stays the paired `KNOCK_DECAY` const).
+        pub knock: 9.0 in 0.0..30.0,
+        /// Turret refire period (seconds). The client's cosmetic gun
+        /// reads the replica so the click-tracer cadence matches.
+        pub gun_cd: 0.25 in 0.05..2.0,
+        /// Truck turret slew rate, rad/s on both axes — the turret
+        /// chases the commanded angles instead of snapping (tank
+        /// feel: a flick runs ahead, the barrel catches up; the
+        /// camera follows the BARREL, so it swings at this rate too).
+        /// The heli gimbal stays crisp.
+        pub turret_rate: 1.8 in 0.2..10.0,
+        /// Bullet max travel (also the client aim line's reach).
+        pub gun_range: 45.0 in 10.0..120.0,
+        /// Bullet speed, u/s (also flies the client's cosmetic tracers
+        /// and the bots' lead arithmetic).
+        pub bullet_speed: 100.0 in 20.0..200.0,
+        /// Friendly-fire hit-circle padding by victim platform:
+        /// forgiveness for shots that would graze a teammate (heli >
+        /// truck — the heli is the one you sweep past at speed).
+        pub hit_pad_truck: 0.35 in 0.0..2.0,
+        pub hit_pad_heli: 0.8 in 0.0..2.0,
+        /// Gunner-hog refire period (seconds; each hog jitters ±35%).
+        pub hoggun_cd: 1.6 in 0.2..6.0,
+        /// Gunner-hog engagement range.
+        pub hoggun_range: 28.0 in 5.0..80.0,
+        /// Gunner-hog chip per hit (lighter than a teammate's cannon).
+        pub hoggun_dmg: 0.12 in 0.0..1.0,
+        /// Tail-boom hit: yaw kick scale (torque scales with obliquity).
+        pub heli_tail_kick: 0.5 in 0.0..2.0,
+        /// Hog reach ceiling: bites and aggro only reach a heli hovering
+        /// below this altitude — climb and the horde loses you.
+        pub hog_leap: 2.4 in 0.5..8.0,
+        /// Fraction of each wave that spawns WINGED (the biomod program
+        /// takes the fight upstairs — see the flyer section below).
+        pub flyer_frac: 0.15 in 0.0..1.0,
+        /// Flyer chase speed, u/s (roaming cruises at ~half of it).
+        pub flyer_speed: 14.0 in 1.0..30.0,
+        /// Flyer cruise altitude while roaming.
+        pub flyer_alt: 9.0 in 2.0..30.0,
+        /// Flyer chase ceiling: climb past it and the flock sheds — the
+        /// band between here and the hard ceiling is the heli's refuge.
+        pub flyer_ceil: 30.0 in 5.0..45.0,
+        /// Truck top speed (forward), and boosted.
+        pub vmax: 18.0 in 5.0..40.0,
+        pub boost_vmax: 30.0 in 10.0..60.0,
+        /// Tire grip: how fast LATERAL velocity bleeds (1/s exponential
+        /// rate). This is the whole "physics" of the truck — steering
+        /// turns the chassis, grip drags the momentum around after it.
+        /// High = rails; low = ice. Boosting loosens the rear
+        /// (powerslide).
+        pub truck_grip: 8.0 in 0.5..20.0,
+        pub truck_grip_boost: 3.2 in 0.5..20.0,
+        /// Heat per second while boosting / cooling per second while not.
+        pub heat_rate: 0.4 in 0.05..2.0,
+        pub heat_cool: 0.25 in 0.05..2.0,
+        /// Collective authority above/below hover trim, and the total
+        /// thrust ceiling.
+        pub heli_lift: 16.0 in 4.0..40.0,
+        pub heli_t_max: 34.0 in 10.0..80.0,
+        /// Tail-rotor yaw rate (rad/s).
+        pub heli_yaw: 1.9 in 0.5..5.0,
     }
 }
 
 /// Default params file path; a `params=PATH` arg overrides. Local tuning
-/// state, gitignored — the shipped defaults live in [`PARAM_SPECS`].
+/// state, gitignored — the shipped defaults live in the [`Params`]
+/// declaration above.
 pub const PARAMS_FILE: &str = "hogs.params";
 
-/// Load the params file: pm-control save-file shape (`name=value` per
-/// line, anything after a space is a human aid, `#` starts a comment).
-/// Missing file or missing names keep spec defaults, unknown names warn
-/// and load on (an old file is normal, a typo shouldn't be silent), and
-/// every value CLAMPS to its spec range — a hand-edited file never loads
-/// raw.
+/// Load the params file through the generated clamped codec. Missing
+/// file = shipped defaults; unknown names and bad values are skipped
+/// with a COUNT warning (a typo shouldn't be silent).
 pub fn params_load(path: &str) -> Params {
-    let mut p = Params::from_specs();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return p; // no file: shipped defaults
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, rest)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = rest.split(' ').next().unwrap_or(rest).trim();
-        let Some(i) = PARAM_SPECS.iter().position(|s| s.name == key) else {
-            eprintln!("[params] {path}: unknown param '{key}' ignored");
-            continue;
-        };
-        match value.parse::<f32>() {
-            Ok(v) => p.as_array_mut()[i] = v.clamp(PARAM_SPECS[i].min, PARAM_SPECS[i].max),
-            Err(_) => eprintln!("[params] {path}: bad value for '{key}' ignored"),
+    let mut p = Params::default();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        let lines = text
+            .lines()
+            .filter(|l| {
+                let l = l.trim();
+                !l.is_empty() && !l.starts_with('#') && l.contains('=')
+            })
+            .count();
+        let applied = p.apply_save_text(&text);
+        if applied < lines {
+            eprintln!(
+                "[params] {path}: {} line(s) ignored (unknown name or bad value)",
+                lines - applied
+            );
         }
     }
     p
 }
 
 /// Rewrite the params file from the authoritative set — the server's
-/// answer to a [`PARAM_SAVE`] event. Whole-file rewrite, spec order,
-/// range as the trailing human aid.
+/// answer to a [`PARAM_SAVE`] event. Whole-file rewrite in the platform
+/// save-set line shape.
 pub fn params_save(path: &str, p: &Params) -> std::io::Result<()> {
-    use std::fmt::Write as _;
-    let mut out = String::from("# hogs params — name=value, edited live via pm-watch (docs/params.md)\n");
-    for (i, s) in PARAM_SPECS.iter().enumerate() {
-        let _ = writeln!(out, "{}={} {}..{}", s.name, p.as_array()[i], s.min, s.max);
-    }
-    std::fs::write(path, out)
+    std::fs::write(
+        path,
+        format!(
+            "# hogs params — name=value, edited live via pm-watch (`set hogs params.<name> V`)\n{}",
+            p.to_save_text()
+        ),
+    )
 }
 
 /// Reliable client→server event: set `params[idx] = value` (the server
@@ -302,6 +284,18 @@ pub struct Flags {
     /// Game params loaded from the params file in `main` (before any
     /// thread spawns) — the client seeds its telemetry knobs from this.
     pub params: Params,
+    /// Where the params file lives — the menu's HOST path hands it to
+    /// the in-process server so live saves land in the same file.
+    pub params_path: String,
+    /// Server address (`addr=` — connect target for client/bot modes,
+    /// bind address for server mode; defaults to [`ADDR`]). Seeds the
+    /// menu's join field.
+    pub addr: String,
+    /// Session password (`password=`, empty = none) — presented when
+    /// joining, required of clients when hosting/serving.
+    pub password: String,
+    /// Show the pre-connect menu (bare launch); CLI modes skip it.
+    pub menu: bool,
 }
 
 /// Live-tunable client knobs, bridged from the telemetry node's signals
@@ -309,11 +303,18 @@ pub struct Flags {
 #[derive(Clone, Copy)]
 pub struct Tune {
     pub day_secs: f32,
+    /// The DEBUG VIEW (tilde toggles): hitbox cages — every entity's
+    /// DERIVED collision hulls, the capsule+band the server sweeps,
+    /// as emissive magenta wireframes (`models::hull_cage_tris`) —
+    /// plus the engine overlay: per-task timings, pool populations,
+    /// and net counters off this client's `Pm`. Client-side only,
+    /// nothing on the wire. The eventual live console opens here.
+    pub show_debug: bool,
 }
 
 impl Default for Tune {
     fn default() -> Self {
-        Tune { day_secs: 480.0 }
+        Tune { day_secs: 480.0, show_debug: false }
     }
 }
 
@@ -336,6 +337,11 @@ pub struct Truck {
     /// it predicts and replicates for free — remote players see your
     /// turret swing.
     pub aim: f32,
+    /// Turret ELEVATION off level, −TRUCK_AIM_DOWN..TRUCK_AIM_UP — the
+    /// heli chin gun's law on the same mouse-y axis (added 2026-07-22:
+    /// flat-only trucks had no answer to the flock). Evolved by
+    /// `truck_step`; the barrel visibly elevates on every client.
+    pub aim_pitch: f32,
     /// Boost heat, 0..1 — rises while boosting, cools otherwise, all in
     /// `truck_step`, so the meter predicts smoothly. Hitting 1.0 is the
     /// SERVER's cue to explode the truck (consequences aren't predicted;
@@ -380,6 +386,13 @@ pub struct Health {
 #[pm::pod]
 pub struct Heli {
     pub body: Body,
+    /// Chin-gun gimbal, relative to the airframe: azimuth off the nose
+    /// (±AIM_MAX — the truck turret's law) and elevation off level
+    /// (±HELI_AIM_PITCH). Evolved by `heli_step` from the command like
+    /// every predicted field, so it replicates for free — remote
+    /// players watch a heli's gun train around under a steady nose.
+    pub aim: f32,
+    pub aim_pitch: f32,
 }
 
 /// A biomod feral hog: server-owned, never predicted — clients read it
@@ -391,6 +404,13 @@ pub struct Heli {
 /// (±512 u range — the walls sit at ±ARENA), angles at 1e-4 rad (the
 /// server wraps `heading` to [-pi, pi) at every write — i16 saturates
 /// past ±3.27), hp at 1/200 over its 0..=HOG_HP range.
+///
+/// The deliberate asymmetry: predicted pools (`Truck`, `Heli`) are
+/// NOT quantized — reconcile error must be able to reach zero, and a
+/// quantization step would leave prediction permanently correcting
+/// against rounded truth. Try it: change x/z scale from 64 to 8 and
+/// play — 1/8-unit position steps make the horde visibly jitter.
+/// Quantization is a *visible* budget decision.
 #[pm::pod]
 pub struct Hog {
     #[wire(i16, scale = 64.0)]
@@ -406,15 +426,253 @@ pub struct Hog {
     pub hp: f32,
 }
 
-/// Server-owned co-op scoreboard, replicated as a synced single (the
-/// SingleRx path drive never exercised): one shared score, the live hog
-/// count, and the wave number.
+/// Server-owned co-op scoreboard AND session state, replicated as a
+/// synced single (the SingleRx path drive never exercised): one shared
+/// score, the live hog count — and since the game-loop ship item, the
+/// whole mission arc every client renders the same screen from. The
+/// server's director task is the only writer; see [`LEVELS`] for what
+/// the mission fields index into.
 #[pm::pod]
 pub struct Hunt {
     pub points: f32,
     pub alive: u32,
+    /// Wave number within the CURRENT mission (waves/defend kinds).
     pub wave: u32,
+    /// Session phase, `PHASE_*` — what screen everyone is on.
+    pub phase: u32,
+    /// Which level ([`LEVELS`] index) and which mission within it.
+    pub level: u32,
+    pub mission: u32,
+    /// Mirror of the current mission's kind/goal (`MISSION_*`) so
+    /// clients render objectives without re-indexing the tables.
+    pub kind: u32,
+    pub goal: u32,
+    /// Progress toward `goal`: waves cleared, checkpoints hit, or the
+    /// boss's remaining hp in percent.
+    pub done: u32,
+    /// Live countdown: brief time remaining, or the race clock.
+    pub timer: f32,
 }
+
+// --- missions + levels -------------------------------------------------------
+//
+// The game-loop design record (2026-07-21). A LEVEL is a series of
+// MISSIONS on one map, each teaching a skill: fight (waves), protect
+// (defend), run (race), then the exam (boss). The tables below are
+// CONTENT — compiled const data like `BUILDINGS`, not params: a mission
+// list is authored, not live-tuned (wave sizing inside a mission still
+// rides `Params::wave_base`/`wave_grow` times the mission's `size`).
+//
+// The arc is a server-side state machine (the director task) that
+// writes ONLY the `Hunt` single; clients render whatever phase says.
+// LOBBY waits for the first vehicle, BRIEF is a titled countdown,
+// PLAYING runs the current mission's objective, WON/LOST are end
+// screens that wait for any player's `Session` event — retry the
+// failed mission, or roll to the next level after a win. Level
+// "loading" is cheap on purpose: same map, purge the NPCs, brief the
+// next mission — a real map switch slots in behind the same seam when
+// maps stop being const.
+
+pub const PHASE_LOBBY: u32 = 0;
+pub const PHASE_BRIEF: u32 = 1;
+pub const PHASE_PLAYING: u32 = 2;
+pub const PHASE_WON: u32 = 3;
+pub const PHASE_LOST: u32 = 4;
+
+/// Mission kinds — what `goal` counts and what fails you:
+/// WAVES: clear `goal` waves; can't fail (deaths just bleed points).
+/// DEFEND: clear `goal` waves while the depot stands; depot down = lost.
+/// RACE: hit `goal` beacons around [`RACE_LOOP`] before `time` runs out.
+/// BOSS: drop the giant hog; `done` reports its hp%.
+pub const MISSION_WAVES: u32 = 0;
+pub const MISSION_DEFEND: u32 = 1;
+pub const MISSION_RACE: u32 = 2;
+pub const MISSION_BOSS: u32 = 3;
+
+/// One mission's authored shape. `size` scales the wave engine
+/// (`wave_base`/`wave_grow` × size) so later levels reuse kinds harder.
+pub struct MissionDef {
+    pub kind: u32,
+    pub goal: u32,
+    /// Race clock, seconds (0 = untimed; only RACE reads it today).
+    pub time: f32,
+    pub size: f32,
+    pub name: &'static str,
+    pub brief: &'static str,
+}
+
+pub struct LevelDef {
+    pub name: &'static str,
+    pub missions: &'static [MissionDef],
+}
+
+/// The campaign. Two levels on the one map — the second exists to prove
+/// level switching and to re-run the kinds harder.
+/// TODO(ship): capture points — the fifth mission kind (hold zones to
+/// tick `done` up); slots into the director's PLAYING match like the
+/// others. And real per-level maps once buildings stop being const.
+pub const LEVELS: &[LevelDef] = &[
+    LevelDef {
+        name: "outbreak",
+        missions: &[
+            MissionDef {
+                kind: MISSION_WAVES,
+                goal: 2,
+                time: 0.0,
+                size: 0.7,
+                name: "first blood",
+                brief: "clear 2 waves. wasd drives, rmb aims, lmb fires.",
+            },
+            MissionDef {
+                kind: MISSION_DEFEND,
+                goal: 3,
+                time: 0.0,
+                size: 0.8,
+                name: "hold the depot",
+                brief: "the horde wants the fuel depot. 3 waves - keep it standing.",
+            },
+            MissionDef {
+                kind: MISSION_RACE,
+                goal: 8,
+                time: 150.0,
+                size: 0.6,
+                name: "supply run",
+                brief: "hit every beacon before the clock dies. outrun them - don't brawl.",
+            },
+            MissionDef {
+                kind: MISSION_BOSS,
+                goal: 100,
+                time: 0.0,
+                size: 0.4,
+                name: "the sow",
+                brief: "the biomod program's finest. aim for the big one.",
+            },
+        ],
+    },
+    LevelDef {
+        name: "deeper country",
+        missions: &[
+            MissionDef {
+                kind: MISSION_WAVES,
+                goal: 3,
+                time: 0.0,
+                size: 1.0,
+                name: "no rest",
+                brief: "3 waves, bigger and meaner.",
+            },
+            MissionDef {
+                kind: MISSION_RACE,
+                goal: 12,
+                time: 190.0,
+                size: 0.9,
+                name: "long haul",
+                brief: "the loop again - half more of it, under real pressure.",
+            },
+            MissionDef {
+                kind: MISSION_DEFEND,
+                goal: 4,
+                time: 0.0,
+                size: 1.1,
+                name: "last depot",
+                brief: "4 waves on the depot. gunners in force.",
+            },
+            MissionDef {
+                kind: MISSION_BOSS,
+                goal: 100,
+                time: 0.0,
+                size: 0.7,
+                name: "matriarch",
+                brief: "she brought the family.",
+            },
+        ],
+    },
+];
+
+/// Countdown on the briefing screen before a mission goes live.
+pub const BRIEF_SECS: f32 = 5.0;
+
+/// The current level, clamped — a stale replica can't index out.
+pub fn level_def(level: u32) -> &'static LevelDef {
+    &LEVELS[(level as usize).min(LEVELS.len() - 1)]
+}
+
+/// The current mission, clamped the same way.
+pub fn mission_def(level: u32, mission: u32) -> &'static MissionDef {
+    let m = level_def(level).missions;
+    &m[(mission as usize).min(m.len() - 1)]
+}
+
+/// The DEFEND objective: a static structure the horde can bite and
+/// gunners can shoot. Replicated so every client draws it and its
+/// damage; the server registers it in the collider pool as
+/// CAT_VEHICLE, which is the whole trick — hog aggro, bites, gunner
+/// fire, and friendly-fire chip all route to it through seams that
+/// already exist (a defend mission cost zero AI code).
+#[pm::pod]
+pub struct Depot {
+    pub x: f32,
+    pub z: f32,
+    pub hp: f32,
+}
+
+/// Where the depot stands (open ground, downtown — sightlines on
+/// purpose), its collider size, and how much chewing it survives
+/// (bites chip `Params::bite_dmg`, stray rounds their usual chips).
+pub const DEPOT_POS: (f32, f32) = (0.0, 20.0);
+pub const DEPOT_R: f32 = 2.4;
+pub const DEPOT_H: f32 = 3.2;
+pub const DEPOT_HP: f32 = 6.0;
+
+/// The depot's world-space hull — one definition, posed nowhere (it's
+/// static): the server registers it, the client mirrors it so bot
+/// hold-fire and debug cages agree.
+pub fn depot_hull(d: &Depot) -> Hull {
+    Hull { a: (d.x, d.z), b: (d.x, d.z), r: DEPOT_R, y: (0.0, DEPOT_H) }
+}
+
+/// The RACE loop: beacons around the arena's rim, clear of every
+/// building footprint, in running order. `Hunt::done % len` is the
+/// current beacon; laps just keep indexing.
+pub const RACE_LOOP: [(f32, f32); 8] = [
+    (0.0, -70.0),
+    (70.0, -70.0),
+    (85.0, 0.0),
+    (70.0, 50.0),
+    (25.0, 85.0),
+    (-40.0, 85.0),
+    (-85.0, 35.0),
+    (-85.0, -40.0),
+];
+/// Beacon capture radius, and the ceiling a heli must dip under to
+/// take one (no scoring the loop from the refuge band).
+pub const RACE_CP_R: f32 = 7.0;
+pub const RACE_CP_H: f32 = 12.0;
+
+/// The BOSS rides the hog pool (same AI, same interp, same collider
+/// seam — adopt, don't rewrite), plus this one-entry synced pool keyed
+/// by the hog's id: real hp (the `Hog::hp` wire repr saturates at
+/// 1.275, so the big number lives here and `Hog::hp` mirrors the
+/// FRACTION for tinting), and membership = "draw me huge".
+#[pm::pod]
+pub struct Boss {
+    pub hp: f32,
+}
+
+pub const BOSS_HP: f32 = 30.0;
+/// Render scale on the hog model, and the collider grow (m on every
+/// surface) that makes the hitbox match the spectacle.
+pub const BOSS_SCALE: f32 = 3.0;
+pub const BOSS_GROW: f32 = 1.4;
+
+/// Reliable client→server event: advance the session from an end
+/// screen (ENTER on won/lost). The server decides what "go" means by
+/// phase — retry the failed mission, or next level after a win.
+#[pm::pod]
+pub struct Session {
+    pub op: u32,
+}
+
+pub const SESSION_GO: u32 = 0;
 
 /// A live bullet: server-owned like the hogs — the server steps it,
 /// judges its hits (lag-compensated per shooter, each tick of flight),
@@ -490,6 +748,11 @@ pub const IMPACT_TTL: f32 = 1.0;
 
 // --- channels --------------------------------------------------------------
 
+// TODO(refactor): pool/channel NAMES ("truck", "hog", "param.set", …)
+// are string literals duplicated across server.rs and client_setup — a
+// typo is a runtime handshake rejection. Pin them as consts here next
+// to their pods.
+
 /// Command-frame input payload: driving plus the turret. `fire` is held
 /// state, not an event — the server's gun cooldown turns it into shots.
 /// `aim` is the turret angle the client wants THIS frame: the hold-to-aim
@@ -509,11 +772,28 @@ pub struct Drive {
     // will eventually own (per-vehicle key contexts live client-side).
     pub pitch: f32, // -1..1: nose down (forward) / up (heli only)
     pub lift: f32,  // -1..1: collective climb / descend (heli only)
+    /// Gun elevation off level — the heli chin gun (±HELI_AIM_PITCH)
+    /// AND the truck turret (−TRUCK_AIM_DOWN..TRUCK_AIM_UP; each step
+    /// clamps its own stops). Azimuth shares `aim` the same way. Same
+    /// client-side hold/ease-back animation, streamed as absolute
+    /// angles.
+    pub aim_pitch: f32,
 }
 
 /// Reliable client→server event: respawn as the chosen vehicle (the
 /// server swaps your ENTITY — see the server's respawn task for why a
 /// swap must be a fresh id).
+// TODO(ship): PLAYABLE HOGS (Connor, 2026-07-22) — let a player
+// control a hog, probably only the SPECIAL kinds (boss / gunner /
+// flyer; a regular hog is too weak to be fun as an avatar). This seam
+// is the door: a hog avatar is "a third vehicle" to the engine — a
+// VEH_* choice here, a spawn branch in the respawn task, own_set, and
+// a hog_step evolving a predicted pod from `Drive` (the current Hog
+// pod is server-stepped/interp-only, so a player hog wants its own
+// predicted pod the way Truck/Heli do, or the avatar keys into the AI
+// pools with the brain skipped). Versus-mode implications (a player
+// boss vs the hunters) can come later — mission kinds already gate
+// what spawns, so a "play the horde" mission slots into the director.
 #[pm::pod]
 pub struct Respawn {
     pub vehicle: u32, // VEH_TRUCK | VEH_HELI
@@ -524,18 +804,20 @@ pub const VEH_HELI: u32 = 1;
 
 // --- tuning ----------------------------------------------------------------
 
-// Tuning that designers move live migrated into [`Params`] (stages 1+2,
-// docs/params.md). What remains const here is STRUCTURAL: geometry,
-// physics identities, and control internals whose live mutation would
-// be meaningless or break contracts.
+// Tuning that designers move live migrated into [`Params`]. What
+// remains const here is STRUCTURAL: geometry, physics identities, and
+// control internals whose live mutation would be meaningless or break
+// contracts (the param-vs-const taxonomy on the Params declaration).
 
 /// Gravity (also the heli's hover-trim baseline).
 pub const G: f32 = 9.81;
 /// Truck hitpoints (what one bite chips is `Params::bite_dmg`; hp is
 /// the scale everything else is expressed in, so it stays 1.0).
 pub const TRUCK_HP: f32 = 1.0;
-/// Truck collision capsule: half-length along forward, radius.
-pub const TRUCK_HL: f32 = 0.8;
+/// Truck body radius — the shared step's building-push circle.
+/// Prediction replays the step byte-exact on both ends, so this stays
+/// a CONST, never model-derived; the bullet/bite capsule lives in the
+/// truck model's `collide.body` box instead (models.rs).
 pub const TRUCK_R: f32 = 0.9;
 /// Steering control-lag time constant for bot drivers (seconds).
 pub const STEER_TAU: f32 = 0.18;
@@ -553,6 +835,11 @@ pub const HOG_TURN: f32 = 2.6;
 pub const ROAM_REPICK: f32 = 9.0;
 /// Turret swing limit either side of straight ahead.
 pub const AIM_MAX: f32 = 2.6;
+/// Turret elevation stops: real-tank asymmetry — plenty of sky (a
+/// flyer at `flyer_ceil` inside gun range needs ~0.55), little
+/// depression (flat shots already connect on the deck via `HOG_H`).
+pub const TRUCK_AIM_UP: f32 = 0.9;
+pub const TRUCK_AIM_DOWN: f32 = 0.35;
 /// Hog GAMEPLAY hit ceiling: a shot connects if its altitude is inside
 /// [0, HOG_H] at the hit point. Taller than the drawn hog on purpose —
 /// truck barrels sit at ~1.45 and flat shots must keep connecting (2D
@@ -576,9 +863,75 @@ pub const HOGGUN_TRAVEL: f32 = 32.0;
 /// Aim error, ± radians on heading AND climb: "kinda bad". At 20 u
 /// that's a ~±2.8 u miss cone vs a ~1 u cabin.
 pub const HOGGUN_SPREAD: f32 = 0.14;
-/// Muzzle height (shoulder-mounted) and where they aim on a truck.
+/// Muzzle height (shoulder-mounted). Where they aim comes from the
+/// target hull's band via [`WorldIndex::nearest`] — no aim consts.
 pub const HOGGUN_Y: f32 = 0.6;
-pub const TRUCK_AIM_Y: f32 = 1.0;
+
+// --- flying hogs -------------------------------------------------------------
+
+// Biomod WINGED hogs: a slice of every wave (`Params::flyer_frac`)
+// grows wings and takes the fight upstairs. The ground horde's reach
+// stops at `hog_leap`; flyers cruise at `flyer_alt`, chase the nearest
+// vehicle by real 3D distance, and bite through the same contact seam
+// as everything else — so altitude stops being absolute safety. It
+// stays RELATIVE safety: climb past `flyer_ceil` and the flock sheds,
+// leaving a thin refuge band under the hard ceiling (you're safe up
+// there; the hunt is thirty units below you). Their colliders join the
+// same pool and history ring as the horde, so player bullets hit them
+// lag-compensated with zero new sweep code.
+
+/// A winged biomod hog: server-owned like the ground horde, clients
+/// interp only. Same quantization scheme as [`Hog`] plus the altitude
+/// (this pool joins the change-dense workload, so it rides the wire
+/// small: 15 B of payload/entry).
+#[pm::pod]
+pub struct Flyer {
+    #[wire(i16, scale = 64.0)]
+    pub x: f32,
+    #[wire(i16, scale = 64.0)]
+    pub y: f32,
+    #[wire(i16, scale = 64.0)]
+    pub z: f32,
+    #[wire(i16, scale = 10000.0)]
+    pub heading: f32,
+    #[wire(i16, scale = 256.0)]
+    pub speed: f32,
+    /// 0..FLYER_HP; clients tint by it. Dead flyers are REMOVED — the
+    /// client's falling ragdoll is the death animation.
+    #[wire(u8, scale = 200.0)]
+    pub hp: f32,
+}
+
+/// Flyer body radius, and the collider's altitude half-band about the
+/// body center (query pads still grow it shooter-side).
+pub const FLYER_R: f32 = 0.7;
+pub const FLYER_H: f32 = 0.8;
+/// One clean cannon hit drops a flyer at the shipped `gun_dmg` —
+/// they're hard to hit, so they're soft.
+pub const FLYER_HP: f32 = 0.5;
+/// Turn rate (rad/s) — a touch under the ground hog's; wide swoops.
+pub const FLYER_TURN: f32 = 2.2;
+/// Vertical authority, u/s — how fast a swoop commits (or breaks off).
+pub const FLYER_CLIMB: f32 = 7.0;
+/// 3D aggro radius. Bigger than the ground horde's `hog_aggro`:
+/// flyers are the interceptors.
+pub const FLYER_AGGRO: f32 = 45.0;
+/// Bite reach above/below the body — the vertical half-band handed to
+/// `hull_hits_circle` (ground hogs use [0, `hog_leap`] instead).
+pub const FLYER_REACH: f32 = 1.3;
+
+/// Interpolate two flyer samples.
+pub fn flyer_lerp(a: &Flyer, b: &Flyer, t: f32) -> Flyer {
+    let l = |x: f32, y: f32| x + (y - x) * t;
+    Flyer {
+        x: l(a.x, b.x),
+        y: l(a.y, b.y),
+        z: l(a.z, b.z),
+        heading: lerp_angle(a.heading, b.heading, t),
+        speed: l(a.speed, b.speed),
+        hp: l(a.hp, b.hp),
+    }
+}
 
 // --- helicopter tuning -------------------------------------------------------
 
@@ -590,6 +943,10 @@ pub const HELI_ATT_K: f32 = 5.0;
 /// than the old cosmetic lean.
 pub const HELI_PITCH_MAX: f32 = 0.70;
 pub const HELI_ROLL_MAX: f32 = 0.50;
+/// Chin-gun elevation limit either side of level (~57°) — steep enough
+/// to hover flat and strafe the deck, or to track a flyer overhead.
+/// Azimuth shares the truck turret's `AIM_MAX`.
+pub const HELI_AIM_PITCH: f32 = 1.0;
 /// Airframe drag, split by axis: the rotor disc brakes horizontal
 /// motion gently (full nose-down cruises ≈ 30 u/s — still the fastest
 /// thing in the arena), induced drag damps vertical (this is what makes
@@ -602,22 +959,11 @@ pub const HELI_VCAP: f32 = 34.0;
 /// Altitude band: skid height when landed, hard ceiling.
 pub const HELI_GROUND: f32 = 0.6;
 pub const HELI_CEIL: f32 = 45.0;
-/// Hull circle for buildings/bites (the client's hold-fire
-/// approximation too).
+/// Hull circle for the shared step's building pushes (prediction
+/// replays it — stays a const, same rule as `TRUCK_R`). The stage-4
+/// hitbox parts (cabin/tail/rotor) are `collide.*` boxes in the heli
+/// model now (models.rs derives and poses them).
 pub const HELI_R: f32 = 1.4;
-/// Stage-4 part geometry (docs/collisions.md §7.4): cabin ball, tail
-/// boom capsule behind it, rotor disc above. The old single ball
-/// (`HELI_R`, `heli_hull`) stays as the CLIENT's hold-fire
-/// approximation — a courtesy heuristic, not a judge.
-pub const HELI_CABIN_R: f32 = 1.0;
-pub const HELI_TAIL_R: f32 = 0.45;
-/// Tail boom near/far distance behind the cabin center.
-pub const HELI_TAIL_A: f32 = 1.2;
-pub const HELI_TAIL_B: f32 = 2.8;
-pub const HELI_ROTOR_R: f32 = 1.7;
-/// Rotor disc altitude band, relative to the body center.
-pub const HELI_ROTOR_LO: f32 = 0.6;
-pub const HELI_ROTOR_HI: f32 = 1.1;
 
 // --- buildings ---------------------------------------------------------------
 
@@ -626,6 +972,29 @@ pub const HELI_ROTOR_HI: f32 = 1.1;
 /// collide against the same walls, so nothing about them replicates
 /// (height is render-only). The south strip (z < -85) stays clear: that's
 /// where trucks spawn.
+///
+/// TODO(roadmap): buildings stop being a const — a synced world pool
+/// threaded into the shared steps params-style (a shared-step input
+/// must be replicated state; `&Params` proved the seam, and a collapse
+/// mispredicts for one blip, the documented params contract). The
+/// prerequisite for ANY destructibility, engine choice independent.
+/// Behind that: a Box3D server-side spike for tier-2 dynamics only
+/// (collapsing buildings, gameplay debris) — the server steps a Box3D
+/// world, poses stream out as quantized pods, sleeping bodies are free
+/// bandwidth. Vehicles STAY on the shared steps: solver state can't
+/// replay, traces can (the engine-survey lesson on the server's
+/// bullets task); rollback physics would be its own future project.
+/// DECIDED 2026-07-20 (source review of erincatto/box3d): if this gets
+/// demanded, FFI the real thing (`cc` + bindgen, pin a commit, one
+/// world owned by a server task) — NEVER rewrite the solver (~15k
+/// lines of manifolds/TGS/islands; a Rust-native solver means
+/// evaluating Rapier, not hand-porting). Box3D's own FAQ rules out
+/// rollback determinism, which confirms this boundary from their side:
+/// the predicted steps and the rewound hit path stay pm's, pods in,
+/// poses out. AND: under ship-mode, cosmetic client-local chaos
+/// (ragdolls, gibs, shake) delivers most of the felt physics at ~zero
+/// cost — do that first; this spike only if destruction is a design
+/// PILLAR.
 pub const BUILDINGS: [(f32, f32, f32, f32, f32); 14] = [
     (10.0, 8.0, 4.0, 4.0, 11.0), // the downtown tower
     (0.0, -22.0, 11.0, 4.0, 6.0),
@@ -691,6 +1060,10 @@ pub fn building_push(x: f32, z: f32, r: f32) -> (f32, f32, f32, f32) {
     (x, z, nx, nz)
 }
 
+// TODO(refactor): building_push IS building_push_below at y = 0 (no
+// roof sits below 0, so the skip never fires) — delegate one to the
+// other and delete the copied body; same compiled math, so prediction
+// byte-exactness survives.
 /// `building_push` for something at altitude `y`: only buildings whose
 /// roof is above you shove the hull — above the roofline you overfly.
 /// Same closest-point math so ground-level callers stay byte-identical.
@@ -746,25 +1119,38 @@ pub fn building_top(x: f32, z: f32) -> f32 {
 /// Muzzle pose, `(x, y, z, heading, climb)` — ONE definition so the
 /// server's real bullet and the client's cosmetic tracer (spawned at
 /// the click from PREDICTED pose) leave the same barrel the same way.
-/// Turret muzzle at the barrel tip: flat shot.
+/// Turret muzzle at the barrel tip, elevated by the turret pitch: the
+/// barrel pivots at (0, 1.45, 0) in truck space (where the mesh's
+/// barrel box starts), so the tip rises along the aimed line.
 pub fn truck_muzzle(t: &Truck) -> (f32, f32, f32, f32, f32) {
     let dir = t.heading() + t.aim;
+    let p = t.aim_pitch;
     let (x, z) = (t.body.pos.x, t.body.pos.z);
-    (x + dir.sin() * 1.9, 1.45, z + dir.cos() * 1.9, dir, 0.0)
+    (
+        x + dir.sin() * 1.9 * p.cos(),
+        1.45 + 1.9 * p.sin(),
+        z + dir.cos() * 1.9 * p.cos(),
+        dir,
+        p,
+    )
 }
 
-/// Heli nose gun fires where the nose points — dive to strafe the
-/// horde. Body pitch>0 = nose down, so the bullet's climb is its
-/// negation.
+/// Heli chin gun fires where the GIMBAL points: azimuth trains off the
+/// nose (`Heli::aim`), elevation off level tilted by the airframe
+/// (body pitch>0 = nose down, so `climb = aim_pitch - pitch` — a dive
+/// still steepens a centered gun, and the gimbal corrects on top). The
+/// muzzle leads along the GUN azimuth at chin radius, so tracers leave
+/// the barrel whichever way it's slewed.
 pub fn heli_muzzle(h: &Heli) -> (f32, f32, f32, f32, f32) {
     let b = h.body;
     let (yaw, pitch, _) = b.rot.to_yaw_pitch_roll();
+    let dir = wrap_angle(yaw + h.aim);
     (
-        b.pos.x + yaw.sin() * 2.3,
+        b.pos.x + dir.sin() * 1.6,
         (b.pos.y - 0.35).max(0.2),
-        b.pos.z + yaw.cos() * 2.3,
-        yaw,
-        -pitch,
+        b.pos.z + dir.cos() * 1.6,
+        dir,
+        h.aim_pitch - pitch,
     )
 }
 
@@ -810,6 +1196,7 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
         body: _,
         steer: _,
         aim: _,
+        aim_pitch: _,
         heat: _,
     } = *t;
     let mut heading = t.heading();
@@ -821,9 +1208,16 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
     } else {
         t.steer = cmd.turn;
     }
-    // Turret: crisp copy of the commanded angle — the client animates
-    // the hold/snap-back, so replaying commands reproduces it exactly.
-    t.aim = cmd.aim.clamp(-AIM_MAX, AIM_MAX);
+    // Turret: SLEWS toward the commanded angles at `turret_rate` (both
+    // axes) instead of snapping — the command is where you want the
+    // gun, the pod is where the barrel actually is, and replaying
+    // commands reproduces the chase exactly. No wrap handling needed:
+    // the stops mean the short way is always through zero.
+    let slew = p.turret_rate * dt;
+    let want = cmd.aim.clamp(-AIM_MAX, AIM_MAX);
+    t.aim += (want - t.aim).clamp(-slew, slew);
+    let want = cmd.aim_pitch.clamp(-TRUCK_AIM_DOWN, TRUCK_AIM_UP);
+    t.aim_pitch += (want - t.aim_pitch).clamp(-slew, slew);
     // Boost: extra shove and a higher ceiling, paid in heat. Heat is
     // predicted state (this is THE shared step), so the client's meter
     // is live; the EXPLOSION at 1.0 is the server's move alone.
@@ -905,7 +1299,16 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
     // COMPILE-TIME COVERAGE — the predicted-pod contract, same as
     // truck_step: every field here is evolved from the command by THIS
     // function. Cover new fields in `heli_err` and `heli_lerp` too.
-    let Heli { body: _ } = *h;
+    let Heli {
+        body: _,
+        aim: _,
+        aim_pitch: _,
+    } = *h;
+    // Chin gun: crisp copy of the commanded gimbal, the truck turret's
+    // law — the client animates the hold and the ease-back, so replay
+    // reproduces it exactly.
+    h.aim = cmd.aim.clamp(-AIM_MAX, AIM_MAX);
+    h.aim_pitch = cmd.aim_pitch.clamp(-HELI_AIM_PITCH, HELI_AIM_PITCH);
     let b = &mut h.body;
 
     // Attitude on the quat via the constrained-vehicle path: extract,
@@ -1000,9 +1403,11 @@ pub fn body_lerp(a: &Body, b: &Body, t: f32) -> Body {
     }
 }
 
-/// Heli prediction error metric — the pod IS a body.
+/// Heli prediction error metric — the shared body term plus the gimbal.
 pub fn heli_err(a: &Heli, b: &Heli) -> f32 {
     body_err(&a.body, &b.body)
+        + (a.aim - b.aim).abs()
+        + (a.aim_pitch - b.aim_pitch).abs()
 }
 
 /// Prediction error metric: the shared body term plus the scalars.
@@ -1010,10 +1415,18 @@ pub fn err_metric(a: &Truck, b: &Truck) -> f32 {
     body_err(&a.body, &b.body)
         + (a.steer - b.steer).abs()
         + (a.aim - b.aim).abs()
+        + (a.aim_pitch - b.aim_pitch).abs()
         + (a.heat - b.heat).abs()
 }
 
 // --- geometry ---------------------------------------------------------------
+
+// TODO(refactor): the five hand-written lerps and two err metrics below
+// are trust-based coverage ("remember to add the new field") — the one
+// gap the steps' exhaustive destructure can't close. Engine candidate:
+// derive lerp/err from #[pm::pod] fields (angle/identity fields tagged
+// the way #[wire] tags quantization) — the pm_params! spirit applied
+// here; a new pod field then costs zero lerp code.
 
 // Angle helpers come from the engine; re-exported so the whole example
 // reaches them through `common::*` like the rest of the shared math.
@@ -1026,6 +1439,7 @@ pub fn truck_lerp(a: &Truck, b: &Truck, t: f32) -> Truck {
         body: body_lerp(&a.body, &b.body, t),
         steer: l(a.steer, b.steer),
         aim: lerp_angle(a.aim, b.aim, t),
+        aim_pitch: lerp_angle(a.aim_pitch, b.aim_pitch, t),
         heat: l(a.heat, b.heat),
     }
 }
@@ -1043,11 +1457,13 @@ pub fn bullet_lerp(a: &Bullet, b: &Bullet, t: f32) -> Bullet {
     }
 }
 
-/// Interpolate two heli samples — the pod is a body, so the shared
-/// body lerp (nlerp attitude) IS the heli lerp.
+/// Interpolate two heli samples — the shared body lerp (nlerp
+/// attitude) plus the gimbal angles.
 pub fn heli_lerp(a: &Heli, b: &Heli, t: f32) -> Heli {
     Heli {
         body: body_lerp(&a.body, &b.body, t),
+        aim: lerp_angle(a.aim, b.aim, t),
+        aim_pitch: lerp_angle(a.aim_pitch, b.aim_pitch, t),
     }
 }
 
@@ -1063,16 +1479,8 @@ pub fn hog_lerp(a: &Hog, b: &Hog, t: f32) -> Hog {
     }
 }
 
-/// A truck's collision capsule as its two segment endpoints (back, front).
-pub fn truck_seg(t: &Truck) -> ((f32, f32), (f32, f32)) {
-    let h = t.heading();
-    let (fx, fz) = (h.sin() * TRUCK_HL, h.cos() * TRUCK_HL);
-    let (x, z) = (t.body.pos.x, t.body.pos.z);
-    ((x - fx, z - fz), (x + fx, z + fz))
-}
-
-/// Distance from point `p` to segment `a`-`b`.
-pub fn seg_point_dist(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
+/// Closest point on segment `a`-`b` to `p`.
+pub fn seg_closest(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> (f32, f32) {
     let (abx, abz) = (b.0 - a.0, b.1 - a.1);
     let (apx, apz) = (p.0 - a.0, p.1 - a.1);
     let len2 = abx * abx + abz * abz;
@@ -1081,23 +1489,25 @@ pub fn seg_point_dist(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
     } else {
         0.0
     };
-    let (cx, cz) = (a.0 + abx * t, a.1 + abz * t);
+    (a.0 + abx * t, a.1 + abz * t)
+}
+
+/// Distance from point `p` to segment `a`-`b`.
+pub fn seg_point_dist(a: (f32, f32), b: (f32, f32), p: (f32, f32)) -> f32 {
+    let (cx, cz) = seg_closest(a, b, p);
     let (dx, dz) = (p.0 - cx, p.1 - cz);
     (dx * dx + dz * dz).sqrt()
 }
 
-/// The truck hull's bullet height band (friendly-fire chip per hit is
-/// `Params::friendly_dmg`).
-pub const TRUCK_HULL_H: f32 = 1.6;
-
-/// A vehicle's bullet-collision shape, decoupled from which pool the
-/// vehicle lives in: a ground-plane capsule (equal endpoints = a
-/// cylinder) plus an altitude band. Every "does a shot touch this
-/// vehicle" question — the server's friendly-fire sweep, the bots'
-/// hold-fire gate — goes through [`ray_hits_hull`]; a NEW VEHICLE adds
-/// its `*_hull` fn here and one registry line per side (the server's
-/// `hulls` list, `ClientWorld::hulls`), and the sweep code never
-/// changes.
+/// A collision shape in WORLD space, decoupled from which pool its
+/// owner lives in: a ground-plane capsule (equal endpoints = a
+/// cylinder) plus an altitude band. Every "does a shot touch this"
+/// question — the server's sweep, the bots' hold-fire gate — goes
+/// through [`ray_hits_hull`]. The shapes themselves are authored as
+/// `collide.*` marker boxes in each MODEL (models.rs derives a
+/// [`crate::models::Proto`] per box; the owner poses it every tick) —
+/// a NEW VEHICLE ships its hitbox inside its .glb, and the sweep code
+/// never changes.
 #[derive(Clone, Copy)]
 pub struct Hull {
     /// Capsule segment endpoints on the ground plane.
@@ -1118,75 +1528,14 @@ impl Hull {
             ..self
         }
     }
-}
 
-pub fn truck_hull(t: &Truck) -> Hull {
-    let (a, b) = truck_seg(t);
-    Hull { a, b, r: TRUCK_R, y: (0.0, TRUCK_HULL_H) }
-}
-
-pub fn heli_hull(h: &Heli) -> Hull {
-    let p = h.body.pos;
-    Hull {
-        a: (p.x, p.z),
-        b: (p.x, p.z),
-        r: HELI_R,
-        y: (p.y - HELI_R, p.y + HELI_R),
+    /// The hull's bounding box — what [`WorldIndex`] files it under.
+    pub fn aabb(self) -> pm::Aabb {
+        pm::Aabb::new(
+            vec3(self.a.0.min(self.b.0) - self.r, self.y.0, self.a.1.min(self.b.1) - self.r),
+            vec3(self.a.0.max(self.b.0) + self.r, self.y.1, self.a.1.max(self.b.1) + self.r),
+        )
     }
-}
-
-/// A hog is a ground cylinder: its round body over the gameplay hit
-/// band [0, `HOG_H`] (taller than the drawn hog on purpose — see
-/// `HOG_H`). The shooter's forgiveness is NOT in here: `Shot::pad`
-/// grows the query, never the collider (docs/collisions.md §8).
-pub fn hog_hull(h: &Hog) -> Hull {
-    Hull {
-        a: (h.x, h.z),
-        b: (h.x, h.z),
-        r: HOG_R,
-        y: (0.0, HOG_H),
-    }
-}
-
-/// The heli's stage-4 parts, posed from the body: `[0]` is the cabin
-/// (the BODY part — bites test `ids[0]` by convention), then the tail
-/// boom, then the rotor disc. Yaw poses the boom; pitch/roll are
-/// ignored by hulls (altitude bands stay vertical — an approximation
-/// the shot pads already forgive).
-pub fn heli_hulls(h: &Heli) -> [(u8, Hull); 3] {
-    let b = h.body;
-    let (x, y, z) = (b.pos.x, b.pos.y, b.pos.z);
-    let yaw = b.yaw();
-    let (fx, fz) = (yaw.sin(), yaw.cos());
-    [
-        (
-            PART_BODY,
-            Hull {
-                a: (x, z),
-                b: (x, z),
-                r: HELI_CABIN_R,
-                y: (y - HELI_CABIN_R, y + HELI_CABIN_R),
-            },
-        ),
-        (
-            PART_TAIL,
-            Hull {
-                a: (x - fx * HELI_TAIL_A, z - fz * HELI_TAIL_A),
-                b: (x - fx * HELI_TAIL_B, z - fz * HELI_TAIL_B),
-                r: HELI_TAIL_R,
-                y: (y - HELI_TAIL_R, y + HELI_TAIL_R),
-            },
-        ),
-        (
-            PART_ROTOR,
-            Hull {
-                a: (x, z),
-                b: (x, z),
-                r: HELI_ROTOR_R,
-                y: (y + HELI_ROTOR_LO, y + HELI_ROTOR_HI),
-            },
-        ),
-    ]
 }
 
 /// Where a gunner points to hit `(tx, ty, tz)` from its muzzle:
@@ -1197,6 +1546,10 @@ pub fn hog_aim(x: f32, y: f32, z: f32, tx: f32, ty: f32, tz: f32) -> (f32, f32) 
     (dx.atan2(dz), dy.atan2((dx * dx + dz * dz).sqrt()))
 }
 
+// TODO(refactor): (x, z, y, heading, reach, dy) rides as six positional
+// f32s through ray_hits_hull / sweep_colliders / the muzzles /
+// line_clear — a small ShotRay struct would align those signatures and
+// end the argument-order juggling.
 /// A shot's travel — `reach` along `heading` on the ground plane, `dy`
 /// total altitude change over it — against one hull, in PRESENT time
 /// (vehicles aren't in the history ring; they're slow enough that
@@ -1204,6 +1557,11 @@ pub fn hog_aim(x: f32, y: f32, z: f32, tx: f32, ty: f32, tz: f32) -> (f32, f32) 
 /// hull radius (≤ 80% of it), so nothing tunnels whether `reach` is a
 /// bullet's per-tick travel or a bot's whole line of fire. Returns the
 /// hit point.
+///
+/// TODO(roadmap): if bullet speeds ever make the sampled sweep leaky,
+/// an EXACT capsule cast drops in behind this signature — same pod,
+/// solved instead of stepped. Not before: the ≤ 0.8 × radius step has
+/// never missed at current speeds.
 pub fn ray_hits_hull(
     x: f32,
     z: f32,
@@ -1228,17 +1586,53 @@ pub fn ray_hits_hull(
     None
 }
 
-// --- the collider pool (docs/collisions.md) ----------------------------------
+// --- the collider pool -------------------------------------------------------
+// The rustdoc on Collider/Contact/Parts/WorldIndex below IS the
+// collisions design record (the former docs/collisions.md, folded onto
+// the types 2026-07-20). The lag-comp half lives on the server's
+// `bullets` task; the broadphase half on pm::DynamicTree.
 
-/// One collidable PART, registered into the server's collider pool by
-/// its owner: detection is data the sweep iterates, never functions
-/// that know a vehicle kind (docs/collisions.md §2). The entry is
-/// keyed by the part's OWN id — a vehicle's parts are child entities
-/// (`id_add` per part, the parent→child link lives in the server's
-/// `parts` pool); a single-part swarm entity may be its own part,
-/// keyed by its owner id, which makes its cleanup free. Owners
-/// re-pose `hull` every tick (the heli-rotor-matrix habit applied to
-/// shapes); the sweep never looks up a pose.
+/// One collidable PART, registered into the collider pool by its
+/// owner. THE collision architecture in one sentence: *a vehicle
+/// registers each of its parts into a pool; the collisions sweep
+/// iterates that pool; the hit is reported back to the vehicle to
+/// handle* — detection is DATA the simulation iterates, never
+/// functions that know what a helicopter is (decided 2026-07-16,
+/// reviewing three generations of coexisting hit tests, each one a
+/// type-branch wearing a trenchcoat).
+///
+/// What that buys: registration is data (spawn writes entries;
+/// nothing enumerates kinds), multi-part vehicles and per-part damage
+/// fall out for free (the heli's cabin/tail/rotor was pure data
+/// entry), and the same contact stream feeds damage, knockback, and
+/// sfx without the sweep growing branches. Gunner hogs proved it the
+/// day it landed: an NPC shooter is just a task writing into pools
+/// the pipeline already understands.
+///
+/// A five-engine survey (2026-07-17: Box2D v3/Box3D, Quake/Source,
+/// Unreal, Unity classic+DOTS, Jolt/Rapier) held the design up
+/// against primary sources; it survived wholesale. Everyone
+/// converged on exactly this shape: contacts as transient data
+/// drained after the sweep (see [`Contact`]), response owned by the
+/// struck entity's code, part identity as a small data key (Unity
+/// `ColliderKey`, Jolt `SubShapeID`, UE `BoneName`), parts attached
+/// flat to one owner with hierarchy kept game-level, and collision
+/// worlds never replicated — only poses go on the wire.
+///
+/// Keying: the entry is keyed by the part's OWN id — a vehicle's
+/// parts are child entities ([`parts_add`]); a single-part swarm
+/// entity is its own part, keyed by its owner id, so death cleans its
+/// entry with the entity and the id space isn't doubled at horde
+/// scale. Owners re-pose `hull` every tick (the heli-rotor-matrix
+/// habit applied to shapes); the sweep never looks up a pose — and
+/// since 2026-07-18 the shapes themselves are authored as `collide.*`
+/// marker boxes in each kind's `.glb` (models.rs), so a new vehicle
+/// ships its hitbox inside its model.
+///
+/// The shape vocabulary is deliberately capsule + altitude band and
+/// nothing else. It becomes debt only when gameplay demands walkable
+/// bridges or stacking — which is exactly the Box3D layer-3 trigger
+/// parked on the physics plan (see the BUILDINGS TODO).
 #[derive(Clone, Copy)]
 pub struct Collider {
     /// The entity this part belongs to — response is ITS business.
@@ -1247,7 +1641,11 @@ pub struct Collider {
     /// to the contact untouched and never interprets it.
     pub part: u8,
     /// Category bits — what this entry IS. Sweeps bring their own mask
-    /// of what they TEST (the `MASK_SHOT` pattern, doc §9).
+    /// of what they TEST (the query-carries-its-filter pattern —
+    /// Quake's `MASK_SHOT`, Box2D's `b2QueryFilter`; the world never
+    /// knows who's asking). Categories are what retired the
+    /// friendly-fire ownership walk: one sweep tests `VEHICLE|HOG`
+    /// and skips the shooter by `owner`.
     pub cat: u8,
     /// World-space shape, pre-posed by the owner every tick.
     pub hull: Hull,
@@ -1264,6 +1662,57 @@ pub const PART_ROTOR: u8 = 2;
 pub const CAT_VEHICLE: u8 = 1 << 0;
 pub const CAT_HOG: u8 = 1 << 1;
 
+/// A vehicle's registered part ids, in registration order — `ids[0]`
+/// is the body part. Fixed capacity; filler slots repeat the owner id
+/// and sit past `n`. Lives on BOTH ends: the server's `vehicle.part`
+/// pool and the client's local mirror use the same link shape.
+///
+/// This link is pm's first real entity RELATIONSHIP, and it breaks an
+/// invariant the engine leans on: `id_remove(vehicle)` cleans pools
+/// keyed by THAT id, but parts have their own ids — kill the heli and
+/// its rotor collider would survive as a ghost. The answer is
+/// CONVENTION, not engine feature: a janitor culls entries whose
+/// `owner` fails `pm.id_alive` (the O(1) generational check — the
+/// same index+generation validate-at-use every surveyed engine ships:
+/// `b2Body_IsValid`, Jolt sequence numbers, Unity `Entity.Version`),
+/// and response tasks re-check the owner at drain so a mid-tick death
+/// never dangles. Engine-level child ids (`id_add_child` + cascading
+/// remove) stay PARKED until more parent→child users appear — every
+/// surveyed engine cascades shape lifetime inside its physics module
+/// and none generalizes it into an entity feature; building it for
+/// one caller is the kernel-decomposition mistake again.
+#[derive(Clone, Copy)]
+pub struct Parts {
+    pub ids: [Id; 4],
+    pub n: u8,
+}
+
+/// Register a vehicle's parts: child entities in the collider pool
+/// plus the parent→child link in `parts` (keyed by the VEHICLE, so
+/// entity removal cleans the link and the janitor reaps the orphaned
+/// parts — see [`Parts`] for why that split exists). Hulls are
+/// re-posed by the owner every tick; registration just needs them
+/// sane. A truck is one BODY entry; the heli is three. Same call on
+/// both ends: the server registers from spawn poses, the client from
+/// draw-pool poses.
+pub fn parts_add(
+    pm: &mut pm::Pm,
+    collider: &pm::PoolHandle<Collider>,
+    parts: &pm::PoolHandle<Parts>,
+    owner: Id,
+    cat: u8,
+    hulls: &[(u8, Hull)],
+) {
+    let mut p = Parts { ids: [owner; 4], n: 0 };
+    for &(part, hull) in hulls {
+        let pid = pm.id_add();
+        collider.get_mut().add(pid, Collider { owner, part, cat, hull });
+        p.ids[p.n as usize] = pid;
+        p.n += 1;
+    }
+    parts.get_mut().add(owner, p);
+}
+
 /// A hit the sweep found: who was struck, where, and how far along the
 /// travel — `frac` is what orders competing hits (nearest wins).
 #[derive(Clone, Copy)]
@@ -1276,12 +1725,43 @@ pub struct SweepHit {
     pub z: f32,
 }
 
+/// One shot-vs-one-entry judgment — the shared core of the history
+/// sweep and [`WorldIndex::sweep`], so the two paths cannot disagree.
+fn sweep_one(
+    x: f32,
+    z: f32,
+    y: f32,
+    heading: f32,
+    reach: f32,
+    dy: f32,
+    pad: f32,
+    c: &Collider,
+) -> Option<SweepHit> {
+    let (hx, hz) = ray_hits_hull(x, z, y, heading, reach, dy, &c.hull.grow(pad))?;
+    let (dx, dz) = (hx - x, hz - z);
+    let frac = (dx * dx + dz * dz).sqrt() / reach.max(1e-6);
+    Some(SweepHit { owner: c.owner, part: c.part, frac, x: hx, y: y + dy * frac, z: hz })
+}
+
 /// THE collisions sweep: one shot's travel against every collider
 /// entry matching `mask`, nearest hit along the path winning (not
-/// registry order — a hog can shield a teammate). `skip` drops the
-/// shooter's own vehicle (bullets are born at its muzzle); `pad`
-/// grows each tested hull QUERY-side (doc §8: the pad is the shot's
-/// forgiveness — a collider doesn't know who's shooting at it).
+/// registry order — a hog can shield a teammate, and before this
+/// ordering a teammate could eat a round a hog between the muzzles
+/// should have caught). `skip` drops the shooter's own vehicle
+/// (bullets are born at its muzzle); `pad` grows each tested hull
+/// QUERY-side — the pad is the shot's forgiveness, and expansion is
+/// query-side everywhere in the genre (Quake 3 expands brush planes
+/// per-trace by that trace's extents): a collider doesn't know who's
+/// shooting at it.
+///
+/// This SLICE form is the history path: rewound shots run against
+/// ring frames, which the tree does not index. Present-time sweeps go
+/// through [`WorldIndex::sweep`] — same judgment, pruned.
+///
+/// Linear over the frame is fine to ~1–2k hogs (~25k capsule tests
+/// per tick at 200 hogs + 60 bullets). If ring sweeps ever show in
+/// profiles, the answer is revisiting present-only lag comp — NOT
+/// `pm::SpatialGrid`, which stays as the simple teaching structure.
 pub fn sweep_colliders(
     x: f32,
     z: f32,
@@ -1299,31 +1779,47 @@ pub fn sweep_colliders(
         if c.cat & mask == 0 || skip == Some(c.owner) {
             continue;
         }
-        let Some((hx, hz)) = ray_hits_hull(x, z, y, heading, reach, dy, &c.hull.grow(pad))
-        else {
+        let Some(hit) = sweep_one(x, z, y, heading, reach, dy, pad, c) else {
             continue;
         };
-        let (dx, dz) = (hx - x, hz - z);
-        let frac = (dx * dx + dz * dz).sqrt() / reach.max(1e-6);
-        if best.is_none_or(|b| frac < b.frac) {
-            best = Some(SweepHit {
-                owner: c.owner,
-                part: c.part,
-                frac,
-                x: hx,
-                y: y + dy * frac,
-                z: hz,
-            });
+        if best.is_none_or(|b| hit.frac < b.frac) {
+            best = Some(hit);
         }
     }
     best
 }
 
 /// A detected touch — written by the sweep on a fresh id, drained the
-/// SAME tick by the struck entity's response task (sweep at prio 31,
-/// responses at 32): transient facts as pool entries, the
-/// contact-points rule. The sweep applies nothing; whoever owns
-/// `owner` owns every consequence (docs/collisions.md §2).
+/// SAME tick by the struck entity's response task (bites at prio 28,
+/// sweep at 31, responses at 32; a runtime guard purges last-tick
+/// leftovers loudly): transient facts as pool entries with a
+/// lifetime, the contact-points rule — never callbacks, never events.
+/// The sweep applies nothing; whoever owns `owner` owns every
+/// consequence, so detection and response never meet in the same
+/// function.
+///
+/// The industry arrived here the hard way, which is why this contract
+/// is non-negotiable: Box2D v2 had mid-step gameplay callbacks
+/// (`BeginContact`/`PreSolve`) and v3 DELETED them for event arrays
+/// drained after the step ("callbacks in multithreading are
+/// problematic... race conditions in user code, user code becomes
+/// non-deterministic" — Catto's migration guide); Unity retrofitted
+/// the same batched shape onto PhysX and got ~30% back; Jolt's
+/// documented pattern is "buffer them yourself, process after
+/// update". Drained-same-tick is that contract with pm's task
+/// priorities as the guarantee.
+///
+/// No normal, no impulse: engines store those for their SOLVER, and
+/// ours has none in the loop — knockback derives from `heading`.
+/// Fields joined with their consumers, not before (`y` because a
+/// rotor strike at altitude is not a ground splash; `source_peer`
+/// because peer attribution is all any response ever wanted).
+///
+/// Small levers, noted not built: opt-in contact REPORTING per
+/// collider if contact volume ever matters (Box2D v3.1 ships events
+/// off-by-default for perf — a report-bit, not a redesign), and
+/// enter/exit EDGES reconstructed owner-side via `pm::Adds` on this
+/// pool if a sustained contact ever appears (heal pads).
 #[derive(Clone, Copy)]
 pub struct Contact {
     pub owner: Id,
@@ -1351,6 +1847,216 @@ pub const KIND_BITE: u8 = 1;
 /// biter's reach; a heli above it is safe however close in plan view).
 pub fn hull_hits_circle(hull: &Hull, cx: f32, cz: f32, r: f32, ylo: f32, yhi: f32) -> bool {
     hull.y.0 <= yhi && ylo <= hull.y.1 && seg_point_dist(hull.a, hull.b, (cx, cz)) < hull.r + r
+}
+
+// --- the query seam ---------------------------------------------------------
+
+/// A proximity answer: who's near, where to aim/steer, and how far.
+/// The point `(x, y, z)` is the closest point on the hull's capsule
+/// AXIS (y clamped into the band) — a chase heading, an aim point, a
+/// bite anchor, depending on the caller. `dist` is measured to that
+/// point, not the hull's skin, so it lives on the same scale the old
+/// center-distance target chains used (`hog_aggro` etc. keep meaning).
+#[derive(Clone, Copy)]
+pub struct Near {
+    pub owner: Id,
+    pub part: u8,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// The hull's altitude band — bite anchors read `band.0`.
+    pub band: (f32, f32),
+    pub dist: f32,
+}
+
+impl Near {
+    fn of(qx: f32, qy: f32, qz: f32, c: &Collider) -> Near {
+        let (px, pz) = seg_closest(c.hull.a, c.hull.b, (qx, qz));
+        let py = qy.clamp(c.hull.y.0, c.hull.y.1);
+        let (dx, dy, dz) = (px - qx, py - qy, pz - qz);
+        Near {
+            owner: c.owner,
+            part: c.part,
+            x: px,
+            y: py,
+            z: pz,
+            band: c.hull.y,
+            dist: (dx * dx + dy * dy + dz * dz).sqrt(),
+        }
+    }
+}
+
+/// THE world-query index: the collider pool mirrored into a
+/// [`pm::DynamicTree`] once per tick, asked three ways —
+/// [`nearest`](WorldIndex::nearest) (targeting),
+/// [`touch`](WorldIndex::touch) (bites), and
+/// [`sweep`](WorldIndex::sweep) (present-time shots; rewound shots
+/// stay on [`sweep_colliders`] over HISTORY frames — the tree only
+/// indexes the present). Every "what's around me" question goes
+/// through here instead of a hand-built per-pool chain: a new vehicle
+/// kind registers collider parts and is chased, bitten, and aimed at
+/// with zero AI edits — and aggro judges reach by the same
+/// band-overlap criterion the bite does.
+///
+/// BOTH ends keep one: the server's `index` task mirrors the sim's
+/// collider pool; the client's `colliders` task poses its own local
+/// pool from the smoothed draw pools and mirrors that — so the
+/// client's index describes the world this client believes it sees,
+/// which is the view the server's lag comp honors for its shots.
+/// The boundary that holds on both ends: colliders answer WHERE
+/// (geometry questions come here); the pods answer WHAT — bot lead
+/// math reads velocity, cage meshes are per kind, and neither belongs
+/// in kind-erased shape data.
+///
+/// Design choices, with their costs:
+/// - **Sync, not hooks**: a task refreshes the mirror at a declared
+///   priority; pools stay dumb data. Cost: queries see last tick's
+///   poses — exactly the staleness the old direct pool reads had
+///   (AI at 28 always read what the pose tasks wrote the tick
+///   before), made explicit.
+/// - **A HashMap rides beside the tree** (`Id → (proxy, Collider)`):
+///   tree leaves carry `Id` only, keeping game data out of the
+///   engine structure. Cost: one map lookup per candidate.
+/// - **False positives by contract**: the tree over-reports
+///   (fat boxes); every verb re-runs the exact hull test. Never a
+///   false negative.
+/// - **The tree buys shape, not milliseconds — today.** ~10 vehicle
+///   parts + a few hundred hogs is linear-scan territory; what was
+///   bought is the verb API every caller speaks, so bigger worlds
+///   (buildings-as-pool, Box3D tier-2) arrive behind the seam with
+///   zero caller edits.
+pub struct WorldIndex {
+    tree: pm::DynamicTree,
+    entries: std::collections::HashMap<Id, (u32, Collider)>,
+}
+
+impl Default for WorldIndex {
+    fn default() -> Self {
+        // Margin ≈ a fast hog's travel over ~8 ticks: an entry re-files
+        // roughly 8x/second instead of 60x, and idle ones never. A
+        // single constant to tune if the tradeoff (lazier updates vs
+        // fatter false-positive rings) ever measures wrong.
+        WorldIndex { tree: pm::DynamicTree::new(1.0), entries: Default::default() }
+    }
+}
+
+impl WorldIndex {
+    /// Mirror the collider pool: new entries insert, moved ones update
+    /// (a no-op inside the fat margin), dead ones leave the tree.
+    pub fn sync(&mut self, pool: &pm::Pool<Collider>) {
+        let WorldIndex { tree, entries } = self;
+        entries.retain(|&id, (proxy, _)| {
+            let live = pool.contains(id);
+            if !live {
+                tree.remove(*proxy);
+            }
+            live
+        });
+        for (id, c) in pool.iter() {
+            match entries.entry(id) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (proxy, stored) = e.get_mut();
+                    *stored = *c;
+                    tree.update(*proxy, c.hull.aabb());
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((tree.insert(c.hull.aabb(), c.cat as u64, id), *c));
+                }
+            }
+        }
+    }
+
+    /// Nearest collider in `mask` whose altitude band overlaps
+    /// `[band.0, band.1]`, within `within` of `(qx, qy, qz)` — the
+    /// targeting verb. The band IS the reach criterion: a hog passes
+    /// `(0, hog_leap)` and a climbing heli simply stops existing for
+    /// it, exactly as it does for the bite.
+    pub fn nearest(
+        &self,
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        within: f32,
+        band: (f32, f32),
+        mask: u8,
+    ) -> Option<Near> {
+        let (ylo, yhi) = (band.0.max(qy - within), band.1.min(qy + within));
+        if ylo > yhi {
+            return None;
+        }
+        let q = pm::Aabb::new(vec3(qx - within, ylo, qz - within), vec3(qx + within, yhi, qz + within));
+        let mut best: Option<Near> = None;
+        self.tree.query(q, mask as u64, |id| {
+            let (_, c) = &self.entries[&id];
+            if c.hull.y.0 > band.1 || c.hull.y.1 < band.0 {
+                return;
+            }
+            let n = Near::of(qx, qy, qz, c);
+            if n.dist <= within && best.is_none_or(|b| n.dist < b.dist) {
+                best = Some(n);
+            }
+        });
+        best
+    }
+
+    /// Nearest collider in `mask` overlapping the vertical circle
+    /// (`r` around `(cx, cz)`, altitude band `[band.0, band.1]`) — the
+    /// bite verb, [`hull_hits_circle`] behind the tree. Multi-part
+    /// owners are touchable on ANY part: a hog flanking a heli's tail
+    /// bites the tail, and the contact carries that part tag.
+    pub fn touch(&self, cx: f32, cz: f32, r: f32, band: (f32, f32), mask: u8) -> Option<Near> {
+        let q = pm::Aabb::new(vec3(cx - r, band.0, cz - r), vec3(cx + r, band.1, cz + r));
+        let qy = (band.0 + band.1) * 0.5;
+        let mut best: Option<Near> = None;
+        self.tree.query(q, mask as u64, |id| {
+            let (_, c) = &self.entries[&id];
+            if !hull_hits_circle(&c.hull, cx, cz, r, band.0, band.1) {
+                return;
+            }
+            let n = Near::of(cx, qy, cz, c);
+            if best.is_none_or(|b| n.dist < b.dist) {
+                best = Some(n);
+            }
+        });
+        best
+    }
+
+    /// PRESENT-time shot sweep behind the tree — the third verb, same
+    /// per-entry judgment as [`sweep_colliders`] (shared [`sweep_one`]
+    /// core: pad grows the hull query-side, nearest `frac` wins,
+    /// `skip` drops the shooter's own vehicle). For callers that live
+    /// in the present: the bots' hold-fire gate. Rewound server shots
+    /// keep the slice walk over history frames — the tree does not
+    /// index the past.
+    pub fn sweep(
+        &self,
+        x: f32,
+        z: f32,
+        y: f32,
+        heading: f32,
+        reach: f32,
+        dy: f32,
+        pad: f32,
+        mask: u8,
+        skip: Option<Id>,
+    ) -> Option<SweepHit> {
+        let p1 = vec3(x, y, z);
+        let p2 = vec3(x + heading.sin() * reach, y + dy, z + heading.cos() * reach);
+        let mut best: Option<SweepHit> = None;
+        self.tree.cast(p1, p2, pad, mask as u64, |id| {
+            let (_, c) = &self.entries[&id];
+            if skip != Some(c.owner) {
+                if let Some(hit) = sweep_one(x, z, y, heading, reach, dy, pad, c) {
+                    if best.is_none_or(|b| hit.frac < b.frac) {
+                        best = Some(hit);
+                    }
+                }
+            }
+            // Clip the remaining traversal to the best hit so far.
+            best.map_or(1.0, |b| b.frac)
+        });
+        best
+    }
 }
 
 // --- presentation helpers --------------------------------------------------
@@ -1390,6 +2096,7 @@ pub fn spawn_heli(peer: u8) -> Heli {
             pos: vec3((peer as f32 - 4.5) * 5.0, HELI_GROUND, -ARENA + 2.5),
             ..Body::default()
         },
+        ..Heli::default()
     }
 }
 
@@ -1401,28 +2108,47 @@ pub fn spawn_heli(peer: u8) -> Heli {
 #[cfg(test)]
 mod hull_tests {
     use super::*;
+    use crate::models::{Proto, collide_protos, posed};
     use std::f32::consts::FRAC_PI_2;
 
-    // Truck at the origin facing +z: capsule (0,∓0.8) r 0.9, band 0..1.6.
-    // Shots travel +x (heading = π/2).
+    // Hulls come from the models now: these tests derive protos from
+    // the code-defined models (the same path the registry runs on a
+    // real .glb) and pose them where each scenario wants — the sweep
+    // itself never knows the difference.
+
+    fn protos(kind: &str) -> Vec<Proto> {
+        collide_protos(&match kind {
+            "truck" => crate::models::truck(),
+            "heli" => crate::models::heli(),
+            "hog" => crate::models::hog(),
+            _ => crate::models::flyer(),
+        })
+    }
+
+    /// Truck hull at `(x, 0)` facing +z: capsule (x,∓0.8) r 0.9, band
+    /// 0..1.6. Shots travel +x (heading = π/2).
+    fn truck_at(x: f32) -> Hull {
+        protos("truck")[0].pose(x, 0.0, 0.0, 0.0)
+    }
+
+    /// Heli cabin ball posed at altitude (the courtesy shape too).
+    fn cabin_at(x: f32, y: f32) -> Hull {
+        protos("heli")[0].pose(x, y, 0.0, 0.0)
+    }
 
     #[test]
     fn sweep_hits_a_crossing_truck() {
-        let t = Truck::default();
-        let hit = ray_hits_hull(-5.0, 0.0, 1.0, FRAC_PI_2, 10.0, 0.0, &truck_hull(&t));
+        let hit = ray_hits_hull(-5.0, 0.0, 1.0, FRAC_PI_2, 10.0, 0.0, &truck_at(0.0));
         assert!(hit.is_some(), "flat shot through the hull must connect");
     }
 
     #[test]
     fn altitude_band_rejects_overflight() {
-        let t = Truck::default();
-        let hit = ray_hits_hull(-5.0, 0.0, 5.0, FRAC_PI_2, 10.0, 0.0, &truck_hull(&t));
+        let hit = ray_hits_hull(-5.0, 0.0, 5.0, FRAC_PI_2, 10.0, 0.0, &truck_at(0.0));
         assert!(hit.is_none(), "a shot 5u up overflies a 1.6u hull");
-        let mut h = Heli::default();
-        h.body.pos = vec3(0.0, 10.0, 0.0);
-        let under = ray_hits_hull(-5.0, 0.0, 1.0, FRAC_PI_2, 10.0, 0.0, &heli_hull(&h));
+        let under = ray_hits_hull(-5.0, 0.0, 1.0, FRAC_PI_2, 10.0, 0.0, &cabin_at(0.0, 10.0));
         assert!(under.is_none(), "a flat shot passes under a heli at 10u");
-        let level = ray_hits_hull(-5.0, 0.0, 10.0, FRAC_PI_2, 10.0, 0.0, &heli_hull(&h));
+        let level = ray_hits_hull(-5.0, 0.0, 10.0, FRAC_PI_2, 10.0, 0.0, &cabin_at(0.0, 10.0));
         assert!(level.is_some(), "a shot at its altitude hits it");
     }
 
@@ -1430,21 +2156,19 @@ mod hull_tests {
     fn long_reach_cannot_tunnel() {
         // A bot's whole line of fire (GUN_RANGE), heli mid-way: the
         // sampling must scale with reach or this skips right over it.
-        let mut h = Heli::default();
-        h.body.pos = vec3(30.0, 8.0, 0.0);
-        let pp = Params::from_specs();
+        let pp = Params::default();
         let dy = 8.0 / 30.0 * pp.gun_range; // climb that crosses its altitude there
-        let hit = ray_hits_hull(0.0, 0.0, 0.0, FRAC_PI_2, pp.gun_range, dy, &heli_hull(&h));
+        let hit =
+            ray_hits_hull(0.0, 0.0, 0.0, FRAC_PI_2, pp.gun_range, dy, &cabin_at(30.0, 8.0));
         assert!(hit.is_some(), "45u sweep must still sample densely enough");
     }
 
     #[test]
     fn grow_pads_the_hold_fire_gate() {
-        let t = Truck::default();
         let graze = |hull: &Hull| ray_hits_hull(-5.0, 2.0, 1.0, FRAC_PI_2, 10.0, 0.0, hull);
-        assert!(graze(&truck_hull(&t)).is_none(), "1.2u off the capsule misses");
+        assert!(graze(&truck_at(0.0)).is_none(), "1.2u off the capsule misses");
         assert!(
-            graze(&truck_hull(&t).grow(0.5)).is_some(),
+            graze(&truck_at(0.0).grow(0.5)).is_some(),
             "the grown gate holds fire on the same pass"
         );
     }
@@ -1454,17 +2178,14 @@ mod hull_tests {
     /// shooter's own vehicle.
     #[test]
     fn sweep_orders_masks_and_skips() {
-        let near = Truck::default(); // origin
-        let mut far = Truck::default();
-        far.body.pos = vec3(6.0, 0.0, 0.0);
         let (nid, fid) = (Id::new(0, 0, 1), Id::new(0, 0, 2));
-        let part = |owner, t: &Truck| Collider {
+        let part = |owner, x| Collider {
             owner,
             part: PART_BODY,
             cat: CAT_VEHICLE,
-            hull: truck_hull(t),
+            hull: truck_at(x),
         };
-        let cols = vec![(fid, part(fid, &far)), (nid, part(nid, &near))];
+        let cols = vec![(fid, part(fid, 6.0)), (nid, part(nid, 0.0))];
         let shot = |mask, skip| {
             sweep_colliders(-5.0, 0.0, 1.0, FRAC_PI_2, 15.0, 0.0, 0.0, mask, skip, &cols)
         };
@@ -1476,11 +2197,10 @@ mod hull_tests {
         assert_eq!(hit.owner, fid, "the shooter's own vehicle is invisible");
     }
 
-    /// The pad grows the QUERY, not the collider (doc §8) — and the hit
+    /// The pad grows the QUERY, not the collider — and the hit
     /// altitude rides the climb.
     #[test]
     fn sweep_pad_is_query_side() {
-        let t = Truck::default();
         let id = Id::new(0, 0, 1);
         let cols = vec![(
             id,
@@ -1488,7 +2208,7 @@ mod hull_tests {
                 owner: id,
                 part: PART_BODY,
                 cat: CAT_VEHICLE,
-                hull: truck_hull(&t),
+                hull: truck_at(0.0),
             },
         )];
         let graze = |pad| {
@@ -1508,10 +2228,6 @@ mod hull_tests {
     /// vertical) — both query-side.
     #[test]
     fn sweep_pads_hog_radius_and_band() {
-        let h = Hog {
-            hp: 1.0,
-            ..Hog::default()
-        };
         let id = Id::new(0, 0, 3);
         let cols = vec![(
             id,
@@ -1519,7 +2235,7 @@ mod hull_tests {
                 owner: id,
                 part: PART_BODY,
                 cat: CAT_HOG,
-                hull: hog_hull(&h),
+                hull: protos("hog")[0].pose(0.0, 0.0, 0.0, 0.0),
             },
         )];
         let shot = |y, pad| {
@@ -1528,7 +2244,7 @@ mod hull_tests {
         assert!(shot(1.0, 0.0).is_some(), "flat shot through the body connects");
         assert!(shot(HOG_H + 0.5, 0.0).is_none(), "overflight misses the band");
         assert!(
-            shot(HOG_H + 0.5, Params::from_specs().hit_pad_heli).is_some(),
+            shot(HOG_H + 0.5, Params::default().hit_pad_heli).is_some(),
             "the heli pad forgives a vertical near-miss"
         );
     }
@@ -1539,13 +2255,13 @@ mod hull_tests {
     /// overflying fire.
     #[test]
     fn heli_parts_pose_and_shield() {
-        let mut h = Heli::default();
-        h.body.pos = vec3(0.0, 10.0, 0.0); // facing +z (identity rot)
-        let parts = heli_hulls(&h);
+        // Facing +z at 10u up.
+        let parts = posed(&protos("heli"), 0.0, 10.0, 0.0, 0.0);
         assert_eq!(parts[0].0, PART_BODY, "ids[0] convention: cabin first");
         let (_, tail) = parts[1];
+        let far = tail.a.1.min(tail.b.1);
         assert!(
-            tail.a.1 < 0.0 && tail.b.1 < tail.a.1,
+            tail.a.1 < 0.0 && tail.b.1 < 0.0 && (far + 2.8).abs() < 1e-4,
             "boom extends behind a +z-facing heli"
         );
         let id = Id::new(0, 0, 7);
@@ -1561,7 +2277,7 @@ mod hull_tests {
         };
         assert_eq!(flank(10.0), Some(PART_BODY), "cabin-height shot hits the cabin");
         assert_eq!(
-            flank(10.0 + HELI_CABIN_R + 0.05),
+            flank(10.0 + 1.05), // just over the r=1.0 cabin ball
             Some(PART_ROTOR),
             "just over the cabin, into the disc"
         );
@@ -1569,6 +2285,16 @@ mod hull_tests {
             sweep_colliders(0.0, -6.0, 10.0, 0.0, 12.0, 0.0, 0.0, CAT_VEHICLE, None, &cols)
                 .map(|hit| hit.part);
         assert_eq!(astern, Some(PART_TAIL), "from astern the boom eats it first");
+    }
+
+    /// A flyer's hull rides its altitude: level shots at its height
+    /// connect, deck-level fire passes under the flock.
+    #[test]
+    fn flyer_hull_rides_its_altitude() {
+        let hull = protos("flyer")[0].pose(0.0, 8.0, 0.0, 0.0);
+        let shot = |y| ray_hits_hull(-5.0, 0.0, y, FRAC_PI_2, 10.0, 0.0, &hull);
+        assert!(shot(8.0).is_some(), "a shot at its altitude connects");
+        assert!(shot(1.0).is_none(), "a deck-level shot passes under it");
     }
 
     /// Gunner ballistics: the aim solution points up at an elevated
@@ -1587,79 +2313,158 @@ mod hull_tests {
     /// the biter's reach — climb and the horde loses you.
     #[test]
     fn bite_touches_in_plan_and_band() {
-        let t = Truck::default(); // capsule (0,∓0.8) r 0.9, band 0..1.6
-        let leap = Params::from_specs().hog_leap;
-        let touch = |z| hull_hits_circle(&truck_hull(&t), 0.0, z, HOG_R, 0.0, leap);
-        assert!(touch(TRUCK_HL + TRUCK_R + HOG_R - 0.05), "nose contact bites");
-        assert!(!touch(TRUCK_HL + TRUCK_R + HOG_R + 0.05), "clear of the capsule");
-        let mut h = Heli::default();
-        h.body.pos = vec3(0.0, 10.0, 0.0);
+        let leap = Params::default().hog_leap;
+        let touch = |z| hull_hits_circle(&truck_at(0.0), 0.0, z, HOG_R, 0.0, leap);
+        // Nose contact: capsule half-length 0.8 + its radius + the hog's.
+        assert!(touch(0.8 + TRUCK_R + HOG_R - 0.05), "nose contact bites");
+        assert!(!touch(0.8 + TRUCK_R + HOG_R + 0.05), "clear of the capsule");
         assert!(
-            !hull_hits_circle(&heli_hull(&h), 0.0, 0.0, HOG_R, 0.0, leap),
+            !hull_hits_circle(&cabin_at(0.0, 10.0), 0.0, 0.0, HOG_R, 0.0, leap),
             "a heli at 10u is out of leaping reach however close in plan"
         );
-        h.body.pos.y = 2.0;
         assert!(
-            hull_hits_circle(&heli_hull(&h), 0.0, 0.0, HOG_R, 0.0, leap),
+            hull_hits_circle(&cabin_at(0.0, 2.0), 0.0, 0.0, HOG_R, 0.0, leap),
             "hovering low over the horde gets nipped"
         );
+        // The flyers' band rides THEIR altitude instead of the ground:
+        // a heli out of leaping range is squarely in winged range.
+        let cabin = cabin_at(0.0, 10.0);
+        assert!(
+            hull_hits_circle(&cabin, 0.0, 0.0, FLYER_R, 10.0 - FLYER_REACH, 10.0 + FLYER_REACH),
+            "a flyer at your altitude bites at any altitude"
+        );
+        assert!(
+            !hull_hits_circle(&cabin, 0.0, 0.0, FLYER_R, 3.0 - FLYER_REACH, 3.0 + FLYER_REACH),
+            "a flyer seven units below is still climbing, not biting"
+        );
+    }
+
+    // --- the query seam over the same posed hulls ---------------------------
+
+    /// A collider pool with a truck body and a heli cabin, plus the
+    /// synced index — the seam tests' little world.
+    fn world(heli_y: f32) -> (pm::Pool<Collider>, WorldIndex, Id, Id) {
+        let mut pool = pm::Pool::new();
+        let (truck_id, heli_id) = (Id::new(0, 0, 1), Id::new(0, 0, 2));
+        pool.add(
+            Id::new(0, 0, 11),
+            Collider { owner: truck_id, part: PART_BODY, cat: CAT_VEHICLE, hull: truck_at(0.0) },
+        );
+        pool.add(
+            Id::new(0, 0, 12),
+            Collider {
+                owner: heli_id,
+                part: PART_BODY,
+                cat: CAT_VEHICLE,
+                hull: cabin_at(6.0, heli_y),
+            },
+        );
+        let mut idx = WorldIndex::default();
+        idx.sync(&pool);
+        (pool, idx, truck_id, heli_id)
+    }
+
+    #[test]
+    fn nearest_band_is_the_aggro_criterion() {
+        // A hog at (10, 0): the heli at 6 is CLOSER in plan, but at 10u
+        // its band misses the leap window — the truck is the answer.
+        let (_, idx, truck_id, heli_id) = world(10.0);
+        let leap = Params::default().hog_leap;
+        let n = idx.nearest(10.0, 0.0, 0.0, 4.0 * ARENA, (0.0, leap), CAT_VEHICLE).unwrap();
+        assert_eq!(n.owner, truck_id, "the climbing heli must not exist for the horde");
+        // Hovering low, the same heli is the nearer legal target.
+        let (_, idx, _, heli_id2) = world(2.0);
+        let n = idx.nearest(10.0, 0.0, 0.0, 4.0 * ARENA, (0.0, leap), CAT_VEHICLE).unwrap();
+        assert_eq!(n.owner, heli_id2, "a low hover is fair game");
+        assert_eq!(heli_id, heli_id2);
+        // And `within` is a hard gate.
+        assert!(idx.nearest(60.0, 0.0, 0.0, 10.0, (0.0, leap), CAT_VEHICLE).is_none());
+    }
+
+    #[test]
+    fn nearest_aim_point_rides_the_band() {
+        // A gunner muzzle at HOGGUN_Y: level shot at a truck (muzzle
+        // height is inside the band), belly shot at a heli overhead
+        // (clamped to the band floor).
+        let (_, idx, truck_id, heli_id) = world(10.0);
+        let any = (f32::NEG_INFINITY, f32::INFINITY);
+        let n = idx.nearest(4.0, HOGGUN_Y, 0.0, 100.0, any, CAT_VEHICLE).unwrap();
+        assert_eq!(n.owner, truck_id, "3D distance: the truck wins up close");
+        assert_eq!(n.y, HOGGUN_Y, "truck band contains the muzzle height: level shot");
+        // Band-filter the ground floor away: only the heli remains, and
+        // the aim point clamps up to its band floor.
+        let n = idx.nearest(6.0, HOGGUN_Y, 0.0, 100.0, (5.0, f32::INFINITY), CAT_VEHICLE).unwrap();
+        assert_eq!(n.owner, heli_id);
+        let cabin = cabin_at(6.0, 10.0);
+        assert_eq!(n.y, cabin.y.0, "heli overhead: aim clamps to the band floor (belly)");
+    }
+
+    #[test]
+    fn touch_is_the_bite_with_a_part_tag() {
+        let (_, idx, truck_id, _) = world(10.0);
+        let leap = Params::default().hog_leap;
+        let hull = truck_at(0.0);
+        // Nose-to-hull contact, same numbers the raw predicate test
+        // uses above — the seam must agree with hull_hits_circle.
+        let z = 0.8 + hull.r + HOG_R - 0.05;
+        let n = idx.touch(0.0, z, HOG_R, (0.0, leap), CAT_VEHICLE).unwrap();
+        assert_eq!((n.owner, n.part), (truck_id, PART_BODY));
+        assert_eq!(n.band, hull.y, "bite anchors read the hull band back");
+        assert!(idx.touch(0.0, z + 0.1, HOG_R, (0.0, leap), CAT_VEHICLE).is_none());
+    }
+
+    #[test]
+    fn index_sweep_agrees_with_the_slice_sweep() {
+        // Same shot, both paths: the tree-pruned present-time sweep and
+        // the history-frame slice walk share sweep_one, so hit, owner,
+        // part, and frac must match exactly — including skip and pad.
+        let (pool, idx, truck_id, heli_id) = world(1.5);
+        let slice: Vec<(Id, Collider)> = pool.iter().map(|(i, c)| (i, *c)).collect();
+        use std::f32::consts::FRAC_PI_2;
+        let shots = [
+            (-5.0, 0.0, 1.0, FRAC_PI_2, 20.0, 0.0, 0.0, None), // down the row
+            (-5.0, 0.0, 1.0, FRAC_PI_2, 20.0, 0.0, 0.0, Some(truck_id)), // skip the near one
+            (-5.0, 0.0, 5.0, FRAC_PI_2, 20.0, 0.0, 0.0, None), // overflies both
+            (-5.0, 0.0, 3.5, FRAC_PI_2, 20.0, 0.0, 1.2, None), // pad rescues a graze
+        ];
+        for (x, z, y, heading, reach, dy, pad, skip) in shots {
+            let a = idx.sweep(x, z, y, heading, reach, dy, pad, CAT_VEHICLE, skip);
+            let b = sweep_colliders(x, z, y, heading, reach, dy, pad, CAT_VEHICLE, skip, &slice);
+            assert_eq!(a.is_some(), b.is_some(), "hit/miss must agree (skip={skip:?})");
+            if let (Some(a), Some(b)) = (a, b) {
+                assert_eq!((a.owner, a.part), (b.owner, b.part));
+                assert_eq!(a.frac, b.frac, "same sweep_one core, same frac");
+            }
+        }
+        // And the skip case actually reaches the far hull.
+        let hit = idx
+            .sweep(-5.0, 0.0, 1.5, FRAC_PI_2, 20.0, 0.0, 0.0, CAT_VEHICLE, Some(truck_id))
+            .expect("heli at 1.5u is on this line");
+        assert_eq!(hit.owner, heli_id);
+    }
+
+    #[test]
+    fn sync_tracks_moves_and_deaths() {
+        let (mut pool, mut idx, truck_id, heli_id) = world(2.0);
+        // The heli relocates far: update must re-file it (well past the
+        // fat margin), and nearest must follow.
+        if let Some(mut c) = pool.get_mut(Id::new(0, 0, 12)) {
+            c.hull = cabin_at(50.0, 2.0);
+        }
+        idx.sync(&pool);
+        let n = idx.nearest(48.0, 0.0, 0.0, 20.0, (0.0, 4.0), CAT_VEHICLE).unwrap();
+        assert_eq!(n.owner, heli_id);
+        // The truck dies: its entry leaves the index on the next sync.
+        pool.remove(Id::new(0, 0, 11));
+        idx.sync(&pool);
+        let n = idx.nearest(0.0, 0.0, 0.0, 4.0 * ARENA, (0.0, 4.0), CAT_VEHICLE).unwrap();
+        assert_eq!(n.owner, heli_id, "only the heli remains");
     }
 }
 
 #[cfg(test)]
 mod params_tests {
     use super::*;
-
-    /// Spec order IS field order (the count is already a compile error
-    /// via `must_cast`; this pins the pairing — a reorder that matters
-    /// changes some default and trips here).
-    #[test]
-    fn params_spec_matches_fields() {
-        let p = Params::from_specs();
-        let by_name = |n: &str| {
-            PARAM_SPECS
-                .iter()
-                .find(|s| s.name == n)
-                .unwrap_or_else(|| panic!("no spec named {n}"))
-                .default
-        };
-        assert_eq!(p.wave_base, by_name("wave_base"));
-        assert_eq!(p.wave_grow, by_name("wave_grow"));
-        assert_eq!(p.gunner_frac, by_name("gunner_frac"));
-        assert_eq!(p.friendly_dmg, by_name("friendly_dmg"));
-        assert_eq!(p.gun_dmg, by_name("gun_dmg"));
-        assert_eq!(p.bite_dmg, by_name("bite_dmg"));
-        assert_eq!(p.hog_fast, by_name("hog_fast"));
-        assert_eq!(p.net_kbps, by_name("net_kbps"));
-        assert_eq!(p.ai_stride, by_name("ai_stride"));
-        assert_eq!(p.hog_aggro, by_name("hog_aggro"));
-        assert_eq!(p.hog_roam, by_name("hog_roam"));
-        assert_eq!(p.hog_flee, by_name("hog_flee"));
-        assert_eq!(p.bite_cd, by_name("bite_cd"));
-        assert_eq!(p.bite_cost, by_name("bite_cost"));
-        assert_eq!(p.kill_points, by_name("kill_points"));
-        assert_eq!(p.death_cost, by_name("death_cost"));
-        assert_eq!(p.knock, by_name("knock"));
-        assert_eq!(p.gun_cd, by_name("gun_cd"));
-        assert_eq!(p.gun_range, by_name("gun_range"));
-        assert_eq!(p.bullet_speed, by_name("bullet_speed"));
-        assert_eq!(p.hit_pad_truck, by_name("hit_pad_truck"));
-        assert_eq!(p.hit_pad_heli, by_name("hit_pad_heli"));
-        assert_eq!(p.hoggun_cd, by_name("hoggun_cd"));
-        assert_eq!(p.hoggun_range, by_name("hoggun_range"));
-        assert_eq!(p.hoggun_dmg, by_name("hoggun_dmg"));
-        assert_eq!(p.heli_tail_kick, by_name("heli_tail_kick"));
-        assert_eq!(p.hog_leap, by_name("hog_leap"));
-        assert_eq!(p.vmax, by_name("vmax"));
-        assert_eq!(p.boost_vmax, by_name("boost_vmax"));
-        assert_eq!(p.truck_grip, by_name("truck_grip"));
-        assert_eq!(p.truck_grip_boost, by_name("truck_grip_boost"));
-        assert_eq!(p.heat_rate, by_name("heat_rate"));
-        assert_eq!(p.heat_cool, by_name("heat_cool"));
-        assert_eq!(p.heli_lift, by_name("heli_lift"));
-        assert_eq!(p.heli_t_max, by_name("heli_t_max"));
-        assert_eq!(p.heli_yaw, by_name("heli_yaw"));
-    }
 
     #[test]
     fn params_file_roundtrip_clamps_and_survives_noise() {
@@ -1687,7 +2492,7 @@ mod params_tests {
 
     #[test]
     fn params_missing_file_is_the_shipped_defaults() {
-        assert_eq!(params_load("does/not/exist.params"), Params::from_specs());
+        assert_eq!(params_load("does/not/exist.params"), Params::default());
     }
 }
 
@@ -1699,7 +2504,7 @@ mod physics_tests {
     /// The shipped tuning — steps read [`Params`] now, tests pin the
     /// invariants at the defaults.
     fn pp() -> Params {
-        Params::from_specs()
+        Params::default()
     }
 
     #[test]
@@ -1752,6 +2557,71 @@ mod physics_tests {
             "centered stick must hover (FBW trim): y {} vel {}",
             h.body.pos.y,
             h.body.vel.len()
+        );
+    }
+
+    /// The chin gun: azimuth and elevation are crisp clamped copies of
+    /// the command (the truck turret's law), and the muzzle solution
+    /// follows the gimbal, not the nose.
+    #[test]
+    fn truck_turret_slews_elevates_and_clamps() {
+        let mut t = spawn_truck(1);
+        let p = pp();
+        let cmd = Drive {
+            aim: 0.5,
+            aim_pitch: 2.0, // past the elevation stop
+            ..Default::default()
+        };
+        truck_step(&mut t, cmd, DT, &p);
+        // One tick moves the turret at most one slew step — no snap.
+        assert!(
+            t.aim > 0.0 && t.aim <= p.turret_rate * DT + 1e-6,
+            "azimuth slews at turret_rate, got {} after one tick",
+            t.aim
+        );
+        // Held long enough, it converges and clamps at the stops.
+        for _ in 0..120 {
+            truck_step(&mut t, cmd, DT, &p);
+        }
+        assert!((t.aim - 0.5).abs() < 1e-4, "azimuth converges on the command");
+        assert_eq!(t.aim_pitch, TRUCK_AIM_UP, "elevation clamps at the stop");
+        let (_, my, _, dir, climb) = truck_muzzle(&t);
+        assert_eq!(climb, TRUCK_AIM_UP, "the shot flies the aimed line");
+        assert!(
+            my > 1.45,
+            "an elevated barrel's muzzle rises off the flat height, got {my}"
+        );
+        assert!(
+            wrap_angle(dir - (t.heading() + t.aim)).abs() < 1e-5,
+            "azimuth still trains off the heading"
+        );
+        // Depression clamps at its own (shallower) stop.
+        for _ in 0..120 {
+            truck_step(&mut t, Drive { aim_pitch: -2.0, ..Default::default() }, DT, &p);
+        }
+        assert_eq!(t.aim_pitch, -TRUCK_AIM_DOWN, "depression stop is asymmetric");
+    }
+
+    #[test]
+    fn heli_chin_gun_gimbals_and_clamps() {
+        let mut h = spawn_heli(1);
+        h.body.pos.y = 10.0;
+        let cmd = Drive {
+            aim: 0.8,
+            aim_pitch: -2.0, // past the gimbal stop
+            ..Default::default()
+        };
+        heli_step(&mut h, cmd, DT, &pp());
+        assert_eq!(h.aim, 0.8, "azimuth is a crisp copy");
+        assert_eq!(h.aim_pitch, -HELI_AIM_PITCH, "elevation clamps at the stop");
+        let (_, _, _, dir, climb) = heli_muzzle(&h);
+        assert!(
+            wrap_angle(dir - 0.8).abs() < 0.05,
+            "the shot trains off the nose with the gimbal, got {dir}"
+        );
+        assert!(
+            climb < -0.9,
+            "a level airframe fires down the depressed gun, got {climb}"
         );
     }
 

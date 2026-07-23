@@ -3,6 +3,13 @@
 //! the standard coast+blend math for dead reckoning. Both games (demo,
 //! hellfire) wrote this by hand before it was hoisted here.
 
+// TODO(roadmap): two smoothing APIs — `pool_mirror` (demo's simple
+// teaching path) vs `interp_pool` (everywhere real) — fold when demo
+// stops needing the simple one.
+// TODO(roadmap): interp draw-pool per-frame cost is a watch item once
+// visible-entity counts grow (it rebuilds every entity every frame;
+// cullable).
+
 use std::collections::{HashMap, VecDeque};
 
 use crate::id::Id;

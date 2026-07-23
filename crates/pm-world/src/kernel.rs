@@ -495,6 +495,22 @@ impl Pm {
         self.pools.remove(name);
     }
 
+    /// Every pool in the store by name with its live entity count,
+    /// largest first (name-ordered within a count) — the introspection
+    /// seam for debug overlays and, later, a live console. Singles are
+    /// one-entity pools, so they show up too. Callable from inside a
+    /// task; panics only if some pool is mutably borrowed at the call
+    /// (a task holding a lock across it — don't).
+    pub fn pool_stats(&self) -> Vec<(String, usize)> {
+        let mut v: Vec<_> = self
+            .pools
+            .iter()
+            .map(|(n, p)| (n.clone(), p.borrow().erased_len()))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
     // --- ids --------------------------------------------------------------
 
     pub fn id_add(&mut self) -> Id {

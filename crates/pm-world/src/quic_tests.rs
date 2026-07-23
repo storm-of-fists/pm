@@ -289,3 +289,80 @@ fn dead_clients_are_reaped_by_idle_timeout() {
     assert!(joined.is_some(), "client never connected");
     assert_eq!(reaped, joined, "dead client must be reaped by idle timeout");
 }
+
+/// The password door (FRAME_AUTH): a right password is admitted and
+/// replicates; a wrong one is closed with the reason on the client; a
+/// silent client (no password set) against a locked server is bounced
+/// too. Admission gating means the bounced clients never appear in
+/// joined_drain — the roster never learns they existed.
+#[test]
+fn password_gates_admission() {
+    let mut spm = Pm::new();
+    let s_pos = spm.pool::<Pos>("pos");
+    let mut snet = NetServer::new(&mut spm);
+    snet.pool_sync("pos", &s_pos);
+    let mut squic = QuicServer::bind("127.0.0.1:0", &snet.schema()).expect("bind");
+    squic.password_set("hogwild");
+    let addr = squic.local_addr().unwrap().to_string();
+    let id = spm.id_add();
+    s_pos.get_mut().add(id, Pos { x: 5.0, y: 7.0 });
+
+    let client = |pw: Option<&str>| {
+        let mut cpm = Pm::new();
+        let c_pos = cpm.pool::<Pos>("pos");
+        let mut n = NetClient::new();
+        n.pool_sync("pos", &c_pos);
+        let mut q = QuicClient::connect(&addr, &n.schema()).expect("connect");
+        if let Some(pw) = pw {
+            q.password_set(pw);
+        }
+        (cpm, c_pos, n, q)
+    };
+    let (mut good_pm, good_pos, good_net, mut good) = client(Some("hogwild"));
+    let (_bad_pm, bad_pos, _bad_net, mut bad) = client(Some("letmein"));
+    let (_mute_pm, mute_pos, _mute_net, mut mute) = client(None);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut admitted = Vec::new();
+    let (mut good_synced, mut bad_closed) = (false, false);
+    while Instant::now() < deadline {
+        squic.pump();
+        admitted.extend(squic.joined_drain());
+        for p in &admitted {
+            if let Some(snap) = snet.snapshot(&spm, *p) {
+                squic.snapshot_send(*p, &snap);
+            }
+        }
+        for p in squic.left_drain() {
+            snet.peer_remove(p);
+        }
+        for p in admitted.iter().copied().collect::<Vec<_>>() {
+            snet.peer_add(p); // idempotent enough for the test loop
+        }
+        spm.loop_once(DT);
+
+        good.pump();
+        for snap in good.snapshots_drain() {
+            let applied = good_net.apply(&mut good_pm, &snap).expect("apply");
+            good.ack_send(applied.tick, applied.seq);
+        }
+        bad.pump();
+        mute.pump();
+
+        good_synced = good_pos.get().get(id) == Some(&Pos { x: 5.0, y: 7.0 });
+        bad_closed = bad.error().is_some() || bad.is_gone();
+        if good_synced && bad_closed {
+            break;
+        }
+    }
+    assert!(good_synced, "right password must replicate");
+    assert!(bad_closed, "wrong password must be disconnected");
+    let reason = bad.error().unwrap_or_default().to_string();
+    assert!(
+        reason.contains("bad password"),
+        "close reason should say why: {reason:?}"
+    );
+    // The wrong/silent clients were never admitted: exactly one join.
+    assert_eq!(admitted.len(), 1, "only the right password joins");
+    assert!(bad_pos.get().is_empty() && mute_pos.get().is_empty(), "no state leaked pre-admission");
+}

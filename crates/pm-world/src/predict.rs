@@ -15,6 +15,13 @@
 //! it wires reconcile/replay to the net task and writes the smoothed
 //! avatar into the draw pool; drive this type directly only for a
 //! hand-rolled predictor.
+//!
+//! To see why the step must be byte-identical on both ends, break it
+//! on purpose: scale one force by 1.1 in the client's step only under
+//! `cfg!(debug_assertions)`, then run a debug client against a release
+//! server — [`Predictor::corrections`] climbs steadily as the server
+//! keeps overruling the optimistic physics. A steady climb in a real
+//! game means exactly that: the two ends' steps have diverged.
 
 use std::collections::VecDeque;
 

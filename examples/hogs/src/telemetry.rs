@@ -5,7 +5,7 @@
 //! (Ctrl-U in pm-mon, `set` in pm-watch), and the game params ride along
 //! as `params.*` knobs seeded from the params file — those go to the
 //! SERVER over the reliable "param.set" event, `params.save` persists
-//! them (docs/params.md).
+//! them (the Params declaration in common.rs is the design record).
 //!
 //! NOTE on `lock` semantics (verified live 2026-07-16): a monitor write
 //! lands in the signal's one value cell, and the game only ever READS
@@ -22,16 +22,14 @@
 //!
 //! Wire layout: the node binds `TELE_BIND` and unicasts to the monitor
 //! address (`mon=IP:PORT` arg; default localhost). pm-mon/pm-watch bind
-//! that address and list us as a peer — see docs/journey.md.
+//! that address and list us as a peer.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use pm_control_core::signal::Stamp;
-use pm_control_core::{
-    NetworkManager, PmF32, PmFault, PmProf, Register, Registrar, SegmentPort, clock, pm_group,
-};
+use pm_control_core::{NetworkManager, PmF32, PmFault, PmProf, SegmentPort, clock, pm_group};
 
 use crate::bot_client::ClientWorld;
 use crate::common::*;
@@ -44,39 +42,6 @@ pub const TELE_BIND: &str = "0.0.0.0:42501";
 /// Default monitor address (pm-watch / pm-mon bind this).
 pub const TELE_MON: &str = "127.0.0.1:42500";
 
-/// One knob signal per [`PARAM_SPECS`] entry, plus the save button —
-/// built FROM the table (the documented Vec-of-signals `Register`
-/// escape hatch), so a new param is a spec line + a `Params` field and
-/// the monitor picks it up untouched. Signals register as
-/// `params.<name>` (`set hogs params.wave_base 300` in pm-watch);
-/// `params.save` is a button: any write ≥ 0.5 asks the SERVER to
-/// persist its file (edge-detected — set it back to 0 to press again).
-struct ParamKnobs {
-    sigs: Vec<PmF32>,
-    save: PmF32,
-}
-
-impl ParamKnobs {
-    fn from_specs() -> ParamKnobs {
-        ParamKnobs {
-            sigs: PARAM_SPECS
-                .iter()
-                .map(|s| PmF32::new().range(s.min, s.max))
-                .collect(),
-            save: PmF32::new().range(0.0, 1.0),
-        }
-    }
-}
-
-impl Register for ParamKnobs {
-    fn register(&self, r: &mut Registrar) {
-        for (sig, spec) in self.sigs.iter().zip(&PARAM_SPECS) {
-            r.child(spec.name, sig);
-        }
-        r.child("save", &self.save);
-    }
-}
-
 pm_group! {
     struct Tele {
         // --- knobs (unlock-writable from the monitor) ---------------
@@ -86,9 +51,13 @@ pm_group! {
         link_loss: PmF32 = PmF32::new().range(0.0, 0.5),
         /// Day-night cycle length (render-side, cosmetic).
         day_secs: PmF32 = PmF32::new().range(10.0, 3600.0),
-        /// The server's game params (docs/params.md), writable here,
-        /// applied via the reliable "param.set" event.
-        params: ParamKnobs = ParamKnobs::from_specs(),
+        /// The server's game params, writable here,
+        /// applied via the reliable "param.set" event. The knobs (and
+        /// their save button) are GENERATED next to the pod — see the
+        /// `pm_params!` declaration in common.rs; `set hogs
+        /// params.wave_base 300` in pm-watch, `params.save 1` persists
+        /// (edge-detected — set back to 0 to press again).
+        params: ParamKnobs = ParamKnobs::new(),
         // --- metrics -------------------------------------------------
         /// Interp delay in force (creation-frozen; report-only).
         interp_ms: PmF32,
@@ -174,10 +143,12 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
     tele.interp_ms.set(flags.interp_ms);
     // Param knobs seed from the file `main` loaded — the same values the
     // server seeded its single from (an in-process session, so they
-    // agree; docs/params.md flags the remote-server display caveat).
-    for (sig, &v) in tele.params.sigs.iter().zip(flags.params.as_array()) {
-        sig.set(v);
-    }
+    // agree). Known caveat: joining a REMOTE server whose params differ
+    // shows stale knob values until the first write. The truthful
+    // display is a read of the replicated single — wire that in when a
+    // remote-tuning session actually happens (the replica is already on
+    // the client; it's a display question, not a transport one).
+    tele.params.seed(&flags.params);
 
     let mut net_mgr = NetworkManager::new();
     net_mgr.publish_health();
@@ -195,7 +166,7 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
     let param_tx = w.param_set.clone();
     // Last knob values we applied to the game (change-detect).
     let mut applied = (flags.link.0, flags.link.1, flags.day);
-    let mut applied_params = *flags.params.as_array();
+    let mut applied_params = flags.params;
     let mut save_was = tele.params.save.val();
     let mut clock_ms = 0.0f64;
 
@@ -226,12 +197,8 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
 
         // Param knobs → reliable events; the server is the clamp of
         // record and replicates the applied value back to everyone.
-        for (i, sig) in tele.params.sigs.iter().enumerate() {
-            let v = sig.val();
-            if v != applied_params[i] {
-                param_tx.send(ParamSet { idx: i as u32, value: v });
-                applied_params[i] = v;
-            }
+        for (idx, value) in tele.params.drain_changes(&mut applied_params) {
+            param_tx.send(ParamSet { idx, value });
         }
         // The save button: rising past 0.5 asks the server to persist.
         let save_now = tele.params.save.val();

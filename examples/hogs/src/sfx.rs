@@ -1,4 +1,4 @@
-//! Hogs' sound effects: `pm::Births` turns replicated state into the
+//! Hogs' sound effects: `pm::Adds` turns replicated state into the
 //! edges one-shot sounds want — a bullet entry appearing IS the gunshot,
 //! an impact entry appearing IS the hit/kill/bite/boom. No sound events
 //! on the wire, no cleanup: the same TTL'd facts the renderer draws.
@@ -15,7 +15,12 @@
 //! Remote players' shots still bang off replication — for them that
 //! delay is just distance.
 
-use pm::{Births, Rng, task};
+// TODO(ship): the sound pass — record/source real WAVs for the
+// placeholder synths, and an engine/rotor hum once pm_sdl::audio
+// grows a looping voice (see the TODO there). Perceived quality
+// lives here more than anywhere.
+
+use pm::{Adds, Rng, task};
 use pm_sdl::audio::{Audio, Clip, MIX_HZ};
 
 use crate::bot_client::ClientWorld;
@@ -97,9 +102,9 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, tracer: &pm::PoolHandle<T
         return;
     };
     let [shot, hit, kill, bite, boom] = make_clips();
-    let mut bullet_births = Births::default();
-    let mut tracer_births = Births::default();
-    let mut impact_births = Births::default();
+    let mut bullet_adds = Adds::default();
+    let mut tracer_adds = Adds::default();
+    let mut impact_adds = Adds::default();
 
     let bullet = w.bullet.clone();
     let impact = w.impact.clone();
@@ -131,7 +136,7 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, tracer: &pm::PoolHandle<T
         };
 
         // Our gun: the local tracer IS the click — bang now.
-        for id in tracer_births.drain(&tracer.get()) {
+        for id in tracer_adds.drain(&tracer.get()) {
             if let Some(tr) = tracer.get_id(id) {
                 audio.play(&shot, 0.5 * att(tr.x, tr.z), rng.rfr(0.92, 1.12));
             }
@@ -139,14 +144,14 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, tracer: &pm::PoolHandle<T
         // Everyone else's guns, off replication; our replicated twins
         // already banged above, skip them.
         let me = net.peer() as f32;
-        for id in bullet_births.drain(&bullet.get()) {
+        for id in bullet_adds.drain(&bullet.get()) {
             if let Some(b) = bullet.get_id(id)
                 && b.owner != me
             {
                 audio.play(&shot, 0.5 * att(b.x, b.z), rng.rfr(0.92, 1.12));
             }
         }
-        for id in impact_births.drain(&impact.get()) {
+        for id in impact_adds.drain(&impact.get()) {
             let Some(c) = impact.get_id(id) else { continue };
             let (clip, vol) = if c.kind == IMPACT_BOOM {
                 (&boom, 1.0)

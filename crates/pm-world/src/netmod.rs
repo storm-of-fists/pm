@@ -54,6 +54,25 @@
 //! - [`event`](PmClient::event) → [`EventTx`]: queue reliable one-way
 //!   client→server events (held until the handshake completes). There is
 //!   no server→client event channel: server→client facts are state.
+//!
+//!   Why isn't the input channel reliable too? A dropped input frame is
+//!   *stale* — the next frame supersedes it. Reliable delivery would
+//!   retransmit it anyway, arriving late in a burst, blocking fresher
+//!   data behind it (head-of-line) exactly when feel matters most.
+//!   Reliability comes from **redundancy** instead: every input
+//!   datagram carries the last several frames, so loss costs nothing
+//!   and nothing is retransmitted late. Reliable events are for facts
+//!   that stay true (a respawn request); the stick position is a fact
+//!   that expires every tick. Two channel kinds because there are two
+//!   kinds of truth. This was re-litigated against Unreal's current
+//!   stack (2026-07-16) and every UE movement system agrees: Enhanced
+//!   Input is client-local (intent pods, never keycodes — forces never
+//!   cross the wire; a replayed input through a deterministic step IS
+//!   the force); CharacterMovementComponent sends moves as an
+//!   explicitly *unreliable* RPC covered by redundant `SavedMoves`
+//!   resubmission; Chaos Networked Physics and Mover define an intent
+//!   input struct networked with history and re-applied during
+//!   resimulation.
 //! - [`sync_single`](PmClient::sync_single) → [`SingleRx`]: typed read
 //!   handle for a server-owned replicated singleton.
 //! - [`predict_pool`](PmClient::predict_pool) /
@@ -88,6 +107,9 @@ use crate::transport::{QuicClient, QuicServer};
 /// Priority of the net task both roles register. It runs first in the
 /// tick (per net.rs: sending before the sim avoids relabeling freshly
 /// stamped entries); register game tasks above it.
+// TODO(roadmap): the "read per-tick net data only from tasks above
+// NET_PRIO" rule lives in folklore + module docs — promote it into a
+// type or runtime guard when touching this area anyway.
 pub const NET_PRIO: f32 = 5.0;
 
 /// Artificial link delay/loss from `PM_LAG_MS` (milliseconds) and
@@ -133,6 +155,7 @@ fn link_lag_from_env() -> Option<(std::time::Duration, f32)> {
 pub struct PmServer {
     pm: Pm,
     addr: String,
+    password: Option<String>,
 }
 
 /// A networked [`Pm`] in the **client** role: mirrors server state and carries
@@ -146,6 +169,7 @@ pub struct PmClient {
     addr: String,
     input_hz: f32,
     link_lag: Option<(std::time::Duration, f32)>,
+    password: Option<String>,
 }
 
 impl Deref for PmServer {
@@ -184,6 +208,7 @@ impl Pm {
         PmServer {
             pm: Pm::new(),
             addr: addr.to_string(),
+            password: None,
         }
     }
 
@@ -196,6 +221,7 @@ impl Pm {
             addr: addr.to_string(),
             input_hz,
             link_lag: None,
+            password: None,
         }
     }
 
@@ -256,8 +282,11 @@ impl Pm {
     /// lagging both sockets stacks: every packet crossed two delay queues
     /// (RTT = 4x the knob, not 2x) and rolled loss twice per direction —
     /// "80 ms / 3%" actually simulated a 320 ms / ~6% link.
-    fn serve(&mut self, addr: &str) -> std::io::Result<()> {
-        let quic = QuicServer::bind(addr, &self.net_schema())?;
+    fn serve(&mut self, addr: &str, password: Option<String>) -> std::io::Result<()> {
+        let mut quic = QuicServer::bind(addr, &self.net_schema())?;
+        if let Some(pw) = &password {
+            quic.password_set(pw);
+        }
         let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
         self.removal_hold_set(true);
         NetServer::with_sync(sync).serve(self, quic);
@@ -272,8 +301,12 @@ impl Pm {
         addr: &str,
         input_hz: f32,
         link_lag: Option<(std::time::Duration, f32)>,
+        password: Option<String>,
     ) -> std::io::Result<()> {
         let mut quic = QuicClient::connect(addr, &self.net_schema())?;
+        if let Some(pw) = &password {
+            quic.password_set(pw);
+        }
         if let Some((delay, loss)) = link_lag.or_else(link_lag_from_env) {
             quic.link_lag_set(delay, loss);
         }
@@ -928,6 +961,17 @@ impl PmClient {
         ret
     }
 
+    /// Present this session password at connect. Must match the
+    /// server's [`PmServer::password`] or the server closes the
+    /// connection ("bad password") — a locked server also drops clients
+    /// that present nothing. A bouncer, not cryptography: QUIC/TLS
+    /// already encrypts the wire; this only decides who is ADMITTED
+    /// (before admission the server sends no snapshots and reads no
+    /// inputs or events).
+    pub fn password(&mut self, pw: &str) {
+        self.password = Some(pw.to_string());
+    }
+
     /// Simulate link conditions on this client: one-way `lag_ms` and
     /// `loss` (0..1 drop fraction), applied in both directions at connect
     /// (RTT rises by ~2x the lag). The programmatic sibling of the
@@ -966,8 +1010,9 @@ impl PmClient {
             addr,
             input_hz,
             link_lag,
+            password,
         } = self;
-        pm.connect(&addr, input_hz, link_lag)?;
+        pm.connect(&addr, input_hz, link_lag, password)?;
         pm.loop_run();
         Ok(())
     }
@@ -1087,12 +1132,22 @@ impl PmServer {
         input_rx(&mut self.pm, name)
     }
 
+    /// Require a session password from every client (the door for a
+    /// hosted game — see [`PmClient::password`] for the contract). Call
+    /// before [`run`](PmServer::run); an unauthenticated connection gets
+    /// the schema hello but is never admitted: no snapshots out, no
+    /// inputs/events in, closed after a short timeout or on a wrong
+    /// guess.
+    pub fn password(&mut self, pw: &str) {
+        self.password = Some(pw.to_string());
+    }
+
     /// Bind the endpoint (the schema is complete now) and run the loop.
     /// Returns when the loop quits, `Err` on bind failure. (The simulated
     /// link is the CLIENT's — see `serve`; the server never lags itself.)
     pub fn run(self) -> std::io::Result<()> {
-        let PmServer { mut pm, addr } = self;
-        pm.serve(&addr)?;
+        let PmServer { mut pm, addr, password } = self;
+        pm.serve(&addr, password)?;
         pm.loop_run();
         Ok(())
     }

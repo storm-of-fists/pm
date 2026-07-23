@@ -7,14 +7,34 @@
 //! camera (both ease back on release); LEFT mouse (or SPACE) fires;
 //! SHIFT boosts — watch the heat bar, 1.0 is an explosion.
 //! HELI: W/S pitches the nose (nose down = forward), A/D yaws, SPACE
-//! climbs, CTRL descends, LEFT mouse fires the nose gun — dive to
-//! strafe. Hogs can leap at a low hover; climb and they lose you.
+//! climbs, CTRL descends. Hold RIGHT mouse to train the CHIN GUN
+//! (mouse-x slews, mouse-y elevates — camera follows the gun like the
+//! truck's turret); LEFT mouse fires. Hover flat and strafe the deck,
+//! or track the winged ones overhead. Ground hogs leap at a low hover;
+//! climb and they lose you — but the flyers don't shed until higher.
 //! H respawns as the heli, T as the truck, R as whatever you are;
-//! 1/2/3 switch cameras; P toggles panini; Esc quits.
+//! 1/2/3 switch cameras; P toggles panini; ` (tilde) toggles the DEBUG
+//! VIEW — hitbox cages (every entity's derived collision hulls, what
+//! the server's sweep actually tests) plus the engine overlay: live
+//! per-task timings, pool populations, and net counters off this
+//! client's Pm (the eventual live console opens here); Esc quits.
 //!
 //! The per-vehicle KEY CONTEXTS below (same keys, different Drive
 //! fields) are hand-rolled — this is the seam the input-map subsystem
 //! will eventually own.
+
+// The MENU landed 2026-07-20 (`menu` at the bottom of this file):
+// HOST / JOIN / address / password before any socket exists, drawn
+// through the same compute-pass text the debug overlay uses. The
+// SCORE SCREEN's first cut landed 2026-07-21 with the mission arc:
+// the phase splashes in the render task (brief / won / lost + ENTER
+// prompts) render whatever the `Hunt` single says — every client
+// shows the same screen, zero client state.
+// TODO(ship): dress the end screens into a real score screen —
+// per-peer contribution (kills/bites eaten) wants a tiny per-peer
+// synced stat pool. Also wanted: surface a "bad password" /
+// disconnect reason IN the window instead of stderr (today a bounced
+// join closes back to the terminal).
 
 use pm::{
     CamAnchor, CamRig, CamView, Mat4, Pm, Vec3, camera_install, camera_manager, camera_track, vec3,
@@ -27,20 +47,34 @@ use sdl3::mouse::MouseButton;
 
 use crate::bot_client::client_setup;
 use crate::common::*;
+use crate::models::hull_cage_tris;
 
 const W: u32 = 1280;
 const H: u32 = 800;
+
+/// How much of the GUN's climb the chase camera follows (0 = level,
+/// 1 = welded to the barrel). Fractional on purpose: the chase eye
+/// rides the anchor frame, so a fully pitched frame would drive the
+/// eye into the dirt at max elevation; at 0.35 the view visibly tips
+/// with the gun while the eye stays above ground. Per-player feel —
+/// a const, not a param (the client-cosmetic rule).
+const CAM_PITCH_FOLLOW: f32 = 0.35;
 
 fn hog_model(h: &Hog) -> Mat4 {
     Mat4::translate(vec3(h.x, 0.0, h.z)) * Mat4::rot_y(h.heading)
 }
 
-/// A dead hog, tumbling: CLIENT-SIDE presentation physics (GPU/CPU
-/// particle-tier — nothing on the wire). A kill is an entity REMOVAL on
-/// the wire; each client turns that edge into its own ragdoll from the
-/// hog's last replicated state. Clients may disagree on exactly how a
-/// corpse tumbles — cosmetic, so nobody cares; that's the line between
-/// server physics (gameplay) and client physics (feel).
+// TODO(refactor): Corpse is a hand-rolled entity type in a Vec captured
+// by the render task — make it a client-local pool + step task (the
+// Tracer pattern below already shows the idiom; pm::Removes now
+// provides the spawn edge).
+/// A dead hog (or flyer — they FALL), tumbling: CLIENT-SIDE
+/// presentation physics (GPU/CPU particle-tier — nothing on the wire).
+/// A kill is an entity REMOVAL on the wire; each client turns that edge
+/// into its own ragdoll from the last replicated state. Clients may
+/// disagree on exactly how a corpse tumbles — cosmetic, so nobody
+/// cares; that's the line between server physics (gameplay) and client
+/// physics (feel).
 struct Corpse {
     x: f32,
     y: f32,
@@ -71,6 +105,23 @@ impl Corpse {
             yaw: h.heading,
             ang: 0.0,
             spin: rng.rfr(5.0, 11.0) * if rng.rf() < 0.5 { -1.0 } else { 1.0 },
+            t: 0.0,
+        }
+    }
+
+    /// A flyer dies where it flew: launched along its final run from
+    /// altitude, spinning harder — the fall to the bounce is the show.
+    fn from_flyer(f: &Flyer, rng: &mut pm::Rng) -> Corpse {
+        Corpse {
+            x: f.x,
+            y: f.y.max(0.45),
+            z: f.z,
+            vx: f.heading.sin() * f.speed * 0.6 + rng.rfr(-1.5, 1.5),
+            vy: rng.rfr(-1.0, 2.5),
+            vz: f.heading.cos() * f.speed * 0.6 + rng.rfr(-1.5, 1.5),
+            yaw: f.heading,
+            ang: 0.0,
+            spin: rng.rfr(7.0, 14.0) * if rng.rf() < 0.5 { -1.0 } else { 1.0 },
             t: 0.0,
         }
     }
@@ -117,7 +168,31 @@ fn hud_bold(frame: &mut Frame3, s: &str, x: f32, y: f32, px: f32, col: (u8, u8, 
 }
 
 pub fn run(flags: Flags) {
-    let mut pm = Pm::client(ADDR, 1.0 / FIXED_DT);
+    // Window + renderer FIRST: the menu draws before any socket exists,
+    // and the game reuses both.
+    let (mut window, mut pump, refresh) = pm_sdl::window(
+        &format!("pm hogs [{}] — wasd drives, rmb aims, lmb fires, 1-3 cams, r respawn, esc", pm::BUILD_ID),
+        W,
+        H,
+    );
+    let mut r3d = Renderer3d::new(&window).expect("renderer");
+    r3d.fog_distance = 320.0;
+
+    // The front door (TODO(ship) launch flow, first half): bare launch
+    // shows HOST / JOIN; CLI modes carry their answer in the flags.
+    let (join_addr, password) = if flags.menu {
+        match menu(&mut pump, &mut r3d, &window, &flags) {
+            Some(choice) => choice,
+            None => return, // quit from the menu
+        }
+    } else {
+        (flags.addr.clone(), flags.password.clone())
+    };
+
+    let mut pm = Pm::client(&join_addr, 1.0 / FIXED_DT);
+    if !password.is_empty() {
+        pm.password(&password);
+    }
     if flags.link != (0.0, 0.0) {
         pm.link_lag(flags.link.0, flags.link.1);
         eprintln!(
@@ -127,7 +202,7 @@ pub fn run(flags: Flags) {
         );
     }
     let w = client_setup(&mut pm);
-    eprintln!("connecting to {ADDR} ...");
+    eprintln!("connecting to {join_addr} ...");
     let net = pm.net();
     // Live-tunable knobs (day length today) — seeded from flags here,
     // written by the telemetry node when a monitor turns the dial.
@@ -147,13 +222,10 @@ pub fn run(flags: Flags) {
     let cam_mgr = camera_manager(&mut pm);
     let cam_view = pm.single::<CamView>("cam.view");
 
-    let (mut window, mut pump, refresh) = pm_sdl::window(
-        &format!("pm hogs [{}] — wasd drives, rmb aims, lmb fires, 1-3 cams, r respawn, esc", pm::BUILD_ID),
-        W,
-        H,
-    );
-    let mut r3d = Renderer3d::new(&window).expect("renderer");
-    r3d.fog_distance = 320.0;
+    // Steal the mouse (relative mode): no cursor wandering onto the
+    // second monitor mid-firefight. Esc quits, which releases it.
+    // (After the menu — nobody wants a grabbed cursor while typing.)
+    pm_sdl::grab_mouse(&window, true);
     let ground = r3d
         .upload_mesh(&checker_ground(
             14,
@@ -162,28 +234,29 @@ pub fn run(flags: Flags) {
             (0.15, 0.18, 0.13),
         ))
         .expect("ground");
-    // Truck: body + cabin, authored facing +z, baked white so the peer
-    // color arrives as a per-draw tint.
-    let body = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-0.9, 0.15, -1.7), vec3(0.9, 0.95, 1.7)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("body");
-    let cabin = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-0.7, 0.95, -1.1), vec3(0.7, 1.55, 0.45)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("cabin");
-    // Turret barrel, authored facing +z on the cab roof — drawn with its
-    // own rot_y(heading + aim), so everyone sees turrets swing.
-    let barrel = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-0.12, 1.45, -0.35), vec3(0.12, 1.72, 1.9)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("barrel");
+    // Entity models off the registry single (client_setup loaded it —
+    // assets/*.glb when present, else the code definitions in
+    // models.rs). Render parts upload here; the same models' collide.*
+    // protos are what the server poses into the collider pool, so the
+    // file IS the shape — visual and hitbox both. Relative shading is
+    // BAKED into part colors; the per-draw tint carries identity/state
+    // (peer color, hp).
+    let truck_m = w.models.get().upload(&r3d, "truck");
+    let heli_m = w.models.get().upload(&r3d, "heli");
+    let hog_m = w.models.get().upload(&r3d, "hog");
+    let flyer_m = w.models.get().upload(&r3d, "flyer");
+    // Hitbox debug cages (part of the tilde debug view): each
+    // kind's DERIVED hulls off the same registry protos the server
+    // poses into the collider pool — so the cage and the hitbox cannot
+    // disagree. Baked white; the magenta rides the instance tint.
+    let cage = |name: &str| {
+        r3d.upload_mesh(&bake(&hull_cage_tris(w.models.get().protos(name)), (1.0, 1.0, 1.0)))
+            .expect("cage")
+    };
+    let truck_cage = cage("truck");
+    let heli_cage = cage("heli");
+    let hog_cage = cage("hog");
+    let flyer_cage = cage("flyer");
     // Bullet tracer: a stretched sliver, centered — bullets carry their
     // own altitude now, so the height rides the translate.
     let tracer_mesh = r3d
@@ -192,34 +265,6 @@ pub fn run(flags: Flags) {
             (1.0, 1.0, 1.0),
         ))
         .expect("tracer");
-    // Heli: cabin pod + tail boom + skid plate + one rotor blade (drawn
-    // spinning by tick), authored facing +z, baked white for peer tint.
-    // The full quat attitude arrives via Body::model(), so the whole
-    // airframe pitches into dives and banks into turns.
-    let heli_body = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-0.9, 0.35, -1.3), vec3(0.9, 1.6, 1.6)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("heli body");
-    let heli_tail = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-0.16, 0.85, -3.6), vec3(0.16, 1.35, -1.3)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("heli tail");
-    let heli_skid = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-1.0, 0.0, -1.3), vec3(1.0, 0.2, 1.4)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("heli skid");
-    let heli_rotor = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-3.1, 1.72, -0.16), vec3(3.1, 1.86, 0.16)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("heli rotor");
     // ONE white unit cube (base centered on the origin, 1 unit tall)
     // stretched per draw by Mat4::scale_xyz — buildings and walls are
     // all just this box (safe here: axis-aligned scaling keeps an
@@ -230,19 +275,6 @@ pub fn run(flags: Flags) {
             (1.0, 1.0, 1.0),
         ))
         .expect("cube");
-    // Hog: low mean slab + a snout, baked white and tinted by hp.
-    let hog_body = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-0.55, 0.1, -0.7), vec3(0.55, 0.8, 0.7)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("hog body");
-    let hog_snout = r3d
-        .upload_mesh(&bake(
-            &box_tris(vec3(-0.28, 0.2, 0.7), vec3(0.28, 0.6, 1.05)),
-            (1.0, 1.0, 1.0),
-        ))
-        .expect("hog snout");
     // Small ground marker: aim-line breadcrumbs and impact flashes.
     let marker = r3d
         .upload_mesh(&bake(
@@ -271,11 +303,21 @@ pub fn run(flags: Flags) {
         r3d.upload_mesh(&bake(&tris, (1.0, 1.0, 1.0))).expect("shadow")
     };
 
+    // TODO(refactor): gun state (aim / aim_pitch / gun_cd) lives in
+    // closure captures — a local "hogs.gun" single would put it where
+    // the doctrine says state lives and let other tasks (HUD) read it.
     // Turret angle is CLIENT state: holding RMB accumulates mouse-x into
     // it, releasing eases it back to dead ahead. The server only ever
     // sees the absolute angle in each command frame — the animation
-    // replays exactly, so prediction never corrects over it.
+    // replays exactly, so prediction never corrects over it. The heli's
+    // chin gun adds the second axis: mouse-y under the same hold is the
+    // gun's elevation (trucks ignore it).
+    // Rad per mouse count while RMB is held. Per-player feel, not shared
+    // truth — a const, not a param (the client-cosmetic rule on the
+    // Params declaration in common.rs).
+    const AIM_SENS: f32 = 0.008;
     let mut aim = 0.0f32;
+    let mut aim_pitch = 0.0f32;
 
     // The cosmetic gun: your bang and tracer at the CLICK, from the
     // PREDICTED muzzle — the authoritative bullet still round-trips for
@@ -286,7 +328,9 @@ pub fn run(flags: Flags) {
 
     pm.task_add("input", 4.0, 0.0, {
         let cam_mgr = cam_mgr.clone();
+        let tune = tune.clone();
         let respawn = w.respawn.clone();
+        let session = w.session.clone();
         let input = w.input.clone();
         let pred = w.pred.clone();
         let pred_heli = w.pred_heli.clone();
@@ -304,10 +348,21 @@ pub fn run(flags: Flags) {
                         ..
                     } => pm.loop_quit(),
                     Event::MouseMotion {
-                        xrel, mousestate, ..
+                        xrel, yrel, mousestate, ..
                     } if mousestate.is_mouse_button_pressed(MouseButton::Right) => {
-                        aim = (aim + xrel * 0.005).clamp(-AIM_MAX, AIM_MAX);
+                        aim = (aim + xrel * AIM_SENS).clamp(-AIM_MAX, AIM_MAX);
+                        // Mouse down = gun down (yrel is +down).
+                        aim_pitch =
+                            (aim_pitch - yrel * AIM_SENS).clamp(-HELI_AIM_PITCH, HELI_AIM_PITCH);
                     }
+                    // ENTER advances the session from an end screen —
+                    // the server's director decides what "go" means by
+                    // phase, so sending it any other time is a no-op.
+                    Event::KeyDown {
+                        scancode: Some(Scancode::Return),
+                        repeat: false,
+                        ..
+                    } => session.send(Session { op: SESSION_GO }),
                     Event::KeyDown {
                         scancode: Some(Scancode::R),
                         repeat: false,
@@ -333,6 +388,14 @@ pub fn run(flags: Flags) {
                         cam_mgr.get().toggle_panini();
                     }
                     Event::KeyDown {
+                        scancode: Some(Scancode::Grave),
+                        repeat: false,
+                        ..
+                    } => {
+                        let mut t = tune.get_mut();
+                        t.show_debug = !t.show_debug;
+                    }
+                    Event::KeyDown {
                         scancode: Some(sc @ (Scancode::_1 | Scancode::_2 | Scancode::_3)),
                         repeat: false,
                         ..
@@ -350,9 +413,14 @@ pub fn run(flags: Flags) {
             if !m.is_mouse_button_pressed(MouseButton::Right) {
                 // Released: exponential ease back to the front — the
                 // smooth snap. Kill the tail so it truly zeroes.
-                aim *= (-9.0 * pm.loop_dt()).exp();
+                let k = (-9.0 * pm.loop_dt()).exp();
+                aim *= k;
+                aim_pitch *= k;
                 if aim.abs() < 0.005 {
                     aim = 0.0;
+                }
+                if aim_pitch.abs() < 0.005 {
+                    aim_pitch = 0.0;
                 }
             }
             let lmb = m.is_mouse_button_pressed(MouseButton::Left) as i32 as f32;
@@ -366,6 +434,7 @@ pub fn run(flags: Flags) {
                     bot: 0.0,
                     pitch: held(Scancode::W) - held(Scancode::S),
                     lift: held(Scancode::Space) - held(Scancode::LCtrl),
+                    aim_pitch,
                 }
             } else {
                 Drive {
@@ -377,6 +446,7 @@ pub fn run(flags: Flags) {
                     bot: 0.0, // human: crisp steering
                     pitch: 0.0,
                     lift: 0.0,
+                    aim_pitch, // turret elevation (mouse-y under RMB)
                 }
             };
             input.set(cmd);
@@ -457,20 +527,29 @@ pub fn run(flags: Flags) {
                         // where the truck drives: holding RMB swings the
                         // camera with the gun (and the ease-back swings
                         // it home), while plain steering under a held
-                        // aim no longer drags the view around.
+                        // aim no longer drags the view around. The
+                        // camera reads the POD's aim — the barrel slews
+                        // at turret_rate, so the view swings with the
+                        // barrel, not the mouse. Elevation tips the
+                        // frame by CAM_PITCH_FOLLOW of the gun climb.
                         let dir = t.heading() + t.aim;
+                        let c = t.aim_pitch * CAM_PITCH_FOLLOW;
                         Some(CamAnchor {
                             pos: t.body.pos,
-                            fwd: vec3(dir.sin(), 0.0, dir.cos()),
+                            fwd: vec3(dir.sin() * c.cos(), c.sin(), dir.cos() * c.cos()),
                         })
                     } else {
-                        // Heli: follow the yaw, level — the airframe
-                        // pitches and banks under a steady camera.
+                        // Heli: follow the CHIN GUN — azimuth exactly
+                        // like the truck turret, and the same fraction
+                        // of the gun line's climb (gimbal against the
+                        // airframe, so a dive tips the view too).
                         heli_draw.get_id(cur).map(|h| *h).map(|h| {
-                            let yaw = h.body.yaw();
+                            let (yaw, pitch, _) = h.body.rot.to_yaw_pitch_roll();
+                            let dir = yaw + h.aim;
+                            let c = (h.aim_pitch - pitch) * CAM_PITCH_FOLLOW;
                             CamAnchor {
                                 pos: h.body.pos,
-                                fwd: vec3(yaw.sin(), 0.0, yaw.cos()),
+                                fwd: vec3(dir.sin() * c.cos(), c.sin(), dir.cos() * c.cos()),
                             }
                         })
                     }
@@ -489,30 +568,81 @@ pub fn run(flags: Flags) {
         let net = net.clone();
         let tracer = tracer_local.clone();
         let tune = tune.clone();
-        // Death-edge tracking for ragdolls: last tick's raw replicas, so
-        // a removal still has the state to launch a corpse from.
-        let mut prev_hogs: std::collections::HashMap<pm::Id, Hog> = Default::default();
+        // Death-edge tracking for ragdolls: pm::Removes hands back each
+        // removal WITH the last replicated state, so a corpse launches
+        // from the pose the entity died in.
+        let mut hog_removes: pm::Removes<Hog> = Default::default();
+        let mut flyer_removes: pm::Removes<Flyer> = Default::default();
         let mut corpses: Vec<Corpse> = Vec::new();
         // Muzzle flashes / explosions as short-lived point lights:
         // births on the local tracer pool (our click, 0 ms), remote
         // bullets, and boom impacts. (pos, seconds left, radius, color).
-        let mut flash_tracer = pm::Births::default();
-        let mut flash_bullet = pm::Births::default();
-        let mut flash_boom = pm::Births::default();
+        let mut flash_tracer = pm::Adds::default();
+        let mut flash_bullet = pm::Adds::default();
+        let mut flash_boom = pm::Adds::default();
+        // TODO(refactor): transient facts as a tuple Vec with a manual
+        // TTL countdown — the contact-points rule says this is a local
+        // Flash pod pool with an expiry task.
         let mut flashes: Vec<(Vec3, f32, f32, (f32, f32, f32))> = Vec::new();
+        // Smoothed frame cycle time for the title bar (EMA so the
+        // readout is legible, not a jittering slot machine).
+        let mut frame_ms = 0.0f32;
+        // Debug-view sample state: task timings and pool counts refresh
+        // once a second (a readable table, not a blur); rates are the
+        // window's deltas. `dbg_on` edge-detects the toggle so the
+        // since-launch stat accumulation is dropped and the first
+        // window shows live numbers.
+        let mut dbg_on = false;
+        let mut dbg_accum = 0.0f32;
+        let mut dbg_tasks: Vec<(String, f32, f32, f32)> = Vec::new(); // name, hz, avg µs, max µs
+        let mut dbg_pools: Vec<(String, usize)> = Vec::new();
+        let mut dbg_snaps = 0.0f32;
+        let mut dbg_snap_rate = 0.0f32;
         move |pm| {
+            frame_ms += (pm.loop_dt() * 1000.0 - frame_ms) * 0.06;
+            let show_debug = tune.get().show_debug;
+            if show_debug && !dbg_on {
+                pm.task_stats_reset();
+                dbg_snaps = net.snapshots() as f32;
+                dbg_accum = 0.0;
+                dbg_tasks.clear();
+            }
+            dbg_on = show_debug;
+            if show_debug {
+                dbg_accum += pm.loop_dt();
+                if dbg_accum >= 1.0 {
+                    dbg_tasks = pm
+                        .task_stats()
+                        .into_iter()
+                        .map(|(n, s)| {
+                            let calls = s.calls.max(1) as f32;
+                            (
+                                n,
+                                s.calls as f32 / dbg_accum,
+                                s.ns_total as f32 / calls / 1000.0,
+                                s.ns_max as f32 / 1000.0,
+                            )
+                        })
+                        .collect();
+                    pm.task_stats_reset();
+                    dbg_pools = pm.pool_stats();
+                    let snaps = net.snapshots() as f32;
+                    dbg_snap_rate = (snaps - dbg_snaps) / dbg_accum;
+                    dbg_snaps = snaps;
+                    dbg_accum = 0.0;
+                }
+            }
             // Spawn corpses off this frame's removals, then step them on
             // the render clock (client-local physics — cosmetic only).
             {
-                let now: std::collections::HashMap<pm::Id, Hog> =
-                    w.hog.get().iter().map(|(id, h)| (id, *h)).collect();
                 let mut rng = pm::Rng::new(pm.tick().wrapping_mul(0x2545_F491) | 1);
-                for (id, h) in &prev_hogs {
-                    if !now.contains_key(id) {
-                        corpses.push(Corpse::from_hog(h, &mut rng));
-                    }
+                for (_, h) in hog_removes.drain(&w.hog.get()) {
+                    corpses.push(Corpse::from_hog(&h, &mut rng));
                 }
-                prev_hogs = now;
+                // Flyers fall: same edge, launched from altitude.
+                for (_, f) in flyer_removes.drain(&w.flyer.get()) {
+                    corpses.push(Corpse::from_flyer(&f, &mut rng));
+                }
                 let dt = pm.loop_dt();
                 corpses.retain_mut(|c| c.step(dt));
             }
@@ -640,20 +770,22 @@ pub fn run(flags: Flags) {
             let mut hog_shadows: Vec<Instance3> = Vec::new();
             let mut hog_bodies: Vec<Instance3> = Vec::new();
             let mut hog_snouts: Vec<Instance3> = Vec::new();
-            for (_, h) in w.hog_draw.get().iter() {
-                // Biomod green fades to livid red as hp drops.
+            for (id, h) in w.hog_draw.get().iter() {
+                // Biomod green fades to livid red as hp drops (the
+                // boss's `Hog::hp` mirrors its big pool's fraction, so
+                // the same ramp reads its health too).
                 let hp = (h.hp / HOG_HP).clamp(0.0, 1.0);
                 let tint = (0.45 + 0.4 * (1.0 - hp), 0.42 * hp + 0.10, 0.28 * hp + 0.06);
-                let model = hog_model(h);
+                // Boss membership is "draw that one huge" — same mesh,
+                // same batch, scaled to match its grown hitbox.
+                let s = if w.boss.get_id(id).is_some() { BOSS_SCALE } else { 1.0 };
+                let model = hog_model(h) * Mat4::scale(s);
                 hog_shadows.push(Instance3::emissive(
-                    Mat4::translate(vec3(h.x, 0.02, h.z)) * Mat4::scale(0.95),
+                    Mat4::translate(vec3(h.x, 0.02, h.z)) * Mat4::scale(0.95 * s),
                     (0.035, 0.04, 0.035),
                 ));
                 hog_bodies.push(Instance3::new(model, tint));
-                hog_snouts.push(Instance3::new(
-                    model,
-                    (tint.0 * 0.7, tint.1 * 0.7, tint.2 * 0.7),
-                ));
+                hog_snouts.push(Instance3::new(model, tint)); // snout shade is baked
             }
             // Ragdoll corpses ride the same meshes — same batches,
             // their own fading tints.
@@ -662,11 +794,41 @@ pub fn run(flags: Flags) {
                 let tint = (0.30 + 0.25 * fade, 0.16 * fade + 0.08, 0.10 * fade + 0.05);
                 let model = c.model();
                 hog_bodies.push(Instance3::new(model, tint));
-                hog_snouts.push(Instance3::new(
-                    model,
-                    (tint.0 * 0.7, tint.1 * 0.7, tint.2 * 0.7),
+                hog_snouts.push(Instance3::new(model, tint)); // snout shade is baked
+            }
+            // The flock: same instanced treatment — body, two wings,
+            // and a shrinking shadow per flyer. The flap is a per-
+            // instance rotation about the forward axis computed here
+            // (the corpse-tumble trick, airborne), phased by id so the
+            // wings never beat in lockstep.
+            let mut flyer_shadows: Vec<Instance3> = Vec::new();
+            let mut flyer_bodies: Vec<Instance3> = Vec::new();
+            let mut flyer_wings_l: Vec<Instance3> = Vec::new();
+            let mut flyer_wings_r: Vec<Instance3> = Vec::new();
+            for (id, f) in w.flyer_draw.get().iter() {
+                let hp = (f.hp / FLYER_HP).clamp(0.0, 1.0);
+                // Biomod violet draining to livid red as hp drops.
+                let tint = (
+                    0.38 + 0.42 * (1.0 - hp),
+                    0.16 + 0.18 * hp,
+                    0.20 + 0.28 * hp,
+                );
+                let model = Mat4::translate(vec3(f.x, f.y, f.z)) * Mat4::rot_y(f.heading);
+                let phase = (id.index() % 16) as f32 * 0.42;
+                let flap = (pm.tick() as f32 * 0.55 + phase).sin() * 0.55;
+                flyer_bodies.push(Instance3::new(model, tint));
+                // Wing shade is baked in the model.
+                flyer_wings_r
+                    .push(Instance3::new(model * Mat4::rot_axis(vec3(0.0, 0.0, 1.0), flap), tint));
+                flyer_wings_l
+                    .push(Instance3::new(model * Mat4::rot_axis(vec3(0.0, 0.0, 1.0), -flap), tint));
+                let s = 0.9 * (1.0 - f.y / (HELI_CEIL * 1.7)).max(0.2);
+                flyer_shadows.push(Instance3::emissive(
+                    Mat4::translate(vec3(f.x, 0.02, f.z)) * Mat4::scale(s),
+                    (0.035, 0.04, 0.035),
                 ));
             }
+
             // Tracers: everyone else's bullets (ours are hidden — the
             // local cosmetic pool drew them at the click) plus the local
             // pool, one emissive batch.
@@ -690,10 +852,95 @@ pub fn run(flags: Flags) {
                     (1.0, 0.92, 0.45),
                 ));
             }
+            // Hitbox debug cages: posed with the SAME (x,y,z,yaw) the
+            // server feeds Proto::pose — yaw-only even for the banking
+            // heli, y=0 for ground vehicles — off the draw pools (what
+            // you see is what favor-shooter lag comp honors). Emissive
+            // so night can't hide a hitbox.
+            let mut cage_inst: Vec<(&pm_sdl::gpu3d::Mesh3, Vec<Instance3>)> = Vec::new();
+            if show_debug {
+                let mag = (1.0, 0.25, 1.0);
+                let at = |x: f32, y: f32, z: f32, yaw: f32| {
+                    Instance3::emissive(Mat4::translate(vec3(x, y, z)) * Mat4::rot_y(yaw), mag)
+                };
+                let mut hogs = Vec::new();
+                for (_, h) in w.hog_draw.get().iter() {
+                    hogs.push(at(h.x, 0.0, h.z, h.heading));
+                }
+                let mut flyers = Vec::new();
+                for (_, f) in w.flyer_draw.get().iter() {
+                    flyers.push(at(f.x, f.y, f.z, f.heading));
+                }
+                let mut trucks = Vec::new();
+                for (_, t) in w.truck_draw.get().iter() {
+                    trucks.push(at(t.body.pos.x, 0.0, t.body.pos.z, t.heading()));
+                }
+                let mut helis = Vec::new();
+                for (_, hl) in w.heli_draw.get().iter() {
+                    helis.push(at(
+                        hl.body.pos.x,
+                        hl.body.pos.y,
+                        hl.body.pos.z,
+                        hl.body.yaw(),
+                    ));
+                }
+                cage_inst.push((&hog_cage, hogs));
+                cage_inst.push((&flyer_cage, flyers));
+                cage_inst.push((&truck_cage, trucks));
+                cage_inst.push((&heli_cage, helis));
+            }
+            let cage_b: Vec<_> = cage_inst
+                .iter()
+                .map(|(mesh, inst)| (*mesh, r3d.instances(inst)))
+                .collect();
             let hog_shadow_b = r3d.instances(&hog_shadows);
             let hog_body_b = r3d.instances(&hog_bodies);
             let hog_snout_b = r3d.instances(&hog_snouts);
+            let flyer_shadow_b = r3d.instances(&flyer_shadows);
+            let flyer_body_b = r3d.instances(&flyer_bodies);
+            let flyer_wing_l_b = r3d.instances(&flyer_wings_l);
+            let flyer_wing_r_b = r3d.instances(&flyer_wings_r);
             let tracer_b = r3d.instances(&tracer_inst);
+
+            let mine = net.mine();
+            // RANGEFINDER: one dot where the own gun line actually
+            // stops — the first collider on the line (hot color: a
+            // live target under the crosshair), else the first wall /
+            // roof / floor / range end the real bullet would die on
+            // (`tracer_step`'s walls, sampled). Replaces the old
+            // breadcrumb ground line: with an elevating turret the
+            // shot leaves the ground plane, so the feedback has to
+            // live on the LINE, not under it.
+            let range_dot = |(mx, my, mz, dir, climb): (f32, f32, f32, f32, f32)| {
+                let reach = gun_range * climb.cos();
+                let dy = gun_range * climb.sin();
+                if let Some(h) = w
+                    .index
+                    .get()
+                    .sweep(mx, mz, my, dir, reach, dy, 0.0, CAT_VEHICLE | CAT_HOG, mine)
+                {
+                    return (vec3(h.x, h.y, h.z), true);
+                }
+                let (sx, sz) = (dir.sin() * climb.cos(), dir.cos() * climb.cos());
+                let sy = climb.sin();
+                let step = 1.5;
+                let mut p = vec3(mx, my, mz);
+                let mut left = gun_range;
+                while left > 0.0 {
+                    let n = p + vec3(sx, sy, sz) * step;
+                    if n.y <= 0.0
+                        || (n.y < building_top(n.x, n.z) && in_building(n.x, n.z, 0.0))
+                        || n.x.abs() > ARENA
+                        || n.z.abs() > ARENA
+                        || n.y > HELI_CEIL
+                    {
+                        break;
+                    }
+                    p = n;
+                    left -= step;
+                }
+                (p, false)
+            };
 
             if let Some(mut frame) = r3d.frame(&window, view_mat, sun_dir) {
                 let white = (1.0, 1.0, 1.0);
@@ -724,8 +971,51 @@ pub fn run(flags: Flags) {
                     );
                 }
 
+                // Mission furniture, straight off the replicas. The
+                // depot (DEFEND): a tank that bruises red as it's
+                // chewed, with a warning strobe once it's half gone.
+                let sb = w.hunt.get();
+                for (_, d) in w.depot.get().iter() {
+                    let f = (d.hp / DEPOT_HP).clamp(0.0, 1.0);
+                    frame.draw(
+                        &cube,
+                        Mat4::translate(vec3(d.x, 0.0, d.z))
+                            * Mat4::scale_xyz(2.0 * DEPOT_R * 0.8, DEPOT_H, 2.0 * DEPOT_R * 0.8),
+                        (0.30 + 0.45 * (1.0 - f), 0.42 * f + 0.10, 0.18 * f + 0.06),
+                        true,
+                    );
+                    let blink = f < 0.5 && (pm.tick() / 20) % 2 == 0;
+                    frame.draw_emissive(
+                        &marker,
+                        Mat4::translate(vec3(d.x, DEPOT_H, d.z)) * Mat4::scale(2.0),
+                        if blink { (1.4, 0.25, 0.1) } else { (0.2, 0.9, 0.4) },
+                        true,
+                    );
+                }
+                // The race loop (RACE, while playing): the live beacon
+                // is a pulsing pillar of light, the next one a dim
+                // promise so you can set up the corner.
+                if sb.phase == PHASE_PLAYING && sb.kind == MISSION_RACE {
+                    let pulse = 1.0 + 0.25 * (pm.tick() as f32 * 0.15).sin();
+                    let n = RACE_LOOP.len();
+                    let (cx, cz) = RACE_LOOP[sb.done as usize % n];
+                    frame.draw_emissive(
+                        &cube,
+                        Mat4::translate(vec3(cx, 0.0, cz))
+                            * Mat4::scale_xyz(1.5 * pulse, 26.0, 1.5 * pulse),
+                        (0.25, 1.1, 1.3),
+                        true,
+                    );
+                    let (nx, nz) = RACE_LOOP[(sb.done as usize + 1) % n];
+                    frame.draw_emissive(
+                        &cube,
+                        Mat4::translate(vec3(nx, 0.0, nz)) * Mat4::scale_xyz(0.9, 14.0, 0.9),
+                        (0.08, 0.22, 0.26),
+                        true,
+                    );
+                }
+
                 // Trucks: smoothed view (predicted self, interp'd others).
-                let mine = net.mine();
                 for (id, t) in w.truck_draw.get().iter() {
                     // Tint by controlling player via the replicated
                     // ownership table — id.peer() is recycling, not control.
@@ -737,42 +1027,36 @@ pub fn run(flags: Flags) {
                         (0.035, 0.04, 0.035),
                         false,
                     );
-                    frame.draw(&body, model, tint, true);
-                    frame.draw(
-                        &cabin,
-                        model,
-                        (tint.0 * 0.5, tint.1 * 0.5, tint.2 * 0.5),
-                        true,
-                    );
-                    // Turret: same origin, rotated by heading + aim —
-                    // replicated state, so every peer's swing is visible.
+                    // Shading (cabin/barrel darker) is baked in the
+                    // model's vertex colors; the tint is pure peer.
+                    frame.draw(truck_m.mesh("body"), model, tint, true);
+                    frame.draw(truck_m.mesh("cabin"), model, tint, true);
+                    // Turret: rotated by heading + aim, elevated about
+                    // the barrel-root pivot (0, 1.45, 0 in truck space
+                    // — where truck_muzzle says the barrel hinges) —
+                    // replicated state, so every peer's swing AND
+                    // elevation are visible.
                     let dir = t.heading() + t.aim;
                     frame.draw(
-                        &barrel,
-                        Mat4::translate(t.body.pos) * Mat4::rot_y(dir),
-                        (tint.0 * 0.35, tint.1 * 0.35, tint.2 * 0.35),
+                        truck_m.mesh("barrel"),
+                        Mat4::translate(t.body.pos)
+                            * Mat4::rot_y(dir)
+                            * Mat4::translate(vec3(0.0, 1.45, 0.0))
+                            * Mat4::rot_x(-t.aim_pitch)
+                            * Mat4::translate(vec3(0.0, -1.45, 0.0)),
+                        tint,
                         true,
                     );
-                    // Own truck: local aim line under the turret, cut
-                    // short by buildings — client-side feedback only,
-                    // nothing on the wire.
+                    // Own truck: the rangefinder dot on the gun line —
+                    // client-side feedback only, nothing on the wire.
                     if mine == Some(id) {
-                        let (dx, dz) = (dir.sin(), dir.cos());
-                        let mut d = 4.0;
-                        while d < gun_range {
-                            let (px, pz) = (t.body.pos.x + dx * d, t.body.pos.z + dz * d);
-                            if in_building(px, pz, 0.0) {
-                                break;
-                            }
-                            let fade = 1.0 - d / gun_range;
-                            frame.draw(
-                                &marker,
-                                Mat4::translate(vec3(px, 0.0, pz)) * Mat4::scale(0.7),
-                                (tint.0 * fade, tint.1 * fade, tint.2 * fade),
-                                true,
-                            );
-                            d += 3.5;
-                        }
+                        let (p, hot) = range_dot(truck_muzzle(&t));
+                        frame.draw_emissive(
+                            &marker,
+                            Mat4::translate(p) * Mat4::scale(if hot { 1.3 } else { 0.9 }),
+                            if hot { (1.4, 0.35, 0.2) } else { (0.8, 0.75, 0.45) },
+                            true,
+                        );
                     }
                 }
 
@@ -793,42 +1077,58 @@ pub fn run(flags: Flags) {
                         (0.035, 0.04, 0.035),
                         false,
                     );
-                    frame.draw(&heli_body, model, tint, true);
+                    // Tail shade is baked; skid and rotor bake their
+                    // ABSOLUTE colors and draw untinted.
+                    frame.draw(heli_m.mesh("body"), model, tint, true);
+                    frame.draw(heli_m.mesh("tail"), model, tint, true);
+                    frame.draw(heli_m.mesh("skid"), model, (1.0, 1.0, 1.0), true);
+                    frame.draw(heli_m.mesh("rotor"), model * spin, (1.0, 1.0, 1.0), true);
+                    // Chin gun at the gimbal's pose — aim is replicated
+                    // Heli state, so every peer sees it train. Pivoted
+                    // at the chin point, not the body origin, so it
+                    // slews in place like a turret.
+                    let (yaw, pitch, _) = hl.body.rot.to_yaw_pitch_roll();
+                    let dir = yaw + hl.aim;
+                    let climb = hl.aim_pitch - pitch;
                     frame.draw(
-                        &heli_tail,
-                        model,
-                        (tint.0 * 0.6, tint.1 * 0.6, tint.2 * 0.6),
+                        heli_m.mesh("gun"),
+                        Mat4::translate(hl.body.pos + vec3(0.0, -0.35, 0.0))
+                            * Mat4::rot_y(dir)
+                            * Mat4::rot_x(-climb),
+                        tint,
                         true,
                     );
-                    frame.draw(&heli_skid, model, (0.2, 0.2, 0.22), true);
-                    frame.draw(&heli_rotor, model * spin, (0.25, 0.25, 0.28), true);
-                    // Own heli: breadcrumb the nose gun's ground
-                    // intersection — where a dive is actually aimed.
+                    // Own heli: the same rangefinder dot the truck
+                    // gets — where the GIMBAL's line actually stops,
+                    // dive or no dive, climb or no climb.
                     if mine == Some(id) {
-                        let (yaw, pitch, _) = hl.body.rot.to_yaw_pitch_roll();
-                        if pitch > 0.02 {
-                            let reach = ((hl.body.pos.y - 0.2) / pitch.tan()).min(gun_range);
-                            let (px, pz) = (
-                                hl.body.pos.x + yaw.sin() * reach,
-                                hl.body.pos.z + yaw.cos() * reach,
-                            );
-                            frame.draw(
-                                &marker,
-                                Mat4::translate(vec3(px, 0.0, pz)) * Mat4::scale(1.2),
-                                tint,
-                                true,
-                            );
-                        }
+                        let (p, hot) = range_dot(heli_muzzle(&hl));
+                        frame.draw_emissive(
+                            &marker,
+                            Mat4::translate(p) * Mat4::scale(if hot { 1.3 } else { 0.9 }),
+                            if hot { (1.4, 0.35, 0.2) } else { (0.8, 0.75, 0.45) },
+                            true,
+                        );
                     }
                 }
 
-                // Tracers, corpses, and the horde: the instance batches
-                // staged above frame() — four draw calls for the whole
-                // crowd (tint/emissive ride per instance).
+                // Tracers, corpses, the horde, and the flock: the
+                // instance batches staged above frame() — a handful of
+                // draw calls for the whole crowd (tint/emissive ride
+                // per instance).
                 frame.draw_instanced(&tracer_mesh, tracer_b, true);
                 frame.draw_instanced(&shadow, hog_shadow_b, false);
-                frame.draw_instanced(&hog_body, hog_body_b, true);
-                frame.draw_instanced(&hog_snout, hog_snout_b, true);
+                frame.draw_instanced(hog_m.mesh("body"), hog_body_b, true);
+                frame.draw_instanced(hog_m.mesh("snout"), hog_snout_b, true);
+                frame.draw_instanced(&shadow, flyer_shadow_b, false);
+                frame.draw_instanced(flyer_m.mesh("body"), flyer_body_b, true);
+                frame.draw_instanced(flyer_m.mesh("wing.l"), flyer_wing_l_b, true);
+                frame.draw_instanced(flyer_m.mesh("wing.r"), flyer_wing_r_b, true);
+                // The hitbox cages ride last so they overlay the art
+                // (thin double-sided ribbons — no cull).
+                for (mesh, batch) in cage_b {
+                    frame.draw_instanced(mesh, batch, false);
+                }
 
                 // Impact facts off the TTL'd pool: existence == recency.
                 for (_, c) in w.impact.get().iter() {
@@ -850,10 +1150,9 @@ pub fn run(flags: Flags) {
                     );
                 }
 
-                // HUD: team score big, wave + horde count under it — all
-                // read RAW off the synced single (server-owned, never
-                // predicted).
-                let sb = w.hunt.get();
+                // HUD: team score big, the current OBJECTIVE under it —
+                // all read RAW off the synced single (server-owned,
+                // never predicted; `sb` copied above the furniture).
                 let spx = 56.0;
                 let score_txt = format!("{}", sb.points as i32);
                 let sw = frame.text_width(&score_txt, spx);
@@ -865,16 +1164,93 @@ pub fn run(flags: Flags) {
                     spx,
                     (245, 245, 245),
                 );
-                let info = format!("wave {}   hogs {}", sb.wave, sb.alive);
-                let iw = frame.text_width(&info, 22.0);
-                hud_bold(
-                    &mut frame,
-                    &info,
-                    (W as f32 - iw) / 2.0,
-                    12.0 + spx + 8.0,
-                    22.0,
-                    (200, 210, 190),
-                );
+                let info = match (sb.phase, sb.kind) {
+                    (PHASE_PLAYING, MISSION_DEFEND) => {
+                        let dp = w
+                            .depot
+                            .get()
+                            .iter()
+                            .next()
+                            .map_or(0, |(_, d)| (d.hp / DEPOT_HP * 100.0).ceil() as i32);
+                        format!(
+                            "wave {}/{}   depot {}%   hogs {}",
+                            sb.wave, sb.goal, dp, sb.alive
+                        )
+                    }
+                    (PHASE_PLAYING, MISSION_RACE) => format!(
+                        "beacon {}/{}   {:.0}s   hogs {}",
+                        sb.done, sb.goal, sb.timer.max(0.0), sb.alive
+                    ),
+                    (PHASE_PLAYING, MISSION_BOSS) => {
+                        format!("boss {}%   hogs {}", sb.done, sb.alive)
+                    }
+                    (PHASE_PLAYING, _) => {
+                        format!("wave {}/{}   hogs {}", sb.wave, sb.goal, sb.alive)
+                    }
+                    _ => String::new(),
+                };
+                if !info.is_empty() {
+                    let iw = frame.text_width(&info, 22.0);
+                    hud_bold(
+                        &mut frame,
+                        &info,
+                        (W as f32 - iw) / 2.0,
+                        12.0 + spx + 8.0,
+                        22.0,
+                        (200, 210, 190),
+                    );
+                }
+
+                // Phase splashes: everyone renders the same screen off
+                // the same single — the director's whole contract.
+                let center = |frame: &mut Frame3, s: &str, y: f32, px: f32, col| {
+                    let tw = frame.text_width(s, px);
+                    hud_bold(frame, s, (W as f32 - tw) / 2.0, y, px, col);
+                };
+                let cy = H as f32 * 0.30;
+                match sb.phase {
+                    PHASE_LOBBY => {
+                        center(&mut frame, "waiting for the team ...", cy, 26.0, (210, 215, 205));
+                    }
+                    PHASE_BRIEF => {
+                        let ld = level_def(sb.level);
+                        let md = mission_def(sb.level, sb.mission);
+                        center(
+                            &mut frame,
+                            &format!("{} — mission {}", ld.name, sb.mission + 1),
+                            cy - 34.0,
+                            22.0,
+                            (170, 180, 170),
+                        );
+                        center(&mut frame, md.name, cy, 44.0, (245, 235, 190));
+                        center(&mut frame, md.brief, cy + 54.0, 20.0, (210, 215, 205));
+                        center(
+                            &mut frame,
+                            &format!("{:.0}", sb.timer.max(0.0).ceil()),
+                            cy + 96.0,
+                            34.0,
+                            (245, 245, 245),
+                        );
+                    }
+                    PHASE_WON => {
+                        center(&mut frame, "LEVEL COMPLETE", cy, 48.0, (150, 240, 150));
+                        center(
+                            &mut frame,
+                            &format!("{} points", sb.points as i32),
+                            cy + 58.0,
+                            26.0,
+                            (235, 235, 225),
+                        );
+                        center(&mut frame, "ENTER - next level", cy + 96.0, 20.0, (200, 210, 190));
+                    }
+                    PHASE_LOST => {
+                        let md = mission_def(sb.level, sb.mission);
+                        center(&mut frame, "MISSION FAILED", cy, 48.0, (245, 110, 90));
+                        center(&mut frame, md.name, cy + 58.0, 24.0, (225, 205, 190));
+                        center(&mut frame, "ENTER - retry", cy + 96.0, 20.0, (200, 210, 190));
+                    }
+                    _ => {}
+                }
 
                 // HP + boost heat, bottom left, as real bars
                 // (`frame.rect`, riding the text compute pass). hp is
@@ -918,6 +1294,110 @@ pub fn run(flags: Flags) {
                         frame.text(label, x + bw + 10.0, ry - 2.0, 18.0, (215, 220, 210));
                     }
                 }
+
+                // --- the DEBUG OVERLAY (tilde): this client's engine,
+                // live — per-task timings and pool populations off the
+                // once-a-second sample above, net counters fresh. Two
+                // panels; the columns are fixed x offsets (the gpu3d
+                // font isn't monospaced, so padding can't align them).
+                // Server tasks live in the other thread's Pm — they get
+                // their window when the live console lands.
+                // TODO(roadmap): the live console (queued 2026-07-18,
+                // per Connor) — typed COMMANDS at this same key:
+                // inspect and poke pools/singles/params from inside the
+                // game, and a window into the SERVER's Pm (its tasks
+                // live on the other thread; likely rides the
+                // telemetry/params seam, which already crosses that gap
+                // both ways).
+                if show_debug {
+                    let (lh, px) = (17.0, 15.0);
+                    let hdr = (250, 205, 120);
+                    let txt = (208, 218, 208);
+                    let dim = (150, 160, 150);
+                    let x0 = 20.0;
+                    let faults = pm.task_faults().len();
+                    let rows1 = 3.6 + dbg_tasks.len().max(1) as f32 + (faults > 0) as u8 as f32;
+                    frame.rect(x0 - 8.0, 12.0, 380.0, rows1 * lh + 14.0, (6, 8, 6), 0.62);
+                    let mut y = 18.0;
+                    frame.text(
+                        &format!(
+                            "debug   tick {}   frame {:.1} ms   rtt {:.0} ms",
+                            pm.tick(),
+                            frame_ms,
+                            net.rtt_ms()
+                        ),
+                        x0,
+                        y,
+                        px,
+                        hdr,
+                    );
+                    y += lh;
+                    frame.text(
+                        &format!(
+                            "peer {}   snaps {:.0}/s   corrections {}",
+                            net.peer(),
+                            dbg_snap_rate,
+                            w.pred.get().corrections + w.pred_heli.get().corrections
+                        ),
+                        x0,
+                        y,
+                        px,
+                        txt,
+                    );
+                    y += lh;
+                    if faults > 0 {
+                        frame.text(
+                            &format!("task faults: {faults} (stderr has the story)"),
+                            x0,
+                            y,
+                            px,
+                            (255, 90, 70),
+                        );
+                        y += lh;
+                    }
+                    y += lh * 0.6;
+                    for (c, s) in [(0.0, "task"), (185.0, "hz"), (245.0, "avg us"), (315.0, "max us")] {
+                        frame.text(s, x0 + c, y, px, dim);
+                    }
+                    y += lh;
+                    if dbg_tasks.is_empty() {
+                        frame.text("sampling ...", x0, y, px, dim);
+                    }
+                    for (name, hz, avg, max) in &dbg_tasks {
+                        frame.text(&name[..name.len().min(20)], x0, y, px, txt);
+                        frame.text(&format!("{hz:.0}"), x0 + 185.0, y, px, txt);
+                        frame.text(&format!("{avg:.0}"), x0 + 245.0, y, px, txt);
+                        frame.text(&format!("{max:.0}"), x0 + 315.0, y, px, txt);
+                        y += lh;
+                    }
+
+                    // Pools panel: every pool (singles included — a
+                    // single is a one-entity pool), largest first,
+                    // capped so a long store can't run off the screen.
+                    const POOL_ROWS: usize = 24;
+                    let x1 = 412.0;
+                    let shown = dbg_pools.len().min(POOL_ROWS);
+                    let rows2 = 1.0 + shown as f32 + (dbg_pools.len() > POOL_ROWS) as u8 as f32;
+                    frame.rect(x1 - 8.0, 12.0, 310.0, rows2 * lh + 14.0, (6, 8, 6), 0.62);
+                    let mut y = 18.0;
+                    frame.text("pool", x1, y, px, dim);
+                    frame.text("entities", x1 + 220.0, y, px, dim);
+                    y += lh;
+                    for (name, n) in dbg_pools.iter().take(POOL_ROWS) {
+                        frame.text(&name[..name.len().min(26)], x1, y, px, txt);
+                        frame.text(&format!("{n}"), x1 + 220.0, y, px, txt);
+                        y += lh;
+                    }
+                    if dbg_pools.len() > POOL_ROWS {
+                        frame.text(
+                            &format!("+ {} more", dbg_pools.len() - POOL_ROWS),
+                            x1,
+                            y,
+                            px,
+                            dim,
+                        );
+                    }
+                }
             }
             if pm.tick() % 30 == 0 {
                 // Whichever predictor is live provides the speed; the
@@ -934,11 +1414,12 @@ pub fn run(flags: Flags) {
                 // BUILD_ID in the title: a staged/copied exe that's out
                 // of date says so on sight (dirty builds carry a `+`).
                 let title = format!(
-                    "pm hogs [{}] — peer {}  {:.0} mph  rtt {:.0} ms  corrections {}  (h heli / t truck)",
+                    "pm hogs [{}] — peer {}  {:.0} mph  rtt {:.0} ms  frame {:.1} ms  corrections {}  (h heli / t truck)",
                     pm::BUILD_ID,
                     net.peer(),
                     speed.abs(),
                     net.rtt_ms(),
+                    frame_ms,
                     w.pred.get().corrections + w.pred_heli.get().corrections,
                 );
                 let _ = window.set_title(&title);
@@ -949,4 +1430,119 @@ pub fn run(flags: Flags) {
     // Display refresh paces the loop (WSLg ignores vsync; see solids).
     pm.loop_rate = refresh;
     pm.run().expect("connect");
+}
+
+/// The pre-connect menu: HOST / JOIN / address / password, keyboard
+/// only (Up/Down rows, type into the text rows, Enter on a verb goes,
+/// Esc quits). Returns `(connect_addr, password)`, or `None` to quit.
+///
+/// HOST spawns the server (+2 bots) in-process, exactly like the old
+/// no-arg launch — bound to `0.0.0.0` so friends can dial your IP —
+/// then joins it over loopback. The password locks the door for
+/// everyone, bots included (they present it too).
+fn menu(
+    pump: &mut sdl3::EventPump,
+    r3d: &mut Renderer3d,
+    window: &sdl3::video::Window,
+    flags: &Flags,
+) -> Option<(String, String)> {
+    const ROWS: usize = 4; // HOST, JOIN, address, password
+    let mut sel = 0usize;
+    let mut addr = flags.addr.clone();
+    let mut password = flags.password.clone();
+    // SDL text input gives us real typed characters (layout/IME aware)
+    // as TextInput events — scancode chords could never spell ':'.
+    let text_input = window.subsystem().text_input();
+    text_input.start(window);
+
+    let choice = 'menu: loop {
+        for ev in pump.poll_iter() {
+            match ev {
+                Event::Quit { .. }
+                | Event::KeyDown { scancode: Some(Scancode::Escape), .. } => {
+                    break 'menu None;
+                }
+                Event::KeyDown { scancode: Some(Scancode::Up), .. } => {
+                    sel = (sel + ROWS - 1) % ROWS;
+                }
+                Event::KeyDown { scancode: Some(Scancode::Down), .. }
+                | Event::KeyDown { scancode: Some(Scancode::Tab), .. } => {
+                    sel = (sel + 1) % ROWS;
+                }
+                Event::KeyDown { scancode: Some(Scancode::Backspace), .. } => {
+                    match sel {
+                        2 => {
+                            addr.pop();
+                        }
+                        3 => {
+                            password.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                Event::KeyDown { scancode: Some(Scancode::Return), .. } => match sel {
+                    0 => break 'menu Some((true, addr.clone(), password.clone())),
+                    1 => break 'menu Some((false, addr.clone(), password.clone())),
+                    _ => sel = (sel + 1) % ROWS, // Enter on a field: next
+                },
+                Event::TextInput { text, .. } => match sel {
+                    2 => addr.push_str(text.trim()),
+                    3 => password.push_str(text.trim()),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        if let Some(mut f) = r3d.frame(window, Mat4::IDENTITY, vec3(0.35, 1.0, 0.3)) {
+            let cx = W as f32 * 0.5 - 220.0;
+            let mut y = H as f32 * 0.30;
+            let dim = (150, 155, 145);
+            let lit = (250, 220, 120);
+            let txt = (215, 220, 210);
+            f.text("PM HOGS", cx, y - 90.0, 46.0, (245, 200, 90));
+            f.text("co-op hog hunting", cx, y - 44.0, 18.0, dim);
+            let row = |f: &mut Frame3, i: usize, sel: usize, label: &str, y: f32| {
+                let on = i == sel;
+                f.text(if on { ">" } else { " " }, cx - 26.0, y, 22.0, lit);
+                f.text(label, cx, y, 22.0, if on { lit } else { txt });
+            };
+            row(&mut f, 0, sel, "HOST GAME   (friends join your ip)", y);
+            y += 34.0;
+            row(&mut f, 1, sel, "JOIN GAME", y);
+            y += 44.0;
+            row(&mut f, 2, sel, &format!("address:  {addr}{}", if sel == 2 { "_" } else { "" }), y);
+            y += 30.0;
+            let mask = "*".repeat(password.chars().count());
+            row(&mut f, 3, sel, &format!("password: {mask}{}", if sel == 3 { "_" } else { "" }), y);
+            y += 44.0;
+            f.text("up/down rows · type in fields · enter go · esc quit", cx, y, 15.0, dim);
+            f.text(
+                "host locks the game with the password; leave it empty for an open door",
+                cx,
+                y + 20.0,
+                15.0,
+                dim,
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    };
+    text_input.stop(window);
+
+    let (host, addr, password) = choice?;
+    if !host {
+        return Some((addr, password));
+    }
+    // HOST: the old no-arg launch, now behind a menu verb — dedicated
+    // thread server bound for the outside world, two bot teammates.
+    let params = flags.params;
+    let path = flags.params_path.clone();
+    let pw = (!password.is_empty()).then(|| password.clone());
+    std::thread::spawn(move || crate::server::run(true, params, path, HOST_BIND, pw));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    for n in 0..2 {
+        let (link, pw) = (flags.link, password.clone());
+        std::thread::spawn(move || crate::bot_client::run_bot(n, link, ADDR, &pw));
+    }
+    Some((ADDR.to_string(), password))
 }

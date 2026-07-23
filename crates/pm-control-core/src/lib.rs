@@ -30,6 +30,7 @@ pub mod fault_table;
 pub mod io;
 pub mod monitor;
 pub mod net;
+pub mod params;
 pub mod prof;
 pub mod record;
 pub mod save;
@@ -47,6 +48,7 @@ pub use monitor::{MonFault, MonNode, MonUnlock, Monitor};
 pub use net::{Message, NetHealth, NetStatus, NetworkManager, SegmentPort};
 pub use prof::{PmProf, ProfSpan};
 pub use record::{Playback, Recording, SNAPSHOT_DELAY_MS, SnapshotTrigger};
+pub use params::ParamSpec;
 pub use save::SaveSet;
 pub use signal::{
     AnySignal, PmBool, PmF32, PmI32, PmI64, PmSignal, PmString, PmU64, RCursor, Register,
@@ -57,6 +59,10 @@ pub use timers::{PmBlinker, PmEdge, PmPulse, PmTimer};
 /// Implementation detail of `pm_group!`'s `@arr` marker.
 #[doc(hidden)]
 pub use alloc::format as __format;
+#[doc(hidden)]
+pub use alloc::string::String as __String;
+#[doc(hidden)]
+pub use alloc::vec::Vec as __Vec;
 
 /// Declare a struct of signals (or nested groups) that knows how to register
 /// itself. Field names become the dotted-path segments — the Rust replacement

@@ -14,6 +14,13 @@
 //!
 //! Certificates are self-signed and the client skips verification — fine
 //! for development; real deployments pin or verify.
+//!
+//! Why QUIC underneath: datagrams for state (unreliable, unordered —
+//! newest wins), one reliable stream for the handshake and events, TLS
+//! for free, and one port. The alternative was measured (`lag_ab`
+//! below): raw UDP through the same simulated conditions performed
+//! identically — the transport was never the bottleneck, the config
+//! was. Verdict final: stay on QUIC, hybrid off the table.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -33,6 +40,17 @@ use quinn_proto::{
 // (pm/2: snapshots carry a per-send seq, acks echo (tick, seq).)
 const ALPN: &[u8] = b"pm/2";
 const FRAME_HELLO: u16 = 0;
+/// Client → server, the client's first frame after a schema-ok hello:
+/// the session password (empty when the client has none). A server
+/// WITHOUT a password ignores it; a server WITH one defers ADMISSION —
+/// no `joined`, no snapshots, no inputs/events accepted — until the
+/// bytes match, and closes the connection on mismatch or timeout. A
+/// bouncer, not cryptography: QUIC/TLS already encrypts the wire; this
+/// only decides who gets past the door.
+const FRAME_AUTH: u16 = 1;
+/// How long an unauthenticated connection may sit before the server
+/// closes it (covers clients that never send FRAME_AUTH).
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// User event types must be >= this; lower values are protocol-reserved.
 pub const EVENT_USER_BASE: u16 = 16;
 const DGRAM_SNAPSHOT: u8 = 0;
@@ -351,6 +369,12 @@ struct ConnState {
     stream_in: Vec<u8>,
     stream_out: Vec<u8>,
     last_input_seq: u32,
+    /// ADMITTED: past the password door (immediately, when the server
+    /// has none). Until this is true the peer is never `joined`, and
+    /// its inputs/events/acks are dropped unread.
+    authed: bool,
+    /// When the connection was accepted — the auth-timeout clock.
+    since: Instant,
 }
 
 /// Server endpoint. Pump from a net task each tick; drain joins/leaves/acks
@@ -362,6 +386,8 @@ pub struct QuicServer {
     peer_conns: HashMap<u8, ConnectionHandle>,
     next_peer: u8,
     schema: Vec<u8>,
+    /// Session password (see [`FRAME_AUTH`]); `None` = open server.
+    password: Option<String>,
     joined: Vec<u8>,
     left: Vec<u8>,
     acks: Vec<(u8, u32, u32)>,
@@ -402,6 +428,7 @@ impl QuicServer {
             peer_conns: HashMap::new(),
             next_peer: 1,
             schema: schema_encode(schema),
+            password: None,
             joined: Vec::new(),
             left: Vec::new(),
             acks: Vec::new(),
@@ -409,6 +436,12 @@ impl QuicServer {
             events: Vec::new(),
             oversize_drops: 0,
         })
+    }
+
+    /// Require this session password from every client (before any
+    /// client connects — set it right after `bind`).
+    pub fn password_set(&mut self, pw: &str) {
+        self.password = Some(pw.to_string());
     }
 
     #[cfg(test)] // test seam
@@ -449,6 +482,8 @@ impl QuicServer {
                                     stream_in: Vec::new(),
                                     stream_out: Vec::new(),
                                     last_input_seq: 0,
+                                    authed: false,
+                                    since: now,
                                 },
                             );
                             self.peer_conns.insert(peer, ch);
@@ -480,15 +515,26 @@ impl QuicServer {
                         st.connected = true;
                         if let Some(id) = st.conn.streams().open(Dir::Bi) {
                             st.stream = Some(id);
+                            // The hello (peer id + schema) goes out even
+                            // before auth — the schema is a contract, not
+                            // a secret, and the client needs it to know
+                            // the stream to answer on. ADMISSION is what
+                            // the password gates.
                             let mut hello = vec![st.peer];
                             hello.extend_from_slice(&self.schema);
                             frame_write(&mut st.stream_out, FRAME_HELLO, &hello);
-                            self.joined.push(st.peer);
+                            if self.password.is_none() {
+                                st.authed = true;
+                                self.joined.push(st.peer);
+                            }
                         }
                     }
                     Event::ConnectionLost { .. } => {
                         st.gone = true;
-                        if st.connected {
+                        // Only ADMITTED peers ever reached NetServer, so
+                        // only they get a leave — a bounced password
+                        // guess never touches the roster.
+                        if st.authed {
                             self.left.push(st.peer);
                         }
                     }
@@ -499,6 +545,9 @@ impl QuicServer {
                 }
             }
             while let Some(d) = st.conn.datagrams().recv() {
+                if !st.authed {
+                    continue; // drained but dropped: no play before the door
+                }
                 match d.first() {
                     Some(&DGRAM_ACK) if d.len() >= 9 => {
                         self.acks.push((
@@ -514,9 +563,25 @@ impl QuicServer {
                 }
             }
             for (ty, payload) in frames_parse(&mut st.stream_in) {
-                if ty >= EVENT_USER_BASE {
+                if ty == FRAME_AUTH && !st.authed && !st.gone {
+                    // The one frame an unadmitted peer may speak. Match →
+                    // admit; mismatch → close now (the client sees the
+                    // reason string). Constant-time compare is overkill
+                    // for a lobby bouncer; QUIC already encrypted it.
+                    if self.password.as_ref().is_some_and(|pw| pw.as_bytes() == payload) {
+                        st.authed = true;
+                        self.joined.push(st.peer);
+                    } else {
+                        st.conn.close(now, 2u32.into(), b"bad password"[..].into());
+                    }
+                } else if ty >= EVENT_USER_BASE && st.authed {
                     self.events.push((st.peer, ty, payload));
                 }
+            }
+            // Never answered the door: drop the connection so half-open
+            // dials can't accumulate.
+            if !st.authed && !st.gone && now.duration_since(st.since) > AUTH_TIMEOUT {
+                st.conn.close(now, 2u32.into(), b"auth timeout"[..].into());
             }
             conn_flush(
                 &mut st.conn,
@@ -681,6 +746,10 @@ pub struct QuicClient {
     stream_in: Vec<u8>,
     stream_out: Vec<u8>,
     schema: Vec<u8>,
+    /// Session password to present (empty = none). Always sent as the
+    /// first frame after a schema-ok hello — the server decides whether
+    /// it matters (see [`FRAME_AUTH`]).
+    password: Option<String>,
     peer: Option<u8>,
     snapshots: Vec<Vec<u8>>,
     error: Option<String>,
@@ -724,12 +793,19 @@ impl QuicClient {
             stream_in: Vec::new(),
             stream_out: Vec::new(),
             schema: schema_encode(schema),
+            password: None,
             peer: None,
             snapshots: Vec::new(),
             error: None,
             input_seq: 0,
             input_buf: VecDeque::new(),
         })
+    }
+
+    /// Present this session password when the hello arrives (set before
+    /// the first `pump`).
+    pub fn password_set(&mut self, pw: &str) {
+        self.password = Some(pw.to_string());
     }
 
     /// Drive the connection. Call once per tick.
@@ -789,6 +865,11 @@ impl QuicClient {
                     continue;
                 }
                 self.peer = Some(payload[0]);
+                // Answer the door: the password (or an empty knock) is
+                // always the first frame back — an open server ignores
+                // it, a locked one gates ADMISSION on it.
+                let pw = self.password.as_deref().unwrap_or("");
+                frame_write(&mut self.stream_out, FRAME_AUTH, pw.as_bytes());
             }
         }
         conn_flush(

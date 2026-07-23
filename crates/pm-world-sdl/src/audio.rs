@@ -11,9 +11,20 @@
 //! cheap pitch knob that keeps a repeated shot from sounding like a
 //! sample loop.
 //!
-//! Pairs with `pm::Births` on the client: replication converges state,
-//! `Births` turns "a new entry appeared in the pool" into the edge a
+//! Pairs with `pm::Adds` on the client: replication converges state,
+//! `Adds` turns "a new entry appeared in the pool" into the edge a
 //! one-shot sound wants.
+//!
+//! Platform lesson (WSLg, 2026-07-16): after long sessions audio
+//! drifted seconds late. This code *can't* queue more than one clip
+//! per voice — the backlog was below SDL, in WSLg's
+//! PulseAudio-over-RDP bridge, whose sink buffer creeps.
+//! `PULSE_LATENCY_MSEC=60` caps it; native Windows (WASAPI) never
+//! drifts. Know which layer you're standing on before you fix the
+//! wrong one — and WSLg is a different platform than Windows.
+
+// TODO(roadmap): no looping voice yet — an engine/rotor hum wants one
+// (a voice that refills from a clip instead of going idle).
 
 use sdl3::audio::{AudioFormat, AudioSpec, AudioSpecWAV, AudioStreamOwner};
 

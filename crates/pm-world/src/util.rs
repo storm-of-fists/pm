@@ -220,17 +220,18 @@ impl Latch {
 /// last call? Replication converges STATE ("what exists"), but one-shot
 /// reactions — sounds, camera shake, particles — need the EDGE ("it
 /// just appeared"). Point one of these at a synced pool (impacts,
-/// bullets) and react to what it returns each tick.
+/// bullets) and react to what it returns each tick. The removal edge is
+/// [`Removes`].
 ///
 /// The first call primes silently and reports nothing: on connect, the
 /// initial snapshot dumps the whole existing world, and a join
 /// shouldn't replay every standing entity as if it just happened.
 ///
 /// ```
-/// use pm::{Births, Id, Pool};
+/// use pm::{Adds, Id, Pool};
 ///
 /// let mut pool: Pool<f32> = Pool::new();
-/// let mut sfx = Births::default();
+/// let mut sfx = Adds::default();
 /// pool.add(Id::new(0, 0, 1), 1.0);
 /// assert!(sfx.drain(&pool).is_empty()); // first call: prime, no replay
 /// pool.add(Id::new(0, 0, 2), 2.0);
@@ -238,12 +239,12 @@ impl Latch {
 /// assert!(sfx.drain(&pool).is_empty()); // an entity is born once
 /// ```
 #[derive(Default)]
-pub struct Births {
+pub struct Adds {
     seen: std::collections::HashSet<crate::Id>,
     primed: bool,
 }
 
-impl Births {
+impl Adds {
     /// Ids present in `pool` that weren't present last call, and forget
     /// ids that have since been removed (so a recycled slot's next
     /// occupant — a new generation — still counts as born).
@@ -257,6 +258,63 @@ impl Births {
         self.seen.retain(|id| pool.contains(*id));
         self.primed = true;
         born
+    }
+}
+
+/// [`Adds`]' opposite — `FallingEdge` for pool membership: which
+/// entities VANISHED since the last call, and what state did they die
+/// with? By the time a consumer can look, the entry is gone (removal is
+/// a kernel flush; on a client it's a snapshot's removal log), so
+/// one-shot reactions to a death — ragdolls launched from the final
+/// pose, wreck sfx, a kill feed — need the last value, not just the id.
+/// The tracker mirrors the pool's values as it drains (one copy of each
+/// live entry per call — pods are small by design; this is the
+/// per-consumer HashMap every client used to hand-roll, kept once).
+///
+/// The first call primes silently, like [`Adds`]: nothing has been seen
+/// yet, so nothing can have vanished.
+///
+/// ```
+/// use pm::{Id, Pool, Removes};
+///
+/// let mut pool: Pool<f32> = Pool::new();
+/// let mut ragdolls = Removes::default();
+/// pool.add(Id::new(0, 0, 1), 7.0);
+/// assert!(ragdolls.drain(&pool).is_empty()); // prime
+/// pool.remove(Id::new(0, 0, 1));
+/// // The removal, with the last value it held:
+/// assert_eq!(ragdolls.drain(&pool), vec![(Id::new(0, 0, 1), 7.0)]);
+/// assert!(ragdolls.drain(&pool).is_empty()); // an entity dies once
+/// ```
+pub struct Removes<T> {
+    mirror: std::collections::HashMap<crate::Id, T>,
+}
+
+// Hand-written so `T: Default` is never required (derive would bound it).
+impl<T> Default for Removes<T> {
+    fn default() -> Self {
+        Removes { mirror: Default::default() }
+    }
+}
+
+impl<T: Copy> Removes<T> {
+    /// Entries gone from `pool` since the last call, each with its
+    /// last-seen value, then refresh the mirror. A recycled slot is a
+    /// new generation, so its previous occupant still reports as
+    /// removed.
+    pub fn drain(&mut self, pool: &crate::Pool<T>) -> Vec<(crate::Id, T)> {
+        let mut gone = Vec::new();
+        self.mirror.retain(|&id, v| {
+            let live = pool.contains(id);
+            if !live {
+                gone.push((id, *v));
+            }
+            live
+        });
+        for (id, v) in pool.iter() {
+            self.mirror.insert(id, *v);
+        }
+        gone
     }
 }
 

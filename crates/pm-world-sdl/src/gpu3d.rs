@@ -594,6 +594,9 @@ impl Renderer3d {
     /// tracer appeared on native Windows (WSLg's Vulkan path masks it).
     /// Pay that cost here, inside startup, where nobody can feel it.
     /// Best-effort: any failure just skips the warm-up.
+    // TODO(ship): verify on native Windows/D3D12 that this actually
+    // eats the first-shot hitch (the diagnosis session was WSLg, which
+    // masks it) — a 290 ms hitch on your first shot is a review bullet.
     fn warmup(&self, window: &Window) -> Option<()> {
         // A degenerate triangle: rasterizes nothing, compiles everything.
         let v = Vertex3 {

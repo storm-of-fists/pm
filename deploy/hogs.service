@@ -1,0 +1,23 @@
+# pm hogs dedicated server — installed to /etc/systemd/system by
+# deploy/deploy.sh. The session password lives in /opt/hogs/hogs.env
+# (HOGS_PASSWORD=...); empty or missing = open server. Edit it on the
+# box, then: sudo systemctl restart hogs
+[Unit]
+Description=pm hogs dedicated server
+After=network.target
+
+[Service]
+Type=simple
+User=hogs
+WorkingDirectory=/opt/hogs
+EnvironmentFile=-/opt/hogs/hogs.env
+# addr=0.0.0.0 takes outside connections; the game speaks QUIC over
+# UDP 48223. assets/ + hogs.params resolve from WorkingDirectory.
+ExecStart=/opt/hogs/hogs server addr=0.0.0.0:48223 password=${HOGS_PASSWORD}
+Restart=always
+RestartSec=2
+# The server is headless (SDL is statically linked and never
+# initialized in server mode) — no display, no audio, no extra deps.
+
+[Install]
+WantedBy=multi-user.target

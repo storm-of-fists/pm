@@ -5,3 +5,9 @@ edition.workspace = true
 
 # no_std + alloc — stays dependency-free.
 [dependencies]
+
+# Tests only: pm_params!'s generated pods derive bytemuck traits (the
+# runtime crate stays dependency-free — expansions resolve ::bytemuck in
+# the DECLARING crate).
+[dev-dependencies]
+bytemuck = { version = "1", features = ["derive"] }

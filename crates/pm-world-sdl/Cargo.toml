@@ -11,6 +11,10 @@ pm-world = { path = "../pm-world" }
 sdl3 = { version = "0.18", features = ["build-from-source", "static-link", "unsafe_textures"] }
 png = "0.18"
 fontdue = "0.9"
+# glTF PARSING only (model.rs): no default features — that pulls the
+# `image` crate for texture decoding, and pm models are vertex-colored
+# by doctrine (gpu3d can't sample textures in a fragment shader).
+gltf = { version = "1", default-features = false, features = ["utils", "names"] }
 
 [build-dependencies]
 naga = { version = "29", features = ["wgsl-in", "spv-out"] }

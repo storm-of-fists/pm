@@ -294,6 +294,7 @@ pub(crate) trait ErasedPool: std::any::Any {
     fn erased_remove(&mut self, id: Id);
     fn tick_set(&mut self, tick: u32);
     fn lock(&mut self);
+    fn erased_len(&self) -> usize;
 }
 
 impl<T: 'static> ErasedPool for Pool<T> {
@@ -309,6 +310,10 @@ impl<T: 'static> ErasedPool for Pool<T> {
 
     fn lock(&mut self) {
         self.locked = true;
+    }
+
+    fn erased_len(&self) -> usize {
+        self.len()
     }
 }
 

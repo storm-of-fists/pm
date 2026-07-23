@@ -11,6 +11,7 @@ pub use sdl3;
 pub mod audio;
 mod font;
 pub mod gpu3d;
+pub mod model;
 mod sprite;
 
 pub use audio::{Audio, Clip};
@@ -43,4 +44,15 @@ pub fn window(title: &str, w: u32, h: u32) -> (sdl3::video::Window, sdl3::EventP
         .unwrap_or(60)
         .max(30);
     (window, pump, refresh)
+}
+
+/// Capture the mouse into the window (SDL relative mode: cursor hidden
+/// and confined, motion arrives as endless `xrel`/`yrel` deltas — FPS
+/// aiming). `false` releases it. Alt-tab still works; process exit
+/// always releases. Raw sys call because the wrapper's `MouseUtil`
+/// needs the `Sdl` context `window()` deliberately doesn't return.
+pub fn grab_mouse(window: &sdl3::video::Window, on: bool) {
+    unsafe {
+        sdl3::sys::mouse::SDL_SetWindowRelativeMouseMode(window.raw(), on);
+    }
 }

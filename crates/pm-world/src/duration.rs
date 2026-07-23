@@ -13,6 +13,10 @@
 //! server-side counterparts of the client's presentation modifiers
 //! ([`PmClient::interp_pool`](crate::PmClient::interp_pool)).
 
+// TODO(roadmap): watch item, no action until measured — history-ring
+// memory and rewind scans past a few thousand colliders (each rewound
+// query walks a full frame copy).
+
 use std::collections::VecDeque;
 
 use crate::id::Id;

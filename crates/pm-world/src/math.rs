@@ -644,6 +644,22 @@ impl Mul for Quat {
 /// rendering takes [`model`](Body::model). This is the seam a future
 /// physics layer grows behind — angular velocity joins when a vehicle
 /// (jets) actually integrates it.
+///
+/// The physics stance: physics is **library functions, not a system**
+/// — there is no rigid-body world to register into, just `Body`,
+/// [`Quat`], and step functions games call from their own tasks, in
+/// three tiers (Source's split):
+/// 1. **Predicted-kinematic** — player vehicles: deterministic pure
+///    steps, shared byte-identical by server and prediction replay.
+/// 2. **Server-dynamic** — NPC impulses (knockback, shoves): the
+///    server writes velocities, replication carries the result,
+///    nobody predicts it. A real constraint solver (Box3D-style)
+///    becomes this tier's backend *if* stacking/joints get demanded;
+///    `Body` is the seam it slots behind.
+/// 3. **Client-cosmetic** — corpse tumbles, tracer flight: never on
+///    the wire. GPU physics, if ever, lives ONLY here — the
+///    authoritative loop must replay deterministically on headless
+///    servers.
 #[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
 #[repr(C)]
 pub struct Body {
