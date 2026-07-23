@@ -80,7 +80,7 @@ fn truck_replay_is_golden() {
 #[test]
 fn heli_replay_is_golden() {
     let p = Params::default();
-    let mut h0 = spawn_heli(2);
+    let mut h0 = spawn_heli(2, &Params::default());
     let mut rng = 0x686f_6773_2e73_696d_u64;
     let mut h = FNV_SEED;
     for tick in 0..TICKS {

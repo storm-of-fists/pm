@@ -67,7 +67,7 @@ struct HogBrain {
 // genuinely-3D lines stay visible.
 /// Server-local per-flyer state — the airborne sibling of [`HogBrain`]:
 /// same think/move split and wander machinery, plus the altitude the
-/// per-tick move chases at `FLYER_CLIMB` authority (a swoop IS
+/// per-tick move chases at `p.flyer_climb` authority (a swoop IS
 /// `target_alt` dropping to a truck's deck).
 #[derive(Clone, Copy, Default)]
 struct FlyerBrain {
@@ -177,7 +177,7 @@ fn spawn_wave(
                     z,
                     heading: (-x).atan2(-z),
                     speed: p.flyer_speed * 0.55,
-                    hp: FLYER_HP,
+                    hp: p.flyer_hp,
                 },
             );
             fbrain.get_mut().add(
@@ -185,7 +185,7 @@ fn spawn_wave(
                 FlyerBrain {
                     seed: rng.rfr(0.0, std::f32::consts::TAU),
                     goal: roam_goal(&mut rng),
-                    repick: rng.rfr(0.2, 1.0) * ROAM_REPICK,
+                    repick: rng.rfr(0.2, 1.0) * p.roam_repick,
                     desired: (-x).atan2(-z),
                     target_speed: p.flyer_speed * 0.55,
                     target_alt: p.flyer_alt,
@@ -202,7 +202,7 @@ fn spawn_wave(
                 z,
                 heading: (-x).atan2(-z),
                 speed: p.hog_roam,
-                hp: HOG_HP,
+                hp: p.hog_hp,
             },
         );
         brain.get_mut().add(
@@ -210,7 +210,7 @@ fn spawn_wave(
             HogBrain {
                 seed: rng.rfr(0.0, std::f32::consts::TAU),
                 goal: roam_goal(&mut rng),
-                repick: rng.rfr(0.2, 1.0) * ROAM_REPICK,
+                repick: rng.rfr(0.2, 1.0) * p.roam_repick,
                 // Match the spawn pose until the first think.
                 desired: (-x).atan2(-z),
                 target_speed: p.hog_roam,
@@ -246,20 +246,20 @@ fn spawn_boss(
     let id = pm.id_add();
     hog.get_mut().add(
         id,
-        Hog { x, z, heading: (-x).atan2(-z), speed: p.hog_roam, hp: HOG_HP },
+        Hog { x, z, heading: (-x).atan2(-z), speed: p.hog_roam, hp: p.hog_hp },
     );
     brain.get_mut().add(
         id,
         HogBrain {
             seed: rng.rfr(0.0, std::f32::consts::TAU),
             goal: roam_goal(&mut rng),
-            repick: ROAM_REPICK,
+            repick: p.roam_repick,
             desired: (-x).atan2(-z),
             target_speed: p.hog_fast,
             ..HogBrain::default()
         },
     );
-    boss.get_mut().add(id, Boss { hp: BOSS_HP });
+    boss.get_mut().add(id, Boss { hp: p.boss_hp });
 }
 
 /// Clear the field between missions: horde, flock, and the depot (its
@@ -286,7 +286,7 @@ fn purge_npcs(
 /// Point the `Hunt` single at a mission's briefing screen — the one
 /// transition every arc edge (join, mission complete, retry, next
 /// level) goes through.
-fn enter_brief(sb: &mut Hunt, level: u32, mission: u32) {
+fn enter_brief(sb: &mut Hunt, level: u32, mission: u32, p: &Params) {
     let m = mission_def(level, mission);
     sb.phase = PHASE_BRIEF;
     sb.level = level;
@@ -295,22 +295,36 @@ fn enter_brief(sb: &mut Hunt, level: u32, mission: u32) {
     sb.goal = m.goal;
     sb.done = 0;
     sb.wave = 0;
-    sb.timer = BRIEF_SECS;
+    sb.timer = p.brief_secs;
 }
 
 /// `addr` is the BIND address (loopback by default; `0.0.0.0:PORT` to
 /// host for the outside world); `password`, when set, locks the session
 /// — the transport bounces wrong or missing passwords before they ever
 /// reach the roster (see `PmServer::password`).
-pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password: Option<String>) {
+pub fn run(
+    quiet: bool,
+    init: Params,
+    params_path: String,
+    addr: &str,
+    password: Option<String>,
+    record: Option<String>,
+    prof: bool,
+) {
     let mut pm = Pm::server(addr);
     if let Some(pw) = &password {
         pm.password(pw);
     }
+    // `record=FILE`: write this session as a keyframe + per-tick
+    // deltas (the wire format is the demo format); watch it later with
+    // `hogs replay=FILE`.
+    if let Some(path) = &record {
+        pm.record_to(path);
+    }
     // Reconnect: the engine parks a dropped session's PEER ID this long
     // (same token → same id back); the roster parks the VEHICLE for the
     // same window. One knob, both halves.
-    pm.reconnect_grace(RECONNECT_GRACE_SECS);
+    pm.reconnect_grace(init.reconnect_grace);
     // Replicated pools: trucks (predicted client-side), hogs (interp'd
     // client-side), impact markers (TTL'd transient facts). Plus the
     // co-op scoreboard as a synced single.
@@ -321,7 +335,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
     let flyer = pm.wire_pool::<Flyer>("flyer");
     let bullet = pm.wire_pool::<Bullet>("bullet");
     let impact = pm.wire_pool::<Impact>("impact");
-    pm.ttl_pool(&impact, IMPACT_TTL);
+    pm.ttl_pool(&impact, init.impact_ttl);
     // Mission furniture: the DEFEND objective (one entry while a defend
     // mission runs) and the boss marker (keyed by the boss's hog id —
     // real hp lives here, `Hog::hp` mirrors the fraction). Both owned
@@ -372,7 +386,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
     // A second of COLLIDER history — the rewind memory every shot is
     // judged in (the bullets task is the lag-comp record): hogs and vehicles in one
     // uniform ring, favor-the-shooter, decided 2026-07-17.
-    let hist = pm.history_pool(&collider, 1.0);
+    let hist = pm.journal_pool(&collider, 1.0);
 
     if !quiet {
         eprintln!(
@@ -404,7 +418,20 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                     .or_else(|| heli.get().get(id).map(|h| (h.body.pos.x, h.body.pos.z)))
             }
         };
+        // VIEW-POSE refinement (item 4 stage 2): a GUI client reports
+        // its camera every tick (`ClientNet::view_set`), so its score
+        // measures distance from the EYE and multiplies in a forward
+        // cone — on-screen hogs first, the swarm behind you at 1/3
+        // cadence (never zero: the engine's staleness multiplier still
+        // carries it). Bots report nothing and keep vehicle distance.
+        let vnet = net.clone();
         let near = move |peer: u8, x: f32, z: f32| {
+            if let Some((eye, fwd)) = vnet.view_pose(peer) {
+                let (dx, dz) = (x - eye.x, z - eye.z);
+                let d2 = dx * dx + dz * dz;
+                let ahead = (dx * fwd.x + dz * fwd.z) / d2.sqrt().max(1e-3);
+                return (0.33 + 0.67 * ahead.max(0.0)) / (1.0 + d2);
+            }
             let Some((px, pz)) = avatar_xz(peer) else {
                 return 1.0; // no avatar (spectating a wipe): flat order
             };
@@ -439,13 +466,14 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
     // removes the wreck. Lefts run BEFORE joins: the engine orders a
     // same-tick reclaim leave-first.
     let mut parked: HashMap<u8, (Id, u32)> = HashMap::new();
-    task!(pm, "roster", 10.0, [truck, health, gun, collider, parts, net, models], move |pm| {
+    task!(pm, "roster", 10.0, [truck, health, gun, collider, parts, net, models, params], move |pm| {
+        let grace = params.get().reconnect_grace;
         for p in net.left() {
             if let Some(id) = net.own(p) {
                 parked.insert(p, (id, pm.tick()));
                 if !quiet {
                     eprintln!(
-                        "[server] peer {p} left — vehicle parked {RECONNECT_GRACE_SECS:.0}s for reconnect"
+                        "[server] peer {p} left — vehicle parked {grace:.0}s for reconnect"
                     );
                 }
             } else if !quiet {
@@ -474,7 +502,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
             let id = pm.id_add();
             let t = spawn_truck(p);
             truck.get_mut().add(id, t);
-            health.get_mut().add(id, Health { hp: TRUCK_HP });
+            health.get_mut().add(id, Health { hp: params.get().truck_hp });
             gun.get_mut().add(id, 0.0);
             let hulls =
                 posed(models.get().protos("truck"), t.body.pos.x, 0.0, t.body.pos.z, t.heading());
@@ -486,7 +514,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
         }
         // Nobody came back for these: clear the wrecks.
         let now = pm.tick();
-        let grace_ticks = (RECONNECT_GRACE_SECS / FIXED_DT) as u32;
+        let grace_ticks = (grace / FIXED_DT) as u32;
         parked.retain(|p, &mut (id, since)| {
             if now.saturating_sub(since) <= grace_ticks {
                 return pm.id_alive(id); // a dead parked vehicle needs no keeper
@@ -509,7 +537,8 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
     // membership — swap the entity, and the removal log plus the
     // ownership table tell every client the whole story. (`respawns`
     // isn't in the capture list: not a shared handle, just moved in.)
-    task!(pm, "respawn", 11.0, [truck, heli, health, gun, collider, parts, net, models], move |pm| {
+    task!(pm, "respawn", 11.0, [truck, heli, health, gun, collider, parts, net, models, params], move |pm| {
+        let p = *params.get();
         for (peer, ev) in respawns.drain() {
             let Some(old) = net.own(peer) else {
                 continue;
@@ -520,7 +549,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
             pm.id_remove(old); // truck/heli + health + gun + parts link go with it
             let id = pm.id_add();
             if ev.vehicle == VEH_HELI {
-                let h = spawn_heli(peer);
+                let h = spawn_heli(peer, &p);
                 heli.get_mut().add(id, h);
                 let b = h.body;
                 let hulls =
@@ -538,7 +567,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                 );
                 parts_add(pm, &collider, &parts, id, CAT_VEHICLE, &hulls);
             }
-            health.get_mut().add(id, Health { hp: TRUCK_HP });
+            health.get_mut().add(id, Health { hp: p.truck_hp });
             gun.get_mut().add(id, 0.0);
             net.own_set(peer, id);
         }
@@ -669,7 +698,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                             let (gx, gz) = (b.goal.0 - h.x, b.goal.1 - h.z);
                             if b.repick <= 0.0 || gx * gx + gz * gz < 9.0 {
                                 b.goal = roam_goal(&mut rng);
-                                b.repick = rng.rfr(0.5, 1.0) * ROAM_REPICK;
+                                b.repick = rng.rfr(0.5, 1.0) * p.roam_repick;
                             }
                             (gx.atan2(gz) + (now * 0.7 + b.seed).sin() * 0.4, p.hog_roam)
                         }
@@ -688,7 +717,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                     // checking delays a bite ≤ stride-1 ticks — noise
                     // next to BITE_CD.
                     // The boss's jaws reach as far as its grown hull.
-                    let reach = if is_boss { HOG_R + BOSS_GROW } else { HOG_R };
+                    let reach = if is_boss { HOG_R + p.boss_grow } else { HOG_R };
                     let bitten = (b.bite_cd <= 0.0)
                         .then(|| idx.touch(h.x, h.z, reach, (0.0, p.hog_leap), CAT_VEHICLE))
                         .flatten();
@@ -717,7 +746,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                 // MOVE (every tick): steer toward the cached decision at
                 // full per-tick turn authority, then integrate.
                 let turn = wrap_angle(b.desired - h.heading)
-                    .clamp(-HOG_TURN * FIXED_DT, HOG_TURN * FIXED_DT);
+                    .clamp(-p.hog_turn * FIXED_DT, p.hog_turn * FIXED_DT);
                 // Wrap at the write: the quantized wire repr saturates
                 // past ±3.27 rad, and += would walk out of range circling.
                 h.heading = wrap_angle(h.heading + turn);
@@ -767,9 +796,9 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                 // pool is local — no wire cost to the change-density.
                 let mut hull = hog_proto.pose(h.x, 0.0, h.z, h.heading);
                 if is_boss {
-                    // The hitbox matches the spectacle (BOSS_SCALE on
+                    // The hitbox matches the spectacle (p.boss_scale on
                     // the client's model).
-                    hull = hull.grow(BOSS_GROW);
+                    hull = hull.grow(p.boss_grow);
                 }
                 cols.add(
                     id,
@@ -785,7 +814,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
     // same think/move cohort split — but the chase is 3D. Nearest
     // target by real distance (a heli counts until it climbs past
     // `flyer_ceil` — that's the refuge band), match its altitude at
-    // FLYER_CLIMB authority, bite through the same contact seam the
+    // p.flyer_climb authority, bite through the same contact seam the
     // horde uses; the response tasks never learn who bit them.
     task!(
         pm,
@@ -833,7 +862,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                         // clamped into the hull band, so the swoop
                         // levels off at a truck's deck or a heli's
                         // cabin edge instead of a hardcoded aim height.
-                        Some(n) if n.dist < FLYER_AGGRO => {
+                        Some(n) if n.dist < p.flyer_aggro => {
                             ((n.x - f.x).atan2(n.z - f.z), p.flyer_speed, n.y)
                         }
                         // Roam like the horde, one story up: the same
@@ -843,7 +872,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                             let (gx, gz) = (b.goal.0 - f.x, b.goal.1 - f.z);
                             if b.repick <= 0.0 || gx * gx + gz * gz < 9.0 {
                                 b.goal = roam_goal(&mut rng);
-                                b.repick = rng.rfr(0.5, 1.0) * ROAM_REPICK;
+                                b.repick = rng.rfr(0.5, 1.0) * p.roam_repick;
                             }
                             (
                                 gx.atan2(gz) + (now * 0.6 + b.seed).sin() * 0.35,
@@ -866,7 +895,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                                 f.x,
                                 f.z,
                                 FLYER_R,
-                                (f.y - FLYER_REACH, f.y + FLYER_REACH),
+                                (f.y - p.flyer_reach, f.y + p.flyer_reach),
                                 CAT_VEHICLE,
                             )
                         })
@@ -894,12 +923,12 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                 // MOVE (every tick): heading and speed like the horde;
                 // altitude chases the decision on its own axis.
                 let turn = wrap_angle(b.desired - f.heading)
-                    .clamp(-FLYER_TURN * FIXED_DT, FLYER_TURN * FIXED_DT);
+                    .clamp(-p.flyer_turn * FIXED_DT, p.flyer_turn * FIXED_DT);
                 f.heading = wrap_angle(f.heading + turn);
                 f.speed += (b.target_speed - f.speed) * (3.0 * FIXED_DT).min(1.0);
                 f.x += f.heading.sin() * f.speed * FIXED_DT;
                 f.z += f.heading.cos() * f.speed * FIXED_DT;
-                f.y += (b.target_alt - f.y).clamp(-FLYER_CLIMB * FIXED_DT, FLYER_CLIMB * FIXED_DT);
+                f.y += (b.target_alt - f.y).clamp(-p.flyer_climb * FIXED_DT, p.flyer_climb * FIXED_DT);
                 if b.shove.0 != 0.0 || b.shove.1 != 0.0 {
                     f.x += b.shove.0 * FIXED_DT;
                     f.z += b.shove.1 * FIXED_DT;
@@ -969,7 +998,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                 continue;
             }
             let Some(h) = hogs.get(id) else { continue };
-            let (mx, my, mz) = (h.x, HOGGUN_Y, h.z);
+            let (mx, my, mz) = (h.x, p.hoggun_y, h.z);
             // Nearest vehicle part in range, ANY altitude (the range
             // sphere is the envelope) — the aim point is the hull's
             // closest axis point, muzzle height clamped into the band:
@@ -992,15 +1021,15 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                     x: mx,
                     y: my,
                     z: mz,
-                    heading: wrap_angle(heading + rng.rfr(-HOGGUN_SPREAD, HOGGUN_SPREAD)),
-                    pitch: wrap_angle(pitch + rng.rfr(-HOGGUN_SPREAD, HOGGUN_SPREAD)),
+                    heading: wrap_angle(heading + rng.rfr(-p.hoggun_spread, p.hoggun_spread)),
+                    pitch: wrap_angle(pitch + rng.rfr(-p.hoggun_spread, p.hoggun_spread)),
                     owner: 0.0, // peer 0 = the server's own trigger finger
                 },
             );
             shot.get_mut().add(
                 bid,
                 Shot {
-                    left: HOGGUN_TRAVEL,
+                    left: p.hoggun_travel,
                     view: pm.tick(),
                     pad: 0.0,
                     mask: CAT_VEHICLE,
@@ -1069,7 +1098,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                             &posed(tp, fresh.body.pos.x, 0.0, fresh.body.pos.z, fresh.heading()),
                         );
                         if let Some(mut v) = health.get_id_mut(id) {
-                            v.hp = TRUCK_HP;
+                            v.hp = p.truck_hp;
                         }
                         let mut sb = hunt.get_mut();
                         sb.points = (sb.points - p.death_cost).max(0.0);
@@ -1092,14 +1121,14 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                 }) {
                     let b = shooter.body;
                     if health.get_id(id).is_some_and(|v| v.hp <= 0.0) {
-                        let fresh = spawn_heli(peer);
+                        let fresh = spawn_heli(peer, &p);
                         if let Some(mut hl) = heli.get_id_mut(id) {
                             *hl = fresh;
                         }
                         let fb = fresh.body;
                         pose(id, &posed(hp, fb.pos.x, fb.pos.y, fb.pos.z, fb.yaw()));
                         if let Some(mut v) = health.get_id_mut(id) {
-                            v.hp = TRUCK_HP;
+                            v.hp = p.truck_hp;
                         }
                         let mut sb = hunt.get_mut();
                         sb.points = (sb.points - p.death_cost).max(0.0);
@@ -1166,7 +1195,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                         // consumption — the queue makes the latter run
                         // a few ticks fresh, which is a clean miss on a
                         // charging hog.
-                        view: inputs.view(peer).saturating_sub(interp_ticks()),
+                        view: inputs.view(peer).saturating_sub(interp_ticks(&p)),
                         pad,
                     },
                 );
@@ -1208,6 +1237,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
         31.0,
         [bullet, shot, collider, contact, impact, net, params],
         move |pm| {
+            let p = *params.get();
             // Same-tick contract check: the response tasks at 32 drain
             // every contact each tick writes. A LAST-tick leftover
             // means a response task missed its owner — purge loudly
@@ -1319,7 +1349,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                             kind: IMPACT_HIT,
                         },
                     );
-                } else if s.left <= 0.0 || b.x.abs() > ARENA || b.z.abs() > ARENA || b.y > HELI_CEIL
+                } else if s.left <= 0.0 || b.x.abs() > ARENA || b.z.abs() > ARENA || b.y > p.heli_ceil
                 {
                     pm.id_remove(id);
                 }
@@ -1512,7 +1542,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                 };
                 if hp_left > 0.0 {
                     if let Some(mut h) = hog.get_id_mut(c.owner) {
-                        h.hp = (hp_left / BOSS_HP).clamp(0.01, 1.0) * HOG_HP;
+                        h.hp = (hp_left / p.boss_hp).clamp(0.01, 1.0) * p.hog_hp;
                     }
                 } else {
                     pm.id_remove(c.owner); // brain + boss entry + collider go with it
@@ -1695,7 +1725,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                     // until then — an empty server idles quiet.
                     if !truck.get().is_empty() || !heli.get().is_empty() {
                         let lv = sb.level;
-                        enter_brief(&mut sb, lv, 0);
+                        enter_brief(&mut sb, lv, 0, &p);
                         if !quiet {
                             let ld = level_def(sb.level);
                             eprintln!("[server] level '{}' begins", ld.name);
@@ -1712,7 +1742,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                         match m.kind {
                             MISSION_DEFEND => {
                                 let id = pm.id_add();
-                                let d = Depot { x: DEPOT_POS.0, z: DEPOT_POS.1, hp: DEPOT_HP };
+                                let d = Depot { x: DEPOT_POS.0, z: DEPOT_POS.1, hp: p.depot_hp };
                                 // Static self-keyed CAT_VEHICLE part —
                                 // the whole defend mission: hog aggro,
                                 // bites, and gunner fire route to it
@@ -1810,7 +1840,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                         MISSION_BOSS => {
                             match boss.get().iter().next() {
                                 Some((_, b)) => {
-                                    sb.done = (b.hp / BOSS_HP * 100.0).ceil().max(1.0) as u32;
+                                    sb.done = (b.hp / p.boss_hp * 100.0).ceil().max(1.0) as u32;
                                     // Escorts whenever the deck goes
                                     // quiet (alive == 1 is the boss
                                     // itself — it rides the hog pool,
@@ -1845,7 +1875,7 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                                 }
                             } else {
                                 let lv = sb.level;
-                                enter_brief(&mut sb, lv, next);
+                                enter_brief(&mut sb, lv, next, &p);
                                 if !quiet {
                                     eprintln!("[server] mission complete");
                                 }
@@ -1865,13 +1895,13 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                     // Next level (wrapping — the campaign loops until
                     // there are more maps than levels).
                     let next = (sb.level + 1) % LEVELS.len() as u32;
-                    enter_brief(&mut sb, next, 0);
+                    enter_brief(&mut sb, next, 0, &p);
                 }
                 PHASE_LOST if go => {
                     // Retry the mission that killed you, not the whole
                     // level.
                     let (lv, ms) = (sb.level, sb.mission);
-                    enter_brief(&mut sb, lv, ms);
+                    enter_brief(&mut sb, lv, ms, &p);
                 }
                 _ => {}
             }
@@ -1914,9 +1944,9 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
 
     // TODO(refactor): duplicated in bot_client.rs — share one prof task
     // fn (or grow an engine pm.prof_task(); every example will want it).
-    // PM_PROF=1: per-task cycle times every 5 s — the stress lab should
+    // `prof` arg: per-task cycle times every 5 s — the stress lab should
     // answer "where does the tick go?" without a profiler attached.
-    if std::env::var("PM_PROF").is_ok() {
+    if prof {
         let mut prev: std::collections::HashMap<String, pm::TaskStat> = Default::default();
         task!(pm, "prof", 91.0, 5.0, [], move |pm| {
             eprintln!("-- server task stats (last 5s) --");

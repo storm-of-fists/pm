@@ -17,11 +17,17 @@ struct Honk {
     freq: u32,
 }
 
+// Unhashed schema identity for the handshake bound (test pod).
+impl crate::PodSchema for Honk {}
+
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct Ready {
     _pad: u32,
 }
+
+// Unhashed schema identity for the handshake bound (test pod).
+impl crate::PodSchema for Ready {}
 
 /// Move whatever the client queued in its outbox into the server's
 /// received-events single, stamped as coming from `peer` — standing in for

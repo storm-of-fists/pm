@@ -22,20 +22,18 @@
 //! single `acked_tick` cursor remains only as the removal-log gate and
 //! the lag-comp anchor.
 //!
-//! Tick semantics: a snapshot is labeled `pm.tick() - 1` — the last
-//! *completed* tick — because stamps from the in-progress tick may still
-//! be written by tasks that haven't run yet. Entries from the current tick
-//! may ride along early; the conservative label only means they get sent
-//! again next time, never lost. Run the net-send task at low priority
-//! (first in the tick) to avoid the duplicate sends entirely.
+//! Tick semantics: a snapshot is labeled `pm.tick()` — packing runs in
+//! the COMMIT phase, after every task has stamped, so the label is the
+//! tick whose final state the snapshot carries (the phase turn,
+//! 2026-07-23; before it, packing ran first in the tick and paid a tick
+//! of staleness for a conservative `tick - 1` label).
 
 // TODO(roadmap): known limits, deliberate until a workload demands
-// otherwise — per-peer pack scan is O(entities × pools) per DATAGRAM,
-// and a multi-datagram flight multiplies it (plus the dirty_bytes
-// counting scan per send): fine at horde scale, the first thing to fold
-// into a per-tick dirty journal near ~10k entities (the tick journal —
-// `PmServer::journal_pool` — is the store that scan would derive from,
-// the v2 item-2 stage still queued); removal recycling is
+// otherwise — (the per-datagram O(entities × pools) pack scan LANDED
+// its fix 2026-07-23, v2 item 2 stage 2: `NetServer::refresh` captures
+// each tick's changed slots ONCE and fans them into per-peer CANDIDATE
+// LISTS — `pack_dirty`/`dirty_bytes` walk only candidates, O(dirty),
+// which is the M2 16×1000 scaling prerequisite); removal recycling is
 // ack-gated ONLY (a peer that stops acking without disconnecting stalls
 // id recycling until the idle timeout reaps it — an ack-OR-timer release
 // is the fix if that ever bites); u32 ticks and send seqs last ~2.2
@@ -51,7 +49,7 @@
 // client view-pose report — just another input channel, when needed.)
 // TODO(roadmap): both sync modifiers are LANDED — interp as
 // `PmClient::interp_pool`, duration as `PmServer::ttl_pool` (transient
-// entries expire) + `PmServer::history_pool` (past-tick ring; rewind to
+// entries expire) + `PmServer::journal_pool` (past-tick ring; rewind to
 // `ServerNet::acked_tick(peer) - interp ticks` = lag-compensated contact
 // resolution, proven in drive's scoring). The ownership table replicates
 // whole in every snapshot header (2026-07-14) — `ClientNet::owner_of`
@@ -74,6 +72,7 @@ use std::rc::Rc;
 
 use bytemuck::Pod;
 
+use crate::blend::PodSchema;
 use crate::id::Id;
 use crate::kernel::{Pm, PoolHandle};
 use crate::paged::PagedArray;
@@ -156,7 +155,23 @@ struct PeerPool {
     /// entry — seq, not tick label, because a flight puts several sends
     /// inside one tick.
     inflight_seq: PagedArray<u32>,
-    /// Dense-index rotation start, so a budget-limited snapshot resumes
+    /// THE CANDIDATE LIST (v2 item 2 stage 2, the journal-derived dirty
+    /// scan): the slots that may carry an unconfirmed change for this
+    /// peer. `NetServer::refresh` captures each tick's changed slots
+    /// ONCE per tick (the tick-journal axis applied to the packer) and
+    /// fans them out here; `pack_dirty` walks only this list — O(dirty)
+    /// per datagram instead of O(entities). A slot stays listed until
+    /// the peer CONFIRMS its newest change (in-flight entries included,
+    /// so a lost send re-qualifies with no re-capture); the pack walk
+    /// compacts confirmed/emptied slots out as it goes. `queued` (1 =
+    /// listed) keeps membership O(1).
+    list: Vec<u32>,
+    queued: PagedArray<u8>,
+    /// A fresh peer's list starts as EVERY occupied slot (a new peer's
+    /// baseline is the whole world — full reconvergence is the
+    /// mechanism); flipped by the seeding pass in `snapshot_budgeted`.
+    seeded: bool,
+    /// Rotation start INTO `list`, so a budget-limited snapshot resumes
     /// where the last one stopped instead of restarting at entity 0.
     cursor: usize,
 }
@@ -167,7 +182,17 @@ impl PeerPool {
             confirmed: PagedArray::new(0),
             inflight_tick: PagedArray::new(0),
             inflight_seq: PagedArray::new(0),
+            list: Vec::new(),
+            queued: PagedArray::new(0),
+            seeded: false,
             cursor: 0,
+        }
+    }
+
+    fn enqueue(&mut self, slot: u32) {
+        if self.queued.get(slot) == 0 {
+            self.queued.set(slot, 1);
+            self.list.push(slot);
         }
     }
 }
@@ -179,18 +204,39 @@ type SentEntry = (u16, u32, u32);
 /// Shared eligibility scan behind [`SyncAdapter::dirty_bytes`]: wire bytes
 /// for the entries that changed past both the confirmed and the in-flight
 /// tick — the same predicate `pack_dirty` sends by, minus the packing.
+/// Walks the peer's candidate list, not the pool — O(dirty).
 fn dirty_bytes<T>(pool: &Pool<T>, pp: &PeerPool, entry_size: usize) -> usize {
-    let ids = pool.ids();
     let ticks = pool.changed_ticks();
     let mut n = 0usize;
-    for (i, id) in ids.iter().enumerate() {
+    for &slot in &pp.list {
+        let Some(i) = pool.index_of_slot(slot) else {
+            continue;
+        };
         let tick = ticks[i];
-        let slot = id.slot();
         if tick > pp.confirmed.get(slot) && tick > pp.inflight_tick.get(slot) {
             n += 1;
         }
     }
     n * entry_size
+}
+
+/// Shared change capture behind [`SyncAdapter::changed_slots`]: slots
+/// whose entries were inserted or mutated after `since`. Run ONCE per
+/// tick by [`NetServer::refresh`] and fanned out to every peer — this
+/// single O(entities) pass replaces the per-peer-per-datagram scans.
+fn changed_slots<T>(pool: &Pool<T>, since: u32, out: &mut Vec<u32>) {
+    let ids = pool.ids();
+    for (i, &tick) in pool.changed_ticks().iter().enumerate() {
+        if tick > since {
+            out.push(ids[i].slot());
+        }
+    }
+}
+
+/// Shared seed scan behind [`SyncAdapter::all_slots`]: every occupied
+/// slot — a fresh peer's candidate baseline.
+fn all_slots<T>(pool: &Pool<T>, out: &mut Vec<u32>) {
+    out.extend(pool.ids().iter().map(|id| id.slot()));
 }
 
 /// A per-peer interest scorer (v2 item 4): game-defined POSITIVE
@@ -201,10 +247,117 @@ fn dirty_bytes<T>(pool: &Pool<T>, pp: &PeerPool, entry_size: usize) -> usize {
 /// budget first. Install via `PmServer::interest_pool`.
 type InterestFn<T> = Rc<dyn Fn(u8, Id, &T) -> f32>;
 
+/// The one pack walk both adapters drive (they differ only in how a
+/// value hits the wire — raw pod vs quantized repr — which is `emit`).
+/// Same dirty predicate as `dirty_bytes`, over the peer's CANDIDATE
+/// LIST only (v2 item 2 stage 2 — O(dirty), never O(entities)); the
+/// walk also compacts the list, dropping slots the peer has confirmed
+/// or that emptied. Interest present → visit in importance × staleness
+/// order (v2 item 4: the budget still does all the throttling, the
+/// score only decides who goes first, staleness guarantees nothing
+/// starves), else cursor rotation.
+#[allow(clippy::too_many_arguments)] // the pack seam's full context, all load-bearing
+fn pack_entries<T>(
+    pool: &Pool<T>,
+    interest: &Option<InterestFn<T>>,
+    pp: &mut PeerPool,
+    peer: u8,
+    now: u32,
+    seq: u32,
+    budget: &mut usize,
+    out: &mut Vec<u8>,
+    sent: &mut Vec<SentEntry>,
+    pool_idx: u16,
+    entry_size: usize,
+    emit: impl Fn(&T, &mut Vec<u8>),
+) -> u32 {
+    let ids = pool.ids();
+    let values = pool.values();
+    let ticks = pool.changed_ticks();
+    // Compact the candidate list in place: keep slots still carrying a
+    // change the peer hasn't CONFIRMED (in-flight ones included — a
+    // lost send must re-qualify without re-capture); drop and unflag
+    // confirmed or emptied slots. `dense` caches each kept slot's
+    // dense index for the walks below.
+    let mut list = std::mem::take(&mut pp.list);
+    let mut dense = Vec::with_capacity(list.len());
+    let mut w = 0;
+    for r in 0..list.len() {
+        let slot = list[r];
+        match pool.index_of_slot(slot) {
+            Some(i) if ticks[i] > pp.confirmed.get(slot) => {
+                list[w] = slot;
+                w += 1;
+                dense.push(i);
+            }
+            _ => pp.queued.set(slot, 0),
+        }
+    }
+    list.truncate(w);
+    let n = list.len();
+    if n == 0 {
+        pp.list = list;
+        pp.cursor = 0;
+        return 0;
+    }
+    let mut count = 0u32;
+    if let Some(score) = interest {
+        let mut order: Vec<(f32, usize)> = (0..n)
+            .filter(|&k| ticks[dense[k]] > pp.inflight_tick.get(list[k]))
+            .map(|k| {
+                let stale = now.saturating_sub(pp.confirmed.get(list[k])) as f32;
+                let i = dense[k];
+                (score(peer, ids[i], &values[i]) * (1.0 + stale), k)
+            })
+            .collect();
+        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, k) in order {
+            if *budget < entry_size {
+                break;
+            }
+            let (slot, i) = (list[k], dense[k]);
+            *budget -= entry_size;
+            out.extend_from_slice(&ids[i].0.to_le_bytes());
+            emit(&values[i], out);
+            pp.inflight_tick.set(slot, ticks[i]);
+            pp.inflight_seq.set(slot, seq);
+            sent.push((pool_idx, slot, ticks[i]));
+            count += 1;
+        }
+        pp.list = list;
+        return count;
+    }
+    let start = if pp.cursor >= n { 0 } else { pp.cursor };
+    let mut resume_at = start;
+    for step in 0..n {
+        let k = (start + step) % n;
+        let (slot, i) = (list[k], dense[k]);
+        if ticks[i] <= pp.inflight_tick.get(slot) {
+            continue; // in flight (or tied): not send-eligible right now
+        }
+        if *budget < entry_size {
+            resume_at = k;
+            break;
+        }
+        *budget -= entry_size;
+        out.extend_from_slice(&ids[i].0.to_le_bytes());
+        emit(&values[i], out);
+        pp.inflight_tick.set(slot, ticks[i]);
+        pp.inflight_seq.set(slot, seq);
+        sent.push((pool_idx, slot, ticks[i]));
+        count += 1;
+    }
+    pp.cursor = resume_at;
+    pp.list = list;
+    count
+}
+
 trait SyncAdapter {
     fn name(&self) -> &str;
     #[cfg(test)] // test seam (SyncSet::schema)
     fn value_size(&self) -> usize;
+    #[cfg(test)] // test seam (SyncSet::schema)
+    fn schema_hash(&self) -> u64;
     /// Wire bytes this pool would pack for `pp` given no budget — the
     /// sort key for smallest-dirty-first packing (see `snapshot_budgeted`).
     fn dirty_bytes(&self, pp: &PeerPool) -> usize;
@@ -227,6 +380,12 @@ trait SyncAdapter {
     /// Install an interest scorer; `f` is an `&InterestFn<T>` behind
     /// `Any` — false when `T` isn't this adapter's element type.
     fn interest_set(&mut self, f: &dyn Any) -> bool;
+    /// Slots whose entries changed after `since` — the once-per-tick
+    /// capture [`NetServer::refresh`] fans out to every peer's
+    /// candidate list.
+    fn changed_slots(&self, since: u32, out: &mut Vec<u32>);
+    /// Every occupied slot — a fresh peer's candidate baseline.
+    fn all_slots(&self, out: &mut Vec<u32>);
 }
 
 struct PoolAdapter<T: Pod> {
@@ -235,7 +394,7 @@ struct PoolAdapter<T: Pod> {
     interest: Option<InterestFn<T>>,
 }
 
-impl<T: Pod> SyncAdapter for PoolAdapter<T> {
+impl<T: Pod + PodSchema> SyncAdapter for PoolAdapter<T> {
     fn name(&self) -> &str {
         &self.name
     }
@@ -243,6 +402,11 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
     #[cfg(test)]
     fn value_size(&self) -> usize {
         size_of::<T>()
+    }
+
+    #[cfg(test)]
+    fn schema_hash(&self) -> u64 {
+        T::SCHEMA_HASH
     }
 
     fn dirty_bytes(&self, pp: &PeerPool) -> usize {
@@ -260,70 +424,20 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
         sent: &mut Vec<SentEntry>,
         pool_idx: u16,
     ) -> u32 {
-        let pool = self.pool.borrow();
-        let ids = pool.ids();
-        let values = pool.values();
-        let ticks = pool.changed_ticks();
-        let n = ids.len();
-        if n == 0 {
-            return 0;
-        }
-        let entry_size = 4 + size_of::<T>();
-        let mut count = 0u32;
-        // Interest (v2 item 4): visit dirty entries in importance ×
-        // staleness order instead of rotation — the budget still does
-        // ALL the throttling, the score only decides who goes first,
-        // and staleness guarantees nothing starves.
-        if let Some(score) = &self.interest {
-            let mut order: Vec<(f32, usize)> = Vec::new();
-            for i in 0..n {
-                let tick = ticks[i];
-                let slot = ids[i].slot();
-                if tick <= pp.confirmed.get(slot) || tick <= pp.inflight_tick.get(slot) {
-                    continue;
-                }
-                let stale = now.saturating_sub(pp.confirmed.get(slot)) as f32;
-                order.push((score(peer, ids[i], &values[i]) * (1.0 + stale), i));
-            }
-            order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-            for (_, i) in order {
-                if *budget < entry_size {
-                    break;
-                }
-                let slot = ids[i].slot();
-                *budget -= entry_size;
-                out.extend_from_slice(&ids[i].0.to_le_bytes());
-                out.extend_from_slice(bytemuck::bytes_of(&values[i]));
-                pp.inflight_tick.set(slot, ticks[i]);
-                pp.inflight_seq.set(slot, seq);
-                sent.push((pool_idx, slot, ticks[i]));
-                count += 1;
-            }
-            return count;
-        }
-        let start = if pp.cursor >= n { 0 } else { pp.cursor };
-        let mut resume_at = start;
-        for k in 0..n {
-            let i = (start + k) % n;
-            let tick = ticks[i];
-            let slot = ids[i].slot();
-            if tick <= pp.confirmed.get(slot) || tick <= pp.inflight_tick.get(slot) {
-                continue;
-            }
-            if *budget < entry_size {
-                resume_at = i;
-                break;
-            }
-            *budget -= entry_size;
-            out.extend_from_slice(&ids[i].0.to_le_bytes());
-            out.extend_from_slice(bytemuck::bytes_of(&values[i]));
-            pp.inflight_tick.set(slot, tick);
-            pp.inflight_seq.set(slot, seq);
-            sent.push((pool_idx, slot, tick));
-            count += 1;
-        }
-        pp.cursor = resume_at;
-        count
+        pack_entries(
+            &self.pool.borrow(),
+            &self.interest,
+            pp,
+            peer,
+            now,
+            seq,
+            budget,
+            out,
+            sent,
+            pool_idx,
+            4 + size_of::<T>(),
+            |v, out| out.extend_from_slice(bytemuck::bytes_of(v)),
+        )
     }
 
     fn apply(&self, pm: &mut Pm, count: u32, r: &mut Reader) -> Result<(), NetError> {
@@ -345,6 +459,14 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
             }
             None => false,
         }
+    }
+
+    fn changed_slots(&self, since: u32, out: &mut Vec<u32>) {
+        changed_slots(&self.pool.borrow(), since, out);
+    }
+
+    fn all_slots(&self, out: &mut Vec<u32>) {
+        all_slots(&self.pool.borrow(), out);
     }
 }
 
@@ -377,7 +499,7 @@ struct WireAdapter<T: Wire> {
     interest: Option<InterestFn<T>>,
 }
 
-impl<T: Wire> SyncAdapter for WireAdapter<T> {
+impl<T: Wire + PodSchema> SyncAdapter for WireAdapter<T> {
     fn name(&self) -> &str {
         &self.name
     }
@@ -385,6 +507,13 @@ impl<T: Wire> SyncAdapter for WireAdapter<T> {
     #[cfg(test)]
     fn value_size(&self) -> usize {
         size_of::<T::Repr>()
+    }
+
+    #[cfg(test)]
+    fn schema_hash(&self) -> u64 {
+        // The GAME type's hash: its descriptor string already covers the
+        // wire attrs, so quantization drift changes it.
+        T::SCHEMA_HASH
     }
 
     fn dirty_bytes(&self, pp: &PeerPool) -> usize {
@@ -402,68 +531,20 @@ impl<T: Wire> SyncAdapter for WireAdapter<T> {
         sent: &mut Vec<SentEntry>,
         pool_idx: u16,
     ) -> u32 {
-        let pool = self.pool.borrow();
-        let ids = pool.ids();
-        let values = pool.values();
-        let ticks = pool.changed_ticks();
-        let n = ids.len();
-        if n == 0 {
-            return 0;
-        }
-        let entry_size = 4 + size_of::<T::Repr>();
-        let mut count = 0u32;
-        // Interest: importance × staleness order (see PoolAdapter — the
-        // horde pools are wire pools, so this is the path that matters).
-        if let Some(score) = &self.interest {
-            let mut order: Vec<(f32, usize)> = Vec::new();
-            for i in 0..n {
-                let tick = ticks[i];
-                let slot = ids[i].slot();
-                if tick <= pp.confirmed.get(slot) || tick <= pp.inflight_tick.get(slot) {
-                    continue;
-                }
-                let stale = now.saturating_sub(pp.confirmed.get(slot)) as f32;
-                order.push((score(peer, ids[i], &values[i]) * (1.0 + stale), i));
-            }
-            order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-            for (_, i) in order {
-                if *budget < entry_size {
-                    break;
-                }
-                let slot = ids[i].slot();
-                *budget -= entry_size;
-                out.extend_from_slice(&ids[i].0.to_le_bytes());
-                out.extend_from_slice(bytemuck::bytes_of(&values[i].to_repr()));
-                pp.inflight_tick.set(slot, ticks[i]);
-                pp.inflight_seq.set(slot, seq);
-                sent.push((pool_idx, slot, ticks[i]));
-                count += 1;
-            }
-            return count;
-        }
-        let start = if pp.cursor >= n { 0 } else { pp.cursor };
-        let mut resume_at = start;
-        for k in 0..n {
-            let i = (start + k) % n;
-            let tick = ticks[i];
-            let slot = ids[i].slot();
-            if tick <= pp.confirmed.get(slot) || tick <= pp.inflight_tick.get(slot) {
-                continue;
-            }
-            if *budget < entry_size {
-                resume_at = i;
-                break;
-            }
-            *budget -= entry_size;
-            out.extend_from_slice(&ids[i].0.to_le_bytes());
-            out.extend_from_slice(bytemuck::bytes_of(&values[i].to_repr()));
-            pp.inflight_tick.set(slot, tick);
-            pp.inflight_seq.set(slot, seq);
-            sent.push((pool_idx, slot, tick));
-            count += 1;
-        }
-        pp.cursor = resume_at;
-        count
+        pack_entries(
+            &self.pool.borrow(),
+            &self.interest,
+            pp,
+            peer,
+            now,
+            seq,
+            budget,
+            out,
+            sent,
+            pool_idx,
+            4 + size_of::<T::Repr>(),
+            |v, out| out.extend_from_slice(bytemuck::bytes_of(&v.to_repr())),
+        )
     }
 
     fn apply(&self, pm: &mut Pm, count: u32, r: &mut Reader) -> Result<(), NetError> {
@@ -485,6 +566,14 @@ impl<T: Wire> SyncAdapter for WireAdapter<T> {
             }
             None => false,
         }
+    }
+
+    fn changed_slots(&self, since: u32, out: &mut Vec<u32>) {
+        changed_slots(&self.pool.borrow(), since, out);
+    }
+
+    fn all_slots(&self, out: &mut Vec<u32>) {
+        all_slots(&self.pool.borrow(), out);
     }
 }
 
@@ -543,15 +632,21 @@ impl WireKind {
 /// parse at all, and a client-side extra is always a bug. Equality turns
 /// every drift into a loud connect error. Revisit only if spectator
 /// clients (no input channel) or version-skewed fleets become real.
+///
+/// Each row also carries the pod's [`PodSchema`](crate::PodSchema)
+/// hash (v2 item 1 stage 2): name + size catch missing channels and
+/// gross layout drift, the hash catches same-size-different-meaning
+/// drift (field order, quantization scales, lerp tags). 0 = an
+/// unhashed pod — the pre-hash contract, still name+size checked.
 #[derive(Default)]
 pub(crate) struct WireReg {
-    entries: Vec<(WireKind, String, usize)>,
+    entries: Vec<(WireKind, String, usize, u64)>,
 }
 
 impl WireReg {
-    pub(crate) fn register(&mut self, kind: WireKind, name: &str, size: usize) {
+    pub(crate) fn register(&mut self, kind: WireKind, name: &str, size: usize, hash: u64) {
         if kind == WireKind::Input
-            && let Some((_, prev, _)) = self.entries.iter().find(|(k, ..)| *k == WireKind::Input)
+            && let Some((_, prev, ..)) = self.entries.iter().find(|(k, ..)| *k == WireKind::Input)
         {
             panic!(
                 "one continuous input channel per connection: '{prev}' is already \
@@ -560,10 +655,10 @@ impl WireReg {
             );
         }
         let key = pool_key(name);
-        if let Some((pk, pn, ps)) = self.entries.iter().find(|(_, n, _)| pool_key(n) == key) {
+        if let Some((pk, pn, ps, ph)) = self.entries.iter().find(|(_, n, ..)| pool_key(n) == key) {
             // Re-registering the same event channel (setup helper + task
             // both grab it) shares the tag; anything else is a real clash.
-            if *pk == kind && kind == WireKind::Event && pn == name && *ps == size {
+            if *pk == kind && kind == WireKind::Event && pn == name && *ps == size && *ph == hash {
                 return;
             }
             if pn == name {
@@ -578,25 +673,25 @@ impl WireReg {
         // guard that edge too — same panic, same place.
         if kind == WireKind::Event {
             let tag = event_tag(name);
-            if let Some((_, pn, _)) = self
+            if let Some((_, pn, ..)) = self
                 .entries
                 .iter()
-                .find(|(k, n, _)| *k == WireKind::Event && event_tag(n) == tag)
+                .find(|(k, n, ..)| *k == WireKind::Event && event_tag(n) == tag)
             {
                 panic!(
                     "event name-hash collision: '{name}' and '{pn}' both tag to {tag:#06x} — rename one"
                 );
             }
         }
-        self.entries.push((kind, name.to_string(), size));
+        self.entries.push((kind, name.to_string(), size, hash));
     }
 
-    /// (kind, name, size) of everything registered, for the QUIC
-    /// handshake. Order-independent: the transport sorts by name.
-    pub(crate) fn schema(&self) -> Vec<(u8, String, usize)> {
+    /// (kind, name, size, schema hash) of everything registered, for the
+    /// QUIC handshake. Order-independent: the transport sorts by name.
+    pub(crate) fn schema(&self) -> Vec<(u8, String, usize, u64)> {
         self.entries
             .iter()
-            .map(|(k, n, s)| (k.byte(), n.clone(), *s))
+            .map(|(k, n, s, h)| (k.byte(), n.clone(), *s, *h))
             .collect()
     }
 }
@@ -607,7 +702,7 @@ pub(crate) struct SyncSet {
 }
 
 impl SyncSet {
-    pub(crate) fn pool_wire<T: Wire>(&mut self, name: &str, pool: &PoolHandle<T>) {
+    pub(crate) fn pool_wire<T: Wire + PodSchema>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.adapters.push(Box::new(WireAdapter {
             name: name.to_string(),
             pool: pool.rc().clone(),
@@ -629,7 +724,11 @@ impl SyncSet {
         );
     }
 
-    pub(crate) fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
+    pub(crate) fn pool_sync<T: Pod + PodSchema + 'static>(
+        &mut self,
+        name: &str,
+        pool: &PoolHandle<T>,
+    ) {
         self.adapters.push(Box::new(PoolAdapter {
             name: name.to_string(),
             pool: pool.rc().clone(),
@@ -646,15 +745,22 @@ impl SyncSet {
             .map(|b| b.as_ref())
     }
 
-    /// (kind, pool name, value size) per registered pool — the pool rows
-    /// of the handshake schema. The full schema (events + input channel
-    /// included) lives in [`WireReg`]; this exists for the sync layer's
-    /// own tests.
+    /// (kind, pool name, value size, schema hash) per registered pool —
+    /// the pool rows of the handshake schema. The full schema (events +
+    /// input channel included) lives in [`WireReg`]; this exists for the
+    /// sync layer's own tests.
     #[cfg(test)]
-    pub(crate) fn schema(&self) -> Vec<(u8, String, usize)> {
+    pub(crate) fn schema(&self) -> Vec<(u8, String, usize, u64)> {
         self.adapters
             .iter()
-            .map(|a| (WireKind::Pool.byte(), a.name().to_string(), a.value_size()))
+            .map(|a| {
+                (
+                    WireKind::Pool.byte(),
+                    a.name().to_string(),
+                    a.value_size(),
+                    a.schema_hash(),
+                )
+            })
             .collect()
     }
 }
@@ -744,6 +850,16 @@ pub struct Snapshot {
     pub more: bool,
 }
 
+/// The RECORDER's peer id (v2 item 2, recordings off the snapshot
+/// stream): a virtual peer — never allocated to a connection (the
+/// transport refuses at 255), never sent a datagram — whose snapshots
+/// are written to disk instead. Because it joins fresh with an
+/// unbounded budget, its FIRST frame is automatically a full keyframe
+/// and every later frame a pure delta; because it self-acks instantly,
+/// it never blocks removal recycling and each frame carries exactly
+/// that tick's changes. The demo format IS the wire format.
+pub const RECORDER_PEER: u8 = u8::MAX;
+
 /// Server side: owns the peer table, packs per-peer deltas, gates id
 /// recycling on acks. Create during init and move into the net task.
 pub struct NetServer {
@@ -752,6 +868,11 @@ pub struct NetServer {
     /// The peer→controlled-entity table, shipped whole in every snapshot
     /// header (same bytes for every peer) — see `owners_set`.
     owners: Vec<(u8, u32)>,
+    /// Tick the change capture last ran at (see [`refresh`](Self::refresh)).
+    scan_tick: u32,
+    /// Recording sink + encoded handshake schema for the file header
+    /// (see [`record_to`](Self::record_to)); consumed by `serve`.
+    pub(crate) record: Option<(std::io::BufWriter<std::fs::File>, Vec<u8>)>,
 }
 
 impl NetServer {
@@ -764,6 +885,8 @@ impl NetServer {
             sync: SyncSet::default(),
             peers: BTreeMap::new(),
             owners: Vec::new(),
+            scan_tick: 0,
+            record: None,
         }
     }
 
@@ -774,21 +897,33 @@ impl NetServer {
             sync,
             peers: BTreeMap::new(),
             owners: Vec::new(),
+            scan_tick: 0,
+            record: None,
         }
     }
 
+    /// Record this server's authoritative state to `w` (see
+    /// [`RECORDER_PEER`] for the mechanism): `serve` writes a `PMREC`
+    /// header carrying `schema_bytes` (the same encoded table the live
+    /// handshake compares, so playback is schema-checked exactly like a
+    /// connect), then one length-prefixed snapshot frame per tick.
+    /// Public front door: [`PmServer::record_to`](crate::PmServer::record_to).
+    pub fn record_to(&mut self, w: std::io::BufWriter<std::fs::File>, schema_bytes: Vec<u8>) {
+        self.record = Some((w, schema_bytes));
+    }
+
     #[cfg(test)] // test seam: manual bind path
-    pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
+    pub fn pool_sync<T: Pod + PodSchema + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
     }
 
     #[cfg(test)] // test seam: manual bind path
-    pub fn pool_wire<T: Wire>(&mut self, name: &str, pool: &PoolHandle<T>) {
+    pub fn pool_wire<T: Wire + PodSchema>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_wire(name, pool);
     }
 
     #[cfg(test)] // test seam: manual bind path
-    pub fn schema(&self) -> Vec<(u8, String, usize)> {
+    pub fn schema(&self) -> Vec<(u8, String, usize, u64)> {
         self.sync.schema()
     }
 
@@ -839,7 +974,7 @@ impl NetServer {
     /// peer or before the first ack). Because acks and inputs share the
     /// client→server path, this is also ≈ the newest snapshot the client
     /// *had* when it sent the inputs now arriving — the anchor for
-    /// lag-compensation rewind (see `PmServer::history_pool`).
+    /// lag-compensation rewind (see `PmServer::journal_pool`).
     pub fn acked_tick(&self, peer: u8) -> u32 {
         self.peers.get(&peer).map_or(0, |p| p.acked_tick)
     }
@@ -870,6 +1005,45 @@ impl NetServer {
         self.snapshot_budgeted(pm, peer, usize::MAX).map(|s| s.bytes)
     }
 
+    /// THE per-tick change capture (v2 item 2 stage 2): scan every
+    /// pool's change stamps ONCE per tick and fan the changed slots out
+    /// to every peer's candidate list — the tick journal's axis applied
+    /// to the packer. Replaces the old per-peer-per-datagram O(entities
+    /// × pools) scans with one O(entities × pools) pass per TICK plus
+    /// O(changed × peers) bookkeeping; the pack walks are O(dirty).
+    ///
+    /// Runs lazily off `snapshot_budgeted` (guarded to once per tick),
+    /// so manual/test drivers need no extra call. The capture window is
+    /// "stamps after `scan_tick - 1`" — the previous capture's
+    /// in-progress tick is re-scanned on purpose (a task above the net
+    /// task may stamp after the capture ran) and the `queued` flag
+    /// dedups the overlap.
+    fn refresh(&mut self, pm: &Pm) {
+        let now = pm.tick();
+        if self.scan_tick == now {
+            return;
+        }
+        let since = self.scan_tick.saturating_sub(1);
+        self.scan_tick = now;
+        let mut changed = Vec::new();
+        for (i, adapter) in self.sync.adapters.iter().enumerate() {
+            changed.clear();
+            adapter.changed_slots(since, &mut changed);
+            if changed.is_empty() {
+                continue;
+            }
+            for peer in self.peers.values_mut() {
+                if let Some(pp) = peer.pools.get_mut(i)
+                    && pp.seeded
+                {
+                    for &slot in &changed {
+                        pp.enqueue(slot);
+                    }
+                }
+            }
+        }
+    }
+
     /// Pack at most `budget` bytes of unconfirmed state for `peer`,
     /// oldest-rotation first. None if the peer is unknown.
     ///
@@ -890,13 +1064,28 @@ impl NetServer {
     /// datagram flight, and packed entries going in-flight is what makes
     /// the next call resume instead of repeating.
     pub fn snapshot_budgeted(&mut self, pm: &Pm, peer: u8, budget: usize) -> Option<Snapshot> {
+        self.refresh(pm);
         let state = self.peers.get_mut(&peer)?;
         // Lazily grow per-pool state for pools registered after peer_add.
         while state.pools.len() < self.sync.adapters.len() {
             state.pools.push(PeerPool::new());
         }
+        // Seed fresh candidate lists (new peer, or a pool registered
+        // after the peer joined) with every occupied slot: a new peer's
+        // baseline is the whole world. Runs here, not in refresh, so a
+        // peer added mid-tick still gets its first snapshot this tick.
+        for (i, pp) in state.pools.iter_mut().enumerate() {
+            if !pp.seeded {
+                pp.seeded = true;
+                let mut slots = Vec::new();
+                self.sync.adapters[i].all_slots(&mut slots);
+                for slot in slots {
+                    pp.enqueue(slot);
+                }
+            }
+        }
         let acked = state.acked_tick;
-        let label = pm.tick().saturating_sub(1);
+        let label = pm.tick();
         let seq = state.next_seq;
         state.next_seq += 1;
 
@@ -1028,17 +1217,17 @@ impl NetClient {
     }
 
     #[cfg(test)] // test seam: manual bind path
-    pub fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
+    pub fn pool_sync<T: Pod + PodSchema + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_sync(name, pool);
     }
 
     #[cfg(test)] // test seam: manual bind path
-    pub fn pool_wire<T: Wire>(&mut self, name: &str, pool: &PoolHandle<T>) {
+    pub fn pool_wire<T: Wire + PodSchema>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.sync.pool_wire(name, pool);
     }
 
     #[cfg(test)] // test seam: manual bind path
-    pub fn schema(&self) -> Vec<(u8, String, usize)> {
+    pub fn schema(&self) -> Vec<(u8, String, usize, u64)> {
         self.sync.schema()
     }
 

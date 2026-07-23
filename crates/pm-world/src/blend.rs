@@ -166,6 +166,36 @@ pub const fn schema_hash_str(s: &str) -> u64 {
     h
 }
 
+/// A pod's schema identity for the connect handshake (v2 item 1, the
+/// hash's stage 2): every type registered on the wire — synced pools,
+/// singles, the input pod, event pods — carries a `SCHEMA_HASH`, and
+/// the handshake compares it per channel alongside name and size.
+/// Same-size-different-meaning drift (a reordered field, a changed
+/// quantization scale, a retagged lerp) fails the connect loudly
+/// instead of silently misparsing.
+///
+/// `#[pm::pod]` implements this for you from the full field descriptor
+/// string — that is the normal path. The default of 0 means "unhashed:
+/// name + size only", the pre-hash contract — implement the trait
+/// empty (`impl pm::PodSchema for X {}`) only for pods built outside
+/// the macro (e.g. `pm_params!` pods hash their generated `SCHEMA`
+/// string instead).
+pub trait PodSchema {
+    const SCHEMA_HASH: u64 = 0;
+}
+
+// A bare primitive synced directly (a counter pool, a tag) hashes its
+// type name — same-size cross-type drift (u32 vs f32) still fails the
+// handshake.
+macro_rules! prim_schema {
+    ($($t:ty),+) => {$(
+        impl PodSchema for $t {
+            const SCHEMA_HASH: u64 = schema_hash_str(stringify!($t));
+        }
+    )+};
+}
+prim_schema!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+
 #[cfg(test)]
 mod tests {
     use super::*;

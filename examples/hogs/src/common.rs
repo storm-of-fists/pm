@@ -9,14 +9,13 @@
 
 pub use hogs_sim::*;
 // The generated blend methods' traits — in scope wherever pods go.
-pub use pm::{PodErr, PodLerp};
 
 use pm::{Id, vec3};
 
 // (`addr=` + `password=` landed 2026-07-20 — menu Join field, CLI args,
 // and the deploy/ box all dial anywhere now. Reconnect-in-place landed
 // 2026-07-22 on the v2 session-token handshake: the server parks a
-// dropped player's vehicle for RECONNECT_GRACE_SECS and the client
+// dropped player's vehicle for p.reconnect_grace and the client
 // redials with the same token — see the server roster task and the
 // player client's redial loop. Join-in-progress was free all along:
 // a fresh peer converges from zero by the delta-cursor design.)
@@ -24,38 +23,37 @@ pub const ADDR: &str = "127.0.0.1:48223";
 /// What the menu's HOST verb binds: every interface, so friends can
 /// dial the host's IP while the host itself joins over loopback.
 pub const HOST_BIND: &str = "0.0.0.0:48223";
-/// How long a dropped player's session stays reclaimable: the engine
-/// parks the PEER ID (same session token → same id back), the roster
-/// parks the VEHICLE, and the client keeps redialing, all on this one
-/// clock. Structural, not a param: both ends bake it in at connect.
-pub const RECONNECT_GRACE_SECS: f32 = 20.0;
 
-/// Remote interpolation delay (seconds) — same shared-constant contract
-/// as drive: the client hands it to `interp_pool` (trucks AND hogs), the
-/// server subtracts it (in ticks) from a peer's acked tick to judge that
-/// peer's shots against the world they were aiming at. `PM_INTERP_MS`
-/// overrides for feel A/B's. 33 ms is the played-in default (picked
-/// 2026-07-18 after the lag=80/loss=3% sessions: "fixed nearly
-/// everything" vs 50 — fresher remotes, and loss bursts still hide
-/// inside the extrapolation cap). Try `interp=200 lag=80 loss=0.03`:
-/// the world turns to soup but shots still land — lag comp rewinds
-/// deeper. Now `interp=8`: fresh but strobing under loss. 33 is a
-/// *choice*, not a law.
-pub const INTERP_DELAY: f32 = 0.033;
-
-/// [`INTERP_DELAY`] with the `PM_INTERP_MS` override applied.
-pub fn interp_delay() -> f32 {
-    std::env::var("PM_INTERP_MS")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .map_or(INTERP_DELAY, |ms| ms / 1000.0)
-}
-
-/// The interp delay in whole sim ticks — what the server subtracts from
-/// a peer's acked tick to find the tick that peer was *seeing*.
-pub fn interp_ticks() -> u32 {
-    (interp_delay() / FIXED_DT).round() as u32
-}
+// (INTERP_DELAY + the PM_INTERP_MS env + interp= arg DISSOLVED
+// 2026-07-23 into the `interp_ms` PARAM — one replicated number, both
+// halves of the lag-comp contract, live-tunable like everything else.)
+//
+// TODO(simplify): THE PARAMS SWEEP (2026-07-23 — Connor: "one big text
+// file... almost everything needs to live not in code constants, but
+// in that text file"). The audit found FOUR mechanisms doing one job
+// (consts, params, env vars, CLI args) and ~60 scalar consts across
+// common.rs + hogs-sim that are TUNING wearing const clothing. The
+// rule going forward (extends the params design record in sim
+// lib.rs): **if a number tunes behavior, it's a param in the text
+// file; `const` is reserved for (a) wire/enum discriminants (PHASE_*,
+// CAT_*, KIND_* — schema, not tuning), (b) determinism anchors
+// (FIXED_DT, SIM_VERSION), (c) authored content tables (BUILDINGS,
+// LEVELS, RACE_LOOP — level data, a future level-file story, wrong
+// shape for scalar params), and (d) invocation identity (ADDR,
+// PARAMS_FILE).** The sweep, in batches so goldens stay green:
+// 1. Sim scalars → Params: TRUCK_R/STEER_TAU/p.aim_max/aim stops,
+//    HELI_* envelope (~10), HOG_*/FLYER_* AI + hp (~12), HOGGUN_*,
+//    p.truck_hp/p.depot_hp/BOSS_* , p.brief_secs, p.impact_ttl,
+//    p.reconnect_grace. Steps already take &Params — mostly
+//    mechanical read-site swaps. Goldens: values identical ⇒ hashes
+//    hold; any drift is a bug caught by the tripwire.
+// 2. A CLIENT-FEEL pod (second pm_params! block, own file, NOT
+//    synced): AIM_SENS, camera constants, extrap (kills the
+//    PM_EXTRAP_MS env), day length (absorbs the `day=` arg + Tune
+//    single). Same macro, same file format — one mechanism, two
+//    scopes (shared truth vs personal feel).
+// 3. Env knobs after the sweep: PM_NETDBG/PM_PROF/PM_CC stay (debug
+//    tooling, not tuning); everything else dies.
 
 /// Default params file path; a `params=PATH` arg overrides. Local tuning
 /// state, gitignored — the shipped defaults live in the [`Params`]
@@ -118,10 +116,6 @@ pub const PARAM_SAVE: u32 = u32::MAX;
 pub struct Flags {
     /// (one-way lag ms, loss fraction) — the simulated link.
     pub link: (f32, f32),
-    /// Day-night cycle length, seconds.
-    pub day: f32,
-    /// Interp delay in force, ms (report-only; frozen at creation).
-    pub interp_ms: f32,
     /// Telemetry monitor address (`mon=IP:PORT`).
     pub mon: String,
     /// Game params loaded from the params file in `main` (before any
@@ -139,13 +133,15 @@ pub struct Flags {
     pub password: String,
     /// Show the pre-connect menu (bare launch); CLI modes skip it.
     pub menu: bool,
+    /// Play back a recording (`replay=FILE`) instead of connecting —
+    /// spectator view of a file written by the server's `record=FILE`.
+    pub replay: Option<String>,
 }
 
 /// Live-tunable client knobs, bridged from the telemetry node's signals
 /// into a pm single (`"hogs.tune"`) that game tasks read each frame.
 #[derive(Clone, Copy)]
 pub struct Tune {
-    pub day_secs: f32,
     /// The DEBUG VIEW (tilde toggles): hitbox cages — every entity's
     /// DERIVED collision hulls, the capsule+band the server sweeps,
     /// as emissive magenta wireframes (`models::hull_cage_tris`) —
@@ -157,7 +153,7 @@ pub struct Tune {
 
 impl Default for Tune {
     fn default() -> Self {
-        Tune { day_secs: 480.0, show_debug: false }
+        Tune { show_debug: false }
     }
 }
 
@@ -181,7 +177,7 @@ pub struct Health {
 /// ~90 entities per 1200 B snapshot instead of ~45. Coords at 1/64 u
 /// (±512 u range — the walls sit at ±ARENA), angles at 1e-4 rad (the
 /// server wraps `heading` to [-pi, pi) at every write — i16 saturates
-/// past ±3.27), hp at 1/200 over its 0..=HOG_HP range.
+/// past ±3.27), hp at 1/200 over its 0..=p.hog_hp range.
 ///
 /// The deliberate asymmetry: predicted pools (`Truck`, `Heli`) are
 /// NOT quantized — reconcile error must be able to reach zero, and a
@@ -200,7 +196,7 @@ pub struct Hog {
     pub heading: f32,
     #[wire(i16, scale = 256.0)]
     pub speed: f32,
-    /// 0..HOG_HP; clients tint by it. Dead hogs are REMOVED, not hp==0.
+    /// 0..p.hog_hp; clients tint by it. Dead hogs are REMOVED, not hp==0.
     #[wire(u8, scale = 200.0)]
     pub hp: f32,
 }
@@ -367,8 +363,6 @@ pub const LEVELS: &[LevelDef] = &[
     },
 ];
 
-/// Countdown on the briefing screen before a mission goes live.
-pub const BRIEF_SECS: f32 = 5.0;
 
 /// The current level, clamped — a stale replica can't index out.
 pub fn level_def(level: u32) -> &'static LevelDef {
@@ -400,7 +394,6 @@ pub struct Depot {
 pub const DEPOT_POS: (f32, f32) = (0.0, 20.0);
 pub const DEPOT_R: f32 = 2.4;
 pub const DEPOT_H: f32 = 3.2;
-pub const DEPOT_HP: f32 = 6.0;
 
 /// The depot's world-space hull — one definition, posed nowhere (it's
 /// static): the server registers it, the client mirrors it so bot
@@ -437,11 +430,6 @@ pub struct Boss {
     pub hp: f32,
 }
 
-pub const BOSS_HP: f32 = 30.0;
-/// Render scale on the hog model, and the collider grow (m on every
-/// surface) that makes the hitbox match the spectacle.
-pub const BOSS_SCALE: f32 = 3.0;
-pub const BOSS_GROW: f32 = 1.4;
 
 /// Reliable client→server event: advance the session from an end
 /// screen (ENTER on won/lost). The server decides what "go" means by
@@ -524,9 +512,6 @@ pub const IMPACT_HIT: f32 = 0.0; // a shot connected
 pub const IMPACT_KILL: f32 = 1.0; // a hog died here
 pub const IMPACT_BITE: f32 = 2.0; // a hog rammed a truck
 pub const IMPACT_BOOM: f32 = 3.0; // a truck exploded (overheat or hp 0)
-/// Marker lifetime — comfortably above one resend window so lossy
-/// clients see every flash before it expires.
-pub const IMPACT_TTL: f32 = 1.0;
 
 // --- channels --------------------------------------------------------------
 
@@ -564,21 +549,9 @@ pub const VEH_HELI: u32 = 1;
 // control internals whose live mutation would be meaningless or break
 // contracts (the param-vs-const taxonomy on the Params declaration).
 
-/// Truck hitpoints (what one bite chips is `Params::bite_dmg`; hp is
-/// the scale everything else is expressed in, so it stays 1.0).
-pub const TRUCK_HP: f32 = 1.0;
 
 /// Hog body radius (they're round; the biomod part is the attitude).
 pub const HOG_R: f32 = 0.7;
-/// Shots to drop a hog: HOG_HP / `Params::gun_dmg`.
-pub const HOG_HP: f32 = 1.0;
-/// Hog turn rate (rad/s) — slower than a truck can steer, so you can
-/// juke a charge.
-pub const HOG_TURN: f32 = 2.6;
-/// While roaming, a hog walks to a random goal and picks a new one
-/// inside this many seconds (or on arrival) — real wandering, not the
-/// old stand-and-wiggle.
-pub const ROAM_REPICK: f32 = 9.0;
 /// Hog GAMEPLAY hit ceiling: a shot connects if its altitude is inside
 /// [0, HOG_H] at the hit point. Taller than the drawn hog on purpose —
 /// truck barrels sit at ~1.45 and flat shots must keep connecting (2D
@@ -595,16 +568,6 @@ pub const HOG_H: f32 = 1.8;
 // in range of many at once, and that's the point: altitude is safety,
 // the deck gets you fried.
 
-/// Max gunner bullet travel (a touch past `Params::hoggun_range` so
-/// edge shots complete at the default; a live range crank past it just
-/// shortens edge shots).
-pub const HOGGUN_TRAVEL: f32 = 32.0;
-/// Aim error, ± radians on heading AND climb: "kinda bad". At 20 u
-/// that's a ~±2.8 u miss cone vs a ~1 u cabin.
-pub const HOGGUN_SPREAD: f32 = 0.14;
-/// Muzzle height (shoulder-mounted). Where they aim comes from the
-/// target hull's band via [`WorldIndex::nearest`] — no aim consts.
-pub const HOGGUN_Y: f32 = 0.6;
 
 // --- flying hogs -------------------------------------------------------------
 
@@ -636,7 +599,7 @@ pub struct Flyer {
     pub heading: f32,
     #[wire(i16, scale = 256.0)]
     pub speed: f32,
-    /// 0..FLYER_HP; clients tint by it. Dead flyers are REMOVED — the
+    /// 0..p.flyer_hp; clients tint by it. Dead flyers are REMOVED — the
     /// client's falling ragdoll is the death animation.
     #[wire(u8, scale = 200.0)]
     pub hp: f32,
@@ -646,19 +609,6 @@ pub struct Flyer {
 /// body center (query pads still grow it shooter-side).
 pub const FLYER_R: f32 = 0.7;
 pub const FLYER_H: f32 = 0.8;
-/// One clean cannon hit drops a flyer at the shipped `gun_dmg` —
-/// they're hard to hit, so they're soft.
-pub const FLYER_HP: f32 = 0.5;
-/// Turn rate (rad/s) — a touch under the ground hog's; wide swoops.
-pub const FLYER_TURN: f32 = 2.2;
-/// Vertical authority, u/s — how fast a swoop commits (or breaks off).
-pub const FLYER_CLIMB: f32 = 7.0;
-/// 3D aggro radius. Bigger than the ground horde's `hog_aggro`:
-/// flyers are the interceptors.
-pub const FLYER_AGGRO: f32 = 45.0;
-/// Bite reach above/below the body — the vertical half-band handed to
-/// `hull_hits_circle` (ground hogs use [0, `hog_leap`] instead).
-pub const FLYER_REACH: f32 = 1.3;
 
 // --- muzzles + cosmetic tracers ----------------------------------------------
 
@@ -666,7 +616,7 @@ pub const FLYER_REACH: f32 = 1.3;
 /// exactly the walls the real bullet dies on (ground, buildings below
 /// the roofline, arena, ceiling, range) so the visual never outlives
 /// where the shot could truthfully be — hogs excepted, on purpose.
-pub fn tracer_step(tr: &mut Tracer, dt: f32, speed: f32) -> bool {
+pub fn tracer_step(tr: &mut Tracer, dt: f32, speed: f32, ceil: f32) -> bool {
     let step = speed * dt;
     tr.x += tr.heading.sin() * tr.pitch.cos() * step;
     tr.z += tr.heading.cos() * tr.pitch.cos() * step;
@@ -677,7 +627,7 @@ pub fn tracer_step(tr: &mut Tracer, dt: f32, speed: f32) -> bool {
         && !(tr.y < building_top(tr.x, tr.z) && in_building(tr.x, tr.z, 0.0))
         && tr.x.abs() <= ARENA
         && tr.z.abs() <= ARENA
-        && tr.y <= HELI_CEIL
+        && tr.y <= ceil
 }
 
 // --- geometry ---------------------------------------------------------------
@@ -752,7 +702,7 @@ impl Hull {
 
 /// Where a gunner points to hit `(tx, ty, tz)` from its muzzle:
 /// `(heading, climb)`. No lead — hogs shoot at where you ARE, which
-/// is most of why they're bad at it (`HOGGUN_SPREAD` is the rest).
+/// is most of why they're bad at it (`p.hoggun_spread` is the rest).
 pub fn hog_aim(x: f32, y: f32, z: f32, tx: f32, ty: f32, tz: f32) -> (f32, f32) {
     let (dx, dy, dz) = (tx - x, ty - y, tz - z);
     (dx.atan2(dz), dy.atan2((dx * dx + dz * dz).sqrt()))
@@ -1485,7 +1435,8 @@ mod hull_tests {
     /// target (the whole reason helis fear the deck).
     #[test]
     fn hog_aim_points_up_at_a_heli() {
-        let (heading, pitch) = hog_aim(0.0, HOGGUN_Y, 0.0, 10.0, HOGGUN_Y + 10.0, 0.0);
+        let p = Params::default();
+        let (heading, pitch) = hog_aim(0.0, p.hoggun_y, 0.0, 10.0, p.hoggun_y + 10.0, 0.0);
         assert!((heading - FRAC_PI_2).abs() < 1e-4, "target due +x");
         assert!(
             (pitch - std::f32::consts::FRAC_PI_4).abs() < 1e-3,
@@ -1513,12 +1464,13 @@ mod hull_tests {
         // The flyers' band rides THEIR altitude instead of the ground:
         // a heli out of leaping range is squarely in winged range.
         let cabin = cabin_at(0.0, 10.0);
+        let p = Params::default();
         assert!(
-            hull_hits_circle(&cabin, 0.0, 0.0, FLYER_R, 10.0 - FLYER_REACH, 10.0 + FLYER_REACH),
+            hull_hits_circle(&cabin, 0.0, 0.0, FLYER_R, 10.0 - p.flyer_reach, 10.0 + p.flyer_reach),
             "a flyer at your altitude bites at any altitude"
         );
         assert!(
-            !hull_hits_circle(&cabin, 0.0, 0.0, FLYER_R, 3.0 - FLYER_REACH, 3.0 + FLYER_REACH),
+            !hull_hits_circle(&cabin, 0.0, 0.0, FLYER_R, 3.0 - p.flyer_reach, 3.0 + p.flyer_reach),
             "a flyer seven units below is still climbing, not biting"
         );
     }
@@ -1567,17 +1519,18 @@ mod hull_tests {
 
     #[test]
     fn nearest_aim_point_rides_the_band() {
-        // A gunner muzzle at HOGGUN_Y: level shot at a truck (muzzle
+        // A gunner muzzle at p.hoggun_y: level shot at a truck (muzzle
         // height is inside the band), belly shot at a heli overhead
         // (clamped to the band floor).
         let (_, idx, truck_id, heli_id) = world(10.0);
+        let p = Params::default();
         let any = (f32::NEG_INFINITY, f32::INFINITY);
-        let n = idx.nearest(4.0, HOGGUN_Y, 0.0, 100.0, any, CAT_VEHICLE).unwrap();
+        let n = idx.nearest(4.0, p.hoggun_y, 0.0, 100.0, any, CAT_VEHICLE).unwrap();
         assert_eq!(n.owner, truck_id, "3D distance: the truck wins up close");
-        assert_eq!(n.y, HOGGUN_Y, "truck band contains the muzzle height: level shot");
+        assert_eq!(n.y, p.hoggun_y, "truck band contains the muzzle height: level shot");
         // Band-filter the ground floor away: only the heli remains, and
         // the aim point clamps up to its band floor.
-        let n = idx.nearest(6.0, HOGGUN_Y, 0.0, 100.0, (5.0, f32::INFINITY), CAT_VEHICLE).unwrap();
+        let n = idx.nearest(6.0, p.hoggun_y, 0.0, 100.0, (5.0, f32::INFINITY), CAT_VEHICLE).unwrap();
         assert_eq!(n.owner, heli_id);
         let cabin = cabin_at(6.0, 10.0);
         assert_eq!(n.y, cabin.y.0, "heli overhead: aim clamps to the band floor (belly)");
@@ -1652,7 +1605,7 @@ mod hull_tests {
 #[cfg(test)]
 mod pod_blend_tests {
     use super::*;
-    use pm::{Body, Quat};
+    use pm::{Body, PodErr, PodLerp, Quat};
 
     #[test]
     fn truck_lerp_and_err_match_the_hand_versions() {

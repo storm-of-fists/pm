@@ -206,8 +206,12 @@ pub fn run(flags: Flags) {
         // ONE reconnect identity per game session, resent on every
         // redial: the server hands the same peer id back inside its
         // grace window and the roster returns the parked vehicle
-        // (common::RECONNECT_GRACE_SECS, both halves).
-        let token = session_token_new();
+        // (common::p.reconnect_grace, both halves). PERSISTED to
+        // disk (mtime refreshed while playing), so a crash or a
+        // patch-and-relaunch inside the grace window is just another
+        // redial — reconnect-after-patch needs no protocol: the pm/4
+        // schema hash guards compatibility, the token carries identity.
+        let token = session_token_persistent(&join_addr);
         let mut first_loss: Option<Instant> = None;
         let mut attempt = 0u32;
         loop {
@@ -221,6 +225,9 @@ pub fn run(flags: Flags) {
                 &password,
                 token,
             );
+            if flags.replay.is_some() {
+                return; // a replay ran (or ended); nothing to redial
+            }
             let Some(reason) = lost else { return }; // local quit (esc)
             if connected {
                 // A real session ran and then dropped: fresh clock.
@@ -230,7 +237,7 @@ pub fn run(flags: Flags) {
             let since = *first_loss.get_or_insert_with(Instant::now);
             attempt += 1;
             eprintln!("[hogs] connection lost: {reason} — redial {attempt}");
-            if since.elapsed().as_secs_f32() > RECONNECT_GRACE_SECS + 5.0 {
+            if since.elapsed().as_secs_f32() > Params::default().reconnect_grace + 5.0 {
                 // Past the server's grace: the peer id and the parked
                 // vehicle are gone; a further dial would be a fresh
                 // join. Back to the menu (or out) instead of pretending.
@@ -248,21 +255,6 @@ pub fn run(flags: Flags) {
             }
         }
     }
-}
-
-/// One reconnect identity per game session: random, resent across
-/// redials, never persisted (see the transport's FRAME_AUTH). The std
-/// hasher's per-instance seed is the entropy source — a bouncer
-/// credential, not cryptography, same doctrine as the password.
-fn session_token_new() -> [u8; 16] {
-    use std::hash::{BuildHasher, Hasher};
-    let mut token = [0u8; 16];
-    for chunk in token.chunks_mut(8) {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u32(std::process::id());
-        chunk.copy_from_slice(&h.finish().to_le_bytes());
-    }
-    token
 }
 
 /// The between-redials screen: reason + attempt count for ~1.2 s,
@@ -311,6 +303,38 @@ fn reconnect_overlay(
 /// means a local quit (Esc), `Some` means the link died and the caller
 /// decides whether to redial with the same token.
 #[allow(clippy::too_many_arguments)] // the redial loop's plumbing, all of it load-bearing
+/// Where this server's session token lives between launches.
+fn session_token_path(addr: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "hogs-session-{}.token",
+        addr.replace([':', '/', '\\'], "_")
+    ))
+}
+
+/// Load (or mint and store) the reconnect token for `addr`. A relaunch
+/// while the on-disk token is younger than the reconnect grace reuses
+/// it — the server hands back the same peer id and parked vehicle — so
+/// crash-and-relaunch and patch-and-relaunch both reconnect. Stale or
+/// unreadable files mint fresh (worst case: a normal new join).
+fn session_token_persistent(addr: &str) -> [u8; 16] {
+    let path = session_token_path(addr);
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age.as_secs_f32() < Params::default().reconnect_grace)
+        && let Ok(bytes) = std::fs::read(&path)
+        && bytes.len() == 16
+    {
+        eprintln!("[hogs] resuming session token (reconnect window)");
+        return bytes.try_into().unwrap();
+    }
+    let token = pm::session_token_random();
+    let _ = std::fs::write(&path, token);
+    token
+}
+
 fn session(
     window_rc: Rc<RefCell<sdl3::video::Window>>,
     pump_rc: Rc<RefCell<sdl3::EventPump>>,
@@ -326,6 +350,22 @@ fn session(
         pm.password(password);
     }
     pm.session_token(token);
+    if let Some(path) = &flags.replay {
+        // Spectate a recording instead of dialing: the engine feeds
+        // recorded frames through the normal apply path — interp, draw
+        // pools, HUD all work; there's just no avatar to predict.
+        pm.replay_from(path);
+        eprintln!("[hogs] replaying {path}");
+    }
+    // Keep the on-disk session token FRESH while playing — the
+    // reconnect-after-crash clock is that file's mtime (see
+    // session_token_persistent).
+    {
+        let path = session_token_path(join_addr);
+        pm.task_add("session.token", 90.0, 5.0, move |_pm| {
+            let _ = std::fs::write(&path, token);
+        });
+    }
     if flags.link != (0.0, 0.0) {
         pm.link_lag(flags.link.0, flags.link.1);
         eprintln!(
@@ -337,10 +377,7 @@ fn session(
     let w = client_setup(&mut pm);
     eprintln!("connecting to {join_addr} ...");
     let net = pm.net();
-    // Live-tunable knobs (day length today) — seeded from flags here,
-    // written by the telemetry node when a monitor turns the dial.
     let tune = pm.single::<Tune>("hogs.tune");
-    tune.get_mut().day_secs = flags.day;
     // The telemetry node: watch (and tune) this session from pm-watch
     // or pm-mon. See telemetry.rs.
     crate::telemetry::install(&mut pm, &w, &flags);
@@ -354,6 +391,22 @@ fn session(
     camera_install(&mut pm);
     let cam_mgr = camera_manager(&mut pm);
     let cam_view = pm.single::<CamView>("cam.view");
+
+    // Report the camera pose to the server (v2 item 4 stage 2): the
+    // server's interest scorers rank the horde by distance from this
+    // EYE plus a forward-cone boost, so what's actually on screen
+    // streams freshest under budget pressure. Bots never report — the
+    // server falls back to vehicle distance for them.
+    {
+        let view = cam_view.clone();
+        let net = net.clone();
+        pm.task_add("view.report", 8.0, 0.0, move |_pm| {
+            let v = view.get();
+            if v.ready() {
+                net.view_set(v.eye, (v.target - v.eye).norm());
+            }
+        });
+    }
 
     // Steal the mouse (relative mode): no cursor wandering onto the
     // second monitor mid-firefight. Esc quits, which releases it.
@@ -493,10 +546,22 @@ fn session(
                     Event::MouseMotion {
                         xrel, yrel, mousestate, ..
                     } if mousestate.is_mouse_button_pressed(MouseButton::Right) => {
-                        aim = (aim + xrel * AIM_SENS).clamp(-AIM_MAX, AIM_MAX);
-                        // Mouse down = gun down (yrel is +down).
-                        aim_pitch =
-                            (aim_pitch - yrel * AIM_SENS).clamp(-HELI_AIM_PITCH, HELI_AIM_PITCH);
+                        aim = (aim + xrel * AIM_SENS).clamp(-params.get().aim_max, params.get().aim_max);
+                        // Mouse down = gun down (yrel is +down). Clamp at
+                        // the CURRENT vehicle's stops: letting the
+                        // accumulator run to the heli gimbal's ±1.0 in a
+                        // truck (stops −0.35..0.9) pinned the barrel with
+                        // dead travel on reversal — "stuck, then moves
+                        // past what I commanded" (Connor, 2026-07-23).
+                        let (lo, hi) = {
+                            let p = params.get();
+                            if flying {
+                                (-p.heli_aim_pitch, p.heli_aim_pitch)
+                            } else {
+                                (-p.truck_aim_down, p.truck_aim_up)
+                            }
+                        };
+                        aim_pitch = (aim_pitch - yrel * AIM_SENS).clamp(lo, hi);
                     }
                     // ENTER advances the session from an end screen —
                     // the server's director decides what "go" means by
@@ -630,13 +695,13 @@ fn session(
         let params = w.params.clone();
         move |pm| {
             let dt = pm.loop_dt();
-            let spd = params.get().bullet_speed;
+            let (spd, ceil) = { let p = params.get(); (p.bullet_speed, p.heli_ceil) };
             let dead: Vec<_> = {
                 let mut trs = tracer.get_mut();
                 let ids: Vec<_> = trs.iter().map(|(id, _)| id).collect();
                 ids.into_iter()
                     .filter(|&id| {
-                        trs.get_mut(id).is_some_and(|mut tr| !tracer_step(&mut tr, dt, spd))
+                        trs.get_mut(id).is_some_and(|mut tr| !tracer_step(&mut tr, dt, spd, ceil))
                     })
                     .collect()
             };
@@ -814,7 +879,7 @@ fn session(
             // the telemetry day_secs knob), biased sine keeps night
             // short.
             let tau = std::f32::consts::TAU;
-            let day_secs = tune.get().day_secs.max(10.0);
+            let day_secs = w.params.get().day_secs.max(10.0);
             let ang = (pm.tick() as f32 * FIXED_DT / day_secs).fract() * tau;
             let elev = ang.sin() * 0.9 + 0.35; // -0.55 deep night .. 1.25 noon
             let lift = elev.clamp(0.0, 1.0);
@@ -921,11 +986,11 @@ fn session(
                 // Biomod green fades to livid red as hp drops (the
                 // boss's `Hog::hp` mirrors its big pool's fraction, so
                 // the same ramp reads its health too).
-                let hp = (h.hp / HOG_HP).clamp(0.0, 1.0);
+                let hp = (h.hp / w.params.get().hog_hp).clamp(0.0, 1.0);
                 let tint = (0.45 + 0.4 * (1.0 - hp), 0.42 * hp + 0.10, 0.28 * hp + 0.06);
                 // Boss membership is "draw that one huge" — same mesh,
                 // same batch, scaled to match its grown hitbox.
-                let s = if w.boss.get_id(id).is_some() { BOSS_SCALE } else { 1.0 };
+                let s = if w.boss.get_id(id).is_some() { w.params.get().boss_scale } else { 1.0 };
                 let model = hog_model(h) * Mat4::scale(s);
                 hog_shadows.push(Instance3::emissive(
                     Mat4::translate(vec3(h.x, 0.02, h.z)) * Mat4::scale(0.95 * s),
@@ -953,7 +1018,7 @@ fn session(
             let mut flyer_wings_l: Vec<Instance3> = Vec::new();
             let mut flyer_wings_r: Vec<Instance3> = Vec::new();
             for (id, f) in w.flyer_draw.get().iter() {
-                let hp = (f.hp / FLYER_HP).clamp(0.0, 1.0);
+                let hp = (f.hp / w.params.get().flyer_hp).clamp(0.0, 1.0);
                 // Biomod violet draining to livid red as hp drops.
                 let tint = (
                     0.38 + 0.42 * (1.0 - hp),
@@ -969,7 +1034,7 @@ fn session(
                     .push(Instance3::new(model * Mat4::rot_axis(vec3(0.0, 0.0, 1.0), flap), tint));
                 flyer_wings_l
                     .push(Instance3::new(model * Mat4::rot_axis(vec3(0.0, 0.0, 1.0), -flap), tint));
-                let s = 0.9 * (1.0 - f.y / (HELI_CEIL * 1.7)).max(0.2);
+                let s = 0.9 * (1.0 - f.y / (w.params.get().heli_ceil * 1.7)).max(0.2);
                 flyer_shadows.push(Instance3::emissive(
                     Mat4::translate(vec3(f.x, 0.02, f.z)) * Mat4::scale(s),
                     (0.035, 0.04, 0.035),
@@ -1079,7 +1144,7 @@ fn session(
                         || (n.y < building_top(n.x, n.z) && in_building(n.x, n.z, 0.0))
                         || n.x.abs() > ARENA
                         || n.z.abs() > ARENA
-                        || n.y > HELI_CEIL
+                        || n.y > w.params.get().heli_ceil
                     {
                         break;
                     }
@@ -1123,7 +1188,7 @@ fn session(
                 // chewed, with a warning strobe once it's half gone.
                 let sb = w.hunt.get();
                 for (_, d) in w.depot.get().iter() {
-                    let f = (d.hp / DEPOT_HP).clamp(0.0, 1.0);
+                    let f = (d.hp / w.params.get().depot_hp).clamp(0.0, 1.0);
                     frame.draw(
                         &cube,
                         Mat4::translate(vec3(d.x, 0.0, d.z))
@@ -1216,7 +1281,7 @@ fn session(
                     let model = hl.body.model();
                     // Shadow shrinks and stays put as the heli climbs —
                     // the cheap read on "how high am I".
-                    let s = 1.9 * (1.0 - hl.body.pos.y / (HELI_CEIL * 1.7)).max(0.2);
+                    let s = 1.9 * (1.0 - hl.body.pos.y / (w.params.get().heli_ceil * 1.7)).max(0.2);
                     frame.draw_emissive(
                         &shadow,
                         Mat4::translate(vec3(hl.body.pos.x, 0.03, hl.body.pos.z))
@@ -1318,7 +1383,7 @@ fn session(
                             .get()
                             .iter()
                             .next()
-                            .map_or(0, |(_, d)| (d.hp / DEPOT_HP * 100.0).ceil() as i32);
+                            .map_or(0, |(_, d)| (d.hp / w.params.get().depot_hp * 100.0).ceil() as i32);
                         format!(
                             "wave {}/{}   depot {}%   hogs {}",
                             sb.wave, sb.goal, dp, sb.alive
@@ -1409,7 +1474,7 @@ fn session(
                     let hp = w
                         .health
                         .get_id(id)
-                        .map_or(0.0, |v| (v.hp / TRUCK_HP).clamp(0.0, 1.0));
+                        .map_or(0.0, |v| (v.hp / w.params.get().truck_hp).clamp(0.0, 1.0));
                     let hp_col = (
                         (60.0 + 195.0 * (1.0 - hp)) as u8,
                         (60.0 + 175.0 * hp) as u8,
@@ -1419,7 +1484,7 @@ fn session(
                     // altitude in the heli (both predicted state — live,
                     // no round trip).
                     let (fill, col, label) = if let Some(hl) = w.pred_heli.get().state() {
-                        let alt = (hl.body.pos.y / HELI_CEIL).clamp(0.0, 1.0);
+                        let alt = (hl.body.pos.y / w.params.get().heli_ceil).clamp(0.0, 1.0);
                         (alt, (120, 190, 235), "alt")
                     } else {
                         let heat = w.pred.get().state().map_or(0.0, |t| t.heat.clamp(0.0, 1.0));
@@ -1692,11 +1757,11 @@ fn menu(
     let params = flags.params;
     let path = flags.params_path.clone();
     let pw = (!password.is_empty()).then(|| password.clone());
-    std::thread::spawn(move || crate::server::run(true, params, path, HOST_BIND, pw));
+    std::thread::spawn(move || crate::server::run(true, params, path, HOST_BIND, pw, None, false));
     std::thread::sleep(std::time::Duration::from_millis(300));
     for n in 0..2 {
         let (link, pw) = (flags.link, password.clone());
-        std::thread::spawn(move || crate::bot_client::run_bot(n, link, ADDR, &pw));
+        std::thread::spawn(move || crate::bot_client::run_bot(n, link, ADDR, &pw, false));
     }
     Some((ADDR.to_string(), password))
 }

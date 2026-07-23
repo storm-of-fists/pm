@@ -1,7 +1,8 @@
 //! Installable net modules: the transport-pumping loop every game wrote
 //! by hand, hoisted into core. `Pm::server` / `Pm::client` pick the role;
-//! `run()` moves the QUIC endpoint into a single net task (priority
-//! [`NET_PRIO`]) that trades exclusively in plain data — games hold typed
+//! `run()` moves the QUIC endpoint into the engine's PRESENT/COMMIT
+//! phases (see `Pm::loop_once`) — receive/apply before the task cycle,
+//! send after it — trading exclusively in plain data; games hold typed
 //! handles and never touch the transport.
 //!
 //! The doctrine: **the client only ever sends channels; the server only
@@ -23,7 +24,7 @@
 //!   ([`acked_tick`](ServerNet::acked_tick)/[`rtt_ms`](ServerNet::rtt_ms)).
 //!   Ownership auto-clears the tick after a leave: the leave handler
 //!   still sees `own(p)` to despawn by.
-//! - [`ttl_pool`](PmServer::ttl_pool) / [`history_pool`](PmServer::history_pool):
+//! - [`ttl_pool`](PmServer::ttl_pool) / [`journal_pool`](PmServer::journal_pool):
 //!   the duration modifiers — transient entries expire after a lifetime;
 //!   a pool keeps a window of past ticks the server can rewind into
 //!   (lag compensation).
@@ -81,10 +82,11 @@
 //!
 //! Handles follow the kernel idiom: fetch at init, clone into the task
 //! closures that need them. Per-tick data (peer joins, events, applied
-//! snapshots) is cleared and refilled by the net task each tick: read it
-//! from tasks at priority above [`NET_PRIO`] — it is valid for the rest
-//! of that tick. A client whose connection errors or closes quits the
-//! loop.
+//! snapshots) is cleared and refilled by the PRESENT phase each tick,
+//! before any task runs — every game task may read it, no ordering rule
+//! to remember (the phase turn, 2026-07-23, retired the old "register
+//! above NET_PRIO" folklore). A client whose connection errors or
+//! closes quits the loop.
 
 use std::any::Any;
 use std::cell::{Cell, Ref, RefCell};
@@ -95,30 +97,96 @@ use std::rc::Rc;
 
 use bytemuck::Pod;
 
-use crate::duration::{HistoryRing, pool_expire};
+use crate::blend::{PodErr, PodLerp, PodSchema};
+use crate::math::{Vec3, vec3};
+use crate::journal::Journal;
 use crate::id::Id;
 use crate::kernel::{Pm, PoolHandle, SingleHandle};
 use crate::net::{
-    Applied, NetClient, NetServer, Outbox, SyncSet, Wire, WireKind, WireReg, event_tag,
+    Applied, NetClient, NetServer, Outbox, RECORDER_PEER, SyncSet, Wire, WireKind, WireReg,
+    event_tag,
 };
 use crate::predict::Predictor;
 use crate::smooth::{InterpBuffer, pool_interp};
 use crate::transport::{QuicClient, QuicServer};
 
-/// Priority of the net task both roles register. It runs first in the
-/// tick (per net.rs: sending before the sim avoids relabeling freshly
-/// stamped entries); register game tasks above it.
-// TODO(roadmap): the "read per-tick net data only from tasks above
-// NET_PRIO" rule lives in folklore + module docs — promote it into a
-// type or runtime guard when touching this area anyway.
-pub const NET_PRIO: f32 = 5.0;
 
-/// Artificial link delay/loss from `PM_LAG_MS` (milliseconds) and
-/// `PM_LOSS` (0..1 drop fraction) — the simulation knob clients used to
-/// wire by hand around the QUIC endpoint, now read by `connect` ONLY
-/// (one lagged socket per link; see `serve` for why the server must not
-/// stack a second one). `None` when both are unset or zero.
-/// `PM_NETDBG=1` — the net doctor. Both roles print link vitals every
+// TODO(refactor): THE API CRITIQUE (2026-07-23, Connor asked for a
+// harder look: "primitives as dumb as possible, networking as hidden
+// as possible" — hogs is now the ONLY consumer, demo/drive/hellfire
+// deleted, so the API serves exactly one game and can be judged by
+// it). What hogs writes that smells engine-shaped, worst first:
+// 1. THE REDIAL LOOP: token persistence, first-loss clock, attempt
+//    counter, grace+5 give-up — ~60 lines of player_client that every
+//    game will need verbatim. Wants `run` to own it: game hands a
+//    session-builder closure, engine owns dial/redial/token/backoff.
+// 2. RECONNECT PARKING: the engine returns the same peer id, but the
+//    game hand-rolls park-on-left / adopt-on-join / expire-at-grace
+//    (roster task HashMap). The ownership table already knows the
+//    peer's entity — `own_park`/`own_adopt` semantics (ownership
+//    survives a leave, marked parked, auto-expiring on the SAME grace
+//    clock) would delete the whole dance.
+// 3. INTEREST SCORERS: hogs' avatar_xz closure + eye/cone math is the
+//    standard scorer every game will write. Wants a built-in: game
+//    supplies position-of-entry (`|v| (x, z)`), engine supplies
+//    eye-else-avatar distance × forward cone × staleness.
+// 4. DRAW-POOL DELAY/EXTRAP REPETITION: interp_pool(&p, delay, extrap)
+//    × 5 pools with the same two constants — wants client-level
+//    defaults (`interp_defaults(delay, extrap)`) so the call is
+//    `interp_pool(&p)`. (Auto-install stays rejected: the line per
+//    pool is the record of which pools get draw siblings.)
+// 5. REGISTRATION DUPLICATION: server.rs and client_setup list the
+//    same 11 channels; the schema check catches drift at CONNECT, a
+//    shared `register_world(pm)` in the game would catch it at
+//    COMPILE. Game-side fix, engine could bless the pattern.
+// 6. DONE 2026-07-23 (the phase turn): engine work moved into the
+//    kernel's PRESENT/COMMIT phases — NET_PRIO deleted, the ordering
+//    folklore is now structure, and send-after-sim reclaimed a tick
+//    of latency each way.
+// 7. THE VEHICLE-DUALITY TAX: truck+heli as separate pools multiplies
+//    every seam (two predictors, two interps, avatar-in-which-pool
+//    checks, per-vehicle clamp bugs — the 07-23 turret bug lived
+//    exactly here). M3 adds infantry for humans AND hogs; decide
+//    before then whether "avatar" becomes one pod with a kind enum or
+//    the engine grows a first-class pool-set-avatar concept.
+// (hellfire's deletion also left `interp_pool_with` caller-less — it
+// stays as the custom-blend escape hatch — and modload without a demo;
+// modload gets a real consumer again when hogs wants mods or not at
+// all. pool_mirror/coast_blend, the demos' dead-reckoning seams, were
+// deleted 2026-07-23 the moment the review found them caller-less.)
+//
+// TODO(refactor): THE NAMING PASS (2026-07-23, Connor: "design as if a
+// hundred people use it — simple, clear, bulletproof"; renames are
+// cheapest RIGHT NOW with one consumer). Recommendations, his pick:
+// 8. `InputRx::view()` now COLLIDES with the view-pose surface
+//    (`view_set`/`view_pose`, different concept entirely) → rename to
+//    `seen_tick(peer)` ("the tick the peer had SEEN when this input
+//    arrived" — which is what the doc already says it is).
+// 9. THREE WORDS FOR ONE CONCEPT: `own_set`/`own`/`owned`/`owner_of`
+//    (server) vs `mine` (client) vs `NetStatus.avatar` (internals) all
+//    mean "the peer's controlled entity" → unify on AVATAR:
+//    `avatar_set`, `avatar(peer)`, `avatars()`, `avatar_owner(id)`;
+//    keep `mine()` as client sugar.
+// 10. `Journal` vs `JournalHandle` vs `InterpBuffer` — three names
+//    for "tick-addressed past of a pool" (v2 item 2 says it's ONE
+//    concept) → converge on JOURNAL: `Journal`→`JournalRing`,
+//    duration.rs→journal.rs; InterpBuffer waits for the client-store
+//    merge.
+// 11. SEAM/METHOD INVERSION: methods are `interp_pool`/`ttl_pool`,
+//    their manual seams are `pool_interp`/`pool_expire` — same words,
+//    flipped order, no rule says which form you're holding → seams
+//    take the method's name + `_into`/demote to pub(crate).
+// 12. `SendTune`/`send_tune` is the per-peer bandwidth BUDGET, and
+//    "tune" already means the link-sim knobs → `send_budget`.
+// 13. KEEP `predict_pool`/`interp_pool` despite the mirror instinct:
+//    they're the industry's own words (a hundred newcomers arrive
+//    knowing them); the pairing belongs in docs ("mine vs everyone
+//    else"), not in renaming away shared vocabulary.
+// 14. netmod.rs (the file) says nothing → roles.rs.
+
+/// THE NET DOCTOR toggle ([`netdbg_enable`](crate::netdbg_enable) —
+/// games surface it as an arg; runtime env knobs are dead by doctrine,
+/// 2026-07-23). Both roles print link vitals every
 /// 5 s: the server reports, per peer, how far its ack cursor trails the
 /// tick (the lag-comp rewind anchor — if this GROWS the peer is being
 /// served stale state), RTT, this tick's snapshot flight size (datagrams
@@ -130,21 +198,16 @@ pub const NET_PRIO: f32 = 5.0;
 /// FIXME(lag-sim) in transport.rs). The history ring also warns when a
 /// rewind clamps past its window instead of clamping silently.
 pub(crate) fn netdbg() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PM_NETDBG").is_ok_and(|v| v != "0"))
+    NETDBG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn link_lag_from_env() -> Option<(std::time::Duration, f32)> {
-    let env = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.0)
-    };
-    let lag_ms = env("PM_LAG_MS");
-    let loss = env("PM_LOSS");
-    (lag_ms > 0.0 || loss > 0.0)
-        .then(|| (std::time::Duration::from_secs_f32(lag_ms / 1000.0), loss))
+static NETDBG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn on the net doctor (periodic link vitals on stderr, plus loud
+/// journal-rewind clamps). Call it from arg parsing — e.g. hogs'
+/// `netdbg` flag; there is no env knob (one way in, by doctrine).
+pub fn netdbg_enable() {
+    NETDBG.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A networked [`Pm`] in the **server** role: owns the simulation, binds the
@@ -157,9 +220,11 @@ pub struct PmServer {
     pm: Pm,
     addr: String,
     password: Option<String>,
+    /// Recording path (see [`record_to`](PmServer::record_to)); opened at `run`.
+    record: Option<String>,
     /// One tick journal per pool name, shared across consumers — the
     /// registry behind [`journal_pool`](PmServer::journal_pool). Boxed
-    /// `(Rc<RefCell<HistoryRing<T>>>, Rc<Cell<f32>>)` per entry.
+    /// `(Rc<RefCell<Journal<T>>>, Rc<Cell<f32>>)` per entry.
     journals: HashMap<String, Box<dyn Any>>,
     /// Reconnect grace override (seconds); `None` = transport default.
     grace: Option<f32>,
@@ -178,6 +243,9 @@ pub struct PmClient {
     link_lag: Option<(std::time::Duration, f32)>,
     password: Option<String>,
     session_token: Option<[u8; 16]>,
+    /// Replay file instead of a live connection (see
+    /// [`replay_from`](PmClient::replay_from)); opened at `run`.
+    replay: Option<String>,
 }
 
 impl Deref for PmServer {
@@ -217,6 +285,7 @@ impl Pm {
             pm: Pm::new(),
             addr: addr.to_string(),
             password: None,
+            record: None,
             journals: HashMap::new(),
             grace: None,
         }
@@ -233,6 +302,7 @@ impl Pm {
             link_lag: None,
             password: None,
             session_token: None,
+            replay: None,
         }
     }
 
@@ -240,7 +310,7 @@ impl Pm {
     /// the one-call replacement for `pool()` + a separate sync step. The
     /// pool's name is its wire identity (hashed; see `pool_key`), so server
     /// and client may register in any order.
-    pub fn sync_pool<T: Pod + 'static>(&mut self, name: &str) -> PoolHandle<T> {
+    pub fn sync_pool<T: Pod + PodSchema + 'static>(&mut self, name: &str) -> PoolHandle<T> {
         let pool = self.pool::<T>(name);
         self.sync(&pool);
         pool
@@ -252,12 +322,13 @@ impl Pm {
     /// quantization attributes). The handshake schema carries the REPR
     /// size, so an end still registering the pool via `sync_pool` is
     /// rejected at connect — switch both sides together.
-    pub fn wire_pool<T: Wire>(&mut self, name: &str) -> PoolHandle<T> {
+    pub fn wire_pool<T: Wire + PodSchema>(&mut self, name: &str) -> PoolHandle<T> {
         let pool = self.pool::<T>(name);
         self.single::<WireReg>("net.reg").get_mut().register(
             WireKind::Pool,
             name,
             size_of::<T::Repr>(),
+            T::SCHEMA_HASH,
         );
         self.single::<SyncSet>("net.sync")
             .get_mut()
@@ -267,11 +338,11 @@ impl Pm {
 
     /// Register an existing `pool` for replication. Internal: `sync_pool`
     /// (shared) and the roles' `sync_single` are the public surface.
-    fn sync<T: Pod + 'static>(&mut self, pool: &PoolHandle<T>) {
+    fn sync<T: Pod + PodSchema + 'static>(&mut self, pool: &PoolHandle<T>) {
         let name = pool.name().to_string();
         self.single::<WireReg>("net.reg")
             .get_mut()
-            .register(WireKind::Pool, &name, size_of::<T>());
+            .register(WireKind::Pool, &name, size_of::<T>(), T::SCHEMA_HASH);
         self.single::<SyncSet>("net.sync")
             .get_mut()
             .pool_sync(&name, pool);
@@ -281,25 +352,24 @@ impl Pm {
     /// and the input channel, as (kind, name, size). Order-independent:
     /// the transport sorts by name, and replication keys sections by name
     /// hash.
-    fn net_schema(&mut self) -> Vec<(u8, String, usize)> {
+    fn net_schema(&mut self) -> Vec<(u8, String, usize, u64)> {
         self.single::<WireReg>("net.reg").get().schema()
     }
 
     /// Bind the server transport and install the net task. Called by `run`.
     ///
-    /// Deliberately does NOT honor `PM_LAG_MS`/`PM_LOSS` — the CLIENT
-    /// applies the simulated link (see `connect`). When server and client
-    /// share a process (hogs no-arg, tests) they share the env too, and
-    /// lagging both sockets stacks: every packet crossed two delay queues
-    /// (RTT = 4x the knob, not 2x) and rolled loss twice per direction —
-    /// "80 ms / 3%" actually simulated a 320 ms / ~6% link.
+    /// The simulated link is the CLIENT's (`PmClient::link_lag`; see
+    /// `connect`): lagging both ends of an in-process pair would stack
+    /// (RTT = 4x the knob, loss rolled twice per direction).
     fn serve(
         &mut self,
         addr: &str,
         password: Option<String>,
         grace: Option<f32>,
+        record: Option<String>,
     ) -> std::io::Result<()> {
-        let mut quic = QuicServer::bind(addr, &self.net_schema())?;
+        let schema = self.net_schema();
+        let mut quic = QuicServer::bind(addr, &schema)?;
         if let Some(pw) = &password {
             quic.password_set(pw);
         }
@@ -308,13 +378,18 @@ impl Pm {
         }
         let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
         self.removal_hold_set(true);
-        NetServer::with_sync(sync).serve(self, quic);
+        let mut net = NetServer::with_sync(sync);
+        if let Some(path) = record {
+            let w = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            net.record_to(w, crate::transport::schema_encode(&schema));
+            eprintln!("[pm net] recording to {path}");
+        }
+        net.serve(self, quic);
         Ok(())
     }
 
-    /// Connect the client transport and install the net task. Called by `run`.
-    /// `link_lag`: an explicit simulated link (one-way delay, loss) wins;
-    /// `None` falls back to the `PM_LAG_MS`/`PM_LOSS` env knob.
+    /// Connect the client transport and install the net phases. Called by
+    /// `run`. `link_lag`: the simulated link (one-way delay, loss), if any.
     fn connect(
         &mut self,
         addr: &str,
@@ -330,7 +405,7 @@ impl Pm {
         if let Some(token) = session_token {
             quic.session_token_set(token);
         }
-        if let Some((delay, loss)) = link_lag.or_else(link_lag_from_env) {
+        if let Some((delay, loss)) = link_lag {
             quic.link_lag_set(delay, loss);
         }
         let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
@@ -485,7 +560,7 @@ impl<C: Pod + 'static> InputRx<C> {
     /// The peer's acked snapshot tick as of when the most recently
     /// consumed input ARRIVED — THE lag-compensation rewind anchor:
     /// subtract the game's interp ticks and judge that input's shots
-    /// against `history_pool` frames at the result. (`ServerNet::
+    /// against journal frames at the result. (`ServerNet::
     /// acked_tick` read at consumption time is subtly too FRESH: the
     /// input waited in this queue while newer acks landed.) 0 before
     /// any input was consumed.
@@ -567,10 +642,10 @@ pub(crate) struct ServerInputChan(Option<Rc<dyn InputSink>>);
 /// Register the client half of the continuous input channel. Crate-shared
 /// so in-crate tests can register on a bare kernel; [`PmClient::input`]
 /// is the public door.
-pub(crate) fn input_tx<C: Pod + 'static>(pm: &mut Pm, name: &str) -> InputTx<C> {
+pub(crate) fn input_tx<C: Pod + PodSchema + 'static>(pm: &mut Pm, name: &str) -> InputTx<C> {
     pm.single::<WireReg>("net.reg")
         .get_mut()
-        .register(WireKind::Input, name, size_of::<C>());
+        .register(WireKind::Input, name, size_of::<C>(), C::SCHEMA_HASH);
     let shared = Rc::new(RefCell::new(InputShared {
         current: C::zeroed(),
         sent: Vec::new(),
@@ -584,10 +659,10 @@ pub(crate) fn input_tx<C: Pod + 'static>(pm: &mut Pm, name: &str) -> InputTx<C> 
 /// Register the server half of the continuous input channel. Crate-shared
 /// so in-crate tests can register on a bare kernel; [`PmServer::input`]
 /// is the public door.
-pub(crate) fn input_rx<C: Pod + 'static>(pm: &mut Pm, name: &str) -> InputRx<C> {
+pub(crate) fn input_rx<C: Pod + PodSchema + 'static>(pm: &mut Pm, name: &str) -> InputRx<C> {
     pm.single::<WireReg>("net.reg")
         .get_mut()
-        .register(WireKind::Input, name, size_of::<C>());
+        .register(WireKind::Input, name, size_of::<C>(), C::SCHEMA_HASH);
     let shared = Rc::new(RefCell::new(InputQueues::default()));
     pm.single::<ServerInputChan>("net.input").get_mut().0 = Some(Rc::new(RxAdapter {
         shared: shared.clone(),
@@ -666,6 +741,18 @@ impl ClientNet {
         self.status.get().connected
     }
 
+    /// Report this client's VIEW POSE (camera eye + forward) to the
+    /// server — the on-screen-ness ingredient for
+    /// [`interest_pool`](crate::PmServer::interest_pool) scorers, read
+    /// there via [`ServerNet::view_pose`]. Call every tick from the
+    /// camera task; the net task ships the latest at the input cadence
+    /// (unreliable, newest-wins — presentation metadata, never sim
+    /// input). Clients that never call it simply score without a pose.
+    pub fn view_set(&self, eye: Vec3, forward: Vec3) {
+        self.status.get_mut().view =
+            Some([eye.x, eye.y, eye.z, forward.x, forward.y, forward.z]);
+    }
+
     /// Why the connection ended, once it has. The handle keeps the
     /// status single alive past the loop, so this is readable AFTER
     /// [`PmClient::run`] returns — `Some` means the loop quit on a
@@ -678,8 +765,8 @@ impl ClientNet {
     /// Snapshots applied this tick, each carrying the server's input-seq
     /// echo — the reconciliation points. [`predict_pool`](PmClient::predict_pool)
     /// consumes these for you; read them directly for HUD/diagnostics or a
-    /// hand-rolled predictor. Valid for the rest of the tick (call from a
-    /// task above [`NET_PRIO`]).
+    /// hand-rolled predictor. Valid for the whole task cycle (the
+    /// PRESENT phase fills it before any task runs).
     pub fn applied(&self) -> Vec<Applied> {
         self.applied.get().0.clone()
     }
@@ -697,8 +784,8 @@ pub struct ServerNet {
 }
 
 impl ServerNet {
-    /// Peers that joined this tick. Per-tick data from the net task: read
-    /// from a task above [`NET_PRIO`].
+    /// Peers that joined this tick. Per-tick data from the PRESENT
+    /// phase: valid for the whole task cycle.
     pub fn joined(&self) -> Vec<u8> {
         self.peers.get().joined.clone()
     }
@@ -754,7 +841,7 @@ impl ServerNet {
     /// arriving now — which makes
     /// `acked_tick(peer) - interp_delay_in_ticks` the tick that peer was
     /// *looking at*: the rewind point for lag compensation (see
-    /// [`history_pool`](PmServer::history_pool)).
+    /// [`journal_pool`](PmServer::journal_pool)).
     pub fn acked_tick(&self, peer: u8) -> u32 {
         self.stats.get().0.get(&peer).map_or(0, |s| s.acked_tick)
     }
@@ -765,6 +852,20 @@ impl ServerNet {
     /// RTT-based rewind instead of the acked-tick one.
     pub fn rtt_ms(&self, peer: u8) -> f32 {
         self.stats.get().0.get(&peer).map_or(0.0, |s| s.rtt_ms)
+    }
+
+    /// `peer`'s latest reported view pose as (eye, forward) — what
+    /// [`ClientNet::view_set`] sent, refreshed every tick. `None` for
+    /// peers that never report (bots). Built for
+    /// [`interest_pool`](crate::PmServer::interest_pool) scorers:
+    /// distance from EYE (not avatar) plus a forward-cone boost is the
+    /// classic on-screen-ness score — keep any boost multiplicative and
+    /// positive so staleness still guarantees off-screen entities a
+    /// cadence (never cull to zero).
+    pub fn view_pose(&self, peer: u8) -> Option<(Vec3, Vec3)> {
+        self.stats.get().0.get(&peer).and_then(|s| s.view).map(|v| {
+            (vec3(v[0], v[1], v[2]), vec3(v[3], v[4], v[5]))
+        })
     }
 }
 
@@ -807,22 +908,20 @@ impl<T: Pod + 'static> SingleRx<T> {
 /// THE JOURNAL is engine-v2 item 2's spine landing in place: one
 /// tick-addressed store of "state at tick T" per synced pool, that the
 /// mechanisms which each kept a bespoke copy derive from instead.
-/// Derived TODAY: the lag-comp rewind ([`PmServer::history_pool`] is a
-/// thin wrapper). QUEUED (the TODO(v2) item-2 status in lib.rs): the
-/// snapshot packer's dirty scan, recordings/replays (serialize the
-/// ring), kill-cams (play it back), and the client stores (interp
-/// samples, predictor window) once those move onto the tick axis.
-pub struct PoolJournal<T> {
-    ring: Rc<RefCell<HistoryRing<T>>>,
+/// Derived TODAY: the lag-comp rewind (rewound frames read straight
+/// off it); the snapshot packer's dirty scan rides the same tick axis
+/// (`NetServer::refresh`, a per-tick change capture → per-peer
+/// candidate lists), and the client's interp samples are stamped with
+/// snapshot LABEL times (see `interp_pool`) — stage 2, 2026-07-23.
+/// QUEUED (the TODO(v2) item-2 status in lib.rs): recordings/replays
+/// (serialize the ring) and kill-cams (play it back).
+pub struct JournalHandle<T> {
+    ring: Rc<RefCell<Journal<T>>>,
 }
-
-/// The pre-journal name for [`PoolJournal`] — same type; kept so
-/// lag-comp call sites read as what they are.
-pub type PoolHistory<T> = PoolJournal<T>;
 
 // Hand-implemented (not derived) so cloning the *handle* never demands
 // `T: Clone` — a derive bounds the impl on T. Same idiom as `InputTx`.
-impl<T> Clone for PoolJournal<T> {
+impl<T> Clone for JournalHandle<T> {
     fn clone(&self) -> Self {
         Self {
             ring: self.ring.clone(),
@@ -830,9 +929,9 @@ impl<T> Clone for PoolJournal<T> {
     }
 }
 
-impl<T: Copy + 'static> PoolJournal<T> {
+impl<T: Copy + 'static> JournalHandle<T> {
     /// The recorded frame nearest `tick` (clamped to the window edges;
-    /// see [`HistoryRing::frame`]) as a zero-copy borrow. `None` only
+    /// see [`Journal::frame`]) as a zero-copy borrow. `None` only
     /// before the first frame is recorded. Don't hold it across a call
     /// that ticks the ring — it borrows the shared `RefCell`.
     pub fn frame(&self, tick: u32) -> Option<Ref<'_, [(Id, T)]>> {
@@ -840,7 +939,7 @@ impl<T: Copy + 'static> PoolJournal<T> {
     }
 
     /// The newest recorded tick label (`None` before the first frame) —
-    /// how deep "now" is; pair with [`oldest`](PoolJournal::oldest) to
+    /// how deep "now" is; pair with [`oldest`](JournalHandle::oldest) to
     /// see the whole recorded window.
     pub fn newest(&self) -> Option<u32> {
         self.ring.borrow().newest()
@@ -875,14 +974,14 @@ impl PmClient {
     /// fields beats a second pod. Discrete intents (respawn, ready) belong
     /// on [`event`](PmClient::event) channels instead — don't event-ize
     /// axes, don't pod-ize one-shots.
-    pub fn input<C: Pod + 'static>(&mut self, name: &str) -> InputTx<C> {
+    pub fn input<C: Pod + PodSchema + 'static>(&mut self, name: &str) -> InputTx<C> {
         input_tx(&mut self.pm, name)
     }
 
     /// Register a synced single and return the typed **read** handle for
     /// its replicated value — the replica side of
     /// [`PmServer::sync_single`], without the pool ceremony.
-    pub fn sync_single<T: Pod + 'static>(&mut self, name: &str) -> SingleRx<T> {
+    pub fn sync_single<T: Pod + PodSchema + 'static>(&mut self, name: &str) -> SingleRx<T> {
         let pool = self.pm.sync_pool::<T>(name);
         SingleRx { pool }
     }
@@ -900,7 +999,10 @@ impl PmClient {
     /// `input` is the channel the predictions replay — the same one the
     /// input task `set`s. `step` is THE shared integration (the same one
     /// the server runs — determinism is what makes reconciliation
-    /// byte-exact); `fixed_dt` is the server's sim step. Pair with
+    /// byte-exact); `fixed_dt` is the server's sim step. The error
+    /// metric comes from the pod itself (`S::pod_err`, generated by
+    /// `#[pm::pod]` — no hand closure to drift); `tolerance` is the
+    /// game's snap threshold over it. Pair with
     /// [`interp_pool`](PmClient::interp_pool) on the same pool for the
     /// remote entities (it returns the draw pool to render). Returns the
     /// predictor single so rendering can read `state()` / `corrections`.
@@ -915,12 +1017,11 @@ impl PmClient {
     /// exhaustive destructure (no `..`) at the top of `step` — a new
     /// field then refuses to compile until someone visits the one place
     /// where this contract is written down (see hogs' `truck_step`).
-    pub fn predict_pool<S: Pod + 'static, C: Pod + 'static>(
+    pub fn predict_pool<S: Pod + PodErr + 'static, C: Pod + 'static>(
         &mut self,
         auth: &PoolHandle<S>,
         input: &InputTx<C>,
         step: impl Fn(&mut S, C, f32) + 'static,
-        err: impl Fn(&S, &S) -> f32 + 'static,
         tolerance: f32,
         fixed_dt: f32,
     ) -> SingleHandle<Predictor<S, C>> {
@@ -935,53 +1036,80 @@ impl PmClient {
         let applied = self.single::<AppliedLog>("net.applied");
         let shared = input.shared.clone();
         let auth = auth.clone();
-        self.task_add(&format!("net.predict.{}", auth.name()), NET_PRIO + 2.0, 0.0, {
-            let pred = pred.clone();
-            move |_pm| {
-                let Some(mine) = status.get().avatar else {
-                    return;
-                };
-                // One fetch for all of this tick's snapshots — the pool
-                // doesn't change between them (the net task already
-                // applied every snapshot before this task runs).
-                let Some(auth_s) = auth.get_id(mine).map(|r| *r) else {
-                    // Avatar isn't in this pool right now (not spawned,
-                    // or currently a different predicted vehicle): idle
-                    // the predictor — otherwise it keeps stepping stale
-                    // state with the other pool's inputs. Emptied, it
-                    // reseeds from authority the moment the avatar is
-                    // back (reconcile's None path), and its state() stays
-                    // None so game code can tell which pool is live.
-                    let mut p = pred.get_mut();
-                    if p.state().is_some() {
-                        *p = Predictor::default();
+        // The step is shared by both phase closures (reconcile/draw in
+        // PRESENT, replay in COMMIT) — one Rc, zero per-tick cost.
+        let step = Rc::new(step);
+        // PRESENT: reconcile against everything the receive phase just
+        // applied, then write the smooth-predicted avatar into draw —
+        // extrapolated by the in-flight input fraction so the render
+        // clock doesn't beat against the fixed predict step (exact:
+        // it's precisely where this tick's replay will land).
+        {
+            let (pred, status, applied) = (pred.clone(), status.clone(), applied.clone());
+            let (shared, auth, draw, step) =
+                (shared.clone(), auth.clone(), draw.clone(), step.clone());
+            self.pm
+                .phase_present(&format!("predict.{}", auth.name()), move |_pm| {
+                    let Some(mine) = status.get().avatar else {
+                        return;
+                    };
+                    // One fetch for all of this tick's snapshots — the
+                    // receive phase already applied every one of them.
+                    let Some(auth_s) = auth.get_id(mine).map(|r| *r) else {
+                        // Avatar isn't in this pool right now (not spawned,
+                        // or currently a different predicted vehicle): idle
+                        // the predictor — otherwise it keeps stepping stale
+                        // state with the other pool's inputs. Emptied, it
+                        // reseeds from authority the moment the avatar is
+                        // back (reconcile's None path), and its state() stays
+                        // None so game code can tell which pool is live.
+                        let mut p = pred.get_mut();
+                        if p.state().is_some() {
+                            *p = Predictor::default();
+                        }
+                        return;
+                    };
+                    for a in &applied.get().0 {
+                        pred.get_mut().reconcile(
+                            auth_s,
+                            a.input_seq,
+                            |s, c| step(s, c, fixed_dt),
+                            S::pod_err,
+                            tolerance,
+                        );
                     }
-                    return;
-                };
-                for a in &applied.get().0 {
-                    pred.get_mut().reconcile(
-                        auth_s,
-                        a.input_seq,
-                        |s, c| step(s, c, fixed_dt),
-                        |a, b| err(a, b),
-                        tolerance,
-                    );
-                }
-                for &(seq, cmd) in &shared.borrow().sent {
-                    pred.get_mut()
-                        .predict(seq, cmd, |s, c| step(s, c, fixed_dt));
-                }
-                // Smooth-predicted local avatar into draw, extrapolated
-                // by the in-flight input fraction. The avatar is present
-                // in `auth` (checked above), so no ghost outlives a
-                // despawn.
-                if let Some(mut s) = pred.get().state() {
-                    let alpha = status.get().input_alpha.min(1.0);
-                    step(&mut s, shared.borrow().current, alpha * fixed_dt);
-                    draw.get_mut().add(mine, s);
-                }
-            }
-        });
+                    // The avatar is present in `auth` (checked above),
+                    // so no ghost outlives a despawn.
+                    if let Some(mut s) = pred.get().state() {
+                        let alpha = status.get().input_alpha.min(1.0);
+                        step(&mut s, shared.borrow().current, alpha * fixed_dt);
+                        draw.get_mut().add(mine, s);
+                    }
+                });
+        }
+        // COMMIT: replay the input sends the net send phase just made
+        // (it runs first in commit and assigns their seqs).
+        // TODO(simplify): predict-on-input — the render task still sees
+        // the avatar one input behind (masked well by the alpha
+        // extrapolation above); true zero-frame response means stepping
+        // the predictor the moment InputTx::set runs, which needs the
+        // input seam to own a peek at the predictor. Revisit after the
+        // phase turn has been played.
+        {
+            let (pred, status, auth) = (pred.clone(), status, auth.clone());
+            self.pm
+                .phase_commit(&format!("predict.{}.replay", auth.name()), move |_pm| {
+                    let Some(mine) = status.get().avatar else {
+                        return;
+                    };
+                    if auth.get_id(mine).is_none() {
+                        return;
+                    }
+                    for &(seq, cmd) in &shared.borrow().sent {
+                        pred.get_mut().predict(seq, cmd, |s, c| step(s, c, fixed_dt));
+                    }
+                });
+        }
         pred
     }
 
@@ -989,7 +1117,8 @@ impl PmClient {
     /// per-pool sync modifier the [`pool_interp`] note promised. Installs a
     /// task that eases every entity in `auth` into a draw sibling pool
     /// (`"<name>.draw"`) ~`delay` seconds behind the newest authoritative
-    /// sample (see [`InterpBuffer`]), via the game's field-aware `lerp`, and
+    /// sample (see [`InterpBuffer`]), via the pod's own generated blend
+    /// (`T::pod_lerp` — angle/snap tags and all; no hand closure), and
     /// returns that draw pool — the one rendering should read. Runs before
     /// [`predict_pool`](PmClient::predict_pool) on the same pool, so the local avatar's
     /// interpolated value is harmlessly overwritten by the predicted one;
@@ -997,7 +1126,31 @@ impl PmClient {
     ///
     /// `delay`/`extrap_max` are seconds; a snapshot interval or two of delay
     /// is the usual start, with a small `extrap_max` to ride loss bursts.
-    pub fn interp_pool<T: Pod + PartialEq + 'static>(
+    ///
+    /// The samples live on the TICK AXIS (v2 item 2 stage 2): each is
+    /// stamped with its applied snapshot's LABEL time (label ×
+    /// 1/input_hz — exact server pacing), not the wall clock it happened
+    /// to arrive on, so flight bursts and arrival jitter never wobble
+    /// the spacing; a budget-rotated entity's samples sit exactly as far
+    /// apart as the server sent them. Rendering samples at a
+    /// smoothly-advancing estimate of the newest label (advance by
+    /// loop_dt, softly slewed onto the label stream; a >0.25 s gap
+    /// snaps), `delay` behind.
+    pub fn interp_pool<T: Pod + PodLerp + PartialEq + 'static>(
+        &mut self,
+        auth: &PoolHandle<T>,
+        delay: f64,
+        extrap_max: f64,
+    ) -> PoolHandle<T> {
+        self.interp_pool_with(auth, T::pod_lerp, delay, extrap_max)
+    }
+
+    /// [`interp_pool`](PmClient::interp_pool) with a custom blend for
+    /// the cases per-field tags can't express (hellfire's "snap on a
+    /// respawn-sized jump" is the canonical one — the decision needs
+    /// BOTH values, not one field). Everything else about the task —
+    /// the draw sibling, the tick-axis sample clock — is identical.
+    pub fn interp_pool_with<T: Pod + PartialEq + 'static>(
         &mut self,
         auth: &PoolHandle<T>,
         lerp: impl Fn(&T, &T, f32) -> T + 'static,
@@ -1005,17 +1158,39 @@ impl PmClient {
         extrap_max: f64,
     ) -> PoolHandle<T> {
         let draw = self.pool::<T>(&format!("{}.draw", auth.name()));
-        // Per-pool task name: several interp'd pools coexist and each
-        // shows up on its own in task_stats / task_stop.
-        let task = format!("net.interp.{}", auth.name());
+        // Per-pool phase name: several interp'd pools coexist and each
+        // shows up on its own in task_stats.
+        let name = format!("interp.{}", auth.name());
+        let applied = self.pm.single::<AppliedLog>("net.applied");
+        let tick_secs = 1.0 / f64::from(self.input_hz.max(1.0));
         let auth = auth.clone();
         let ret = draw.clone();
         let mut buf = InterpBuffer::<T>::new(delay);
         buf.extrap_max = extrap_max;
-        let mut clock = 0.0f64;
-        self.task_add(&task, NET_PRIO + 1.0, 0.0, move |pm| {
-            clock += pm.loop_dt() as f64;
-            pool_interp(&auth, &draw, &mut buf, clock, &lerp);
+        // Newest applied label in server seconds, and the render-now
+        // estimate on that same axis (None until the first snapshot).
+        let mut label_time: Option<f64> = None;
+        let mut clock: Option<f64> = None;
+        self.pm.phase_present(&name, move |pm| {
+            if let Some(t) = applied.get().0.iter().map(|a| a.tick).max() {
+                let lt = t as f64 * tick_secs;
+                label_time = Some(label_time.map_or(lt, |p| p.max(lt)));
+            }
+            let Some(target) = label_time else {
+                return; // nothing applied yet — no time axis to be on
+            };
+            let now = {
+                let c = clock.get_or_insert(target);
+                *c += f64::from(pm.loop_dt());
+                let err = target - *c;
+                if err.abs() > 0.25 {
+                    *c = target; // rejoin after a gap (reconnect, long stall)
+                } else {
+                    *c += err * 0.1; // soft slew onto the label stream
+                }
+                *c
+            };
+            pool_interp(&auth, &draw, &mut buf, target, now, &lerp);
         });
         ret
     }
@@ -1033,10 +1208,8 @@ impl PmClient {
 
     /// Simulate link conditions on this client: one-way `lag_ms` and
     /// `loss` (0..1 drop fraction), applied in both directions at connect
-    /// (RTT rises by ~2x the lag). The programmatic sibling of the
-    /// `PM_LAG_MS`/`PM_LOSS` env knob — an explicit call wins over the
-    /// env, so games can surface these as CLI arguments (env vars are a
-    /// pain to pass on Windows). Zero/zero means a clean link.
+    /// (RTT rises by ~2x the lag). Surface these as CLI arguments (hogs:
+    /// `lag=80 loss=0.03`); zero/zero means a clean link.
     pub fn link_lag(&mut self, lag_ms: f32, loss: f32) {
         self.link_lag = Some((
             std::time::Duration::from_secs_f32(lag_ms.max(0.0) / 1000.0),
@@ -1071,10 +1244,32 @@ impl PmClient {
             link_lag,
             password,
             session_token,
+            replay,
         } = self;
+        if let Some(path) = replay {
+            let schema = pm.net_schema();
+            let sync = std::mem::take(&mut *pm.single::<SyncSet>("net.sync").get_mut());
+            NetClient::with_sync(sync).replay(&mut pm, &path, input_hz, &schema)?;
+            pm.loop_run();
+            return Ok(());
+        }
         pm.connect(&addr, input_hz, link_lag, password, session_token)?;
         pm.loop_run();
         Ok(())
+    }
+
+    /// PLAY BACK a recording instead of connecting: `run` reads `path`
+    /// (written by [`PmServer::record_to`](PmServer::record_to)) on the
+    /// tick clock and applies its snapshot frames through the normal
+    /// apply path — [`interp_pool`](PmClient::interp_pool), draw pools,
+    /// HUD reads all work unchanged, which is the point: the demo
+    /// format IS the wire format. The viewer must register the SAME
+    /// wire schema as the recording server (checked like a live
+    /// connect, mismatch names the channel). There is no input, no
+    /// prediction (no avatar), and no redial; when the file ends the
+    /// world freezes and [`ClientNet::lost`] reads "replay ended".
+    pub fn replay_from(&mut self, path: &str) {
+        self.replay = Some(path.to_string());
     }
 
     /// Present this session token at the handshake — the RECONNECT
@@ -1096,8 +1291,8 @@ impl PmClient {
     /// [`EventTx`] queues an event the net task ships reliably once
     /// connected. Events are fixed-size pods; a short name is a
     /// `Name([u8; 24])`, not a `String`.
-    pub fn event<E: Pod + 'static>(&mut self, name: &str) -> EventTx<E> {
-        let tag = event_register(&mut self.pm, name, size_of::<E>());
+    pub fn event<E: Pod + PodSchema + 'static>(&mut self, name: &str) -> EventTx<E> {
+        let tag = event_register(&mut self.pm, name, size_of::<E>(), E::SCHEMA_HASH);
         EventTx {
             out: self.pm.single::<Outbox>("net.out"),
             tag,
@@ -1112,6 +1307,33 @@ impl PmClient {
 fn secs_ticks(pm: &Pm, secs: f32) -> u32 {
     (secs * pm.loop_rate.max(1) as f32).ceil() as u32
 }
+
+/// Remove every entity whose entry in `pool` was last written more than
+/// `ttl_ticks` ago. Removal goes through the normal deferred path
+/// ([`Pm::id_remove`]), so on a server it replicates like any other
+/// removal.
+///
+/// The clock is **ticks since last write** (the pool's change stamps): a
+/// mutated entry refreshes its lifetime; the immutable transient facts
+/// this exists for age from birth. Expiry removes the *entity*, not just
+/// the pool entry — a TTL'd pool owns its entities (each occurrence gets a
+/// fresh [`Id`]; see the contact-points rule in the crate netcode docs).
+pub(crate) fn pool_expire<T: 'static>(pm: &mut Pm, pool: &PoolHandle<T>, ttl_ticks: u32) {
+    let now = pm.tick();
+    let expired: Vec<Id> = {
+        let pool = pool.get();
+        pool.ids()
+            .iter()
+            .zip(pool.changed_ticks())
+            .filter(|&(_, &t)| now.saturating_sub(t) > ttl_ticks)
+            .map(|(&id, _)| id)
+            .collect()
+    };
+    for id in expired {
+        pm.id_remove(id);
+    }
+}
+
 
 impl PmServer {
     /// The server's in-task surface as a handle: fetch once at init, clone
@@ -1149,78 +1371,74 @@ impl PmServer {
     /// expire before a lossy client ever saw it — its add and its removal
     /// coalesce into nothing.
     pub fn ttl_pool<T: 'static>(&mut self, pool: &PoolHandle<T>, secs: f32) {
-        let task = format!("net.ttl.{}", pool.name());
+        let name = format!("ttl.{}", pool.name());
         let pool = pool.clone();
-        self.task_add(&task, NET_PRIO + 0.5, 0.0, move |pm| {
+        self.pm.phase_present(&name, move |pm| {
             pool_expire(pm, &pool, secs_ticks(pm, secs));
         });
     }
 
-    /// Keep a `secs`-deep window of `pool`'s **past ticks** on the server
-    /// and return the [`PoolHistory`] handle that rewinds into it — the
-    /// memory lag compensation reads.
+    /// Record `pool`'s TICK JOURNAL — a `secs`-deep ring of tick-stamped
+    /// whole-pool frames — and return the [`JournalHandle`] handle that
+    /// reads it. ONE ring per pool no matter how many consumers: a
+    /// second call for the same pool shares the ring and widens the
+    /// window to the larger `secs`. This is the "state at tick T" store
+    /// every tick-addressed feature derives from (see [`JournalHandle`]).
     ///
     /// Frames are labeled like snapshots (`tick - 1`, the last completed
     /// tick, recorded right after the net task packs), so a frame label
-    /// IS a snapshot tick a client may have seen. To judge an acting
-    /// peer's view — "was I really on that car when I hit it?" — rewind
-    /// to what they were looking at when they issued the input:
+    /// IS a snapshot tick a client may have seen. That makes it the
+    /// lag-compensation memory: to judge an acting peer's view — "was I
+    /// really on that car when I hit it?" — rewind to what they were
+    /// looking at when they issued the input:
     ///
     /// ```text
     /// let view = net.acked_tick(peer)              // newest tick they HAD
     ///     .saturating_sub(interp_ticks);           // minus their interp delay
-    /// let frame = hist.frame(view);                // other entities, as seen
+    /// let frame = journal.frame(view);             // other entities, as seen
     /// ```
     ///
     /// The interp delay is the client's presentation constant
     /// ([`interp_pool`](PmClient::interp_pool)'s `delay`, in ticks) —
     /// share it between both builds like the fixed dt. Rewinds deeper
-    /// than the window clamp to the oldest frame (bounded rewind).
-    pub fn history_pool<T: Copy + 'static>(
-        &mut self,
-        pool: &PoolHandle<T>,
-        secs: f32,
-    ) -> PoolHistory<T> {
-        self.journal_pool(pool, secs)
-    }
-
-    /// Record `pool`'s TICK JOURNAL — a `secs`-deep ring of tick-stamped
-    /// whole-pool frames — and return the [`PoolJournal`] handle that
-    /// reads it. ONE ring per pool no matter how many consumers: a
-    /// second call for the same pool shares the ring and widens the
-    /// window to the larger `secs`. This is the "state at tick T" store
-    /// every tick-addressed feature derives from (see [`PoolJournal`]);
-    /// [`history_pool`](PmServer::history_pool) is the lag-comp-flavored
-    /// name for the same registration.
-    ///
-    /// Frames are labeled like snapshots (`tick - 1`, the last completed
-    /// tick), so a frame label IS a snapshot tick a client may have seen.
+    /// than the window clamp to the oldest frame (bounded rewind), and
+    /// keep `secs` comfortably above the deepest honest rewind
+    /// (~interp delay + a worst-case RTT).
+    // TODO(simplify): the interp-delay CONTRACT is still folklore — the
+    // client's interp delay and the server's rewind depth are the same
+    // number, shared today by game convention (hogs' interp_delay()).
+    // Engine-own it: the client reports its delay at the handshake, and
+    // the journal grows `frame_seen_by(peer)` doing the
+    // `acked_tick - delay_ticks` arithmetic itself, so games stop
+    // hand-writing the lag-comp rewind recipe.
     pub fn journal_pool<T: Copy + 'static>(
         &mut self,
         pool: &PoolHandle<T>,
         secs: f32,
-    ) -> PoolJournal<T> {
-        type Entry<T> = (Rc<RefCell<HistoryRing<T>>>, Rc<Cell<f32>>);
+    ) -> JournalHandle<T> {
+        type Entry<T> = (Rc<RefCell<Journal<T>>>, Rc<Cell<f32>>);
         let key = pool.name().to_string();
         if let Some(entry) = self.journals.get(&key) {
             let (ring, want) = entry
                 .downcast_ref::<Entry<T>>()
                 .expect("journal_pool: a pool journals one element type");
             want.set(want.get().max(secs));
-            return PoolJournal { ring: ring.clone() };
+            return JournalHandle { ring: ring.clone() };
         }
-        let ring = Rc::new(RefCell::new(HistoryRing::new(1)));
+        let ring = Rc::new(RefCell::new(Journal::new(1)));
         let want = Rc::new(Cell::new(secs));
         self.journals
             .insert(key, Box::new((ring.clone(), want.clone()) as Entry<T>));
-        let task = format!("net.journal.{}", pool.name());
+        let name = format!("journal.{}", pool.name());
         let pool = pool.clone();
-        let handle = PoolJournal { ring: ring.clone() };
-        self.task_add(&task, NET_PRIO + 0.5, 0.0, move |pm| {
+        let handle = JournalHandle { ring: ring.clone() };
+        // COMMIT phase: the frame captures the tick's FINAL state,
+        // labeled `tick` — the same label this tick's snapshots carry.
+        self.pm.phase_commit(&name, move |pm| {
             let mut ring = ring.borrow_mut();
             ring.cap_set(secs_ticks(pm, want.get()).max(1) as usize);
             let frame: Vec<(Id, T)> = pool.get().iter().map(|(id, v)| (id, *v)).collect();
-            ring.push(pm.tick().saturating_sub(1), frame);
+            ring.push(pm.tick(), frame);
         });
         handle
     }
@@ -1259,7 +1477,7 @@ impl PmServer {
     /// the handshake schema enforces it). Exactly one continuous channel
     /// per connection (a second registration panics); see
     /// [`PmClient::input`].
-    pub fn input<C: Pod + 'static>(&mut self, name: &str) -> InputRx<C> {
+    pub fn input<C: Pod + PodSchema + 'static>(&mut self, name: &str) -> InputRx<C> {
         input_rx(&mut self.pm, name)
     }
 
@@ -1281,19 +1499,30 @@ impl PmServer {
         self.grace = Some(secs);
     }
 
+    /// RECORD this session to `path` (v2 item 2: recordings derive from
+    /// the snapshot stream — see [`RECORDER_PEER`](crate::RECORDER_PEER)
+    /// for why the file starts with a free keyframe and stays pure
+    /// deltas). Play it back with
+    /// [`PmClient::replay_from`](PmClient::replay_from) — the viewer
+    /// needs the same registered schema, checked like a live connect.
+    /// Call before [`run`](PmServer::run); the file is created there.
+    pub fn record_to(&mut self, path: &str) {
+        self.record = Some(path.to_string());
+    }
+
     /// Bind the endpoint (the schema is complete now) and run the loop.
     /// Returns when the loop quits, `Err` on bind failure. (The simulated
     /// link is the CLIENT's — see `serve`; the server never lags itself.)
     pub fn run(self) -> std::io::Result<()> {
-        let PmServer { mut pm, addr, password, grace, .. } = self;
-        pm.serve(&addr, password, grace)?;
+        let PmServer { mut pm, addr, password, grace, record, .. } = self;
+        pm.serve(&addr, password, grace, record)?;
         pm.loop_run();
         Ok(())
     }
 
     /// Create a replicated singleton the server owns. The replica side
     /// reads it through [`PmClient::sync_single`]'s typed handle.
-    pub fn sync_single<T: Pod + Default + 'static>(&mut self, name: &str) -> SingleHandle<T> {
+    pub fn sync_single<T: Pod + PodSchema + Default + 'static>(&mut self, name: &str) -> SingleHandle<T> {
         let single = self.pm.single::<T>(name);
         self.pm.sync(single.pool());
         single
@@ -1303,8 +1532,8 @@ impl PmServer {
     /// Events are one-way client→server (see [`PmClient::event`]); drain the
     /// returned [`EventRx`] from a server task to read this tick's events,
     /// each tagged with the sender peer.
-    pub fn event<E: Pod + 'static>(&mut self, name: &str) -> EventRx<E> {
-        let tag = event_register(&mut self.pm, name, size_of::<E>());
+    pub fn event<E: Pod + PodSchema + 'static>(&mut self, name: &str) -> EventRx<E> {
+        let tag = event_register(&mut self.pm, name, size_of::<E>(), E::SCHEMA_HASH);
         EventRx {
             events: self.pm.single::<ServerEvents>("net.events"),
             tag,
@@ -1316,10 +1545,10 @@ impl PmServer {
 /// Register an event channel in the wire registry (idempotent for the
 /// same name/pod; panics on a hash collision or a kind/size mismatch)
 /// and derive its wire tag.
-fn event_register(pm: &mut Pm, name: &str, size: usize) -> u16 {
+fn event_register(pm: &mut Pm, name: &str, size: usize, hash: u64) -> u16 {
     pm.single::<WireReg>("net.reg")
         .get_mut()
-        .register(WireKind::Event, name, size);
+        .register(WireKind::Event, name, size, hash);
     event_tag(name)
 }
 
@@ -1351,8 +1580,8 @@ pub struct EventRx<E> {
 
 impl<E: Pod> EventRx<E> {
     /// This tick's received events of type `E`, as `(peer, event)`. Reading
-    /// is non-destructive (each receiver filters its own tag), valid for the
-    /// rest of the tick — call from a server task above [`NET_PRIO`].
+    /// is non-destructive (each receiver filters its own tag), valid for
+    /// the whole task cycle (the PRESENT phase fills it).
     pub fn drain(&self) -> Vec<(u8, E)> {
         self.events
             .get()
@@ -1388,6 +1617,8 @@ pub(crate) struct PeerStats(pub HashMap<u8, PeerStat>);
 pub(crate) struct PeerStat {
     pub acked_tick: u32,
     pub rtt_ms: f32,
+    /// Latest view pose the peer reported (see [`ClientNet::view_set`]).
+    pub view: Option<[f32; 6]>,
 }
 
 /// Per-peer controlled entity (server, `"net.own"`). Internal plumbing
@@ -1478,6 +1709,11 @@ pub(crate) struct NetStatus {
     /// Read through [`ClientNet::owner_of`]/[`own`](ClientNet::own)/
     /// [`owned`](ClientNet::owned).
     pub owners: Vec<(u8, Id)>,
+    /// View pose to report to the server (`[eye xyz, forward xyz]`) —
+    /// set via [`ClientNet::view_set`]; the net task ships it at the
+    /// input cadence as a newest-wins datagram. `None` = never report
+    /// (bots, tools).
+    pub view: Option<[f32; 6]>,
     /// Fraction (0..1) of the next fixed input step already accumulated
     /// this tick. The predictor advances in whole `1/input_hz` steps; at
     /// render rates not phase-locked to that, draw the local avatar at
@@ -1499,20 +1735,35 @@ impl NetServer {
     /// into a net task that pumps the wire and trades in the `"net.*"`
     /// singles (see module docs). Call after registering synced pools
     /// and channels.
-    pub fn serve(self, pm: &mut Pm, mut quic: QuicServer) {
+    pub fn serve(self, pm: &mut Pm, quic: QuicServer) {
         let mut net = self;
+        let mut rec = net.record.take();
+        let mut header_done = false;
+        if rec.is_some() {
+            net.peer_add(RECORDER_PEER);
+        }
         let peers = pm.single::<PeerEvents>("net.peers");
         let events = pm.single::<ServerEvents>("net.events");
         let own = pm.single::<ServerOwn>("net.own");
+        let commit_own = own.clone();
         let stats = pm.single::<PeerStats>("net.peerstat");
         let tune = pm.single::<SendTune>("net.sendtune");
         let sink = pm.single::<ServerInputChan>("net.input").get().0.clone();
-        pm.task_add("net", NET_PRIO, 0.0, move |pm| {
+        // One NetServer + endpoint, shared by the two phase closures —
+        // receive in PRESENT (the sim reads a fresh world), send in
+        // COMMIT (snapshots carry THIS tick's state: the phase turn
+        // reclaimed the tick of staleness the old net-task-first
+        // ordering paid).
+        let shared = Rc::new(RefCell::new((net, quic)));
+        let commit_shared = shared.clone();
+        let commit_sink = sink.clone();
+        pm.phase_present_front("net.recv", move |_pm| {
+            let (net, quic) = &mut *shared.borrow_mut();
             quic.pump();
             {
                 let mut pe = peers.get_mut();
-                // Leaves reported last tick have had a full tick above
-                // NET_PRIO with ownership intact (games despawn via
+                // Leaves reported last tick have had a full task cycle
+                // with ownership intact (games despawn via
                 // `own(p)`); drop their entries now — peer ids recycle,
                 // and a stale entry would mark the departed player's
                 // entity as the NEXT player's own. Runs before this
@@ -1563,14 +1814,11 @@ impl NetServer {
                     for (p, seq, bytes) in quic.inputs_drain() {
                         s.push(p, seq, &bytes, net.acked_tick(p));
                     }
-                    // Echo what the sim consumed (last tick — it runs
-                    // after this task); clients reconcile against this.
-                    for (p, seq) in s.applied_seqs() {
-                        net.input_processed(p, seq);
-                    }
                 }
             }
-            let plist: Vec<u8> = net.peers().collect();
+            // The recorder (if any) is a virtual peer: keep it out of
+            // stats, flights, and the net doctor.
+            let plist: Vec<u8> = net.peers().filter(|&p| p != RECORDER_PEER).collect();
             {
                 // Per-peer stats, refreshed now that this tick's acks
                 // landed; departed peers' rows drop with them (peer ids
@@ -1582,6 +1830,7 @@ impl NetServer {
                     let e = st.0.entry(p).or_default();
                     e.acked_tick = net.acked_tick(p);
                     e.rtt_ms = quic.rtt(p).as_secs_f32() * 1e3;
+                    e.view = quic.view(p);
                 }
             }
             {
@@ -1589,10 +1838,45 @@ impl NetServer {
                 ev.clear();
                 ev.extend(quic.events_drain());
             }
+        });
+        pm.phase_commit_front("net.send", move |pm| {
+            let (net, quic) = &mut *commit_shared.borrow_mut();
+            // Echo what the sim consumed THIS tick (the task cycle just
+            // ran) — the phase turn made the reconcile echo one tick
+            // fresher for free.
+            if let Some(s) = &commit_sink {
+                for (p, seq) in s.applied_seqs() {
+                    net.input_processed(p, seq);
+                }
+            }
+            let plist: Vec<u8> = net.peers().filter(|&p| p != RECORDER_PEER).collect();
             // Ship the whole peer→entity table in every header (same
             // bytes for all peers); sorted inside owners_set so the
             // HashMap's iteration order never reaches the wire.
-            net.owners_set(own.get().0.iter().map(|(&p, &id)| (p, id.0)).collect());
+            net.owners_set(commit_own.get().0.iter().map(|(&p, &id)| (p, id.0)).collect());
+            // RECORDING: one unbounded-budget frame per tick to disk,
+            // self-acked immediately so every frame is exactly that
+            // tick's changes and removal recycling never waits on the
+            // file. Runs after owners_set (headers must carry the
+            // table) and before the flights (same tick label).
+            if let Some((w, schema)) = &mut rec {
+                use std::io::Write;
+                if !header_done {
+                    header_done = true;
+                    let _ = w.write_all(b"PMREC\x01");
+                    let _ = w.write_all(&(pm.loop_rate as u32).to_le_bytes());
+                    let _ = w.write_all(&(schema.len() as u32).to_le_bytes());
+                    let _ = w.write_all(schema);
+                }
+                if let Some(snap) = net.snapshot_budgeted(pm, RECORDER_PEER, usize::MAX) {
+                    let label = u32::from_le_bytes(snap.bytes[0..4].try_into().unwrap());
+                    let seq = u32::from_le_bytes(snap.bytes[4..8].try_into().unwrap());
+                    let _ = w.write_all(&(snap.bytes.len() as u32).to_le_bytes());
+                    let _ = w.write_all(&snap.bytes);
+                    let _ = w.flush();
+                    net.ack(RECORDER_PEER, label, seq);
+                }
+            }
             // Multi-datagram flights (roadmap 2026-07-17): the datagram
             // is atomic in one UDP packet, so per-tick freshness scales
             // by COUNT, not size. The first send is unconditional (the
@@ -1647,24 +1931,148 @@ impl NetServer {
 }
 
 impl NetClient {
+    /// Install a REPLAY net task: read `path` (a `PMREC` file written
+    /// by the server recorder) and apply one recorded frame per sim
+    /// tick, paced by `hz` against the loop clock — the file-reading
+    /// sibling of [`connect`](NetClient::connect). `schema` is this
+    /// viewer's registered wire schema; it must equal the recording's
+    /// (byte compare, same rule as the live handshake) or this returns
+    /// a named-diff error instead of misparsing frames. Fills the same
+    /// `"net.*"` singles a live connection would (applied log, owner
+    /// table, connected flag), so presentation code can't tell the
+    /// difference.
+    pub fn replay(
+        self,
+        pm: &mut Pm,
+        path: &str,
+        hz: f32,
+        schema: &[(u8, String, usize, u64)],
+    ) -> std::io::Result<()> {
+        use std::io::Read;
+        let file = std::fs::File::open(path)?;
+        let mut r = std::io::BufReader::new(file);
+        let mut magic = [0u8; 6];
+        r.read_exact(&mut magic)?;
+        if &magic != b"PMREC\x01" {
+            return Err(std::io::Error::other("not a pm recording (bad magic)"));
+        }
+        let mut w4 = [0u8; 4];
+        r.read_exact(&mut w4)?;
+        let _recorded_rate = u32::from_le_bytes(w4); // informational
+        r.read_exact(&mut w4)?;
+        let slen = u32::from_le_bytes(w4) as usize;
+        let mut theirs = vec![0u8; slen];
+        r.read_exact(&mut theirs)?;
+        let mine = crate::transport::schema_encode(schema);
+        if theirs != mine {
+            use crate::transport::{schema_decode, schema_diff};
+            let diff = match (schema_decode(&theirs), schema_decode(&mine)) {
+                (Some(t), Some(m)) => schema_diff(&t, &m),
+                _ => "undecodable schema".into(),
+            };
+            return Err(std::io::Error::other(format!(
+                "recording schema mismatch: {diff}"
+            )));
+        }
+
+        let net = self;
+        let status = pm.single::<NetStatus>("net.status");
+        let applied = pm.single::<AppliedLog>("net.applied");
+        let step = 1.0 / hz.max(1.0);
+        let mut accum = 0.0f32;
+        // Read-ahead of one frame; `None` after EOF.
+        let mut next_frame = |r: &mut std::io::BufReader<std::fs::File>| -> Option<Vec<u8>> {
+            let mut w4 = [0u8; 4];
+            r.read_exact(&mut w4).ok()?;
+            let mut frame = vec![0u8; u32::from_le_bytes(w4) as usize];
+            r.read_exact(&mut frame).ok()?;
+            Some(frame)
+        };
+        let mut pending = next_frame(&mut r);
+        // Play label — the recorded tick currently being shown; frames
+        // apply as the label reaches them.
+        let mut play: Option<u32> = None;
+        pm.phase_present_front("net.replay", move |pm| {
+            applied.get_mut().0.clear();
+            {
+                let mut st = status.get_mut();
+                st.connected = true;
+            }
+            // Advance the play clock at the recorded cadence, whatever
+            // rate this loop renders at.
+            accum += pm.loop_dt();
+            let mut ticks = 0u32;
+            while accum >= step {
+                accum -= step;
+                ticks += 1;
+            }
+            if play.is_none() {
+                // First frame: adopt its label so playback starts at
+                // the recording's keyframe immediately.
+                play = pending
+                    .as_ref()
+                    .and_then(|f| f.get(0..4))
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                ticks = 0;
+            }
+            let Some(p) = &mut play else { return };
+            *p = p.saturating_add(ticks);
+            // Apply every frame due at (or before) the play label.
+            while let Some(frame) = &pending {
+                let label = frame
+                    .get(0..4)
+                    .map_or(u32::MAX, |b| u32::from_le_bytes(b.try_into().unwrap()));
+                if label > *p {
+                    break;
+                }
+                if let Ok(a) = net.apply(pm, frame) {
+                    let mut st = status.get_mut();
+                    st.owners = a.owners.clone();
+                    st.snapshots += 1;
+                    drop(st);
+                    applied.get_mut().0.push(a);
+                }
+                pending = next_frame(&mut r);
+                if pending.is_none() {
+                    // End of the recording: freeze the world and say so
+                    // (viewers read `ClientNet::lost`; Escape still
+                    // quits the loop the normal way).
+                    status
+                        .get_mut()
+                        .lost
+                        .get_or_insert_with(|| "replay ended".into());
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Install the client net module: moves `self` and the endpoint
     /// into a net task that pumps the wire and trades in the `"net.*"`
     /// singles (see module docs). The input channel (if registered) is
     /// sampled at a fixed `input_hz` cadence (match the server's sim
     /// rate — 60.0 for a 60 Hz server). Connection errors quit the loop.
-    pub fn connect(self, pm: &mut Pm, mut quic: QuicClient, input_hz: f32) {
+    pub fn connect(self, pm: &mut Pm, quic: QuicClient, input_hz: f32) {
         let net = self;
         let status = pm.single::<NetStatus>("net.status");
+        let commit_status = status.clone();
         let applied = pm.single::<AppliedLog>("net.applied");
         let out = pm.single::<Outbox>("net.out");
         let chan = pm.single::<ClientInputChan>("net.input").get().0.clone();
+        let commit_chan = chan.clone();
         let tune = pm.single::<LinkTune>("net.linktune");
         let mut tune_seq = 0u32;
-        let mut accum = 0.0f32;
         // Net-doctor state: (applied count, newest label) at last report.
         let mut dbg_prev = (0u32, 0u32);
         let mut dbg_newest = 0u32;
-        pm.task_add("net", NET_PRIO, 0.0, move |pm| {
+        // One NetClient + endpoint + input-cadence accumulator, shared
+        // by the two phase closures — receive/apply in PRESENT, send in
+        // COMMIT so the input the game set THIS tick leaves THIS tick
+        // (the phase turn's other reclaimed tick of latency).
+        let shared = Rc::new(RefCell::new((net, quic, 0.0f32)));
+        let commit_shared = shared.clone();
+        pm.phase_present_front("net.recv", move |pm| {
+            let (net, quic, accum) = &mut *shared.borrow_mut();
             // Live link-sim retune (telemetry knobs): seq bump = apply.
             {
                 let t = tune.get();
@@ -1695,9 +2103,6 @@ impl NetClient {
                 drop(st);
                 pm.loop_quit();
                 return;
-            }
-            if let Some(ch) = &chan {
-                ch.frame_begin();
             }
             applied.get_mut().0.clear();
             let mut snaps = quic.snapshots_drain();
@@ -1738,21 +2143,12 @@ impl NetClient {
                     st.peer = peer;
                     st.connected = true;
                 }
-                for (ty, payload) in out.get_mut().drain() {
-                    quic.event_send(ty, &payload);
-                }
-                // Fixed-cadence input: the server consumes one per
-                // sim tick, and prediction must step the same fixed
-                // dt — regardless of what rate this loop runs at.
-                accum += pm.loop_dt();
-                let step = 1.0 / input_hz;
-                while accum >= step {
-                    accum -= step;
-                    if let Some(ch) = &chan {
-                        ch.send(&mut quic);
-                    }
-                }
-                status.get_mut().input_alpha = accum * input_hz;
+                // The input-cadence clock advances in PRESENT so the
+                // render extrapolation (`input_alpha`, clamped by its
+                // readers) sees this tick's dt; the sends it schedules
+                // happen in COMMIT, after the game's input task ran.
+                *accum += pm.loop_dt();
+                status.get_mut().input_alpha = *accum * input_hz;
             }
             status.get_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
             if netdbg() && pm.tick() % 300 == 0 {
@@ -1768,6 +2164,40 @@ impl NetClient {
                 );
                 dbg_prev = (snaps, dbg_newest);
             }
+        });
+        pm.phase_commit_front("net.send", move |_pm| {
+            let (_net, quic, accum) = &mut *commit_shared.borrow_mut();
+            if quic.handshake_done().is_none() || quic.is_gone() {
+                return;
+            }
+            // Reliable events queued during this tick's tasks.
+            for (ty, payload) in out.get_mut().drain() {
+                quic.event_send(ty, &payload);
+            }
+            // Fixed-cadence input: the server consumes one per sim
+            // tick, and prediction must step the same fixed dt —
+            // regardless of what rate this loop runs at. Sent HERE,
+            // after the game's input task set this tick's pod (the
+            // predictor's replay phase runs right after and picks up
+            // the seqs these sends assign).
+            if let Some(ch) = &commit_chan {
+                ch.frame_begin();
+            }
+            let step = 1.0 / input_hz;
+            let mut ticked = false;
+            while *accum >= step {
+                *accum -= step;
+                ticked = true;
+                if let Some(ch) = &commit_chan {
+                    ch.send(quic);
+                }
+            }
+            // View pose rides the same cadence (newest-wins, so once
+            // per burst is enough).
+            if ticked && let Some(pose) = commit_status.get().view {
+                quic.view_send(pose);
+            }
+            commit_status.get_mut().input_alpha = *accum * input_hz;
         });
     }
 }

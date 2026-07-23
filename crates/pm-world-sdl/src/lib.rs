@@ -1,5 +1,5 @@
-//! SDL-side companions to the pm kernel: sprite loading with mtime
-//! hot-reload and TTF text rendering. A separate crate (not a pm cargo
+//! SDL-side companions to the pm kernel: windowing, the gpu3d
+//! renderer, audio, glTF models, and TTF text. A separate crate (not a pm cargo
 //! feature) so `pm` itself compiles exactly one way — mods link the
 //! same pm as the host no matter how the game is built.
 //!
@@ -12,11 +12,9 @@ pub mod audio;
 mod font;
 pub mod gpu3d;
 pub mod model;
-mod sprite;
 
 pub use audio::{Audio, Clip};
 pub use font::{Font, Raster};
-pub use sprite::Sprite;
 
 /// The windowed-client opening ceremony, in one call: SDL init, a
 /// centered window, the event pump, and the display's measured refresh

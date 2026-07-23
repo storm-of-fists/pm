@@ -18,6 +18,9 @@ struct Pos {
     y: f32,
 }
 
+// Unhashed schema identity for the handshake bound (test pod).
+impl crate::PodSchema for Pos {}
+
 fn server_client_pair() -> (Pm, NetServer, Pm, NetClient) {
     let mut server = Pm::new();
     let s_pos = server.pool::<Pos>("pos");
@@ -684,6 +687,9 @@ struct QPos {
     x: f32,
     y: f32,
 }
+
+// Unhashed schema identity for the handshake bound (test pod).
+impl crate::PodSchema for QPos {}
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]

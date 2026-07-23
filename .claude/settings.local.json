@@ -116,7 +116,27 @@
       "Bash(python3 /tmp/claude-1000/-home-clatham-pm/07156d95-7d5b-4f7a-a895-12da1f123343/scratchpad/cut_common.py)",
       "Bash(python3 /tmp/claude-1000/-home-clatham-pm/07156d95-7d5b-4f7a-a895-12da1f123343/scratchpad/cut_common.py --write)",
       "Bash(awk -F: '$2 > 1320 && $2 < 1440')",
-      "Bash(awk -F': ' '{print $2}')"
+      "Bash(awk -F': ' '{print $2}')",
+      "Bash(awk '{a+=$1; d+=$2} END {print \"added\", a, \"deleted\", d}')",
+      "Bash(awk '{ *)",
+      "Bash(awk '{a+=$1; d+=$2; printf \"%-40s +%s -%s\\\\n\", $3, $1, $2} END {print \"TOTAL +\"a\" -\"d\" \\(net \"a-d\"\\)\"}')",
+      "Bash(awk 'NR>=107 && /^\\\\}/{print NR; exit}' examples/hogs/sim/src/lib.rs)",
+      "Bash(grep -oE \"trait bound \\\\`[a-zA-Z_:]+: PodSchema\")",
+      "Bash(awk -F: '{print $1}')",
+      "Bash(awk -F: '{print $1\":\"$2}')",
+      "Bash(awk -F'[:. ]+' '{print $4}')",
+      "Bash(grep -oE \"cannot find value \\\\`[A-Z_]+\")",
+      "Bash(sort -u -t: -k1,1 -k2,2n)",
+      "Bash(awk -F: '$2<633')",
+      "Bash(awk -F: '$1>420 && $1<720')",
+      "Bash(awk -F: '$1>520 && $1<560 || $1>1050 && $1<1130 || $1>1300 && $1<1350 || $1>1650 && $1<1730')",
+      "Bash(awk 'NR>=1300 && NR<=1352 && \\(/task!/ || /let p = /\\)' examples/hogs/src/server.rs)",
+      "Bash(awk -F: '$1>1880')",
+      "Bash(awk 'NR>=1880 && NR<=1920' examples/hogs/src/server.rs)",
+      "Bash(awk -F: '$1>1700')",
+      "Bash(awk 'NR<=1897 && /task!/ {last=NR} END {print last}' examples/hogs/src/server.rs)",
+      "Bash(sed -n \"$\\(awk 'NR<=1897 && /task!/ {last=NR} END {print last}' examples/hogs/src/server.rs\\),+8p\" examples/hogs/src/server.rs)",
+      "Bash(awk '{s+=$4} END {print \"total passed:\", s}')"
     ],
     "defaultMode": "bypassPermissions"
   }

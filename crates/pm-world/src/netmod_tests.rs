@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::net::{NetClient, NetServer, Outbox};
-use crate::netmod::{PeerEvents, PeerStats, ServerEvents, ServerOwn, input_rx};
+use crate::netmod::{PeerEvents, PeerStats, ServerEvents, ServerOwn, input_rx, pool_expire};
 use crate::transport::{QuicClient, QuicServer};
 use crate::{Id, Pm};
 
@@ -23,11 +23,17 @@ struct Pos {
     y: f32,
 }
 
+// Unhashed schema identity for the handshake bound (test pod).
+impl crate::PodSchema for Pos {}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct Cmd {
     dx: f32,
 }
+
+// Unhashed schema identity for the handshake bound (test pod).
+impl crate::PodSchema for Cmd {}
 
 #[derive(Default)]
 struct Garage(HashMap<u8, Id>);
@@ -201,15 +207,16 @@ fn ttl_pool_expires_stale_entries() {
     );
 }
 
-/// `history_pool` frames carry the snapshot label convention (`tick - 1`):
-/// the frame labeled T holds the state the tick-T snapshot packed. The
-/// window clamps — a rewind past its edges gets the nearest kept frame.
+/// journal frames carry the snapshot label convention (`tick`, since
+/// the phase turn): the frame labeled T holds tick T's FINAL state —
+/// exactly what the tick-T snapshot packed in the same commit phase.
+/// The window clamps — a rewind past its edges gets the nearest frame.
 #[test]
-fn history_pool_rewinds_past_ticks() {
+fn journal_rewinds_past_ticks() {
     let mut pm = Pm::server("127.0.0.1:0");
     pm.loop_rate = 60;
     let pool = pm.sync_pool::<Pos>("pos");
-    let hist = pm.history_pool(&pool, 0.5); // 30 frames
+    let hist = pm.journal_pool(&pool, 0.5); // 30 frames
 
     let id = pm.id_add();
     pool.get_mut().add(id, Pos::default());
@@ -219,13 +226,12 @@ fn history_pool_rewinds_past_ticks() {
         }
         pm.loop_once(DT);
     }
-    // The kernel is born at tick 1, so iteration i runs as tick i+2 and
-    // the frame it records is labeled i+1 holding x == i: frame L reads
-    // L-1 — exactly the state a snapshot labeled L would have packed
-    // (both copy the pool as the tick begins).
+    // The kernel is born at tick 1, so iteration i (which set x == i)
+    // runs as tick i+2 and its COMMIT records the frame labeled i+2
+    // holding x == i: frame L reads L-2.
     let probe = |label: u32| hist.frame(label).expect("frame")[0].1.x;
-    assert_eq!(probe(35), 34.0, "exact rewind");
-    assert_eq!(probe(12), 11.0, "exact rewind near the window edge");
+    assert_eq!(probe(35), 33.0, "exact rewind");
+    assert_eq!(probe(12), 10.0, "exact rewind at the window edge");
     assert_eq!(probe(0), 10.0, "older than the window clamps to oldest");
     assert_eq!(probe(1000), 39.0, "future clamps to newest");
 }
@@ -317,3 +323,133 @@ fn ownership_auto_clears_after_leave_tick() {
         spm.task_faults()
     );
 }
+
+/// Record → replay roundtrip (v2 item 2, recordings): a server records
+/// its session to disk (keyframe-then-deltas by construction — the
+/// recorder is a fresh virtual peer); a replay client with the same
+/// schema plays the file back through the normal apply path and ends
+/// up with the same world, removals included. The replay clock paces
+/// one recorded tick per `1/hz` seconds of loop time.
+#[test]
+fn record_replay_roundtrip() {
+    let path = std::env::temp_dir().join(format!("pm-rec-test-{}.pmrec", std::process::id()));
+    let path_s = path.to_str().unwrap().to_string();
+
+    // --- recording server: three entities, motion, one mid-run removal.
+    let (a, b, c);
+    {
+        let mut spm = Pm::new();
+        let s_pos = spm.pool::<Pos>("pos");
+        let mut snet = NetServer::new(&mut spm);
+        snet.pool_sync("pos", &s_pos);
+        let w = std::io::BufWriter::new(std::fs::File::create(&path).expect("create"));
+        snet.record_to(w, crate::transport::schema_encode(&snet.schema()));
+        let squic = QuicServer::bind("127.0.0.1:0", &snet.schema()).expect("bind");
+        snet.serve(&mut spm, squic);
+
+        a = spm.id_add();
+        b = spm.id_add();
+        c = spm.id_add();
+        for (i, id) in [a, b, c].into_iter().enumerate() {
+            s_pos.get_mut().add(id, Pos { x: i as f32, y: 0.0 });
+        }
+        for tick in 0..40 {
+            for id in [a, b, c] {
+                if let Some(mut p) = s_pos.get_mut().get_mut(id) {
+                    p.y += 1.0;
+                }
+            }
+            if tick == 20 {
+                s_pos.get_mut().remove(b);
+                spm.id_remove(b);
+            }
+            spm.loop_once(DT);
+        }
+        assert!(
+            spm.task_faults().is_empty(),
+            "server task faults: {:?}",
+            spm.task_faults()
+        );
+        // Dropping the server drops the net task and its BufWriter —
+        // but frames were flushed per tick, so the file is complete.
+    }
+
+    // --- replay viewer: same schema, applies the file on the tick clock.
+    let mut cpm = Pm::new();
+    let c_pos = cpm.pool::<Pos>("pos");
+    let mut cnet = NetClient::new();
+    cnet.pool_sync("pos", &c_pos);
+    let schema = cnet.schema();
+    cnet.replay(&mut cpm, &path_s, 1.0 / DT, &schema)
+        .expect("replay open");
+    // 40 recorded ticks + slack; each loop tick advances one play tick.
+    for _ in 0..60 {
+        cpm.loop_once(DT);
+    }
+    assert!(
+        cpm.task_faults().is_empty(),
+        "replay task faults: {:?}",
+        cpm.task_faults()
+    );
+
+    let pos = c_pos.get();
+    assert_eq!(pos.len(), 2, "replay ends with a and c alive");
+    // 40 writes of +1.0 on top of the initial row (b removed at 20).
+    assert_eq!(pos.get(a), Some(&Pos { x: 0.0, y: 40.0 }));
+    assert_eq!(pos.get(c), Some(&Pos { x: 2.0, y: 40.0 }));
+    assert_eq!(pos.get(b), None, "recorded removal replays");
+    assert!(!cpm.id_alive(b), "removal releases the id on the viewer");
+
+    // Schema drift is rejected with a named diff, like a live connect.
+    let mut xpm = Pm::new();
+    let x_other = xpm.pool::<Pos>("other");
+    let mut xnet = NetClient::new();
+    xnet.pool_sync("other", &x_other);
+    let xschema = xnet.schema();
+    let err = xnet
+        .replay(&mut xpm, &path_s, 1.0 / DT, &xschema)
+        .expect_err("mismatched schema must not play");
+    assert!(
+        err.to_string().contains("'other'"),
+        "diff names the channel: {err}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// Relocated from journal.rs when TTL moved out (they were never siblings).
+#[test]
+fn expire_removes_after_ttl_and_refreshes_on_write() {
+    #[derive(Clone, Copy)]
+    struct P(f32);
+
+    let mut pm = Pm::new();
+    let pool = pm.pool::<P>("p");
+    pm.task_add("ttl", 5.0, 0.0, {
+        let pool = pool.clone();
+        move |pm| pool_expire(pm, &pool, 5)
+    });
+
+    let a = pm.id_add();
+    let b = pm.id_add();
+    pool.get_mut().add(a, P(0.0));
+    pool.get_mut().add(b, P(0.0));
+    for i in 0..4 {
+        // Keep writing `b`: its TTL clock restarts every write.
+        if let Some(mut e) = pool.get_mut().get_mut(b) {
+            e.0 = i as f32;
+        }
+        pm.loop_once(1.0 / 60.0);
+    }
+    assert!(pool.get().contains(a), "still inside ttl");
+    for _ in 0..4 {
+        pm.loop_once(1.0 / 60.0);
+    }
+    assert!(!pool.get().contains(a), "expired after ttl ticks");
+    assert!(pool.get().contains(b), "writes refreshed b's ttl");
+    assert!(
+        !pm.id_alive(a),
+        "expiry removes the entity, not just the entry"
+    );
+}
+

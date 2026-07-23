@@ -55,7 +55,7 @@ fn truck_slides_more_when_boosting() {
 
 #[test]
 fn heli_hovers_hands_off() {
-    let mut h = spawn_heli(1);
+    let mut h = spawn_heli(1, &Params::default());
     h.body.pos.y = 20.0;
     for _ in 0..300 {
         heli_step(&mut h, Drive::default(), DT, &pp());
@@ -92,9 +92,9 @@ fn truck_turret_slews_elevates_and_clamps() {
         truck_step(&mut t, cmd, DT, &p);
     }
     assert!((t.aim - 0.5).abs() < 1e-4, "azimuth converges on the command");
-    assert_eq!(t.aim_pitch, TRUCK_AIM_UP, "elevation clamps at the stop");
+    assert_eq!(t.aim_pitch, p.truck_aim_up, "elevation clamps at the stop");
     let (_, my, _, dir, climb) = truck_muzzle(&t);
-    assert_eq!(climb, TRUCK_AIM_UP, "the shot flies the aimed line");
+    assert_eq!(climb, p.truck_aim_up, "the shot flies the aimed line");
     assert!(
         my > 1.45,
         "an elevated barrel's muzzle rises off the flat height, got {my}"
@@ -107,12 +107,12 @@ fn truck_turret_slews_elevates_and_clamps() {
     for _ in 0..120 {
         truck_step(&mut t, Drive { aim_pitch: -2.0, ..Default::default() }, DT, &p);
     }
-    assert_eq!(t.aim_pitch, -TRUCK_AIM_DOWN, "depression stop is asymmetric");
+    assert_eq!(t.aim_pitch, -p.truck_aim_down, "depression stop is asymmetric");
 }
 
 #[test]
 fn heli_chin_gun_gimbals_and_clamps() {
-    let mut h = spawn_heli(1);
+    let mut h = spawn_heli(1, &Params::default());
     h.body.pos.y = 10.0;
     let cmd = Drive {
         aim: 0.8,
@@ -121,7 +121,7 @@ fn heli_chin_gun_gimbals_and_clamps() {
     };
     heli_step(&mut h, cmd, DT, &pp());
     assert_eq!(h.aim, 0.8, "azimuth is a crisp copy");
-    assert_eq!(h.aim_pitch, -HELI_AIM_PITCH, "elevation clamps at the stop");
+    assert_eq!(h.aim_pitch, -pp().heli_aim_pitch, "elevation clamps at the stop");
     let (_, _, _, dir, climb) = heli_muzzle(&h);
     assert!(
         wrap_angle(dir - 0.8).abs() < 0.05,
@@ -135,7 +135,7 @@ fn heli_chin_gun_gimbals_and_clamps() {
 
 #[test]
 fn heli_full_tilt_cruises_fast_but_capped() {
-    let mut h = spawn_heli(1);
+    let mut h = spawn_heli(1, &Params::default());
     h.body.pos.y = 20.0;
     let cmd = Drive {
         pitch: 1.0,
@@ -145,9 +145,10 @@ fn heli_full_tilt_cruises_fast_but_capped() {
         heli_step(&mut h, cmd, DT, &pp());
     }
     let hs = (h.body.vel.x * h.body.vel.x + h.body.vel.z * h.body.vel.z).sqrt();
+    let vcap = pp().heli_vcap;
     assert!(
-        hs > 20.0 && hs <= HELI_VCAP + 0.1,
-        "full nose-down should cruise 20..{HELI_VCAP} u/s, got {hs}"
+        hs > 20.0 && hs <= vcap + 0.1,
+        "full nose-down should cruise 20..{vcap} u/s, got {hs}"
     );
     assert!(
         (h.body.pos.y - 20.0).abs() < 2.0,

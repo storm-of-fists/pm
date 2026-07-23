@@ -23,6 +23,9 @@ struct Critter {
     tag: [u8; 4],
 }
 
+// Unhashed schema identity for the handshake bound (test pod).
+impl pm::PodSchema for Critter {}
+
 #[test]
 fn repr_is_packed_and_small() {
     // i16 + i16 + i16 + u8 + u32 + [u8; 4] = 15 B, no padding.

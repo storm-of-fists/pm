@@ -53,11 +53,10 @@ pub const ARENA: f32 = 100.0;
 //   scale is a handshake fact, not a feel knob).
 // - CLIENT-COSMETIC knobs — day length, link sim. Live-tunable per
 //   client via the telemetry node; per-client state, not shared truth.
-// - CREATION-FROZEN config — the interp delay: baked into pool
-//   registration at connect. A param must be hot-readable; interp
-//   needed a reconnect story first (which LANDED 2026-07-22 — the
-//   redial loop rebuilds every registration, so interp-as-param is
-//   now merely queued work, not blocked).
+// - CREATION-FROZEN config — DONE 2026-07-23: the interp delay is the
+//   `interp_ms` param now (the redial loop rebuilds registrations, so
+//   a new value takes effect per session; the server rewind reads it
+//   live). The category is empty — it was only ever this one value.
 // - SHARED-STEP constants (`vmax`, grips, heli thrust…) ARE params:
 //   the steps take `&Params` and each end reads its copy.
 //
@@ -204,7 +203,101 @@ pm_control_core::pm_params! {
         pub heli_t_max: 34.0 in 10.0..80.0,
         /// Tail-rotor yaw rate (rad/s).
         pub heli_yaw: 1.9 in 0.5..5.0,
+        /// Remote interpolation delay, ms — ONE replicated number for
+        /// the whole lag-comp contract: clients render remotes this far
+        /// behind, the server rewinds exactly this far to judge their
+        /// shots ([`interp_ticks`]). Formerly the INTERP_DELAY const +
+        /// PM_INTERP_MS env folklore; 33 is the played-in default
+        /// (2026-07-18, lag=80/loss=3%: "fixed nearly everything" vs
+        /// 50). Try 200: soup, but shots land. Try 8: fresh but
+        /// strobing under loss. A choice, not a law. Takes effect per
+        /// session (interp buffers capture it at install).
+        pub interp_ms: 33.0 in 0.0..200.0,
+        // --- THE PARAMS SWEEP batch 1 (2026-07-23): everything below
+        // was a `pub const` wearing tuning clothing; the const/param
+        // split is FINAL (see common.rs) — consts are for enum
+        // discriminants, determinism anchors (FIXED_DT/SIM_VERSION),
+        // authored geometry (hull radii, BUILDINGS, LEVELS), and
+        // invocation identity. Values are the played-in defaults.
+        /// Steering filter time constant, s (bots lag the wheel more).
+        pub steer_tau: 0.18 in 0.02..1.0,
+        /// Turret azimuth stops, rad each side of forward.
+        pub aim_max: 2.6 in 0.5..3.14,
+        /// Truck turret elevation stops, rad (asymmetric on purpose:
+        /// flyers overhead beat ditch-aiming).
+        pub truck_aim_up: 0.9 in 0.1..1.5,
+        pub truck_aim_down: 0.35 in 0.0..1.0,
+        /// Heli fly-by-wire attitude filter gain.
+        pub heli_att_k: 5.0 in 1.0..15.0,
+        /// Commanded attitude limits, rad.
+        pub heli_pitch_max: 0.70 in 0.1..1.2,
+        pub heli_roll_max: 0.50 in 0.1..1.2,
+        /// Chin-gun elevation gimbal, rad each way.
+        pub heli_aim_pitch: 1.0 in 0.2..1.5,
+        /// Horizontal / vertical drag while flying.
+        pub heli_hdrag: 0.28 in 0.0..2.0,
+        pub heli_vdrag: 1.6 in 0.0..4.0,
+        /// Horizontal speed cap, u/s.
+        pub heli_vcap: 34.0 in 5.0..80.0,
+        /// Skid height when landed / hard altitude ceiling (the hog
+        /// refuge band lives between `heli_ceil` and flyer shed).
+        pub heli_ground: 0.6 in 0.1..2.0,
+        pub heli_ceil: 45.0 in 10.0..120.0,
+        /// Gravity, u/s² — arcade knob, not physics dogma.
+        pub gravity: 9.81 in 1.0..30.0,
+        /// Vehicle/NPC hit points (hp scale is 1.0 = one cannon hit
+        /// per `gun_dmg` 0.5 ≈ two hits).
+        pub truck_hp: 1.0 in 0.2..10.0,
+        pub hog_hp: 1.0 in 0.1..10.0,
+        pub flyer_hp: 0.5 in 0.1..5.0,
+        pub depot_hp: 6.0 in 1.0..50.0,
+        pub boss_hp: 30.0 in 5.0..200.0,
+        /// Boss render/collider scale and its low-hp growl growth.
+        pub boss_scale: 3.0 in 1.0..8.0,
+        pub boss_grow: 1.4 in 1.0..3.0,
+        /// Hog/flyer turn rates (rad/s) and the roam goal re-pick, s.
+        pub hog_turn: 2.6 in 0.5..8.0,
+        pub flyer_turn: 2.2 in 0.5..8.0,
+        pub roam_repick: 9.0 in 1.0..30.0,
+        /// Flyer climb rate (u/s), 3D aggro radius, and bite reach.
+        pub flyer_climb: 7.0 in 1.0..20.0,
+        pub flyer_aggro: 45.0 in 5.0..120.0,
+        pub flyer_reach: 1.3 in 0.5..4.0,
+        /// Gunner-hog shoulder gun: bullet travel (u), spread (rad),
+        /// muzzle height (u).
+        pub hoggun_travel: 32.0 in 5.0..100.0,
+        pub hoggun_spread: 0.14 in 0.0..0.5,
+        pub hoggun_y: 0.6 in 0.1..2.0,
+        /// Mission brief hold, s; impact marker lifetime, s.
+        pub brief_secs: 5.0 in 0.0..30.0,
+        pub impact_ttl: 1.0 in 0.2..5.0,
+        /// Reconnect window, s — peer id + parked vehicle survive this
+        /// long (one clock: engine grace, roster parking, the client's
+        /// give-up timer and token-file freshness).
+        pub reconnect_grace: 20.0 in 0.0..120.0,
+        /// Interp extrapolation cap, ms (rides loss bursts; was the
+        /// PM_EXTRAP_MS env).
+        pub extrap_ms: 50.0 in 0.0..200.0,
+        /// Day-night cycle length, s (cosmetic sky time — shared so a
+        /// squad sees one sky; was the `day=` arg + Tune single).
+        pub day_secs: 480.0 in 10.0..3600.0,
     }
+}
+
+/// The interp delay in whole sim ticks — what the server subtracts from
+/// a peer's acked tick to find the tick that peer was *seeing* (the
+/// client hands the same param, in seconds, to `interp_pool`).
+pub fn interp_ticks(p: &Params) -> u32 {
+    (p.interp_ms / 1000.0 / FIXED_DT).round() as u32
+}
+
+/// Handshake schema identity for the params pod (`pm_params!` can't
+/// emit this itself — pm-control-core stays engine-free): hash the
+/// macro's generated field descriptor, so a client whose param LIST
+/// drifted from the server's fails the connect with a named diff
+/// instead of misreading the replica.
+impl pm::PodSchema for Params {
+    const SCHEMA_HASH: u64 = pm::schema_hash_str(Params::SCHEMA);
 }
 
 // --- the predicted pods ------------------------------------------------------
@@ -224,11 +317,13 @@ pub struct Truck {
     /// Turret angle relative to heading (the mouse-aim seam). Evolved
     /// by `truck_step` from the command frame like everything else, so
     /// it predicts and replicates for free — remote players see your
-    /// turret swing.
-    #[lerp(angle)]
+    /// turret swing. NOT `#[lerp(angle)]`: a clamped gimbal isn't
+    /// cyclic — the barrel physically slews through ZERO between the
+    /// stops, so remote interpolation must too (lerp_angle sent a
+    /// −2.5→2.5 flick the short way through the BACK, through the
+    /// stops; caught watching bot turrets, 2026-07-23).
     pub aim: f32,
-    #[lerp(angle)]
-    /// Turret ELEVATION off level, −TRUCK_AIM_DOWN..TRUCK_AIM_UP — the
+    /// Turret ELEVATION off level, −p.truck_aim_down..p.truck_aim_up — the
     /// heli chin gun's law on the same mouse-y axis (added 2026-07-22:
     /// flat-only trucks had no answer to the flock). Evolved by
     /// `truck_step`; the barrel visibly elevates on every client.
@@ -268,13 +363,13 @@ impl Truck {
 pub struct Heli {
     pub body: Body,
     /// Chin-gun gimbal, relative to the airframe: azimuth off the nose
-    /// (±AIM_MAX — the truck turret's law) and elevation off level
-    /// (±HELI_AIM_PITCH). Evolved by `heli_step` from the command like
+    /// (±p.aim_max — the truck turret's law) and elevation off level
+    /// (±p.heli_aim_pitch). Evolved by `heli_step` from the command like
     /// every predicted field, so it replicates for free — remote
     /// players watch a heli's gun train around under a steady nose.
-    #[lerp(angle)]
+    /// NOT `#[lerp(angle)]` — clamped gimbals, not cyclic; the
+    /// through-zero rule on `Truck::aim` applies to both axes here.
     pub aim: f32,
-    #[lerp(angle)]
     pub aim_pitch: f32,
 }
 
@@ -288,7 +383,7 @@ pub struct Drive {
     pub thrust: f32, // -1..1 (truck only)
     pub turn: f32,   // -1..1: steer (truck) / yaw (heli)
     pub fire: f32,   // 0/1: trigger held
-    pub aim: f32,    // turret angle relative to heading, +-AIM_MAX (truck only)
+    pub aim: f32,    // turret angle relative to heading, +-p.aim_max (truck only)
     pub boost: f32,  // 0/1: burn heat for speed (truck only)
     pub bot: f32,    // 0/1: AI controller — its steering lags
     // Heli axes, dead weight in a truck. ONE continuous channel per
@@ -297,8 +392,8 @@ pub struct Drive {
     // will eventually own (per-vehicle key contexts live client-side).
     pub pitch: f32, // -1..1: nose down (forward) / up (heli only)
     pub lift: f32,  // -1..1: collective climb / descend (heli only)
-    /// Gun elevation off level — the heli chin gun (±HELI_AIM_PITCH)
-    /// AND the truck turret (−TRUCK_AIM_DOWN..TRUCK_AIM_UP; each step
+    /// Gun elevation off level — the heli chin gun (±p.heli_aim_pitch)
+    /// AND the truck turret (−p.truck_aim_down..p.truck_aim_up; each step
     /// clamps its own stops). Azimuth shares `aim` the same way. Same
     /// client-side hold/ease-back animation, streamed as absolute
     /// angles.
@@ -312,49 +407,14 @@ pub struct Drive {
 // control internals whose live mutation would be meaningless or break
 // contracts (the param-vs-const taxonomy on the Params declaration).
 
-/// Gravity (also the heli's hover-trim baseline).
-pub const G: f32 = 9.81;
 /// Truck body radius — the shared step's building-push circle.
 /// Prediction replays the step byte-exact on both ends, so this stays
 /// a CONST, never model-derived; the bullet/bite capsule lives in the
 /// truck model's `collide.body` box instead (models.rs).
 pub const TRUCK_R: f32 = 0.9;
-/// Steering control-lag time constant for bot drivers (seconds).
-pub const STEER_TAU: f32 = 0.18;
-/// Turret swing limit either side of straight ahead.
-pub const AIM_MAX: f32 = 2.6;
-/// Turret elevation stops: real-tank asymmetry — plenty of sky (a
-/// flyer at `flyer_ceil` inside gun range needs ~0.55), little
-/// depression (flat shots already connect on the deck via `HOG_H`).
-pub const TRUCK_AIM_UP: f32 = 0.9;
-pub const TRUCK_AIM_DOWN: f32 = 0.35;
 
 // --- helicopter tuning -------------------------------------------------------
 
-/// How hard the heli cyclic chases the stick (1/s) — attitude is still
-/// first-order servo'd; the FORCES are honest.
-pub const HELI_ATT_K: f32 = 5.0;
-/// Attitude limits: pitch tilts up to ~40°, banks up to ~29°. Tilt is
-/// the throttle now (it vectors the rotor), so the nose gets more range
-/// than the old cosmetic lean.
-pub const HELI_PITCH_MAX: f32 = 0.70;
-pub const HELI_ROLL_MAX: f32 = 0.50;
-/// Chin-gun elevation limit either side of level (~57°) — steep enough
-/// to hover flat and strafe the deck, or to track a flyer overhead.
-/// Azimuth shares the truck turret's `AIM_MAX`.
-pub const HELI_AIM_PITCH: f32 = 1.0;
-/// Airframe drag, split by axis: the rotor disc brakes horizontal
-/// motion gently (full nose-down cruises ≈ 30 u/s — still the fastest
-/// thing in the arena), induced drag damps vertical (this is what makes
-/// centered-stick hover settle instead of bobbing).
-pub const HELI_HDRAG: f32 = 0.28;
-pub const HELI_VDRAG: f32 = 1.6;
-/// Hard horizontal airspeed cap (advancing-blade limit, flavor-wise):
-/// full collective + full tilt would otherwise run away.
-pub const HELI_VCAP: f32 = 34.0;
-/// Altitude band: skid height when landed, hard ceiling.
-pub const HELI_GROUND: f32 = 0.6;
-pub const HELI_CEIL: f32 = 45.0;
 /// Hull circle for the shared step's building pushes (prediction
 /// replays it — stays a const, same rule as `TRUCK_R`). The stage-4
 /// hitbox parts (cabin/tail/rotor) are `collide.*` boxes in the heli
@@ -418,48 +478,14 @@ pub fn in_building(x: f32, z: f32, pad: f32) -> bool {
 /// Push a circle at `(x, z)` radius `r` out of every building it
 /// overlaps. Returns the corrected position and the last push normal
 /// (zero if nothing touched) — callers use the normal to scrub speed
-/// (trucks) or slide the heading along the wall (hogs).
+/// (trucks) or slide the heading along the wall (hogs). Ground level is
+/// altitude 0: no roof sits below it, so the roofline skip never fires
+/// and this IS `building_push_below` at y = 0 — same compiled math, so
+/// prediction byte-exactness survives (the golden replays pin it).
 pub fn building_push(x: f32, z: f32, r: f32) -> (f32, f32, f32, f32) {
-    let (mut x, mut z) = (x, z);
-    let (mut nx, mut nz) = (0.0, 0.0);
-    for &(bx, bz, hw, hd, _) in &BUILDINGS {
-        // Closest point on the box to the circle center.
-        let cx = x.clamp(bx - hw, bx + hw);
-        let cz = z.clamp(bz - hd, bz + hd);
-        let (dx, dz) = (x - cx, z - cz);
-        let d2 = dx * dx + dz * dz;
-        if d2 >= r * r {
-            continue;
-        }
-        if d2 > 1e-8 {
-            // Center outside the box: push straight away from the wall.
-            let d = d2.sqrt();
-            nx = dx / d;
-            nz = dz / d;
-            x = cx + nx * r;
-            z = cz + nz * r;
-        } else {
-            // Center INSIDE the box (tunneled): exit by the nearest face.
-            let ex = hw + r - (x - bx).abs();
-            let ez = hd + r - (z - bz).abs();
-            if ex < ez {
-                nx = (x - bx).signum();
-                nz = 0.0;
-                x = bx + nx * (hw + r);
-            } else {
-                nx = 0.0;
-                nz = (z - bz).signum();
-                z = bz + nz * (hd + r);
-            }
-        }
-    }
-    (x, z, nx, nz)
+    building_push_below(x, z, r, 0.0)
 }
 
-// TODO(refactor): building_push IS building_push_below at y = 0 (no
-// roof sits below 0, so the skip never fires) — delegate one to the
-// other and delete the copied body; same compiled math, so prediction
-// byte-exactness survives.
 /// `building_push` for something at altitude `y`: only buildings whose
 /// roof is above you shove the hull — above the roofline you overfly.
 /// Same closest-point math so ground-level callers stay byte-identical.
@@ -582,7 +608,7 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
     let speed = t.speed();
 
     if cmd.bot > 0.5 {
-        let k = 1.0 - (-dt / STEER_TAU).exp();
+        let k = 1.0 - (-dt / p.steer_tau).exp();
         t.steer += (cmd.turn - t.steer) * k;
     } else {
         t.steer = cmd.turn;
@@ -593,9 +619,9 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
     // commands reproduces the chase exactly. No wrap handling needed:
     // the stops mean the short way is always through zero.
     let slew = p.turret_rate * dt;
-    let want = cmd.aim.clamp(-AIM_MAX, AIM_MAX);
+    let want = cmd.aim.clamp(-p.aim_max, p.aim_max);
     t.aim += (want - t.aim).clamp(-slew, slew);
-    let want = cmd.aim_pitch.clamp(-TRUCK_AIM_DOWN, TRUCK_AIM_UP);
+    let want = cmd.aim_pitch.clamp(-p.truck_aim_down, p.truck_aim_up);
     t.aim_pitch += (want - t.aim_pitch).clamp(-slew, slew);
     // Boost: extra shove and a higher ceiling, paid in heat. Heat is
     // predicted state (this is THE shared step), so the client's meter
@@ -687,8 +713,8 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
     // Chin gun: crisp copy of the commanded gimbal, the truck turret's
     // law — the client animates the hold and the ease-back, so replay
     // reproduces it exactly.
-    h.aim = cmd.aim.clamp(-AIM_MAX, AIM_MAX);
-    h.aim_pitch = cmd.aim_pitch.clamp(-HELI_AIM_PITCH, HELI_AIM_PITCH);
+    h.aim = cmd.aim.clamp(-p.aim_max, p.aim_max);
+    h.aim_pitch = cmd.aim_pitch.clamp(-p.heli_aim_pitch, p.heli_aim_pitch);
     let b = &mut h.body;
 
     // Attitude on the quat via the constrained-vehicle path: extract,
@@ -696,9 +722,9 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
     // and roll ease toward the stick (yaw input banks the roll).
     let (yaw0, pitch0, roll0) = b.rot.to_yaw_pitch_roll();
     let yaw = wrap_angle(yaw0 + cmd.turn * p.heli_yaw * dt);
-    let k = 1.0 - (-HELI_ATT_K * dt).exp();
-    let pitch = pitch0 + (cmd.pitch.clamp(-1.0, 1.0) * HELI_PITCH_MAX - pitch0) * k;
-    let roll = roll0 + (-cmd.turn.clamp(-1.0, 1.0) * HELI_ROLL_MAX - roll0) * k;
+    let k = 1.0 - (-p.heli_att_k * dt).exp();
+    let pitch = pitch0 + (cmd.pitch.clamp(-1.0, 1.0) * p.heli_pitch_max - pitch0) * k;
+    let roll = roll0 + (-cmd.turn.clamp(-1.0, 1.0) * p.heli_roll_max - roll0) * k;
     b.rot = Quat::from_yaw_pitch_roll(yaw, pitch, roll).norm();
 
     // Main rotor: ONE thrust vector along body-up, against real gravity.
@@ -711,15 +737,15 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
     // attitude, a hard dive costs you climb authority — the machine has
     // momentum and a weight now, not axes.
     let up = b.up();
-    let trim = G / up.y.clamp(0.6, 1.0);
+    let trim = p.gravity / up.y.clamp(0.6, 1.0);
     let thrust = (trim + cmd.lift.clamp(-1.0, 1.0) * p.heli_lift).clamp(0.0, p.heli_t_max);
-    b.vel.x = (b.vel.x + up.x * thrust * dt) * (1.0 - HELI_HDRAG * dt);
-    b.vel.z = (b.vel.z + up.z * thrust * dt) * (1.0 - HELI_HDRAG * dt);
-    b.vel.y = (b.vel.y + (up.y * thrust - G) * dt) * (1.0 - HELI_VDRAG * dt);
+    b.vel.x = (b.vel.x + up.x * thrust * dt) * (1.0 - p.heli_hdrag * dt);
+    b.vel.z = (b.vel.z + up.z * thrust * dt) * (1.0 - p.heli_hdrag * dt);
+    b.vel.y = (b.vel.y + (up.y * thrust - p.gravity) * dt) * (1.0 - p.heli_vdrag * dt);
     // Advancing-blade cap: full collective + full tilt can't run away.
     let h2 = b.vel.x * b.vel.x + b.vel.z * b.vel.z;
-    if h2 > HELI_VCAP * HELI_VCAP {
-        let s = HELI_VCAP / h2.sqrt();
+    if h2 > p.heli_vcap * p.heli_vcap {
+        let s = p.heli_vcap / h2.sqrt();
         b.vel.x *= s;
         b.vel.z *= s;
     }
@@ -727,13 +753,13 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
 
     // Altitude band: skids on the deck (extra drag — parked, not
     // sliding), hard ceiling.
-    if b.pos.y <= HELI_GROUND {
-        b.pos.y = HELI_GROUND;
+    if b.pos.y <= p.heli_ground {
+        b.pos.y = p.heli_ground;
         b.vel.y = b.vel.y.max(0.0);
         b.vel.x *= 1.0 - 3.0 * dt;
         b.vel.z *= 1.0 - 3.0 * dt;
-    } else if b.pos.y >= HELI_CEIL {
-        b.pos.y = HELI_CEIL;
+    } else if b.pos.y >= p.heli_ceil {
+        b.pos.y = p.heli_ceil;
         b.vel.y = b.vel.y.min(0.0);
     }
     // Arena walls stop you in the air too (biomod containment field).
@@ -776,10 +802,10 @@ pub fn spawn_truck(peer: u8) -> Truck {
 }
 
 /// Helipad row behind the truck slots, skids down, facing in.
-pub fn spawn_heli(peer: u8) -> Heli {
+pub fn spawn_heli(peer: u8, p: &Params) -> Heli {
     Heli {
         body: Body {
-            pos: vec3((peer as f32 - 4.5) * 5.0, HELI_GROUND, -ARENA + 2.5),
+            pos: vec3((peer as f32 - 4.5) * 5.0, p.heli_ground, -ARENA + 2.5),
             ..Body::default()
         },
         ..Heli::default()

@@ -282,6 +282,16 @@ pub struct Pm {
     // `Arc<Store>`, for crash isolation and safe unload.
     pools: HashMap<String, Rc<RefCell<dyn ErasedPool>>>,
     tasks: Vec<TaskEntry>,
+    /// ENGINE PHASES around the task cycle (see `loop_once`): PRESENT
+    /// runs before every task ("the world is as fresh as the wire
+    /// allows when your tasks run"), COMMIT after every task ("what
+    /// you set this tick leaves this tick"). Crate-internal
+    /// registration only — games order their own tasks with
+    /// priorities; they can never schedule into the engine's phases,
+    /// which is the point: engine/game ordering is structure, not
+    /// float-literal folklore. Timed into `task_stats` by name.
+    present: Vec<(String, PhaseFn)>,
+    commit: Vec<(String, PhaseFn)>,
     tasks_dirty: bool,
     stop_requests: Vec<String>,
     /// Names whose currently-running task should be dropped at end of
@@ -319,6 +329,8 @@ impl Default for Pm {
         Self {
             pools: HashMap::new(),
             tasks: Vec::new(),
+            present: Vec::new(),
+            commit: Vec::new(),
             tasks_dirty: false,
             stop_requests: Vec::new(),
             replace_requests: Vec::new(),
@@ -340,7 +352,74 @@ impl Default for Pm {
     }
 }
 
+/// An engine phase closure (see the `present`/`commit` fields on [`Pm`]).
+type PhaseFn = Box<dyn FnMut(&mut Pm)>;
+
 impl Pm {
+    /// Register an engine PRESENT-phase closure (runs before the task
+    /// cycle, in registration order). Crate-internal by design.
+    pub(crate) fn phase_present(&mut self, name: &str, f: impl FnMut(&mut Pm) + 'static) {
+        self.present.push((name.to_string(), Box::new(f)));
+    }
+
+    /// [`phase_present`](Self::phase_present), but FIRST in the phase:
+    /// the net module's receive closure claims this slot at
+    /// connect/serve so modifiers registered during setup (interp,
+    /// ttl) always see a freshly-applied world.
+    pub(crate) fn phase_present_front(&mut self, name: &str, f: impl FnMut(&mut Pm) + 'static) {
+        self.present.insert(0, (name.to_string(), Box::new(f)));
+    }
+
+    /// Register an engine COMMIT-phase closure (runs after the task
+    /// cycle and the removal flush, in registration order).
+    pub(crate) fn phase_commit(&mut self, name: &str, f: impl FnMut(&mut Pm) + 'static) {
+        self.commit.push((name.to_string(), Box::new(f)));
+    }
+
+    /// [`phase_commit`](Self::phase_commit), but FIRST in the phase:
+    /// the net module's send closure claims this slot (it assigns the
+    /// input seqs the predictor's replay closure consumes).
+    pub(crate) fn phase_commit_front(&mut self, name: &str, f: impl FnMut(&mut Pm) + 'static) {
+        self.commit.insert(0, (name.to_string(), Box::new(f)));
+    }
+
+    /// Record one timed run into `task_stats` — shared by the task loop
+    /// and the phase runner (phases and tasks read out of one stats
+    /// table on purpose: PM_PROF shows the whole tick, whoever ran it).
+    fn stat_record(&mut self, name: &str, ns: u64) {
+        match self.stats.get_mut(name) {
+            Some(s) => {
+                s.calls += 1;
+                s.ns_total += ns;
+                s.ns_max = s.ns_max.max(ns);
+            }
+            None => {
+                self.stats.insert(
+                    name.to_string(),
+                    TaskStat {
+                        calls: 1,
+                        ns_total: ns,
+                        ns_max: ns,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Run one engine phase list (timed into `task_stats` per closure).
+    fn phase_run(&mut self, take: impl Fn(&mut Pm) -> Vec<(String, PhaseFn)>, put: impl Fn(&mut Pm, Vec<(String, PhaseFn)>)) {
+        let mut running = take(self);
+        for (name, f) in &mut running {
+            let started_at = Instant::now();
+            f(self);
+            let ns = started_at.elapsed().as_nanos() as u64;
+            self.stat_record(name, ns);
+        }
+        // Phases registered DURING a phase (predict_pool called from a
+        // setup task, say) land in the (empty) list and merge behind.
+        put(self, running);
+    }
+
     /// Bare headless kernel — pools/tasks/ids with no role. For the crate's
     /// own tests and benches; games are multiplayer-only and construct a
     /// role instead ([`Pm::server`] / [`Pm::client`]), which is why this is
@@ -614,6 +693,15 @@ impl Pm {
         for pool in self.pools.values() {
             pool.borrow_mut().tick_set(self.tick);
         }
+        // PRESENT: the engine brings the world up to date (receive +
+        // apply + interp + reconcile) before any game task runs.
+        self.phase_run(
+            |pm| std::mem::take(&mut pm.present),
+            |pm, mut v| {
+                v.append(&mut pm.present);
+                pm.present = v;
+            },
+        );
         if self.tasks_dirty {
             self.tasks.sort_by(|a, b| a.priority.total_cmp(&b.priority));
             self.tasks_dirty = false;
@@ -646,23 +734,7 @@ impl Pm {
                     error: err.to_string(),
                 });
             }
-            match self.stats.get_mut(&entry.name) {
-                Some(s) => {
-                    s.calls += 1;
-                    s.ns_total += ns;
-                    s.ns_max = s.ns_max.max(ns);
-                }
-                None => {
-                    self.stats.insert(
-                        entry.name.clone(),
-                        TaskStat {
-                            calls: 1,
-                            ns_total: ns,
-                            ns_max: ns,
-                        },
-                    );
-                }
-            }
+            self.stat_record(&entry.name, ns);
         }
         running.retain(|t| !t.faulted);
         running.append(&mut self.tasks);
@@ -685,7 +757,20 @@ impl Pm {
             self.tasks.retain(|t| t.name != name);
         }
 
+        // Removal flush BEFORE commit: entities removed by this tick's
+        // tasks (or TTL) enter the removal log now, so the commit
+        // phase's snapshots carry them THIS tick, not next.
         self.id_process_removes();
+        // COMMIT: the engine ships what the tick produced (inputs set
+        // by the game, journal frame, snapshot flights) — what you set
+        // this tick leaves this tick.
+        self.phase_run(
+            |pm| std::mem::take(&mut pm.commit),
+            |pm, mut v| {
+                v.append(&mut pm.commit);
+                pm.commit = v;
+            },
+        );
     }
 
     /// Run the loop at `loop_rate` ticks per second until `loop_quit`.

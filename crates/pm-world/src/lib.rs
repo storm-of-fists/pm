@@ -129,13 +129,12 @@
 //!   handles.
 //! - **predict / smooth**: the front doors are
 //!   [`PmClient::predict_pool`] (local avatar) and
-//!   [`PmClient::interp_pool`] (remote entities); [`Predictor`] and the
-//!   manual helpers [`pool_mirror`], [`coast_blend`], [`pool_interp`]
-//!   ([`InterpBuffer`]) are their seams.
-//! - **duration**: the server-side counterparts —
-//!   [`PmServer::ttl_pool`] (transient entries expire) and
-//!   [`PmServer::history_pool`] (past-tick window + rewind, the lag-comp
-//!   memory); [`pool_expire`] and [`HistoryRing`] are their seams.
+//!   [`PmClient::interp_pool`] (remote entities); [`Predictor`] is the
+//!   replay core beneath.
+//! - **journal**: the server's tick-addressed past —
+//!   [`PmServer::journal_pool`] returns the [`JournalHandle`] rewinds
+//!   read (lag comp, recordings); [`PmServer::ttl_pool`] is the other
+//!   server time modifier (transient entries expire).
 //! - **camera**: cameras as entities attached to other entities
 //!   ([`camera_track`], [`CameraRack`], [`CamManager`]).
 //! - [`modload`]: dylib hot-reload mods.
@@ -177,27 +176,64 @@
 // upgrades (today's strict-equality handshake is the right cheap
 // call and a dead end). pm_params! already proved the one-line-
 // declaration style; this is that idea applied to every synced pod.
+// STAGE 2 LANDED 2026-07-23: the hash rides the handshake (ALPN pm/4)
+// — every wire registration demands `PodSchema` (macro-emitted; the
+// empty impl is the unhashed fallback), schema rows carry it, and a
+// mismatch now names the drifted channel ("'hog': schema hash
+// differs") instead of shrugging. Same-size field drift — reordering,
+// a quantization scale, a lerp tag — fails the connect. The pod also
+// SUPPLIES its own blend now: `interp_pool`/`predict_pool` read
+// pod_lerp/pod_err by trait, no closures at the call sites (hand
+// lerps in demo/drive deleted too). CLOSED 2026-07-23 with two
+// DECISIONS, not code: (a) accept-compatible version NEGOTIATION is
+// consciously deferred — WireReg's strict-equality doctrine holds
+// until version-skewed fleets are real, and the concrete thing
+// "reconnect-after-patch" needed was never negotiation: it's a
+// PERSISTED session token (hogs writes it to disk, mtime-refreshed
+// while playing) + the hash keeping same-schema relaunches
+// compatible. (b) auto-installing interp/predict stays explicit-one-
+// line-per-pool: the derivable half (lerp/err) is generated, the step
+// can't be, and the remaining line IS the record of which pools get
+// draw siblings — hiding it buys nothing and costs surprise.
 //
 // TODO(v2): 2. ONE TICK-ADDRESSED STATE HISTORY under everything —
 // the only genuinely rewrite-shaped item. Four mechanisms are
 // secretly the same thing, each with bespoke storage of "state at
 // tick T": snapshot unacked/resend tracking, interp_pool's sample
-// buffer, history_pool's lag-comp ring, the predictor's replay
+// buffer, the journal's lag-comp ring, the predictor's replay
 // window. V2 shape: every synced pool is backed by a single ring of
 // tick-stamped frames, and snapshots, interp, rewind, and prediction
 // replay all DERIVE from it — as do the features that keep being
 // hard because it doesn't exist: recordings, replays, kill-cams.
 // STAGE 1 LANDED 2026-07-22: `PmServer::journal_pool` is the named
-// journal (one shared tick-stamped ring per pool; `history_pool` now
-// derives from it), and RECONNECT shipped with it — though the recon
+// journal (one shared tick-stamped ring per pool — history_pool's
+// wrapper has since been folded away), and RECONNECT shipped with it — though the recon
 // found reconnect never needed the journal: a fresh peer's delta
 // cursors already reconverge from zero, so reconnect is the pm/3
 // session-token handshake (transport.rs: token reclaims the peer id
 // inside a grace window; hogs parks the vehicle) plus
 // `ClientNet::lost` for the redial loop. Join-in-progress was free
-// all along. STILL QUEUED here: the packer's dirty scan and the
-// client stores (interp samples, predictor window) deriving from the
-// journal, then recordings/replays/kill-cams on top.
+// all along. STAGE 2 LANDED 2026-07-23, both halves. Server: the
+// packer's dirty scan derives from a per-tick change capture
+// (`NetServer::refresh` → per-peer CANDIDATE LISTS; pack walks are
+// O(dirty), the old O(entities × pools × peers × datagrams) scan is
+// gone — the M2 16×1000 prerequisite). Client: interp samples live on
+// the TICK AXIS — stamped with applied snapshot LABEL times, sampled
+// by a soft-slewed estimate of the newest label, so arrival jitter
+// and flight bursts stop wobbling the spacing (the predictor's window
+// already rode input seqs — that axis by construction).
+// STAGE 3 (RECORDINGS) LANDED 2026-07-23, exactly as the net.rs note
+// predicted: the recorder is a virtual peer (RECORDER_PEER=255, id
+// reserved at admission) with an unbounded budget and instant
+// self-ack — first frame is a free keyframe, every later frame a pure
+// delta, removal recycling never waits. `PmServer::record_to(path)`
+// writes PMREC (header carries the encoded handshake schema);
+// `PmClient::replay_from(path)` plays it through the NORMAL apply
+// path on the tick clock — interp/draw/HUD can't tell the difference,
+// and a schema-drifted viewer is rejected with the same named diff as
+// a live connect. hogs: `server record=FILE` / `hogs replay=FILE`.
+// Kill-cam is now a GAME feature (play the tail of a recording, or a
+// journal window, back through the same seam) — pull when wanted.
 //
 // TODO(v2): 3. AN EXPLICIT DETERMINISM BOUNDARY. Shared steps must
 // replay byte-exact and today that's convention (const-vs-param
@@ -226,8 +262,14 @@
 // (priority accumulator — staleness guarantees nothing starves), the
 // budget keeps doing all the throttling, cross-pool fairness
 // unchanged. hogs scores hog/flyer/bullet by distance to the peer's
-// vehicle. Queued refinement: on-screen-ness via a client view-pose
-// report (just another input channel) when a game wants it.
+// vehicle. STAGE 2 LANDED 2026-07-23: the view-pose report — a
+// newest-wins DGRAM_VIEW (eye + forward, `ClientNet::view_set` →
+// `ServerNet::view_pose`), deliberately NOT the input channel (pure
+// presentation metadata, never sim input, bots simply don't send
+// one). hogs' scorer now measures from the camera EYE with a
+// forward-cone boost: on-screen hogs stream freshest, the swarm
+// behind you rides the staleness floor. Play-feel at lag=80/loss=3%
+// still unverified — watch for pop-in when whipping the camera.
 //
 // TODO(v2): 5. (pm-sdl, noted here so the list is one grep) THE
 // RENDERER BACKEND. SDL_gpu + naga's combined-sampler limitation —
@@ -238,10 +280,75 @@
 // samplers, and shadow maps. Sequence it BEFORE heavy shader
 // investment on the current backend.
 
+// TODO(roadmap): THE COMPONENT TURN (2026-07-23 — Connor: pull shared
+// aspects OUT of the per-vehicle pods; "position should be predicted
+// the same for almost everything"; forces applied to part assemblies,
+// realistic integration with fictional/arcade forces, Unreal-style).
+// The insight is right and half-true already: every avatar pod EMBEDS
+// `Body` as its kinematic chunk — composition exists, it's just not
+// REGISTERED. The hard constraint nobody may forget: prediction's
+// atomicity. A predicted pod reconciles as ONE unit against ONE
+// input-seq echo; split Body into its own synced pool and a budget
+// boundary can deliver Body from tick T with vehicle-extras from T-1
+// — the predictor corrects against a state that never existed.
+// Component-split PREDICTED state therefore needs pack-atomic
+// component GROUPS ("this peer's avatar components ride the same
+// datagram") before the split is sound. Staged accordingly:
+// STAGE 0 (now, no wire change): physics as a LIBRARY over Body —
+//   formalize the parts/attachment layer (parts pool already exists):
+//   per-part mass/offset → assembly aggregation (total mass, COM,
+//   inertia scalar), forces/impulses accumulate per part → resolve to
+//   ONE Body integration → part poses derive from attachment
+//   transforms. Vehicles stop hand-rolling "how forces move me";
+//   steps become force lists + the shared integrator (the landed
+//   truck-grip/heli-thrust model, generalized). Arcade knob = the
+//   forces, realism = the integrator — exactly the Unreal recipe.
+// STAGE 1 (the M3 avatar decision): predictor over component TUPLES
+//   ((Body, TruckCtl) etc), pack-atomic groups in the packer, THEN
+//   Body graduates to its own registered pool and interp/predict/
+//   collider/interest all key on it once instead of per-vehicle.
+// Anti-goal either stage: a solver object owning state — pools stay
+// the state, physics stays functions (destruction stance: authored
+// states + cosmetic debris; see pm-physics memory).
+// TODO(roadmap): THE SCALE LADDER (2026-07-23 — Connor restated the
+// end goal, then SHARPENED it same day: "hog hunting is THE game for
+// this engine... bf6 level [netcode]... 16 people at a time, maybe
+// more... hogs and humans [playable]... destruction... boss battles
+// ... a coop story mode. i want it all."). hogs is not a prototype
+// for some later game — every rung below is a hogs feature. pm grows
+// by making each rung MEASURABLE with bot soaks: scale is testable
+// without players, so every rung names its gate and the engine work
+// it forces. DESTRUCTION IS NOW A DECLARED PILLAR — that's the
+// recorded trigger for the server-side Box3D FFI path when M4 opens
+// (never a solver rewrite; prediction stays pm's).
+// M1 SHIP HOGS — the helldivers shape (4-8 co-op vs hordes): the
+//    TODO(ship) list as-is. Finishing its loop proves the whole stack
+//    end to end; the co-op STORY mode grows from the mission system +
+//    TODO(story) lore (playing AS hogs is already a story device).
+// M2 16×1000 — the mid-size battle: 16 bot clients, 1000 live
+//    entities, lag=80/loss=3%. GATE: server tick < 8 ms, ≤ 2 Mbps per
+//    peer, clean feel. Forces: journal-derived dirty scan (v2 item 2
+//    next stage), view-pose interest (item 4 next stage), tick-budget
+//    profiling — and the wgpu swap (item 5) lands HERE, before the
+//    content push that follows it.
+// M3 INFANTRY — a character shared-step (walk/sprint/jump/vault),
+//    skinning (its recorded trigger fires: organic art), input-map
+//    key contexts, first-person camera. Playable hogs (TODO(ship)) is
+//    the stepping stone: the first avatar that isn't a vehicle.
+// M4 THE WORLD FIGHTS BACK — buildings→synced world pool (the
+//    recorded destructibility prerequisite on BUILDINGS), terrain
+//    heightfield in the collider story, Box3D FFI spike ONLY if
+//    destruction becomes a design pillar.
+// M5 64 AND BEYOND — the 64-bot soak; interest cells, delta
+//    baselines, threaded stores: each lands ONLY when its measurement
+//    demands it, never speculatively.
+// Recordings/killcam (journal playback) slot in wherever the journal
+// stages land — a battlefield-style killcam IS a journal replay.
+
 mod blend;
 mod bvh;
 mod camera;
-mod duration;
+mod journal;
 mod id;
 mod kernel;
 mod math;
@@ -262,8 +369,7 @@ pub use camera::{
     CAMERA_PRIO, CamAnchor, CamManager, CamRig, CamView, CameraRack, camera_install,
     camera_manager, camera_track,
 };
-pub use blend::{PodErr, PodLerp, schema_hash_str};
-pub use duration::{HistoryRing, pool_expire};
+pub use blend::{PodErr, PodLerp, PodSchema, schema_hash_str};
 pub use id::Id;
 pub use kernel::{
     EntryMut, IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
@@ -272,7 +378,7 @@ pub use math::{Body, Mat4, Quat, Rng, Vec2, Vec3, lerp_angle, vec2, vec3, wrap_a
 pub use modload::{
     BUILD_ID, BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr,
 };
-pub use net::{Applied, Wire};
+pub use net::{Applied, RECORDER_PEER, Wire};
 /// Derive [`Wire`]: generates the compact `<Name>Wire` repr pod from
 /// per-field `#[wire(i16, scale = 64.0)]` quantization attributes, for
 /// pools registered via [`wire_pool`](Pm::wire_pool). Generated
@@ -285,13 +391,13 @@ pub use pm_derive::Wire;
 /// `#[wire(..)]` attribute. See `pm_derive::pod` for the fine print.
 pub use pm_derive::pod;
 pub use netmod::{
-    ClientNet, EventRx, EventTx, InputRx, InputTx, NET_PRIO, PmClient, PmServer, PoolHistory,
-    PoolJournal,
+    netdbg_enable,
+    ClientNet, EventRx, EventTx, InputRx, InputTx, PmClient, PmServer, JournalHandle,
     ServerNet, SingleRx,
 };
 pub use pool::{Mut, Pool};
 pub use predict::Predictor;
-pub use smooth::{InterpBuffer, coast_blend, pool_interp, pool_mirror};
+pub use transport::token_random as session_token_random;
 pub use spatial::SpatialGrid;
 pub use util::{Adds, Cooldown, Counter, DelayTimer, FallingEdge, Hysteresis, Latch, Removes, RisingEdge};
 

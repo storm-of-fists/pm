@@ -111,8 +111,13 @@ fn expand_pod(mut input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let wire = has_wire_fields.then(|| quote! { , ::pm::Wire });
 
     // The generated blend/schema half (named-field structs only — a
-    // unit/tuple pod keeps just the derive set).
-    let mut compiled = proc_macro2::TokenStream::new();
+    // unit/tuple pod keeps just the derive set, plus a name-level
+    // PodSchema so it still clears the handshake-hash bound).
+    let mut compiled = quote! {
+        impl ::pm::PodSchema for #name {
+            const SCHEMA_HASH: u64 = ::pm::schema_hash_str(stringify!(#name));
+        }
+    };
     if let Fields::Named(fields) = &mut data.fields {
         let mut lerps = Vec::new();
         let mut errs = Vec::new();
@@ -186,6 +191,11 @@ fn expand_pod(mut input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 /// types, quantization, lerp tags). Two builds agree on
                 /// it iff their views of this pod agree.
                 pub const SCHEMA_HASH: u64 = ::pm::schema_hash_str(#schema);
+            }
+            // The same hash as the trait the handshake reads (the
+            // inherent const stays for direct/test use).
+            impl ::pm::PodSchema for #name {
+                const SCHEMA_HASH: u64 = ::pm::schema_hash_str(#schema);
             }
         };
     }

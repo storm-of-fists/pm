@@ -19,6 +19,9 @@ struct Pos {
     y: f32,
 }
 
+// Unhashed schema identity for the handshake bound (test pod).
+impl crate::PodSchema for Pos {}
+
 #[test]
 fn quic_loopback_full_stack() {
     // --- server world ---
@@ -173,7 +176,38 @@ fn schema_mismatch_is_rejected() {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(cquic.error(), Some("schema mismatch with server"));
+    // The pm/4 hello diff names the drifted channel, not just the fact.
+    assert_eq!(
+        cquic.error(),
+        Some("schema mismatch with server: 'hp' only on this end")
+    );
+}
+
+/// The hash half of the pm/4 handshake (v2 item 1 stage 2): same
+/// channel name, same byte size, different SCHEMA_HASH — the drift
+/// name+size can't see (a reordered field, a changed quantization
+/// scale) — must fail the connect and say which channel moved.
+#[test]
+fn schema_hash_drift_is_rejected() {
+    let row = |h: u64| vec![(b'p', "pos".to_string(), 8usize, h)];
+    let mut squic = QuicServer::bind("127.0.0.1:0", &row(0x1111)).expect("bind");
+    let addr = squic.local_addr().unwrap().to_string();
+    let mut cquic = QuicClient::connect(&addr, &row(0x2222)).expect("connect");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        squic.pump();
+        squic.joined_drain();
+        cquic.pump();
+        if cquic.error().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        cquic.error(),
+        Some("schema mismatch with server: 'pos': schema hash differs (field-level drift)")
+    );
 }
 
 #[test]
@@ -365,6 +399,36 @@ fn password_gates_admission() {
     // The wrong/silent clients were never admitted: exactly one join.
     assert_eq!(admitted.len(), 1, "only the right password joins");
     assert!(bad_pos.get().is_empty() && mute_pos.get().is_empty(), "no state leaked pre-admission");
+}
+
+/// The view-pose report (v2 item 4 stage 2): a client's `view_send`
+/// reaches the server as its latest pose; a client that never reports
+/// stays `None` — nothing about admission or replication requires it.
+#[test]
+fn view_pose_reaches_the_server() {
+    let row = vec![(b'p', "pos".to_string(), 8usize, 0u64)];
+    let mut squic = QuicServer::bind("127.0.0.1:0", &row).expect("bind");
+    let addr = squic.local_addr().unwrap().to_string();
+    let mut cquic = QuicClient::connect(&addr, &row).expect("connect");
+
+    let mut peer = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        squic.pump();
+        for p in squic.joined_drain() {
+            peer = Some(p);
+        }
+        cquic.pump();
+        if let (Some(p), Some(_)) = (peer, cquic.handshake_done()) {
+            cquic.view_send([1.0, 2.0, 3.0, 0.0, 0.0, -1.0]);
+            if squic.view(p).is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let p = peer.expect("client admitted");
+    assert_eq!(squic.view(p), Some([1.0, 2.0, 3.0, 0.0, 0.0, -1.0]));
 }
 
 /// The reconnect handshake (pm/3): a session token parked at disconnect

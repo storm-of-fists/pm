@@ -40,8 +40,12 @@ use quinn_proto::{
 // (pm/2: snapshots carry a per-send seq, acks echo (tick, seq).
 //  pm/3: the hello carries the schema only; FRAME_AUTH leads with a
 //  16-byte session token; FRAME_WELCOME assigns the peer id at
-//  admission — the reconnect handshake.)
-const ALPN: &[u8] = b"pm/3";
+//  admission — the reconnect handshake.
+//  pm/4: schema rows carry the pod's SCHEMA_HASH (v2 item 1 stage 2 —
+//  same-size-different-meaning drift now fails the connect, and the
+//  client reports a per-channel diff); DGRAM_VIEW carries the client's
+//  view pose for interest scoring.)
+const ALPN: &[u8] = b"pm/4";
 /// Server → client at QUIC connect: the wire schema (a contract, not a
 /// secret — sent before auth so the client knows the stream to answer
 /// on). The peer id is NOT here anymore: identity is decided at
@@ -76,6 +80,13 @@ pub const EVENT_USER_BASE: u16 = 16;
 const DGRAM_SNAPSHOT: u8 = 0;
 const DGRAM_ACK: u8 = 1;
 const DGRAM_INPUT: u8 = 2;
+/// Client → server, unreliable, newest-wins: the client's VIEW POSE
+/// (`[eye f32x3][forward f32x3]`, 24 bytes) — the on-screen-ness
+/// ingredient for interest scoring (v2 item 4 stage 2). Pure
+/// presentation metadata: never touches the sim, never acked; a lost
+/// one is superseded by the next. Absent entirely for clients that
+/// never call `view_send` (bots) — the server just sees `None`.
+const DGRAM_VIEW: u8 = 3;
 /// How many recent inputs ride along in every input datagram. Up to 7
 /// consecutive lost packets cost nothing; beyond that the gap is skipped
 /// (input is ephemeral — newest wins).
@@ -83,29 +94,92 @@ const INPUT_REDUNDANCY: usize = 8;
 
 // --- small helpers --------------------------------------------------------
 
-fn schema_encode(schema: &[(u8, String, usize)]) -> Vec<u8> {
+pub(crate) fn schema_encode(schema: &[(u8, String, usize, u64)]) -> Vec<u8> {
     // Sort by name so the handshake compare is registration-order
     // independent — both ends agree as long as the *set* of (kind, name,
-    // size) entries matches, regardless of registration order. The kind
-    // byte keeps a pool and an event channel that share a name from
-    // silently passing as each other.
+    // size, hash) entries matches, regardless of registration order. The
+    // kind byte keeps a pool and an event channel that share a name from
+    // silently passing as each other; the hash (from `pm::PodSchema`,
+    // usually `#[pm::pod]`-generated) catches same-size field drift.
     let mut schema = schema.to_vec();
     schema.sort_by(|a, b| a.1.cmp(&b.1));
     let mut out = Vec::new();
     out.extend_from_slice(&(schema.len() as u16).to_le_bytes());
-    for (kind, name, size) in &schema {
+    for (kind, name, size, hash) in &schema {
         out.push(*kind);
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(&(*size as u32).to_le_bytes());
+        out.extend_from_slice(&hash.to_le_bytes());
     }
     out
 }
 
+/// Decode a `schema_encode` payload back into rows (`None` on a
+/// malformed buffer) — only used to explain a mismatch: the CONNECT
+/// decision is the byte compare, this is the diagnosis.
+pub(crate) fn schema_decode(mut b: &[u8]) -> Option<Vec<(u8, String, usize, u64)>> {
+    let take = |b: &mut &[u8], n: usize| -> Option<Vec<u8>> {
+        (b.len() >= n).then(|| {
+            let (head, rest) = b.split_at(n);
+            *b = rest;
+            head.to_vec()
+        })
+    };
+    let count = u16::from_le_bytes(take(&mut b, 2)?.try_into().ok()?);
+    let mut rows = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let kind = take(&mut b, 1)?[0];
+        let nlen = u16::from_le_bytes(take(&mut b, 2)?.try_into().ok()?) as usize;
+        let name = String::from_utf8(take(&mut b, nlen)?).ok()?;
+        let size = u32::from_le_bytes(take(&mut b, 4)?.try_into().ok()?) as usize;
+        let hash = u64::from_le_bytes(take(&mut b, 8)?.try_into().ok()?);
+        rows.push((kind, name, size, hash));
+    }
+    b.is_empty().then_some(rows)
+}
+
+/// Human-readable per-channel diff for a failed schema compare: which
+/// channels only one end has, and which agree on the name but not on
+/// kind, size, or schema hash (hash-only = same layout size, different
+/// field meaning — the drift name+size alone can't see).
+pub(crate) fn schema_diff(
+    server: &[(u8, String, usize, u64)],
+    client: &[(u8, String, usize, u64)],
+) -> String {
+    let mut parts = Vec::new();
+    for (kind, name, size, hash) in client {
+        match server.iter().find(|(_, n, ..)| n == name) {
+            None => parts.push(format!("'{name}' only on this end")),
+            Some((sk, _, ss, sh)) => {
+                if sk != kind || ss != size {
+                    parts.push(format!("'{name}': {size} B here vs {ss} B on server"));
+                } else if sh != hash {
+                    parts.push(format!("'{name}': schema hash differs (field-level drift)"));
+                }
+            }
+        }
+    }
+    for (_, name, ..) in server {
+        if !client.iter().any(|(_, n, ..)| n == name) {
+            parts.push(format!("'{name}' only on server"));
+        }
+    }
+    if parts.is_empty() {
+        // Bytes differed but rows compare equal — version skew in the
+        // encoding itself (should be caught by ALPN first).
+        parts.push("encoding mismatch".into());
+    }
+    parts.join("; ")
+}
+
 /// A random session token — unpredictability from the std hasher's
 /// per-instance seed. A bouncer credential like the password, not
-/// cryptography (QUIC/TLS encrypts the wire it rides).
-fn token_random() -> [u8; 16] {
+/// cryptography (QUIC/TLS encrypts the wire it rides). Exported as
+/// `pm::session_token_random`: generate ONE per game session, keep it
+/// across redials, pass it to every [`Pm::client`](crate::Pm::client)
+/// via [`PmClient::session_token`](crate::PmClient::session_token).
+pub fn token_random() -> [u8; 16] {
     use std::hash::{BuildHasher, Hasher};
     let mut token = [0u8; 16];
     for chunk in token.chunks_mut(8) {
@@ -270,25 +344,11 @@ fn transport_config() -> Arc<TransportConfig> {
     // throttling 60 Hz snapshots to ~half rate at PM_LOSS=0.02. BBR
     // models bandwidth/RTT instead and shrugs off random loss.
     //
-    // PM_CC=cubic-big swaps in Cubic with a 16 MiB initial window — an
-    // experiment knob, not a mode: quinn's pacer meters packets out at
-    // cwnd/sRTT, and our once-per-tick pump turns every pacer hold into
-    // a full 16.7 ms stall (see the lag-sim FIXME below). A huge window
-    // makes the pacer's budget effectively infinite, which isolates
-    // whether pacer-vs-pump is the latency amplifier.
-    match std::env::var("PM_CC").as_deref() {
-        Ok("cubic-big") => {
-            let mut cc = quinn_proto::congestion::CubicConfig::default();
-            cc.initial_window(16 * 1024 * 1024);
-            tc.congestion_controller_factory(Arc::new(cc));
-            eprintln!("[pm net] PM_CC=cubic-big: Cubic, 16 MiB initial window (pacer defused)");
-        }
-        _ => {
-            tc.congestion_controller_factory(Arc::new(
-                quinn_proto::congestion::BbrConfig::default(),
-            ));
-        }
-    }
+    // (The PM_CC=cubic-big experiment knob was DELETED 2026-07-23 with
+    // the rest of the runtime env vars — the pacer-vs-pump question it
+    // existed to answer was settled by lag_ab: QUIC == raw UDP, verdict
+    // final.)
+    tc.congestion_controller_factory(Arc::new(quinn_proto::congestion::BbrConfig::default()));
     Arc::new(tc)
 }
 
@@ -419,6 +479,8 @@ struct ConnState {
     /// The session token FRAME_AUTH presented (zeros until then; an
     /// all-zero token never parks or reclaims).
     token: [u8; 16],
+    /// Latest view pose this peer reported (see [`DGRAM_VIEW`]).
+    view: Option<[f32; 6]>,
 }
 
 /// Server endpoint. Pump from a net task each tick; drain joins/leaves/acks
@@ -452,7 +514,7 @@ pub struct QuicServer {
 }
 
 impl QuicServer {
-    pub fn bind(addr: &str, schema: &[(u8, String, usize)]) -> io::Result<Self> {
+    pub fn bind(addr: &str, schema: &[(u8, String, usize, u64)]) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
 
@@ -549,6 +611,7 @@ impl QuicServer {
                                     authed: false,
                                     since: now,
                                     token: [0; 16],
+                                    view: None,
                                 },
                             );
                         }
@@ -622,6 +685,13 @@ impl QuicServer {
                     }
                     Some(&DGRAM_INPUT) => {
                         inputs_parse(&d[1..], st.peer, &mut st.last_input_seq, &mut self.inputs);
+                    }
+                    Some(&DGRAM_VIEW) if d.len() >= 25 => {
+                        let mut pose = [0f32; 6];
+                        for (k, v) in pose.iter_mut().enumerate() {
+                            *v = f32::from_le_bytes(d[1 + k * 4..5 + k * 4].try_into().unwrap());
+                        }
+                        st.view = Some(pose);
                     }
                     _ => {}
                 }
@@ -697,7 +767,14 @@ impl QuicServer {
                 peer
             } else {
                 // Fresh ids are never reused; u8 saturation refuses new
-                // peers rather than colliding.
+                // peers rather than colliding — and 255 is RESERVED for
+                // the server's recorder (a virtual peer, never on the
+                // wire; see `NetServer::record_to`).
+                if self.next_peer >= u8::MAX {
+                    let st = self.conns.get_mut(&ch).unwrap();
+                    st.conn.close(now, 2u32.into(), b"server full"[..].into());
+                    continue;
+                }
                 let peer = self.next_peer;
                 self.next_peer = self.next_peer.saturating_add(1);
                 peer
@@ -766,6 +843,15 @@ impl QuicServer {
     /// `EventRx` channels.
     pub fn events_drain(&mut self) -> Vec<(u8, u16, Vec<u8>)> {
         std::mem::take(&mut self.events)
+    }
+
+    /// `peer`'s latest reported view pose (`[eye xyz, forward xyz]`),
+    /// `None` for peers that never report one (bots, HUD-less tools).
+    pub fn view(&self, peer: u8) -> Option<[f32; 6]> {
+        self.peer_conns
+            .get(&peer)
+            .and_then(|ch| self.conns.get(ch))
+            .and_then(|st| st.view)
     }
 
     /// Round-trip time to `peer` as quinn currently estimates it
@@ -895,7 +981,7 @@ pub struct QuicClient {
 }
 
 impl QuicClient {
-    pub fn connect(addr: &str, schema: &[(u8, String, usize)]) -> io::Result<Self> {
+    pub fn connect(addr: &str, schema: &[(u8, String, usize, u64)]) -> io::Result<Self> {
         let server: SocketAddr = addr.parse().map_err(io::Error::other)?;
         let bind = if server.is_ipv4() {
             "0.0.0.0:0"
@@ -1006,7 +1092,13 @@ impl QuicClient {
         for (ty, payload) in frames_parse(&mut self.stream_in) {
             if ty == FRAME_HELLO {
                 if payload != self.schema[..] {
-                    self.error = Some("schema mismatch with server".into());
+                    // Diagnose per channel — the compare stays the byte
+                    // equality above, the diff only explains it.
+                    let diff = match (schema_decode(&payload), schema_decode(&self.schema)) {
+                        (Some(srv), Some(cli)) => schema_diff(&srv, &cli),
+                        _ => "undecodable schema".into(),
+                    };
+                    self.error = Some(format!("schema mismatch with server: {diff}"));
                     self.conn
                         .close(now, 1u32.into(), b"schema mismatch"[..].into());
                     continue;
@@ -1094,6 +1186,18 @@ impl QuicClient {
         self.input_seq
     }
 
+    /// Report the view pose (`[eye xyz, forward xyz]`) as an unreliable
+    /// newest-wins datagram — see [`DGRAM_VIEW`]. Call at the input
+    /// cadence; loss costs nothing.
+    pub fn view_send(&mut self, pose: [f32; 6]) {
+        let mut d = Vec::with_capacity(25);
+        d.push(DGRAM_VIEW);
+        for v in pose {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        let _ = self.conn.datagrams().send(d.into(), true);
+    }
+
     /// Send a typed event on the reliable ordered stream (`ty` must be
     /// >= EVENT_USER_BASE).
     pub fn event_send(&mut self, ty: u16, payload: &[u8]) {
@@ -1130,10 +1234,10 @@ mod lag_ab {
     const DELAY_MS: u64 = 80;
     const LOSS: f32 = 0.03;
     const TICK: Duration = Duration::from_micros(16_667);
-    const SCHEMA: (u8, &str, usize) = (0, "pos", 8);
+    const SCHEMA: (u8, &str, usize, u64) = (0, "pos", 8, 0);
 
-    fn schema() -> Vec<(u8, String, usize)> {
-        vec![(SCHEMA.0, SCHEMA.1.into(), SCHEMA.2)]
+    fn schema() -> Vec<(u8, String, usize, u64)> {
+        vec![(SCHEMA.0, SCHEMA.1.into(), SCHEMA.2, SCHEMA.3)]
     }
 
     fn stats(label: &str, mut ms: Vec<f32>) {
@@ -1243,16 +1347,9 @@ mod lag_ab {
         stats(label, rtts);
     }
 
-    /// Legs 2 + 3 in one test (they must not run concurrently: the CC
-    /// selection rides the process-global `PM_CC`).
     #[test]
     #[ignore]
     fn lag_ab_quic() {
         quic_leg("quic bbr");
-        // SAFETY: single-threaded at this point in the test; the var is
-        // read once per endpoint construction inside quic_leg.
-        unsafe { std::env::set_var("PM_CC", "cubic-big") };
-        quic_leg("quic cubic");
-        unsafe { std::env::remove_var("PM_CC") };
     }
 }

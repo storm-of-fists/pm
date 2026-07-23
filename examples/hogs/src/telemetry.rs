@@ -50,7 +50,6 @@ pm_group! {
         /// Simulated drop fraction, live-applied via LinkTune.
         link_loss: PmF32 = PmF32::new().range(0.0, 0.5),
         /// Day-night cycle length (render-side, cosmetic).
-        day_secs: PmF32 = PmF32::new().range(10.0, 3600.0),
         /// The server's game params, writable here,
         /// applied via the reliable "param.set" event. The knobs (and
         /// their save button) are GENERATED next to the pod — see the
@@ -139,8 +138,7 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
     // so plain set() works and clamps to the declared ranges).
     tele.link_lag_ms.set(flags.link.0);
     tele.link_loss.set(flags.link.1);
-    tele.day_secs.set(flags.day);
-    tele.interp_ms.set(flags.interp_ms);
+    tele.interp_ms.set(flags.params.interp_ms);
     // Param knobs seed from the file `main` loaded — the same values the
     // server seeded its single from (an in-process session, so they
     // agree). Known caveat: joining a REMOTE server whose params differ
@@ -156,8 +154,6 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
     net_mgr.bind("hogs", &[]);
 
     let tune = pm.link_tune();
-    let day = pm.single::<Tune>("hogs.tune");
-    day.get_mut().day_secs = flags.day;
     let net = pm.net();
     let pred = w.pred.clone();
     let pred_heli = w.pred_heli.clone();
@@ -165,7 +161,7 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
     let bullet = w.bullet.clone();
     let param_tx = w.param_set.clone();
     // Last knob values we applied to the game (change-detect).
-    let mut applied = (flags.link.0, flags.link.1, flags.day);
+    let mut applied = (flags.link.0, flags.link.1);
     let mut applied_params = flags.params;
     let mut save_was = tele.params.save.val();
     let mut clock_ms = 0.0f64;
@@ -179,21 +175,16 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
 
         // Knobs → game. A monitor write lands in the same value cell
         // (the signal unlocks while commanded); we just diff values.
-        let knobs = (
-            tele.link_lag_ms.val(),
-            tele.link_loss.val(),
-            tele.day_secs.val(),
-        );
-        if (knobs.0, knobs.1) != (applied.0, applied.1) {
+        let knobs = (tele.link_lag_ms.val(), tele.link_loss.val());
+        if knobs != applied {
             let mut t = tune.get_mut();
             t.lag_ms = knobs.0;
             t.loss = knobs.1;
             t.seq = t.seq.wrapping_add(1);
         }
-        if knobs.2 != applied.2 {
-            day.get_mut().day_secs = knobs.2.max(10.0);
-        }
         applied = knobs;
+        // (day length is an ordinary PARAM now — its knob lives in the
+        // params panel with everything else.)
 
         // Param knobs → reliable events; the server is the clamp of
         // record and replicates the applied value back to everyone.

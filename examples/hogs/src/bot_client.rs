@@ -124,7 +124,6 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
             let params = params.clone();
             move |s, c, dt| truck_step(s, c, dt, &params.get())
         },
-        Truck::pod_err,
         1e-4,
         FIXED_DT,
     );
@@ -135,32 +134,33 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
             let params = params.clone();
             move |s, c, dt| heli_step(s, c, dt, &params.get())
         },
-        Heli::pod_err,
         1e-4,
         FIXED_DT,
     );
 
     // Remote smoothing, shared delay contract with the server's shot
-    // rewind (see common.rs INTERP_DELAY). Capped extrapolation rides
-    // loss bursts — and, for the horde, budget-rotation gaps.
-    let extrap = std::env::var("PM_EXTRAP_MS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map_or(0.05, |ms| ms / 1000.0);
-    let truck_draw = pm.interp_pool(&truck, Truck::pod_lerp, interp_delay() as f64, extrap);
-    let heli_draw = pm.interp_pool(&heli, Heli::pod_lerp, interp_delay() as f64, extrap);
-    let hog_draw = pm.interp_pool(&hog, Hog::pod_lerp, interp_delay() as f64, extrap);
-    let flyer_draw = pm.interp_pool(&flyer, Flyer::pod_lerp, interp_delay() as f64, extrap);
+    // rewind — ONE number, the `interp_ms` param (the replica holds the
+    // shipped default until the first snapshot, so pre-connect installs
+    // read 33). Capped extrapolation rides loss bursts — and, for the
+    // horde, budget-rotation gaps.
+    let (interp, extrap) = {
+        let p = params.get();
+        (f64::from(p.interp_ms) / 1000.0, f64::from(p.extrap_ms) / 1000.0)
+    };
+    let truck_draw = pm.interp_pool(&truck, interp, extrap);
+    let heli_draw = pm.interp_pool(&heli, interp, extrap);
+    let hog_draw = pm.interp_pool(&hog, interp, extrap);
+    let flyer_draw = pm.interp_pool(&flyer, interp, extrap);
     // Bullets too: they live ~0.6 s and cross the map in a straight
     // line — interp (plus the extrapolation cap) is plenty.
-    let bullet_draw = pm.interp_pool(&bullet, Bullet::pod_lerp, interp_delay() as f64, extrap);
+    let bullet_draw = pm.interp_pool(&bullet, interp, extrap);
 
     // The client-local collider pool + query index — the SAME
     // structures the server keeps, posed from the draw pools instead
     // of the sim. Local pools, never in the
     // handshake; the shared names make the symmetry legible in
     // pool_stats. The `colliders` task at 6.5 runs right after the
-    // interp tasks (NET_PRIO+1) refresh the draw pools, so the index
+    // engine's PRESENT phase refreshes the draw pools, so the index
     // is exactly as fresh as what's on screen.
     let colliders = pm.pool::<Collider>("collider");
     let cparts = pm.pool::<Parts>("vehicle.part");
@@ -171,6 +171,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
         let (depot, boss) = (depot.clone(), boss.clone());
         let (colliders, cparts, index, models) =
             (colliders.clone(), cparts.clone(), index.clone(), models.clone());
+        let params = params.clone();
         // Lifecycle edges off the draw pools: vehicles get part child
         // entities exactly like the server's roster/respawn path; the
         // horde is self-keyed and just overwrite-posed.
@@ -252,7 +253,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
                     // debug cage agree with what shots actually hit.
                     let mut hull = hog_p.pose(h.x, 0.0, h.z, h.heading);
                     if boss.get_id(id).is_some() {
-                        hull = hull.grow(BOSS_GROW);
+                        hull = hull.grow(params.get().boss_grow);
                     }
                     cols.add(
                         id,
@@ -322,7 +323,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
 /// up, wander when the wave is dead. Trucks also engage flyers that
 /// swoop into flat-shot height; pilot bots (n >= 2) gimbal the chin
 /// gun onto them wherever they are.
-pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str) {
+pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str, prof: bool) {
     let mut pm = Pm::client(addr, 1.0 / FIXED_DT);
     if !password.is_empty() {
         pm.password(password);
@@ -409,7 +410,7 @@ pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str) {
                             // so it servos as the nose wanders).
                             let want = ((hy - (b.pos.y - 0.35)) / d.max(2.0)).atan();
                             let ap =
-                                (want + pitch_now).clamp(-HELI_AIM_PITCH, HELI_AIM_PITCH);
+                                (want + pitch_now).clamp(-p.heli_aim_pitch, p.heli_aim_pitch);
                             let aligned = err.abs() < 0.3
                                 && d < p.gun_range * 0.9
                                 && line_clear(b.pos.x, b.pos.y, b.pos.z, bearing, want, d);
@@ -423,7 +424,7 @@ pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str) {
                                 && line_clear(b.pos.x, b.pos.y, b.pos.z, bearing, -dive, d);
                             (
                                 err.clamp(-1.0, 1.0),
-                                (dive / HELI_PITCH_MAX).clamp(-1.0, 1.0),
+                                (dive / p.heli_pitch_max).clamp(-1.0, 1.0),
                                 aligned as i32 as f32,
                                 0.0,
                             )
@@ -511,7 +512,7 @@ pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str) {
                 // isn't fired at — it comes back into the envelope on
                 // its swoop or as the truck opens distance.
                 let climb = ((hy - 1.45) / d.max(2.0)).atan();
-                let feasible = (-TRUCK_AIM_DOWN..=TRUCK_AIM_UP).contains(&climb);
+                let feasible = (-p.truck_aim_down..=p.truck_aim_up).contains(&climb);
                 // GRIP-PHYSICS throttle: momentum carries now, so the
                 // old two-speed throttle glided into every close hog
                 // and ate the bite. Chase a TARGET SPEED instead —
@@ -534,7 +535,7 @@ pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str) {
                         && d < p.gun_range * 0.95
                         && line_clear(me.body.pos.x, 1.45, me.body.pos.z, bearing, climb, d))
                         as i32 as f32,
-                    climb.clamp(-TRUCK_AIM_DOWN, TRUCK_AIM_UP),
+                    climb.clamp(-p.truck_aim_down, p.truck_aim_up),
                 )
             }
             // Wave's dead: lazy sine wander until the next one lands.
@@ -604,7 +605,7 @@ pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str) {
     // interleave. The corrections line is the PREDICTION health gauge:
     // it should stay flat while driving; a live shared-step param write
     // may step it once, never stream (the documented shared-step blip).
-    if n == 0 && std::env::var("PM_PROF").is_ok() {
+    if n == 0 && prof {
         let mut prev: std::collections::HashMap<String, pm::TaskStat> = Default::default();
         let pred = w2_pred.clone();
         let pred_heli = w2_pred_heli.clone();

@@ -169,6 +169,14 @@ impl<T> Pool<T> {
         &self.changed
     }
 
+    /// Dense index of the entity currently occupying `slot`, if any —
+    /// the sync layer's candidate-list lookup (slot-level on purpose:
+    /// whoever occupies the slot NOW is what a snapshot would carry).
+    pub(crate) fn index_of_slot(&self, slot: u32) -> Option<usize> {
+        let idx = self.sparse.get(slot);
+        (idx != EMPTY).then_some(idx as usize)
+    }
+
     /// Plain `&mut` access that stamps the changed-tick immediately —
     /// the `Single` handle's mutable path. Prefer `get_mut` (write-gated
     /// stamping) for entity iteration.

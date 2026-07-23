@@ -95,6 +95,16 @@ macro_rules! pm_params {
         }
 
         impl $Pod {
+            /// Field-level schema descriptor (name + every field, in
+            /// order) — dependency-free here; an engine that hashes pod
+            /// schemas into its connect handshake hashes this string
+            /// (pm: `impl pm::PodSchema for Pod { const SCHEMA_HASH =
+            /// pm::schema_hash_str(Pod::SCHEMA); }` next to the
+            /// declaration). Adding/renaming/reordering a param changes
+            /// it, so version-skewed ends fail loudly at connect.
+            $vis const SCHEMA: &'static str =
+                concat!(stringify!($Pod) $(, "|", stringify!($field), ":f32")+);
+
             /// One [`ParamSpec`]($crate::ParamSpec) per field, in
             /// declaration order — the index space every other surface
             /// (events, knobs, `set_clamped`) shares by construction.

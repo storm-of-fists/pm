@@ -32,9 +32,8 @@
 //! itself. `interp=MS` A/B's the interpolation delay (default 33 —
 //! lower trades remote smoothness under loss for freshness; in split
 //! server/client runs pass the SAME value to both, it also sets the
-//! server's lag-comp rewind). `day=SECS`
-//! sets the day-night cycle length (default 480; try day=60 to preview
-//! a full day fast). Game tuning (wave size, damages, hog speed…) lives
+//! server's lag-comp rewind). Game tuning (wave size, damages, hog
+//! speed, day length, interp delay…) lives
 //! in the `hogs.params` file (`params=PATH` overrides; the `Params`
 //! declaration in common.rs is the design record):
 //! loaded here before any thread spawns, live-tunable from pm-watch
@@ -131,26 +130,26 @@ fn main() {
     let kvs = |key: &str| args.iter().find_map(|a| a.strip_prefix(key).map(String::from));
     let addr = kvs("addr=").unwrap_or_else(|| common::ADDR.to_string());
     let password = kvs("password=").unwrap_or_default();
+    // Recording/replay (v2 item 2): the server writes `record=FILE`
+    // (keyframe + per-tick deltas — the wire format IS the demo
+    // format); any client plays it back with `replay=FILE`.
+    let record = kvs("record=");
+    let replay = kvs("replay=");
+    // Diagnostics are ARGS, not env vars (one way in): `netdbg` = the
+    // engine's net doctor, `prof` = per-task cycle times every 5 s.
+    let netdbg = args.iter().any(|a| a == "netdbg");
+    let prof = args.iter().any(|a| a == "prof");
+    if netdbg {
+        pm::netdbg_enable();
+    }
     let flags = common::Flags {
         params,
         params_path: params_path.clone(),
         addr: addr.clone(),
         password: password.clone(),
         menu: false, // CLI modes go straight in; the bare launch flips it
+        replay: replay.clone(),
         link,
-        // Day-night cycle length, seconds (render-only; each client may
-        // differ — it's cosmetic time, not shared time). Live-tunable
-        // via telemetry after launch.
-        day: kv("day=").unwrap_or(480.0).max(10.0),
-        // Effective interp delay (for the telemetry report): the flag,
-        // else the env, else the shipped 33 ms default.
-        interp_ms: kv("interp=")
-            .or_else(|| {
-                std::env::var("PM_INTERP_MS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            })
-            .unwrap_or(33.0),
         // Telemetry monitor address (pm-watch/pm-mon bind this; when
         // the game runs on Windows and the monitor in WSL, pass the
         // WSL IP: mon=172.x.x.x:42500).
@@ -159,14 +158,8 @@ fn main() {
             .find_map(|a| a.strip_prefix("mon=").map(String::from))
             .unwrap_or_else(|| telemetry::TELE_MON.to_string()),
     };
-    if let Some(ms) = kv("interp=") {
-        // The interp delay is a shared const with a PM_INTERP_MS env
-        // override read at startup (client render delay AND server
-        // lag-comp rewind — common.rs interp_delay). Surface it as an
-        // arg the same way: set the env before any thread exists.
-        // SAFETY: main is still single-threaded here.
-        unsafe { std::env::set_var("PM_INTERP_MS", format!("{ms}")) };
-    }
+    // (`interp=` retired 2026-07-23: the delay is the `interp_ms` PARAM
+    // now — tune it in hogs.params or live from pm-watch.)
     let mode = args.get(1).filter(|a| !a.contains('=')).map(String::as_str);
     match mode {
         // Seed/refresh the .glb assets from the code-defined models —
@@ -194,13 +187,17 @@ fn main() {
             // connections (the default binds loopback for dev),
             // `password=...` to lock the session. See deploy/.
             let pw = (!password.is_empty()).then_some(password);
-            server::run(false, params, params_path, &addr, pw);
+            server::run(false, params, params_path, &addr, pw, record, prof);
         }
         Some("bot") => {
             let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-            bot_client::run_bot(n, link, &addr, &password);
+            bot_client::run_bot(n, link, &addr, &password, prof);
         }
         Some("client") => player_client::run(flags),
+        None if replay.is_some() => {
+            // `hogs replay=FILE` — straight into the viewer, no menu.
+            player_client::run(flags);
+        }
         None => {
             // Bare launch: the menu is the front door — HOST spawns the
             // server + bots in-process (player_client's host path),

@@ -14,7 +14,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use pm::{Pm, Predictor, SpatialGrid, pool_mirror, vec2};
+use pm::{Pm, Predictor, SpatialGrid, vec2};
 
 #[derive(Clone, Copy, PartialEq, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -193,30 +193,6 @@ fn predictor() {
     });
 }
 
-fn mirror() {
-    println!("-- pool_mirror (10k entities, per full mirror pass) --");
-    let mut pm = Pm::new();
-    let auth = pm.pool::<P>("auth");
-    let draw = pm.pool::<P>("draw");
-    for i in 0..10_000 {
-        let id = pm.id_add();
-        auth.get_mut().add(
-            id,
-            P {
-                x: i as f32,
-                y: 0.0,
-            },
-        );
-    }
-    time("mirror + blend", 10_000 * 100, || {
-        for _ in 0..100 {
-            pool_mirror(&auth, &draw, |_, d, a: &P| P {
-                x: d.x + (a.x - d.x) * 0.15,
-                y: a.y,
-            });
-        }
-    });
-}
 
 fn main() {
     pools();
@@ -225,6 +201,5 @@ fn main() {
     // net pack/apply lives in-crate now (the sync layer is not public):
     //     cargo test --release -p pm --lib -- --ignored net_bench --nocapture
     predictor();
-    mirror();
     println!("(task dispatch overhead: see `taskbench`; end-to-end loop: see `sim`)");
 }

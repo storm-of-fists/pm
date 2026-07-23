@@ -1,11 +1,9 @@
-//! Presentation-side helpers for replicated state: mirror an
-//! authoritative pool into a draw pool with a game-supplied blend, and
-//! the standard coast+blend math for dead reckoning. Both games (demo,
-//! hellfire) wrote this by hand before it was hoisted here.
+//! Presentation-side interpolation for replicated state: the
+//! [`InterpBuffer`] sample rings and the [`pool_interp`] mirror pass
+//! behind [`PmClient::interp_pool`](crate::PmClient::interp_pool).
+//! (pool_mirror and coast_blend — the deleted demos' dead-reckoning
+//! teaching seams — were removed 2026-07-23 with their last callers.)
 
-// TODO(roadmap): two smoothing APIs — `pool_mirror` (demo's simple
-// teaching path) vs `interp_pool` (everywhere real) — fold when demo
-// stops needing the simple one.
 // TODO(roadmap): interp draw-pool per-frame cost is a watch item once
 // visible-entity counts grow (it rebuilds every entity every frame;
 // cullable).
@@ -14,36 +12,6 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::id::Id;
 use crate::kernel::PoolHandle;
-use crate::math::Vec2;
-
-/// Mirror `auth` into `draw`: new entities copy in, existing ones go
-/// through `blend(id, previous_draw, auth) -> next_draw`, entities gone
-/// from `auth` drop out. Call once per tick from a smoothing task; the
-/// draw pool is what rendering should read.
-pub fn pool_mirror<T: Copy + 'static>(
-    auth: &PoolHandle<T>,
-    draw: &PoolHandle<T>,
-    mut blend: impl FnMut(crate::Id, T, &T) -> T,
-) {
-    let auth = auth.get();
-    let mut draw = draw.get_mut();
-    for (id, a) in auth.iter() {
-        match draw.get_mut(id) {
-            Some(mut d) => *d = blend(id, *d, a),
-            None => draw.add(id, *a),
-        }
-    }
-    draw.retain(|id, _| auth.contains(id));
-}
-
-/// Dead-reckoning step: coast the previous draw position along its
-/// velocity for `dt`, then ease toward the authoritative position by
-/// `blend` (0..1). Hides the bounded staleness of budget-rotated
-/// snapshots without visible snapping.
-pub fn coast_blend(pos: Vec2, vel: Vec2, auth_pos: Vec2, dt: f32, blend: f32) -> Vec2 {
-    let coast = pos + vel * dt;
-    coast + (auth_pos - coast) * blend
-}
 
 /// Snapshot interpolation: a per-entity ring of authoritative samples, so
 /// rendering can show a remote entity at `now - delay` — *between* two
@@ -56,24 +24,14 @@ pub fn coast_blend(pos: Vec2, vel: Vec2, auth_pos: Vec2, dt: f32, blend: f32) ->
 /// latency on the entities it smooths, which for non-owned entities is the
 /// standard trade (your own avatar stays on the predictor, instant).
 ///
-/// Drive against `pool_interp` once per smoothing tick; tune `delay` to a
-/// snapshot interval or two (long enough to ride the worst loss burst,
-/// short enough that other entities don't feel laggy).
-///
-/// ```
-/// use pm::{Id, InterpBuffer};
-///
-/// let mut buf = InterpBuffer::new(0.1); // render 100 ms behind newest
-/// let id = Id::new(0, 0, 1);
-/// buf.push(id, 0.0, 0.0); // sample at t=0.0
-/// buf.push(id, 0.1, 10.0); // sample at t=0.1 (moved 0 -> 10)
-///
-/// // At now=0.15 we render now-delay=0.05 — halfway *between* the two
-/// // known-true samples, never extrapolated past the newest.
-/// let lerp = |a: &f32, b: &f32, t: f32| a + (b - a) * t;
-/// assert_eq!(buf.sample(id, 0.15, lerp), Some(5.0));
-/// ```
-pub struct InterpBuffer<T> {
+/// Crate-internal: the one public door is
+/// [`PmClient::interp_pool`](crate::PmClient::interp_pool). This is the
+/// per-entity CHANGE-POINT projection of a pool's past — same tick axis
+/// as the server's `Journal`, different query ("when did this entity
+/// last actually move", which is what smooth rendering interpolates
+/// across); it folds into a client-side `Journal` if kill-cam ever
+/// gives that store a second customer.
+pub(crate) struct InterpBuffer<T> {
     /// Per entity, `(sample_time, value)` oldest-first. Only genuinely new
     /// values append — a held/stationary entity adds nothing and reads its
     /// last value straight back.
@@ -169,25 +127,34 @@ impl<T: Copy + PartialEq> InterpBuffer<T> {
 }
 
 /// Mirror `auth` into `draw` through an [`InterpBuffer`]: feed this tick's
-/// authoritative values in, then write each entity's `now - delay`
-/// interpolated value out (via the game's angle-/field-aware `lerp`).
-/// Entities gone from `auth` drop from both the buffer and `draw`. The
-/// snapshot-interpolation counterpart to `pool_mirror` + `coast_blend`.
+/// authoritative values in stamped at `push_now`, then write each entity's
+/// `now - delay` interpolated value out (via the game's angle-/field-aware
+/// `lerp`). Entities gone from `auth` drop from both the buffer and
+/// `draw`. The snapshot-interpolation counterpart to `pool_mirror` +
+/// `coast_blend`.
+///
+/// `push_now` and `now` are separate so samples can live on the TICK
+/// AXIS (v2 item 2): stamp pushes at the applied snapshot's label time
+/// (exact server pacing, immune to arrival jitter) while `now` is the
+/// smoothly-advancing render estimate on that same axis. A caller on a
+/// single local clock passes the same value for both — the old behavior.
 ///
 /// This is the manual seam; the per-pool modifier it was promoted into is
 /// [`PmClient::interp_pool`](crate::PmClient::interp_pool) — one call
-/// installs the task, owns the buffer, and hands back the draw pool.
-pub fn pool_interp<T: Copy + PartialEq + 'static>(
+/// installs the task, owns the buffer and both clocks, and hands back the
+/// draw pool.
+pub(crate) fn pool_interp<T: Copy + PartialEq + 'static>(
     auth: &PoolHandle<T>,
     draw: &PoolHandle<T>,
     buf: &mut InterpBuffer<T>,
+    push_now: f64,
     now: f64,
     lerp: impl Fn(&T, &T, f32) -> T,
 ) {
     {
         let auth = auth.get();
         for (id, a) in auth.iter() {
-            buf.push(id, now, *a);
+            buf.push(id, push_now, *a);
         }
         buf.retain_live(|id| auth.contains(id));
     }
@@ -202,4 +169,23 @@ pub fn pool_interp<T: Copy + PartialEq + 'static>(
         }
     }
     draw.retain(|id, _| buf.contains(id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn samples_between_known_points_never_past_newest() {
+        let mut buf = InterpBuffer::new(0.1); // render 100 ms behind newest
+        let id = Id::new(0, 0, 1);
+        buf.push(id, 0.0, 0.0f32); // sample at t=0.0
+        buf.push(id, 0.1, 10.0); // sample at t=0.1 (moved 0 -> 10)
+        // At now=0.15 we render now-delay=0.05 — halfway BETWEEN the two
+        // known-true samples, never extrapolated past the newest.
+        let lerp = |a: &f32, b: &f32, t: f32| a + (b - a) * t;
+        assert_eq!(buf.sample(id, 0.15, lerp), Some(5.0));
+        // Pure-interp default: past the newest sample it holds.
+        assert_eq!(buf.sample(id, 0.5, lerp), Some(10.0));
+    }
 }

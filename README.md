@@ -19,11 +19,12 @@ embellish.
 ```bash
 cargo doc -p pm-world --open   # the docs: API tour, design, netcode, 3D, mods
 cargo test --workspace    # all tests, incl. doctests + QUIC loopback
-cargo run --release -p hogs   # THE game (hellfire/demo/drive/solids = older examples)
+cargo run --release -p hogs   # THE game (solids = renderer scratchpad; the old demo/drive/hellfire examples were DELETED 2026-07-23 — hogs eclipses them, see git history)
 grep -rn "TODO(ship)" crates/ examples/      # the shipping queue — work this
 grep -rn "TODO(roadmap)" crates/ examples/   # engine queue — only if blocking
 grep -rn "TODO(v2)" crates/                  # engine-v2 adoption — greenlit, in flight
 grep -rn "TODO(story)" examples/             # the lore — Connor authors this
+grep -rn "TODO(simplify)" crates/ examples/  # zoom-outs/generalizations noticed while working — the standing simplification track
 ```
 
 New here (or want the whole system explained start to finish)? Open the
