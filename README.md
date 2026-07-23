@@ -11,9 +11,10 @@ when the goal became SHIP THE GAME): `TODO(ship)` is the shipping queue
 — player-facing work, and the only list that gets touched by default;
 `TODO(roadmap)` is engine work and scaling cliffs, touched only when a
 ship item is actually blocked by one; `TODO(v2)` is the engine-v2
-lessons list (what we'd make foundational in a rewrite — a record, not
-a plan; lives at the top of pm-world's lib.rs); `TODO(story)` is the
-game's lore, Connor's alone — capture, never embellish.
+adoption list (GREENLIT 2026-07-22 — landing in-place, order 3→2→1→4;
+the list and per-item status live at the top of pm-world's lib.rs);
+`TODO(story)` is the game's lore, Connor's alone — capture, never
+embellish.
 
 ```bash
 cargo doc -p pm-world --open   # the docs: API tour, design, netcode, 3D, mods
@@ -21,7 +22,7 @@ cargo test --workspace    # all tests, incl. doctests + QUIC loopback
 cargo run --release -p hogs   # THE game (hellfire/demo/drive/solids = older examples)
 grep -rn "TODO(ship)" crates/ examples/      # the shipping queue — work this
 grep -rn "TODO(roadmap)" crates/ examples/   # engine queue — only if blocking
-grep -rn "TODO(v2)" crates/                  # engine-v2 lessons — a record, not a plan
+grep -rn "TODO(v2)" crates/                  # engine-v2 adoption — greenlit, in flight
 grep -rn "TODO(story)" examples/             # the lore — Connor authors this
 ```
 

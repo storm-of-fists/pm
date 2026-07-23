@@ -33,19 +33,22 @@
 // otherwise — per-peer pack scan is O(entities × pools) per DATAGRAM,
 // and a multi-datagram flight multiplies it (plus the dirty_bytes
 // counting scan per send): fine at horde scale, the first thing to fold
-// into a per-tick dirty journal near ~10k entities;
-// reconnect/peer-id reassignment is unbuilt; removal recycling is
+// into a per-tick dirty journal near ~10k entities (the tick journal —
+// `PmServer::journal_pool` — is the store that scan would derive from,
+// the v2 item-2 stage still queued); removal recycling is
 // ack-gated ONLY (a peer that stops acking without disconnecting stalls
 // id recycling until the idle timeout reaps it — an ack-OR-timer release
 // is the fix if that ever bites); u32 ticks and send seqs last ~2.2
-// years.
-// TODO(roadmap): foveal relevancy = a SORT KEY, not a scheduler — parked
-// until a demo has enough entities that the byte budget actually
-// rotates. The packer + rotation cursor already IS graduated cadence:
-// importance (distance + angle-off-view-center) would only change the
-// visit order inside `pack_dirty`; the budget keeps doing all the
-// throttling. NOT per-entity due-times, NOT culling. The client's
-// view-pose report is just another input channel.
+// years. (Reconnect LANDED 2026-07-22 as the pm/3 session-token
+// handshake: same token inside the grace window → same peer id, fresh
+// cursors, and full reconvergence — the delta cursors were the baseline
+// mechanism all along. See transport.rs FRAME_AUTH/FRAME_WELCOME.)
+// (Foveal relevancy LANDED 2026-07-22 as predicted — a SORT KEY, not a
+// scheduler: `PmServer::interest_pool` installs a per-peer scorer and
+// `pack_dirty` visits dirty entries in importance × staleness order;
+// the budget keeps doing all the throttling. NOT per-entity due-times,
+// NOT culling. The angle-off-view-center refinement still wants the
+// client view-pose report — just another input channel, when needed.)
 // TODO(roadmap): both sync modifiers are LANDED — interp as
 // `PmClient::interp_pool`, duration as `PmServer::ttl_pool` (transient
 // entries expire) + `PmServer::history_pool` (past-tick ring; rewind to
@@ -64,6 +67,7 @@
 // - SAVING: a world save is "every synced pool + id state at one tick" —
 //   the SyncSet adapters already serialize exactly that (a save is an
 //   unbudgeted keyframe snapshot; loading is apply() into a fresh Pm).
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -189,6 +193,14 @@ fn dirty_bytes<T>(pool: &Pool<T>, pp: &PeerPool, entry_size: usize) -> usize {
     n * entry_size
 }
 
+/// A per-peer interest scorer (v2 item 4): game-defined POSITIVE
+/// importance for an entry as seen by `peer`. The packer multiplies it
+/// by the entry's STALENESS (ticks since that peer last confirmed it) —
+/// the priority-accumulator model — so low-importance entries send at a
+/// lower cadence instead of never, and importance decides who fills the
+/// budget first. Install via `PmServer::interest_pool`.
+type InterestFn<T> = Rc<dyn Fn(u8, Id, &T) -> f32>;
+
 trait SyncAdapter {
     fn name(&self) -> &str;
     #[cfg(test)] // test seam (SyncSet::schema)
@@ -203,6 +215,8 @@ trait SyncAdapter {
     fn pack_dirty(
         &self,
         pp: &mut PeerPool,
+        peer: u8,
+        now: u32,
         seq: u32,
         budget: &mut usize,
         out: &mut Vec<u8>,
@@ -210,11 +224,15 @@ trait SyncAdapter {
         pool_idx: u16,
     ) -> u32;
     fn apply(&self, pm: &mut Pm, count: u32, r: &mut Reader) -> Result<(), NetError>;
+    /// Install an interest scorer; `f` is an `&InterestFn<T>` behind
+    /// `Any` — false when `T` isn't this adapter's element type.
+    fn interest_set(&mut self, f: &dyn Any) -> bool;
 }
 
 struct PoolAdapter<T: Pod> {
     name: String,
     pool: Rc<RefCell<Pool<T>>>,
+    interest: Option<InterestFn<T>>,
 }
 
 impl<T: Pod> SyncAdapter for PoolAdapter<T> {
@@ -234,6 +252,8 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
     fn pack_dirty(
         &self,
         pp: &mut PeerPool,
+        peer: u8,
+        now: u32,
         seq: u32,
         budget: &mut usize,
         out: &mut Vec<u8>,
@@ -249,8 +269,39 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
             return 0;
         }
         let entry_size = 4 + size_of::<T>();
-        let start = if pp.cursor >= n { 0 } else { pp.cursor };
         let mut count = 0u32;
+        // Interest (v2 item 4): visit dirty entries in importance ×
+        // staleness order instead of rotation — the budget still does
+        // ALL the throttling, the score only decides who goes first,
+        // and staleness guarantees nothing starves.
+        if let Some(score) = &self.interest {
+            let mut order: Vec<(f32, usize)> = Vec::new();
+            for i in 0..n {
+                let tick = ticks[i];
+                let slot = ids[i].slot();
+                if tick <= pp.confirmed.get(slot) || tick <= pp.inflight_tick.get(slot) {
+                    continue;
+                }
+                let stale = now.saturating_sub(pp.confirmed.get(slot)) as f32;
+                order.push((score(peer, ids[i], &values[i]) * (1.0 + stale), i));
+            }
+            order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            for (_, i) in order {
+                if *budget < entry_size {
+                    break;
+                }
+                let slot = ids[i].slot();
+                *budget -= entry_size;
+                out.extend_from_slice(&ids[i].0.to_le_bytes());
+                out.extend_from_slice(bytemuck::bytes_of(&values[i]));
+                pp.inflight_tick.set(slot, ticks[i]);
+                pp.inflight_seq.set(slot, seq);
+                sent.push((pool_idx, slot, ticks[i]));
+                count += 1;
+            }
+            return count;
+        }
+        let start = if pp.cursor >= n { 0 } else { pp.cursor };
         let mut resume_at = start;
         for k in 0..n {
             let i = (start + k) % n;
@@ -285,6 +336,16 @@ impl<T: Pod> SyncAdapter for PoolAdapter<T> {
         }
         Ok(())
     }
+
+    fn interest_set(&mut self, f: &dyn Any) -> bool {
+        match f.downcast_ref::<InterestFn<T>>() {
+            Some(f) => {
+                self.interest = Some(f.clone());
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// A synced pod with a compact wire representation: the pool keeps the
@@ -312,6 +373,8 @@ pub trait Wire: Copy + 'static {
 struct WireAdapter<T: Wire> {
     name: String,
     pool: Rc<RefCell<Pool<T>>>,
+    /// Scores the GAME value (full precision), not the wire repr.
+    interest: Option<InterestFn<T>>,
 }
 
 impl<T: Wire> SyncAdapter for WireAdapter<T> {
@@ -331,6 +394,8 @@ impl<T: Wire> SyncAdapter for WireAdapter<T> {
     fn pack_dirty(
         &self,
         pp: &mut PeerPool,
+        peer: u8,
+        now: u32,
         seq: u32,
         budget: &mut usize,
         out: &mut Vec<u8>,
@@ -346,8 +411,37 @@ impl<T: Wire> SyncAdapter for WireAdapter<T> {
             return 0;
         }
         let entry_size = 4 + size_of::<T::Repr>();
-        let start = if pp.cursor >= n { 0 } else { pp.cursor };
         let mut count = 0u32;
+        // Interest: importance × staleness order (see PoolAdapter — the
+        // horde pools are wire pools, so this is the path that matters).
+        if let Some(score) = &self.interest {
+            let mut order: Vec<(f32, usize)> = Vec::new();
+            for i in 0..n {
+                let tick = ticks[i];
+                let slot = ids[i].slot();
+                if tick <= pp.confirmed.get(slot) || tick <= pp.inflight_tick.get(slot) {
+                    continue;
+                }
+                let stale = now.saturating_sub(pp.confirmed.get(slot)) as f32;
+                order.push((score(peer, ids[i], &values[i]) * (1.0 + stale), i));
+            }
+            order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            for (_, i) in order {
+                if *budget < entry_size {
+                    break;
+                }
+                let slot = ids[i].slot();
+                *budget -= entry_size;
+                out.extend_from_slice(&ids[i].0.to_le_bytes());
+                out.extend_from_slice(bytemuck::bytes_of(&values[i].to_repr()));
+                pp.inflight_tick.set(slot, ticks[i]);
+                pp.inflight_seq.set(slot, seq);
+                sent.push((pool_idx, slot, ticks[i]));
+                count += 1;
+            }
+            return count;
+        }
+        let start = if pp.cursor >= n { 0 } else { pp.cursor };
         let mut resume_at = start;
         for k in 0..n {
             let i = (start + k) % n;
@@ -381,6 +475,16 @@ impl<T: Wire> SyncAdapter for WireAdapter<T> {
             pool.add(id, T::from_repr(repr));
         }
         Ok(())
+    }
+
+    fn interest_set(&mut self, f: &dyn Any) -> bool {
+        match f.downcast_ref::<InterestFn<T>>() {
+            Some(f) => {
+                self.interest = Some(f.clone());
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -507,13 +611,29 @@ impl SyncSet {
         self.adapters.push(Box::new(WireAdapter {
             name: name.to_string(),
             pool: pool.rc().clone(),
+            interest: None,
         }));
+    }
+
+    /// Attach an interest scorer to the already-registered pool `name`.
+    pub(crate) fn interest<T: 'static>(&mut self, name: &str, f: InterestFn<T>) {
+        let ad = self
+            .adapters
+            .iter_mut()
+            .find(|a| a.name() == name)
+            .unwrap_or_else(|| panic!("interest: pool '{name}' is not synced"));
+        assert!(
+            ad.interest_set(&f),
+            "interest: pool '{name}' does not hold {}",
+            std::any::type_name::<T>()
+        );
     }
 
     pub(crate) fn pool_sync<T: Pod + 'static>(&mut self, name: &str, pool: &PoolHandle<T>) {
         self.adapters.push(Box::new(PoolAdapter {
             name: name.to_string(),
             pool: pool.rc().clone(),
+            interest: None,
         }));
     }
 
@@ -844,6 +964,8 @@ impl NetServer {
             out.extend_from_slice(&0u32.to_le_bytes());
             let count = adapter.pack_dirty(
                 &mut state.pools[i],
+                peer,
+                label,
                 seq,
                 &mut remaining,
                 &mut out,
@@ -862,6 +984,14 @@ impl NetServer {
             entries,
             more,
         })
+    }
+
+    /// Attach an interest scorer to a synced pool — the seam behind
+    /// [`PmServer::interest_pool`](crate::PmServer::interest_pool)
+    /// (which is the documented front door; this exists for direct
+    /// `NetServer` embedders and tests).
+    pub fn interest<T: 'static>(&mut self, name: &str, f: Rc<dyn Fn(u8, Id, &T) -> f32>) {
+        self.sync.interest(name, f);
     }
 
     /// Recycle removal-log entries every peer has acked. Call once per net

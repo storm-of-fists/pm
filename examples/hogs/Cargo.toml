@@ -11,3 +11,7 @@ pm-world-sdl = { path = "../../crates/pm-world-sdl" }
 # only (no_std) — the UDP port is 20 lines in telemetry.rs, so the
 # game doesn't inherit the host crate's TUI deps.
 pm-control-core = { path = "../../crates/pm-control-core" }
+# THE DETERMINISM BOUNDARY (v2 item 3): the shared steps, predicted
+# pods, params, and shared geometry — everything that must run
+# byte-identical on server and client, re-exported through common.rs.
+hogs-sim = { path = "sim" }

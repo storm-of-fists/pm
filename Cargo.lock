@@ -493,9 +493,19 @@ name = "hogs"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "hogs-sim",
  "pm-control-core",
  "pm-world",
  "pm-world-sdl",
+]
+
+[[package]]
+name = "hogs-sim"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pm-control-core",
+ "pm-world",
 ]
 
 [[package]]

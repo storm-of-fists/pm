@@ -23,6 +23,8 @@
 // 32 drain / 33 director / 95 telemetry…) — the same-tick contact
 // contract already has a runtime guard; the numbers deserve names.
 
+use std::collections::HashMap;
+
 use pm::{Id, Pm, Rng, task};
 
 use crate::common::*;
@@ -305,6 +307,10 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
     if let Some(pw) = &password {
         pm.password(pw);
     }
+    // Reconnect: the engine parks a dropped session's PEER ID this long
+    // (same token → same id back); the roster parks the VEHICLE for the
+    // same window. One knob, both halves.
+    pm.reconnect_grace(RECONNECT_GRACE_SECS);
     // Replicated pools: trucks (predicted client-side), hogs (interp'd
     // client-side), impact markers (TTL'd transient facts). Plus the
     // co-op scoreboard as a synced single.
@@ -376,6 +382,42 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
         );
     }
     let net = pm.net();
+
+    // INTEREST (v2 item 4): the change-dense pools fill each peer's
+    // snapshot budget nearest-their-vehicle-first. The horde re-dirties
+    // every tick, so under budget pressure the far side of the arena
+    // used to steal bytes from the hog about to bite you; now distance
+    // decides the order and the engine's staleness multiplier keeps the
+    // far side flowing at a lower cadence instead of never (the
+    // starvation lesson, wearing its seatbelt). Scorers run inside the
+    // net task's pack — they read the vehicle pools through handles,
+    // never the pool being scored.
+    {
+        let avatar_xz = {
+            let (net, truck, heli) = (net.clone(), truck.clone(), heli.clone());
+            move |peer: u8| -> Option<(f32, f32)> {
+                let id = net.own(peer)?;
+                truck
+                    .get()
+                    .get(id)
+                    .map(|t| (t.body.pos.x, t.body.pos.z))
+                    .or_else(|| heli.get().get(id).map(|h| (h.body.pos.x, h.body.pos.z)))
+            }
+        };
+        let near = move |peer: u8, x: f32, z: f32| {
+            let Some((px, pz)) = avatar_xz(peer) else {
+                return 1.0; // no avatar (spectating a wipe): flat order
+            };
+            let (dx, dz) = (x - px, z - pz);
+            1.0 / (1.0 + dx * dx + dz * dz)
+        };
+        let n = near.clone();
+        pm.interest_pool(&hog, move |p, _, h: &Hog| n(p, h.x, h.z));
+        let n = near.clone();
+        pm.interest_pool(&flyer, move |p, _, f: &Flyer| n(p, f.x, f.z));
+        pm.interest_pool(&bullet, move |p, _, b: &Bullet| near(p, b.x, b.z));
+    }
+
     let inputs = pm.input::<Drive>("drive");
     let respawns = pm.event::<Respawn>("respawn");
     let sessions = pm.event::<Session>("session");
@@ -387,9 +429,48 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
     // spawn + death_cost + boom impact + log) are twins in drive —
     // extract spawn_vehicle() / vehicle_died() helpers.
     // Joins and leaves: a truck (with health, gun, and body part) per
-    // peer.
+    // peer. A LEAVE parks the vehicle instead of deleting it (the v2
+    // reconnect seam): the entity stays in the world — hittable,
+    // biteable, exactly where the drop left it — and a rejoin inside
+    // the grace window re-adopts it (the engine hands the same peer id
+    // back to the same session token), hp and heat intact. A vehicle
+    // that died while parked re-adopts dead and the drive task's death
+    // branch respawns it fresh, the normal way. Grace expiry finally
+    // removes the wreck. Lefts run BEFORE joins: the engine orders a
+    // same-tick reclaim leave-first.
+    let mut parked: HashMap<u8, (Id, u32)> = HashMap::new();
     task!(pm, "roster", 10.0, [truck, health, gun, collider, parts, net, models], move |pm| {
+        for p in net.left() {
+            if let Some(id) = net.own(p) {
+                parked.insert(p, (id, pm.tick()));
+                if !quiet {
+                    eprintln!(
+                        "[server] peer {p} left — vehicle parked {RECONNECT_GRACE_SECS:.0}s for reconnect"
+                    );
+                }
+            } else if !quiet {
+                eprintln!("[server] peer {p} left");
+            }
+        }
         for p in net.joined() {
+            if net.own(p).is_some() {
+                // Quiet supersede: the same session redialed before the
+                // old connection was declared dead — ownership never
+                // lapsed, the vehicle never stopped being theirs.
+                if !quiet {
+                    eprintln!("[server] peer {p} reconnected in place");
+                }
+                continue;
+            }
+            if let Some((id, _)) = parked.remove(&p)
+                && pm.id_alive(id)
+            {
+                net.own_set(p, id);
+                if !quiet {
+                    eprintln!("[server] peer {p} reconnected — vehicle restored");
+                }
+                continue;
+            }
             let id = pm.id_add();
             let t = spawn_truck(p);
             truck.get_mut().add(id, t);
@@ -403,14 +484,21 @@ pub fn run(quiet: bool, init: Params, params_path: String, addr: &str, password:
                 eprintln!("[server] peer {p} joined");
             }
         }
-        for p in net.left() {
-            if let Some(id) = net.own(p) {
+        // Nobody came back for these: clear the wrecks.
+        let now = pm.tick();
+        let grace_ticks = (RECONNECT_GRACE_SECS / FIXED_DT) as u32;
+        parked.retain(|p, &mut (id, since)| {
+            if now.saturating_sub(since) <= grace_ticks {
+                return pm.id_alive(id); // a dead parked vehicle needs no keeper
+            }
+            if pm.id_alive(id) {
                 pm.id_remove(id);
+                if !quiet {
+                    eprintln!("[server] peer {p}'s parked vehicle expired");
+                }
             }
-            if !quiet {
-                eprintln!("[server] peer {p} left");
-            }
-        }
+            false
+        });
     });
 
     // Respawn events: back to your spawn slot as the CHOSEN vehicle.

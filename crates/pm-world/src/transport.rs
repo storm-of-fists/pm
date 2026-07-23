@@ -37,20 +37,40 @@ use quinn_proto::{
 
 // Bump on any dgram/header format change: cross-version connects then
 // fail the TLS handshake loudly instead of misparsing each other.
-// (pm/2: snapshots carry a per-send seq, acks echo (tick, seq).)
-const ALPN: &[u8] = b"pm/2";
+// (pm/2: snapshots carry a per-send seq, acks echo (tick, seq).
+//  pm/3: the hello carries the schema only; FRAME_AUTH leads with a
+//  16-byte session token; FRAME_WELCOME assigns the peer id at
+//  admission — the reconnect handshake.)
+const ALPN: &[u8] = b"pm/3";
+/// Server → client at QUIC connect: the wire schema (a contract, not a
+/// secret — sent before auth so the client knows the stream to answer
+/// on). The peer id is NOT here anymore: identity is decided at
+/// admission, where a reconnecting session can reclaim its old one.
 const FRAME_HELLO: u16 = 0;
 /// Client → server, the client's first frame after a schema-ok hello:
-/// the session password (empty when the client has none). A server
-/// WITHOUT a password ignores it; a server WITH one defers ADMISSION —
-/// no `joined`, no snapshots, no inputs/events accepted — until the
-/// bytes match, and closes the connection on mismatch or timeout. A
-/// bouncer, not cryptography: QUIC/TLS already encrypts the wire; this
-/// only decides who gets past the door.
+/// `[session token; 16][password bytes]` (password empty when the
+/// client has none). The token is the RECONNECT identity — random per
+/// game session, resent on every redial, so a dropped player's new
+/// connection can claim the peer id (and therefore the parked avatar)
+/// the old one held. A server WITHOUT a password ignores the password
+/// part; a server WITH one defers ADMISSION — no `joined`, no
+/// snapshots, no inputs/events accepted — until the bytes match, and
+/// closes the connection on mismatch or timeout. A bouncer, not
+/// cryptography: QUIC/TLS already encrypts the wire; this only decides
+/// who gets past the door (and which door was theirs).
 const FRAME_AUTH: u16 = 1;
+/// Server → client at ADMISSION: `[peer id u8]`. Completes the
+/// handshake (the client's `handshake_done`). Separate from the hello
+/// because the id depends on the token the client hasn't sent yet at
+/// hello time.
+const FRAME_WELCOME: u16 = 2;
 /// How long an unauthenticated connection may sit before the server
 /// closes it (covers clients that never send FRAME_AUTH).
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long after a disconnect a session token may still reclaim its
+/// peer id (override with [`QuicServer::reconnect_grace_set`]). Games
+/// that park avatars for rejoin should use the same window.
+const RECONNECT_GRACE: Duration = Duration::from_secs(20);
 /// User event types must be >= this; lower values are protocol-reserved.
 pub const EVENT_USER_BASE: u16 = 16;
 const DGRAM_SNAPSHOT: u8 = 0;
@@ -80,6 +100,24 @@ fn schema_encode(schema: &[(u8, String, usize)]) -> Vec<u8> {
         out.extend_from_slice(&(*size as u32).to_le_bytes());
     }
     out
+}
+
+/// A random session token — unpredictability from the std hasher's
+/// per-instance seed. A bouncer credential like the password, not
+/// cryptography (QUIC/TLS encrypts the wire it rides).
+fn token_random() -> [u8; 16] {
+    use std::hash::{BuildHasher, Hasher};
+    let mut token = [0u8; 16];
+    for chunk in token.chunks_mut(8) {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        chunk.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    token
 }
 
 fn frame_write(out: &mut Vec<u8>, ty: u16, payload: &[u8]) {
@@ -362,6 +400,9 @@ impl LagSocket {
 
 struct ConnState {
     conn: Connection,
+    /// Peer id, ASSIGNED AT ADMISSION (0 = not yet admitted — real ids
+    /// start at 1). Fresh sessions draw from `next_peer`; a reconnecting
+    /// session token reclaims the id it held.
     peer: u8,
     connected: bool,
     gone: bool,
@@ -369,12 +410,15 @@ struct ConnState {
     stream_in: Vec<u8>,
     stream_out: Vec<u8>,
     last_input_seq: u32,
-    /// ADMITTED: past the password door (immediately, when the server
-    /// has none). Until this is true the peer is never `joined`, and
-    /// its inputs/events/acks are dropped unread.
+    /// ADMITTED: past the session/password door. Until this is true the
+    /// peer is never `joined`, and its inputs/events/acks are dropped
+    /// unread.
     authed: bool,
     /// When the connection was accepted — the auth-timeout clock.
     since: Instant,
+    /// The session token FRAME_AUTH presented (zeros until then; an
+    /// all-zero token never parks or reclaims).
+    token: [u8; 16],
 }
 
 /// Server endpoint. Pump from a net task each tick; drain joins/leaves/acks
@@ -395,6 +439,16 @@ pub struct QuicServer {
     events: Vec<(u8, u16, Vec<u8>)>,
     /// Snapshots dropped for exceeding the datagram size (see README).
     pub oversize_drops: u32,
+    /// Recently-departed sessions: token → (peer id, when they left).
+    /// A reconnect presenting a parked token inside `grace` gets the
+    /// same peer id back — with fresh net state (all delta cursors at
+    /// zero), because full reconvergence IS the baseline mechanism.
+    parked: HashMap<[u8; 16], (u8, Instant)>,
+    /// How long a parked session may reclaim its id.
+    grace: Duration,
+    /// Admissions resolved after the pump's event loop (identity needs
+    /// `&mut` access across connections for the supersede scan).
+    pending_admit: Vec<ConnectionHandle>,
 }
 
 impl QuicServer {
@@ -435,6 +489,9 @@ impl QuicServer {
             inputs: Vec::new(),
             events: Vec::new(),
             oversize_drops: 0,
+            parked: HashMap::new(),
+            grace: RECONNECT_GRACE,
+            pending_admit: Vec::new(),
         })
     }
 
@@ -442,6 +499,13 @@ impl QuicServer {
     /// client connects — set it right after `bind`).
     pub fn password_set(&mut self, pw: &str) {
         self.password = Some(pw.to_string());
+    }
+
+    /// How long after a disconnect the session's token may reclaim its
+    /// peer id (default [`RECONNECT_GRACE`]). Keep the game's avatar
+    /// parking window in step with this.
+    pub fn reconnect_grace_set(&mut self, grace: Duration) {
+        self.grace = grace;
     }
 
     #[cfg(test)] // test seam
@@ -467,15 +531,15 @@ impl QuicServer {
                     out.clear();
                     match endpoint.accept(incoming, now, out, None) {
                         Ok((ch, conn)) => {
-                            let peer = self.next_peer;
-                            // Peer ids are not reused; u8 wrap aborts
-                            // accepting rather than colliding.
-                            self.next_peer = self.next_peer.saturating_add(1);
+                            // No peer id yet: identity is decided at
+                            // ADMISSION, where a reconnect token can
+                            // reclaim the id it held (and a bounced
+                            // dial burns nothing).
                             self.conns.insert(
                                 ch,
                                 ConnState {
                                     conn,
-                                    peer,
+                                    peer: 0,
                                     connected: false,
                                     gone: false,
                                     stream: None,
@@ -484,9 +548,9 @@ impl QuicServer {
                                     last_input_seq: 0,
                                     authed: false,
                                     since: now,
+                                    token: [0; 16],
                                 },
                             );
-                            self.peer_conns.insert(peer, ch);
                         }
                         Err(err) => {
                             if let Some(t) = err.response {
@@ -515,27 +579,27 @@ impl QuicServer {
                         st.connected = true;
                         if let Some(id) = st.conn.streams().open(Dir::Bi) {
                             st.stream = Some(id);
-                            // The hello (peer id + schema) goes out even
-                            // before auth — the schema is a contract, not
-                            // a secret, and the client needs it to know
-                            // the stream to answer on. ADMISSION is what
-                            // the password gates.
-                            let mut hello = vec![st.peer];
-                            hello.extend_from_slice(&self.schema);
-                            frame_write(&mut st.stream_out, FRAME_HELLO, &hello);
-                            if self.password.is_none() {
-                                st.authed = true;
-                                self.joined.push(st.peer);
-                            }
+                            // The hello (schema only) goes out before
+                            // auth — the schema is a contract, not a
+                            // secret, and the client needs it to know
+                            // the stream to answer on. Identity waits
+                            // for FRAME_AUTH's session token; ADMISSION
+                            // (and the peer id) arrive in FRAME_WELCOME.
+                            frame_write(&mut st.stream_out, FRAME_HELLO, &self.schema);
                         }
                     }
                     Event::ConnectionLost { .. } => {
                         st.gone = true;
                         // Only ADMITTED peers ever reached NetServer, so
                         // only they get a leave — a bounced password
-                        // guess never touches the roster.
+                        // guess never touches the roster. A real session
+                        // parks: its token may reclaim this peer id
+                        // inside the grace window.
                         if st.authed {
                             self.left.push(st.peer);
+                            if st.token != [0; 16] {
+                                self.parked.insert(st.token, (st.peer, now));
+                            }
                         }
                     }
                     Event::Stream(StreamEvent::Readable { id }) => {
@@ -564,15 +628,24 @@ impl QuicServer {
             }
             for (ty, payload) in frames_parse(&mut st.stream_in) {
                 if ty == FRAME_AUTH && !st.authed && !st.gone {
-                    // The one frame an unadmitted peer may speak. Match →
-                    // admit; mismatch → close now (the client sees the
-                    // reason string). Constant-time compare is overkill
+                    // The one frame an unadmitted peer may speak:
+                    // `[token; 16][password]`. Password mismatch →
+                    // close now (the client sees the reason string);
+                    // otherwise identity resolves in the admission
+                    // phase below (it needs to look across
+                    // connections). Constant-time compare is overkill
                     // for a lobby bouncer; QUIC already encrypted it.
-                    if self.password.as_ref().is_some_and(|pw| pw.as_bytes() == payload) {
-                        st.authed = true;
-                        self.joined.push(st.peer);
-                    } else {
+                    if payload.len() < 16 {
+                        st.conn.close(now, 2u32.into(), b"bad session frame"[..].into());
+                    } else if self
+                        .password
+                        .as_ref()
+                        .is_some_and(|pw| pw.as_bytes() != &payload[16..])
+                    {
                         st.conn.close(now, 2u32.into(), b"bad password"[..].into());
+                    } else {
+                        st.token = payload[..16].try_into().unwrap();
+                        self.pending_admit.push(ch);
                     }
                 } else if ty >= EVENT_USER_BASE && st.authed {
                     self.events.push((st.peer, ty, payload));
@@ -583,6 +656,61 @@ impl QuicServer {
             if !st.authed && !st.gone && now.duration_since(st.since) > AUTH_TIMEOUT {
                 st.conn.close(now, 2u32.into(), b"auth timeout"[..].into());
             }
+        }
+
+        // ADMISSION: decide who this connection IS, with full access
+        // across connections. Priority: a live connection already
+        // holding the token (the same player redialing before the drop
+        // was noticed — supersede it QUIETLY, no `left`, ownership
+        // stands), then a parked token inside the grace window (normal
+        // reconnect — same peer id back, fresh delta cursors, and full
+        // reconvergence IS the baseline mechanism), else a fresh id.
+        let pending = std::mem::take(&mut self.pending_admit);
+        for ch in pending {
+            let Some(st) = self.conns.get(&ch) else {
+                continue;
+            };
+            if st.gone || st.authed {
+                continue;
+            }
+            let token = st.token;
+            self.parked
+                .retain(|_, &mut (_, since)| now.duration_since(since) <= self.grace);
+            let live = (token != [0; 16])
+                .then(|| {
+                    self.conns.iter().find_map(|(&c, s)| {
+                        (c != ch && s.authed && !s.gone && s.token == token)
+                            .then_some((c, s.peer))
+                    })
+                })
+                .flatten();
+            let peer = if let Some((old_ch, old_peer)) = live {
+                let old = self.conns.get_mut(&old_ch).unwrap();
+                old.authed = false; // quiet: no left, the id lives on
+                old.conn
+                    .close(now, 3u32.into(), b"superseded by reconnect"[..].into());
+                self.peer_conns.remove(&old_peer);
+                old_peer
+            } else if let Some((peer, _)) =
+                (token != [0; 16]).then(|| self.parked.remove(&token)).flatten()
+            {
+                peer
+            } else {
+                // Fresh ids are never reused; u8 saturation refuses new
+                // peers rather than colliding.
+                let peer = self.next_peer;
+                self.next_peer = self.next_peer.saturating_add(1);
+                peer
+            };
+            let st = self.conns.get_mut(&ch).unwrap();
+            st.peer = peer;
+            st.authed = true;
+            frame_write(&mut st.stream_out, FRAME_WELCOME, &[peer]);
+            self.peer_conns.insert(peer, ch);
+            self.joined.push(peer);
+        }
+
+        for (&ch, st) in self.conns.iter_mut() {
             conn_flush(
                 &mut st.conn,
                 &mut self.endpoint,
@@ -598,7 +726,12 @@ impl QuicServer {
         }
         for ch in drained {
             if let Some(st) = self.conns.remove(&ch) {
-                self.peer_conns.remove(&st.peer);
+                // Only clear the peer mapping if it still points HERE —
+                // a superseded connection's peer id now belongs to the
+                // reconnected one.
+                if self.peer_conns.get(&st.peer) == Some(&ch) {
+                    self.peer_conns.remove(&st.peer);
+                }
             }
         }
     }
@@ -746,10 +879,14 @@ pub struct QuicClient {
     stream_in: Vec<u8>,
     stream_out: Vec<u8>,
     schema: Vec<u8>,
-    /// Session password to present (empty = none). Always sent as the
-    /// first frame after a schema-ok hello — the server decides whether
-    /// it matters (see [`FRAME_AUTH`]).
+    /// Session password to present (empty = none). Rides FRAME_AUTH
+    /// after a schema-ok hello — the server decides whether it matters.
     password: Option<String>,
+    /// Session token FRAME_AUTH leads with — the reconnect identity.
+    /// Random per client by default; a game that redials passes the
+    /// SAME token again ([`session_token_set`](QuicClient::session_token_set))
+    /// to reclaim its peer id and parked avatar.
+    token: [u8; 16],
     peer: Option<u8>,
     snapshots: Vec<Vec<u8>>,
     error: Option<String>,
@@ -794,6 +931,7 @@ impl QuicClient {
             stream_out: Vec::new(),
             schema: schema_encode(schema),
             password: None,
+            token: token_random(),
             peer: None,
             snapshots: Vec::new(),
             error: None,
@@ -806,6 +944,14 @@ impl QuicClient {
     /// the first `pump`).
     pub fn password_set(&mut self, pw: &str) {
         self.password = Some(pw.to_string());
+    }
+
+    /// Use this session token instead of the random default (set before
+    /// the first `pump`). A redial presenting the token of a session
+    /// inside the server's reconnect grace gets its old peer id back —
+    /// generate one token per GAME session and reuse it across dials.
+    pub fn session_token_set(&mut self, token: [u8; 16]) {
+        self.token = token;
     }
 
     /// Drive the connection. Call once per tick.
@@ -854,22 +1000,26 @@ impl QuicClient {
                 self.snapshots.push(d[1..].to_vec());
             }
         }
-        // The reliable stream only ever carries the hello downstream:
-        // events are one-way client→server; server→client facts are state.
+        // The reliable stream only carries the handshake downstream
+        // (hello, then welcome): events are one-way client→server;
+        // server→client facts are state.
         for (ty, payload) in frames_parse(&mut self.stream_in) {
             if ty == FRAME_HELLO {
-                if payload.len() < 1 + self.schema.len() || payload[1..] != self.schema[..] {
+                if payload != self.schema[..] {
                     self.error = Some("schema mismatch with server".into());
                     self.conn
                         .close(now, 1u32.into(), b"schema mismatch"[..].into());
                     continue;
                 }
+                // Answer the door: session token + password (or an
+                // empty knock) — an open server ignores the password
+                // part, a locked one gates ADMISSION on it; the token
+                // is who we ARE if we've been here before.
+                let mut auth = self.token.to_vec();
+                auth.extend_from_slice(self.password.as_deref().unwrap_or("").as_bytes());
+                frame_write(&mut self.stream_out, FRAME_AUTH, &auth);
+            } else if ty == FRAME_WELCOME && !payload.is_empty() {
                 self.peer = Some(payload[0]);
-                // Answer the door: the password (or an empty knock) is
-                // always the first frame back — an open server ignores
-                // it, a locked one gates ADMISSION on it.
-                let pw = self.password.as_deref().unwrap_or("");
-                frame_write(&mut self.stream_out, FRAME_AUTH, pw.as_bytes());
             }
         }
         conn_flush(

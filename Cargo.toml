@@ -13,6 +13,7 @@ members = [
     "examples/hellfire/meteor",
     "examples/hellfire/mod-template",
     "examples/hogs",
+    "examples/hogs/sim",
     "examples/solids",
 ]
 

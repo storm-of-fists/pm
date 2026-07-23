@@ -1,0 +1,14 @@
+[package]
+name = "hogs-sim"
+version = "0.1.0"
+edition = "2024"
+
+# THE DETERMINISM BOUNDARY (engine-v2 item 3): this crate is everything
+# the server and client prediction must run byte-identical, and nothing
+# else. The dependency list IS the enforcement — pm (math + pod derives)
+# and pm-control-core (the params macro) are pure; adding std::fs, rand,
+# clocks, or pool access here should hurt at review time.
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+pm-world = { path = "../../../crates/pm-world" }
+pm-control-core = { path = "../../../crates/pm-control-core" }

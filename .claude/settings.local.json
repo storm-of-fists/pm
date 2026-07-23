@@ -112,7 +112,11 @@
       "Bash(chmod +x /home/clatham/pm/deploy/deploy.sh)",
       "Bash(bash -n /home/clatham/pm/deploy/deploy.sh)",
       "Bash(cargo clippy *)",
-      "Bash(awk '/level complete/{found=NR} END{print \"lines after win:\", NR-found}' /tmp/claude-1000/-home-clatham-pm/99a029b7-513f-4dd7-9056-3f873b58afe7/scratchpad/server.log)"
+      "Bash(awk '/level complete/{found=NR} END{print \"lines after win:\", NR-found}' /tmp/claude-1000/-home-clatham-pm/99a029b7-513f-4dd7-9056-3f873b58afe7/scratchpad/server.log)",
+      "Bash(python3 /tmp/claude-1000/-home-clatham-pm/07156d95-7d5b-4f7a-a895-12da1f123343/scratchpad/cut_common.py)",
+      "Bash(python3 /tmp/claude-1000/-home-clatham-pm/07156d95-7d5b-4f7a-a895-12da1f123343/scratchpad/cut_common.py --write)",
+      "Bash(awk -F: '$2 > 1320 && $2 < 1440')",
+      "Bash(awk -F': ' '{print $2}')"
     ],
     "defaultMode": "bypassPermissions"
   }

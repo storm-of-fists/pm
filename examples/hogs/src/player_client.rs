@@ -36,6 +36,10 @@
 // disconnect reason IN the window instead of stderr (today a bounced
 // join closes back to the terminal).
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
 use pm::{
     CamAnchor, CamRig, CamView, Mat4, Pm, Vec3, camera_install, camera_manager, camera_track, vec3,
 };
@@ -169,30 +173,159 @@ fn hud_bold(frame: &mut Frame3, s: &str, x: f32, y: f32, px: f32, col: (u8, u8, 
 
 pub fn run(flags: Flags) {
     // Window + renderer FIRST: the menu draws before any socket exists,
-    // and the game reuses both.
-    let (mut window, mut pump, refresh) = pm_sdl::window(
+    // and the game (across every reconnect) reuses both — hence the
+    // Rc<RefCell<…>>: each session's task closures borrow them per
+    // tick instead of consuming them, so a redial can build a fresh Pm
+    // against the same window.
+    let (window, pump, refresh) = pm_sdl::window(
         &format!("pm hogs [{}] — wasd drives, rmb aims, lmb fires, 1-3 cams, r respawn, esc", pm::BUILD_ID),
         W,
         H,
     );
-    let mut r3d = Renderer3d::new(&window).expect("renderer");
-    r3d.fog_distance = 320.0;
-
-    // The front door (TODO(ship) launch flow, first half): bare launch
-    // shows HOST / JOIN; CLI modes carry their answer in the flags.
-    let (join_addr, password) = if flags.menu {
-        match menu(&mut pump, &mut r3d, &window, &flags) {
-            Some(choice) => choice,
-            None => return, // quit from the menu
-        }
-    } else {
-        (flags.addr.clone(), flags.password.clone())
+    let window = Rc::new(RefCell::new(window));
+    let pump = Rc::new(RefCell::new(pump));
+    let r3d = {
+        let mut r = Renderer3d::new(&window.borrow()).expect("renderer");
+        r.fog_distance = 320.0;
+        Rc::new(RefCell::new(r))
     };
 
-    let mut pm = Pm::client(&join_addr, 1.0 / FIXED_DT);
-    if !password.is_empty() {
-        pm.password(&password);
+    'app: loop {
+        // The front door (TODO(ship) launch flow, first half): bare
+        // launch shows HOST / JOIN; CLI modes carry their answer in the
+        // flags.
+        let (join_addr, password) = if flags.menu {
+            match menu(&mut pump.borrow_mut(), &mut r3d.borrow_mut(), &window.borrow(), &flags) {
+                Some(choice) => choice,
+                None => return, // quit from the menu
+            }
+        } else {
+            (flags.addr.clone(), flags.password.clone())
+        };
+
+        // ONE reconnect identity per game session, resent on every
+        // redial: the server hands the same peer id back inside its
+        // grace window and the roster returns the parked vehicle
+        // (common::RECONNECT_GRACE_SECS, both halves).
+        let token = session_token_new();
+        let mut first_loss: Option<Instant> = None;
+        let mut attempt = 0u32;
+        loop {
+            let (connected, lost) = session(
+                window.clone(),
+                pump.clone(),
+                r3d.clone(),
+                refresh,
+                &flags,
+                &join_addr,
+                &password,
+                token,
+            );
+            let Some(reason) = lost else { return }; // local quit (esc)
+            if connected {
+                // A real session ran and then dropped: fresh clock.
+                first_loss = None;
+                attempt = 0;
+            }
+            let since = *first_loss.get_or_insert_with(Instant::now);
+            attempt += 1;
+            eprintln!("[hogs] connection lost: {reason} — redial {attempt}");
+            if since.elapsed().as_secs_f32() > RECONNECT_GRACE_SECS + 5.0 {
+                // Past the server's grace: the peer id and the parked
+                // vehicle are gone; a further dial would be a fresh
+                // join. Back to the menu (or out) instead of pretending.
+                eprintln!(
+                    "[hogs] gave up after {:.0}s — the session moved on",
+                    since.elapsed().as_secs_f32()
+                );
+                if flags.menu {
+                    continue 'app;
+                }
+                return;
+            }
+            if !reconnect_overlay(&pump, &r3d, &window, &reason, attempt) {
+                return; // esc during the wait
+            }
+        }
     }
+}
+
+/// One reconnect identity per game session: random, resent across
+/// redials, never persisted (see the transport's FRAME_AUTH). The std
+/// hasher's per-instance seed is the entropy source — a bouncer
+/// credential, not cryptography, same doctrine as the password.
+fn session_token_new() -> [u8; 16] {
+    use std::hash::{BuildHasher, Hasher};
+    let mut token = [0u8; 16];
+    for chunk in token.chunks_mut(8) {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        chunk.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    token
+}
+
+/// The between-redials screen: reason + attempt count for ~1.2 s,
+/// Esc/close gives up (returns false). Ungrabs the mouse — the grab
+/// belongs to a live session.
+fn reconnect_overlay(
+    pump: &Rc<RefCell<sdl3::EventPump>>,
+    r3d: &Rc<RefCell<Renderer3d>>,
+    window: &Rc<RefCell<sdl3::video::Window>>,
+    reason: &str,
+    attempt: u32,
+) -> bool {
+    pm_sdl::grab_mouse(&window.borrow(), false);
+    let until = Instant::now() + Duration::from_millis(1200);
+    while Instant::now() < until {
+        for ev in pump.borrow_mut().poll_iter() {
+            match ev {
+                Event::Quit { .. }
+                | Event::KeyDown { scancode: Some(Scancode::Escape), .. } => return false,
+                _ => {}
+            }
+        }
+        let mut r3d = r3d.borrow_mut();
+        let window = window.borrow();
+        if let Some(mut f) = r3d.frame(&window, Mat4::IDENTITY, vec3(0.35, 1.0, 0.3)) {
+            let cx = W as f32 * 0.5 - 220.0;
+            let y = H as f32 * 0.42;
+            f.text("CONNECTION LOST", cx, y, 34.0, (245, 120, 90));
+            f.text(
+                &format!("reconnecting (attempt {attempt}) — {reason}"),
+                cx,
+                y + 44.0,
+                18.0,
+                (215, 220, 210),
+            );
+            f.text("esc gives up", cx, y + 72.0, 15.0, (150, 155, 145));
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    true
+}
+
+/// One connected life of the game: builds a `Pm`, wires every task
+/// against the shared window/renderer, runs until the loop quits.
+/// Returns `(handshake_completed, ClientNet::lost())` — `lost` `None`
+/// means a local quit (Esc), `Some` means the link died and the caller
+/// decides whether to redial with the same token.
+#[allow(clippy::too_many_arguments)] // the redial loop's plumbing, all of it load-bearing
+fn session(
+    window_rc: Rc<RefCell<sdl3::video::Window>>,
+    pump_rc: Rc<RefCell<sdl3::EventPump>>,
+    r3d_rc: Rc<RefCell<Renderer3d>>,
+    refresh: u32,
+    flags: &Flags,
+    join_addr: &str,
+    password: &str,
+    token: [u8; 16],
+) -> (bool, Option<String>) {
+    let mut pm = Pm::client(join_addr, 1.0 / FIXED_DT);
+    if !password.is_empty() {
+        pm.password(password);
+    }
+    pm.session_token(token);
     if flags.link != (0.0, 0.0) {
         pm.link_lag(flags.link.0, flags.link.1);
         eprintln!(
@@ -225,7 +358,13 @@ pub fn run(flags: Flags) {
     // Steal the mouse (relative mode): no cursor wandering onto the
     // second monitor mid-firefight. Esc quits, which releases it.
     // (After the menu — nobody wants a grabbed cursor while typing.)
-    pm_sdl::grab_mouse(&window, true);
+    pm_sdl::grab_mouse(&window_rc.borrow(), true);
+    // Mesh uploads under one scoped borrow (released before the tasks
+    // run — they take their own per-tick borrows). A redial re-uploads;
+    // TODO(refactor): hoist static meshes out of the session once the
+    // model registry can load without a Pm.
+    let mut r3d_hold = r3d_rc.borrow_mut();
+    let r3d = &mut *r3d_hold;
     let ground = r3d
         .upload_mesh(&checker_ground(
             14,
@@ -302,6 +441,7 @@ pub fn run(flags: Flags) {
             .collect();
         r3d.upload_mesh(&bake(&tris, (1.0, 1.0, 1.0))).expect("shadow")
     };
+    drop(r3d_hold);
 
     // TODO(refactor): gun state (aim / aim_pitch / gun_cd) lives in
     // closure captures — a local "hogs.gun" single would put it where
@@ -337,6 +477,9 @@ pub fn run(flags: Flags) {
         let tracer = tracer_local.clone();
         let params = w.params.clone();
         move |pm| {
+            // Per-tick borrow of the shared pump (the redial loop owns
+            // it between sessions).
+            let mut pump = pump_rc.borrow_mut();
             // The live predictor answers "am I flying?" — it decides
             // which KEY CONTEXT fills the (shared) input pod below.
             let flying = pred_heli.get().state().is_some();
@@ -599,6 +742,10 @@ pub fn run(flags: Flags) {
         let mut dbg_snaps = 0.0f32;
         let mut dbg_snap_rate = 0.0f32;
         move |pm| {
+            // Per-tick borrows of the shared renderer + window (the
+            // redial loop owns them between sessions).
+            let mut r3d = r3d_rc.borrow_mut();
+            let mut window = window_rc.borrow_mut();
             frame_ms += (pm.loop_dt() * 1000.0 - frame_ms) * 0.06;
             let show_debug = tune.get().show_debug;
             if show_debug && !dbg_on {
@@ -1429,7 +1576,14 @@ pub fn run(flags: Flags) {
 
     // Display refresh paces the loop (WSLg ignores vsync; see solids).
     pm.loop_rate = refresh;
-    pm.run().expect("connect");
+    let ran = pm.run();
+    // The Pm is gone; the cloned handles keep the status single alive —
+    // this is how the redial loop learns WHY the loop ended.
+    let connected = net.peer() != 0;
+    match ran {
+        Ok(()) => (connected, net.lost()),
+        Err(e) => (connected, Some(format!("connect failed: {e}"))),
+    }
 }
 
 /// The pre-connect menu: HOST / JOIN / address / password, keyboard

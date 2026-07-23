@@ -86,7 +86,8 @@
 //! of that tick. A client whose connection errors or closes quits the
 //! loop.
 
-use std::cell::{Ref, RefCell};
+use std::any::Any;
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -156,6 +157,12 @@ pub struct PmServer {
     pm: Pm,
     addr: String,
     password: Option<String>,
+    /// One tick journal per pool name, shared across consumers — the
+    /// registry behind [`journal_pool`](PmServer::journal_pool). Boxed
+    /// `(Rc<RefCell<HistoryRing<T>>>, Rc<Cell<f32>>)` per entry.
+    journals: HashMap<String, Box<dyn Any>>,
+    /// Reconnect grace override (seconds); `None` = transport default.
+    grace: Option<f32>,
 }
 
 /// A networked [`Pm`] in the **client** role: mirrors server state and carries
@@ -170,6 +177,7 @@ pub struct PmClient {
     input_hz: f32,
     link_lag: Option<(std::time::Duration, f32)>,
     password: Option<String>,
+    session_token: Option<[u8; 16]>,
 }
 
 impl Deref for PmServer {
@@ -209,6 +217,8 @@ impl Pm {
             pm: Pm::new(),
             addr: addr.to_string(),
             password: None,
+            journals: HashMap::new(),
+            grace: None,
         }
     }
 
@@ -222,6 +232,7 @@ impl Pm {
             input_hz,
             link_lag: None,
             password: None,
+            session_token: None,
         }
     }
 
@@ -282,10 +293,18 @@ impl Pm {
     /// lagging both sockets stacks: every packet crossed two delay queues
     /// (RTT = 4x the knob, not 2x) and rolled loss twice per direction —
     /// "80 ms / 3%" actually simulated a 320 ms / ~6% link.
-    fn serve(&mut self, addr: &str, password: Option<String>) -> std::io::Result<()> {
+    fn serve(
+        &mut self,
+        addr: &str,
+        password: Option<String>,
+        grace: Option<f32>,
+    ) -> std::io::Result<()> {
         let mut quic = QuicServer::bind(addr, &self.net_schema())?;
         if let Some(pw) = &password {
             quic.password_set(pw);
+        }
+        if let Some(secs) = grace {
+            quic.reconnect_grace_set(std::time::Duration::from_secs_f32(secs.max(0.0)));
         }
         let sync = std::mem::take(&mut *self.single::<SyncSet>("net.sync").get_mut());
         self.removal_hold_set(true);
@@ -302,10 +321,14 @@ impl Pm {
         input_hz: f32,
         link_lag: Option<(std::time::Duration, f32)>,
         password: Option<String>,
+        session_token: Option<[u8; 16]>,
     ) -> std::io::Result<()> {
         let mut quic = QuicClient::connect(addr, &self.net_schema())?;
         if let Some(pw) = &password {
             quic.password_set(pw);
+        }
+        if let Some(token) = session_token {
+            quic.session_token_set(token);
         }
         if let Some((delay, loss)) = link_lag.or_else(link_lag_from_env) {
             quic.link_lag_set(delay, loss);
@@ -637,9 +660,19 @@ impl ClientNet {
         self.status.get().peer
     }
 
-    /// Whether the handshake has completed.
+    /// Whether the handshake has completed (and the connection hasn't
+    /// died since — the net task flips this false when the link drops).
     pub fn connected(&self) -> bool {
         self.status.get().connected
+    }
+
+    /// Why the connection ended, once it has. The handle keeps the
+    /// status single alive past the loop, so this is readable AFTER
+    /// [`PmClient::run`] returns — `Some` means the loop quit on a
+    /// dead link (redial with the same session token to reconnect),
+    /// `None` means a local quit (menu, Escape).
+    pub fn lost(&self) -> Option<String> {
+        self.status.get().lost.clone()
     }
 
     /// Snapshots applied this tick, each carrying the server's input-seq
@@ -766,16 +799,30 @@ impl<T: Pod + 'static> SingleRx<T> {
     }
 }
 
-/// Read handle over a server-side window of a pool's past ticks — what
-/// [`PmServer::history_pool`] returns. Clone into the tasks that rewind
-/// (the handles share one ring; the installed task writes it each tick).
-pub struct PoolHistory<T> {
+/// Read handle over a pool's TICK JOURNAL — the server-side ring of
+/// tick-stamped whole-pool frames behind [`PmServer::journal_pool`].
+/// Clone into the tasks that rewind (all handles for one pool share one
+/// ring; the installed task writes it once per tick).
+///
+/// THE JOURNAL is engine-v2 item 2's spine landing in place: one
+/// tick-addressed store of "state at tick T" per synced pool, that the
+/// mechanisms which each kept a bespoke copy derive from instead.
+/// Derived TODAY: the lag-comp rewind ([`PmServer::history_pool`] is a
+/// thin wrapper). QUEUED (the TODO(v2) item-2 status in lib.rs): the
+/// snapshot packer's dirty scan, recordings/replays (serialize the
+/// ring), kill-cams (play it back), and the client stores (interp
+/// samples, predictor window) once those move onto the tick axis.
+pub struct PoolJournal<T> {
     ring: Rc<RefCell<HistoryRing<T>>>,
 }
 
+/// The pre-journal name for [`PoolJournal`] — same type; kept so
+/// lag-comp call sites read as what they are.
+pub type PoolHistory<T> = PoolJournal<T>;
+
 // Hand-implemented (not derived) so cloning the *handle* never demands
 // `T: Clone` — a derive bounds the impl on T. Same idiom as `InputTx`.
-impl<T> Clone for PoolHistory<T> {
+impl<T> Clone for PoolJournal<T> {
     fn clone(&self) -> Self {
         Self {
             ring: self.ring.clone(),
@@ -783,13 +830,25 @@ impl<T> Clone for PoolHistory<T> {
     }
 }
 
-impl<T: Copy + 'static> PoolHistory<T> {
+impl<T: Copy + 'static> PoolJournal<T> {
     /// The recorded frame nearest `tick` (clamped to the window edges;
     /// see [`HistoryRing::frame`]) as a zero-copy borrow. `None` only
     /// before the first frame is recorded. Don't hold it across a call
     /// that ticks the ring — it borrows the shared `RefCell`.
     pub fn frame(&self, tick: u32) -> Option<Ref<'_, [(Id, T)]>> {
         Ref::filter_map(self.ring.borrow(), |r| r.frame(tick)).ok()
+    }
+
+    /// The newest recorded tick label (`None` before the first frame) —
+    /// how deep "now" is; pair with [`oldest`](PoolJournal::oldest) to
+    /// see the whole recorded window.
+    pub fn newest(&self) -> Option<u32> {
+        self.ring.borrow().newest()
+    }
+
+    /// The oldest recorded tick label still in the window.
+    pub fn oldest(&self) -> Option<u32> {
+        self.ring.borrow().oldest()
     }
 }
 
@@ -1011,10 +1070,22 @@ impl PmClient {
             input_hz,
             link_lag,
             password,
+            session_token,
         } = self;
-        pm.connect(&addr, input_hz, link_lag, password)?;
+        pm.connect(&addr, input_hz, link_lag, password, session_token)?;
         pm.loop_run();
         Ok(())
+    }
+
+    /// Present this session token at the handshake — the RECONNECT
+    /// identity. Generate one random token per game session, keep it
+    /// across redials, and pass it to every [`Pm::client`] you build for
+    /// that session: a redial inside the server's grace window gets the
+    /// same peer id back (and whatever the game parked under it). Left
+    /// unset, the transport rolls a fresh random token — first connects
+    /// don't need this call.
+    pub fn session_token(&mut self, token: [u8; 16]) {
+        self.session_token = Some(token);
     }
 
     /// Register a typed reliable event channel and return its **sender**.
@@ -1110,17 +1181,77 @@ impl PmServer {
         pool: &PoolHandle<T>,
         secs: f32,
     ) -> PoolHistory<T> {
+        self.journal_pool(pool, secs)
+    }
+
+    /// Record `pool`'s TICK JOURNAL — a `secs`-deep ring of tick-stamped
+    /// whole-pool frames — and return the [`PoolJournal`] handle that
+    /// reads it. ONE ring per pool no matter how many consumers: a
+    /// second call for the same pool shares the ring and widens the
+    /// window to the larger `secs`. This is the "state at tick T" store
+    /// every tick-addressed feature derives from (see [`PoolJournal`]);
+    /// [`history_pool`](PmServer::history_pool) is the lag-comp-flavored
+    /// name for the same registration.
+    ///
+    /// Frames are labeled like snapshots (`tick - 1`, the last completed
+    /// tick), so a frame label IS a snapshot tick a client may have seen.
+    pub fn journal_pool<T: Copy + 'static>(
+        &mut self,
+        pool: &PoolHandle<T>,
+        secs: f32,
+    ) -> PoolJournal<T> {
+        type Entry<T> = (Rc<RefCell<HistoryRing<T>>>, Rc<Cell<f32>>);
+        let key = pool.name().to_string();
+        if let Some(entry) = self.journals.get(&key) {
+            let (ring, want) = entry
+                .downcast_ref::<Entry<T>>()
+                .expect("journal_pool: a pool journals one element type");
+            want.set(want.get().max(secs));
+            return PoolJournal { ring: ring.clone() };
+        }
         let ring = Rc::new(RefCell::new(HistoryRing::new(1)));
-        let task = format!("net.hist.{}", pool.name());
+        let want = Rc::new(Cell::new(secs));
+        self.journals
+            .insert(key, Box::new((ring.clone(), want.clone()) as Entry<T>));
+        let task = format!("net.journal.{}", pool.name());
         let pool = pool.clone();
-        let handle = PoolHistory { ring: ring.clone() };
+        let handle = PoolJournal { ring: ring.clone() };
         self.task_add(&task, NET_PRIO + 0.5, 0.0, move |pm| {
             let mut ring = ring.borrow_mut();
-            ring.cap_set(secs_ticks(pm, secs).max(1) as usize);
+            ring.cap_set(secs_ticks(pm, want.get()).max(1) as usize);
             let frame: Vec<(Id, T)> = pool.get().iter().map(|(id, v)| (id, *v)).collect();
             ring.push(pm.tick().saturating_sub(1), frame);
         });
         handle
+    }
+
+    /// Give `pool` a per-peer INTEREST scorer (v2 item 4): `score(peer,
+    /// id, value)` returns a POSITIVE importance, and the snapshot
+    /// packer visits that pool's dirty entries in `importance ×
+    /// staleness` order instead of plain rotation — what fills the byte
+    /// budget first is what matters most to THAT peer (distance,
+    /// recency, on-screen-ness; the classic priority-accumulator).
+    /// Staleness (ticks since the peer confirmed the entry) multiplies
+    /// in so a low-importance entry sends at a lower cadence, never
+    /// never — the starvation lesson is load-bearing here. The budget
+    /// still does ALL the throttling; cross-pool fairness
+    /// (smallest-dirty-first) is unchanged.
+    ///
+    /// Call after the pool's `sync_pool`/`wire_pool` registration
+    /// (panics on an unknown pool or a mismatched element type). The
+    /// scorer runs inside the net task's pack, per peer per datagram —
+    /// keep it cheap, and read other pools through cloned handles only
+    /// (never the pool being scored).
+    pub fn interest_pool<T: 'static>(
+        &mut self,
+        pool: &PoolHandle<T>,
+        score: impl Fn(u8, Id, &T) -> f32 + 'static,
+    ) {
+        let f: Rc<dyn Fn(u8, Id, &T) -> f32> = Rc::new(score);
+        self.pm
+            .single::<SyncSet>("net.sync")
+            .get_mut()
+            .interest(pool.name(), f);
     }
 
     /// Register the **continuous input channel** and return its receiver.
@@ -1142,12 +1273,20 @@ impl PmServer {
         self.password = Some(pw.to_string());
     }
 
+    /// How long after a disconnect a session token may reclaim its peer
+    /// id (default 20 s). Keep the game's avatar-parking window in step
+    /// — the engine remembers WHO a returning connection is; parking
+    /// what they owned is the game's half of reconnect.
+    pub fn reconnect_grace(&mut self, secs: f32) {
+        self.grace = Some(secs);
+    }
+
     /// Bind the endpoint (the schema is complete now) and run the loop.
     /// Returns when the loop quits, `Err` on bind failure. (The simulated
     /// link is the CLIENT's — see `serve`; the server never lags itself.)
     pub fn run(self) -> std::io::Result<()> {
-        let PmServer { mut pm, addr, password } = self;
-        pm.serve(&addr, password)?;
+        let PmServer { mut pm, addr, password, grace, .. } = self;
+        pm.serve(&addr, password, grace)?;
         pm.loop_run();
         Ok(())
     }
@@ -1324,6 +1463,12 @@ pub(crate) struct NetStatus {
     pub rtt_ms: f32,
     pub snapshots: u32,
     pub connected: bool,
+    /// Why the connection ended, once it has ("server closed…", a QUIC
+    /// error). The net task fills this and quits the loop; the single
+    /// outlives the `Pm` through cloned handles, so the game reads it
+    /// AFTER `run()` returns to decide whether to redial (reconnect)
+    /// or surface the reason.
+    pub lost: Option<String>,
     /// This peer's controlled entity, as the server marked it (see
     /// [`ServerNet::own_set`]). `None` until the first snapshot that
     /// carries one. [`ClientNet::mine`] is the sugar most game code reads.
@@ -1377,19 +1522,33 @@ impl NetServer {
                 }
                 pe.joined.clear();
                 pe.left.clear();
-                for p in quic.joined_drain() {
-                    net.peer_add(p);
-                    if let Some(s) = &sink {
-                        s.peer_add(p);
-                    }
-                    pe.joined.push(p);
-                }
+                // Lefts BEFORE joins: a reconnect can reclaim its peer
+                // id the same tick the old connection's leave lands
+                // (the transport always orders the leave first), and
+                // processing the leave second would tear down the
+                // fresh peer. Games handling both lists should park on
+                // `left` before adopting on `joined` for the same
+                // reason.
                 for p in quic.left_drain() {
                     net.peer_remove(p);
                     if let Some(s) = &sink {
                         s.peer_remove(p);
                     }
                     pe.left.push(p);
+                }
+                for p in quic.joined_drain() {
+                    // Reset-on-join: a `joined` for a peer id we still
+                    // hold is a reconnect that superseded its old
+                    // connection (no leave fired). The new client
+                    // starts empty, so its net state must too — full
+                    // reconvergence IS the baseline mechanism.
+                    net.peer_remove(p);
+                    net.peer_add(p);
+                    if let Some(s) = &sink {
+                        s.peer_remove(p);
+                        s.peer_add(p);
+                    }
+                    pe.joined.push(p);
                 }
                 // Acks BEFORE inputs: they rode the same datagrams, and
                 // each input gets stamped with the acked tick as of its
@@ -1520,11 +1679,20 @@ impl NetClient {
             quic.pump();
             if let Some(err) = quic.error() {
                 eprintln!("[net] disconnected: {err}");
+                let mut st = status.get_mut();
+                st.connected = false;
+                st.lost = Some(err.to_string());
+                drop(st);
                 pm.loop_quit();
                 return;
             }
             if quic.is_gone() {
                 eprintln!("[net] server closed the connection");
+                let mut st = status.get_mut();
+                st.connected = false;
+                st.lost
+                    .get_or_insert_with(|| "server closed the connection".into());
+                drop(st);
                 pm.loop_quit();
                 return;
             }

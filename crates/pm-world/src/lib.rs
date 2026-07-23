@@ -155,7 +155,14 @@
 // are the lessons that would change what sits at the CENTER — most
 // are retrofittable one at a time, and several existing
 // TODO(refactor)/TODO(roadmap) items are partial steps toward them.
-// Ranked by how much we'd pay for them:
+// Ranked by how much we'd pay for them.
+//
+// GREENLIT 2026-07-22 (Connor): no longer a record — being adopted
+// IN-PLACE, each item landing beside the old machinery and the old
+// path torn out once the new one proves. Order: 3 (determinism
+// boundary, the safety net) → 2 (tick journal, scoped to reconnect
+// first — it IS the ship-list reconnect item) → 1 (pod compiler) →
+// 4 when entity counts demand → 5 at the next serious shader push.
 //
 // TODO(v2): 1. THE POD COMPILER as the engine's spine. A replicated
 // pod's semantics live smeared across the struct, #[wire] attrs, a
@@ -179,10 +186,18 @@
 // window. V2 shape: every synced pool is backed by a single ring of
 // tick-stamped frames, and snapshots, interp, rewind, and prediction
 // replay all DERIVE from it — as do the features that keep being
-// hard because it doesn't exist: recordings, replays, kill-cams, and
-// reconnect/join-in-progress (a late peer = play the journal
-// forward). Where the current design fights us rather than merely
-// costing edits.
+// hard because it doesn't exist: recordings, replays, kill-cams.
+// STAGE 1 LANDED 2026-07-22: `PmServer::journal_pool` is the named
+// journal (one shared tick-stamped ring per pool; `history_pool` now
+// derives from it), and RECONNECT shipped with it — though the recon
+// found reconnect never needed the journal: a fresh peer's delta
+// cursors already reconverge from zero, so reconnect is the pm/3
+// session-token handshake (transport.rs: token reclaims the peer id
+// inside a grace window; hogs parks the vehicle) plus
+// `ClientNet::lost` for the redial loop. Join-in-progress was free
+// all along. STILL QUEUED here: the packer's dirty scan and the
+// client stores (interp samples, predictor window) deriving from the
+// journal, then recordings/replays/kill-cams on top.
 //
 // TODO(v2): 3. AN EXPLICIT DETERMINISM BOUNDARY. Shared steps must
 // replay byte-exact and today that's convention (const-vs-param
@@ -191,14 +206,28 @@
 // CI fails if a step's output changes. Makes cross-version
 // prediction, replay files, and "did this refactor change the
 // physics" machine-answerable instead of soak-answerable.
+// STAGE 1 LANDED 2026-07-22: hogs' boundary extracted verbatim to
+// the `hogs-sim` crate (examples/hogs/sim — steps, predicted pods,
+// Drive, Params, shared geometry, muzzles, spawns), re-exported
+// through common.rs so call sites didn't move; golden replays
+// (sim/tests/golden.rs, scripted LCG command streams → FNV over
+// every tick's pod bytes) + SIM_VERSION pin the math. Engine-side
+// golden helpers can graduate into pm-world when a second game
+// wants them.
 //
 // TODO(v2): 4. INTEREST MANAGEMENT inside the snapshot packer.
 // Smallest-dirty-first fairness is fairness, not RELEVANCE — at 300+
 // entities every peer still eventually gets everything. V2 shape:
 // per-peer interest scoring (distance, recency, on-screen-ness — the
 // parked foveal-as-sort-key idea) decides what fills the flight.
-// Fully retrofittable: the packer is one function, and this is the
-// natural next move the day entity counts jump 10x.
+// LANDED 2026-07-22 exactly as the old foveal note predicted — a SORT
+// KEY, not a scheduler: PmServer::interest_pool(pool, score) makes
+// pack_dirty visit dirty entries in importance × staleness order
+// (priority accumulator — staleness guarantees nothing starves), the
+// budget keeps doing all the throttling, cross-pool fairness
+// unchanged. hogs scores hog/flyer/bullet by distance to the peer's
+// vehicle. Queued refinement: on-screen-ness via a client view-pose
+// report (just another input channel) when a game wants it.
 //
 // TODO(v2): 5. (pm-sdl, noted here so the list is one grep) THE
 // RENDERER BACKEND. SDL_gpu + naga's combined-sampler limitation —
@@ -209,6 +238,7 @@
 // samplers, and shadow maps. Sequence it BEFORE heavy shader
 // investment on the current backend.
 
+mod blend;
 mod bvh;
 mod camera;
 mod duration;
@@ -232,6 +262,7 @@ pub use camera::{
     CAMERA_PRIO, CamAnchor, CamManager, CamRig, CamView, CameraRack, camera_install,
     camera_manager, camera_track,
 };
+pub use blend::{PodErr, PodLerp, schema_hash_str};
 pub use duration::{HistoryRing, pool_expire};
 pub use id::Id;
 pub use kernel::{
@@ -255,6 +286,7 @@ pub use pm_derive::Wire;
 pub use pm_derive::pod;
 pub use netmod::{
     ClientNet, EventRx, EventTx, InputRx, InputTx, NET_PRIO, PmClient, PmServer, PoolHistory,
+    PoolJournal,
     ServerNet, SingleRx,
 };
 pub use pool::{Mut, Pool};

@@ -40,18 +40,35 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Data, DeriveInput, Fields, Ident, Lit, Token, parse_macro_input, spanned::Spanned};
 
-/// `#[pm::pod]` — the one-line pod contract. Expands to `#[repr(C)]` plus
-/// the standard derive set every replicated pod carries by convention
-/// (`Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable`), and adds
-/// `pm::Wire` automatically when any field has a `#[wire(..)]` attribute:
+/// `#[pm::pod]` — the one-line pod contract, and the POD COMPILER's
+/// front door (engine-v2 item 1). Expands to `#[repr(C)]` plus the
+/// standard derive set every replicated pod carries by convention
+/// (`Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable`), adds
+/// `pm::Wire` automatically when any field has a `#[wire(..)]`
+/// attribute, and — for named-field structs — GENERATES the pod's
+/// blend semantics and schema identity:
+///
+/// - `pm::PodLerp` — fieldwise interpolation (the `interp_pool` lerp).
+///   Tag angular f32 fields `#[lerp(angle)]` to lerp short-way and err
+///   wrap-aware; integers and `Id`s are identity (never blend) by type.
+/// - `pm::PodErr` — the fieldwise prediction-error metric (the
+///   `predict_pool` err).
+/// - `SCHEMA_HASH: u64` — an FNV over the pod's name and every field's
+///   (name, type, wire quantization, lerp tag): two builds agree on it
+///   iff they agree on everything that gives the bytes meaning. (The
+///   versioned handshake it unlocks is the queued half of the item.)
 ///
 /// ```ignore
 /// #[pm::pod]
 /// pub struct Hog {
 ///     #[wire(i16, scale = 64.0)]
 ///     pub x: f32,
-///     pub hp: f32, // pass-through on the wire, full f32
+///     #[wire(i16, scale = 10000.0)]
+///     #[lerp(angle)]
+///     pub heading: f32,
+///     pub hp: f32, // pass-through on the wire, linear lerp
 /// }
+/// // pm.interp_pool(&hog, Hog::pod_lerp, …) — no hand lerp to forget.
 /// ```
 ///
 /// This must be an ATTRIBUTE macro, not part of `derive(Wire)`: a derive
@@ -74,27 +91,117 @@ pub fn pod(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     let input = parse_macro_input!(item as DeriveInput);
-    let Data::Struct(data) = &input.data else {
-        return syn::Error::new(input.ident.span(), "#[pm::pod] only supports structs")
-            .to_compile_error()
-            .into();
+    expand_pod(input)
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
+}
+
+fn expand_pod(mut input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let Data::Struct(data) = &mut input.data else {
+        return Err(syn::Error::new(
+            input.ident.span(),
+            "#[pm::pod] only supports structs",
+        ));
     };
+    let name = input.ident.clone();
     let has_wire_fields = data
         .fields
         .iter()
         .any(|f| f.attrs.iter().any(|a| a.path().is_ident("wire")));
     let wire = has_wire_fields.then(|| quote! { , ::pm::Wire });
+
+    // The generated blend/schema half (named-field structs only — a
+    // unit/tuple pod keeps just the derive set).
+    let mut compiled = proc_macro2::TokenStream::new();
+    if let Fields::Named(fields) = &mut data.fields {
+        let mut lerps = Vec::new();
+        let mut errs = Vec::new();
+        let mut schema = format!("{name}");
+        for f in &mut fields.named {
+            let fname = f.ident.clone().unwrap();
+            let fty = f.ty.clone();
+            // Parse AND STRIP #[lerp(..)] — it's this macro's attribute,
+            // nothing downstream should see it. `angle` = cyclic f32
+            // (short-way lerp, wrap-aware err); `snap` = identity (an id
+            // or enum riding a float — never blend, newest wins).
+            let mut angle = false;
+            let mut snap = false;
+            for a in f.attrs.iter().filter(|a| a.path().is_ident("lerp")) {
+                let tag: Ident = a.parse_args()?;
+                match () {
+                    _ if tag == "angle" => angle = true,
+                    _ if tag == "snap" => snap = true,
+                    _ => {
+                        return Err(syn::Error::new(
+                            tag.span(),
+                            "expected #[lerp(angle)] or #[lerp(snap)]",
+                        ));
+                    }
+                }
+                if !is_f32(&fty) {
+                    return Err(syn::Error::new(
+                        fty.span(),
+                        "#[lerp(..)] tags only apply to f32 fields (other types have their meaning by type)",
+                    ));
+                }
+            }
+            f.attrs.retain(|a| !a.path().is_ident("lerp"));
+            let wire_desc = f
+                .attrs
+                .iter()
+                .find(|a| a.path().is_ident("wire"))
+                .map(|a| quote!(#a).to_string())
+                .unwrap_or_default();
+            schema.push_str(&format!(
+                "|{fname}:{}:{wire_desc}{}{}",
+                quote!(#fty),
+                if angle { ":angle" } else { "" },
+                if snap { ":snap" } else { "" }
+            ));
+            if angle {
+                lerps.push(quote! { #fname: ::pm::lerp_angle(self.#fname, b.#fname, t) });
+                errs.push(quote! { ::pm::wrap_angle(self.#fname - b.#fname).abs() });
+            } else if snap {
+                lerps.push(quote! { #fname: b.#fname });
+                errs.push(quote! { if self.#fname == b.#fname { 0.0 } else { 1.0 } });
+            } else {
+                lerps.push(quote! { #fname: ::pm::PodLerp::pod_lerp(&self.#fname, &b.#fname, t) });
+                errs.push(quote! { ::pm::PodErr::pod_err(&self.#fname, &b.#fname) });
+            }
+        }
+        compiled = quote! {
+            impl ::pm::PodLerp for #name {
+                fn pod_lerp(&self, b: &Self, t: f32) -> Self {
+                    Self { #(#lerps,)* }
+                }
+            }
+            impl ::pm::PodErr for #name {
+                fn pod_err(&self, b: &Self) -> f32 {
+                    0.0 #(+ #errs)*
+                }
+            }
+            impl #name {
+                /// Generated by `#[pm::pod]`: the identity of everything
+                /// that gives this pod's bytes meaning (name, fields,
+                /// types, quantization, lerp tags). Two builds agree on
+                /// it iff their views of this pod agree.
+                pub const SCHEMA_HASH: u64 = ::pm::schema_hash_str(#schema);
+            }
+        };
+    }
+
     let has_repr = input.attrs.iter().any(|a| a.path().is_ident("repr"));
     let repr = (!has_repr).then(|| quote! { #[repr(C)] });
-    quote! {
+    Ok(quote! {
         #[derive(
             Clone, Copy, PartialEq, Debug, Default,
             ::bytemuck::Pod, ::bytemuck::Zeroable #wire
         )]
         #repr
         #input
-    }
-    .into()
+
+        #compiled
+    })
 }
 
 /// Parsed `#[wire(i16)]` / `#[wire(i16, scale = 64.0)]`.

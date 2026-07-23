@@ -124,7 +124,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
             let params = params.clone();
             move |s, c, dt| truck_step(s, c, dt, &params.get())
         },
-        err_metric,
+        Truck::pod_err,
         1e-4,
         FIXED_DT,
     );
@@ -135,7 +135,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
             let params = params.clone();
             move |s, c, dt| heli_step(s, c, dt, &params.get())
         },
-        heli_err,
+        Heli::pod_err,
         1e-4,
         FIXED_DT,
     );
@@ -147,13 +147,13 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .map_or(0.05, |ms| ms / 1000.0);
-    let truck_draw = pm.interp_pool(&truck, truck_lerp, interp_delay() as f64, extrap);
-    let heli_draw = pm.interp_pool(&heli, heli_lerp, interp_delay() as f64, extrap);
-    let hog_draw = pm.interp_pool(&hog, hog_lerp, interp_delay() as f64, extrap);
-    let flyer_draw = pm.interp_pool(&flyer, flyer_lerp, interp_delay() as f64, extrap);
+    let truck_draw = pm.interp_pool(&truck, Truck::pod_lerp, interp_delay() as f64, extrap);
+    let heli_draw = pm.interp_pool(&heli, Heli::pod_lerp, interp_delay() as f64, extrap);
+    let hog_draw = pm.interp_pool(&hog, Hog::pod_lerp, interp_delay() as f64, extrap);
+    let flyer_draw = pm.interp_pool(&flyer, Flyer::pod_lerp, interp_delay() as f64, extrap);
     // Bullets too: they live ~0.6 s and cross the map in a straight
     // line — interp (plus the extrapolation cap) is plenty.
-    let bullet_draw = pm.interp_pool(&bullet, bullet_lerp, interp_delay() as f64, extrap);
+    let bullet_draw = pm.interp_pool(&bullet, Bullet::pod_lerp, interp_delay() as f64, extrap);
 
     // The client-local collider pool + query index — the SAME
     // structures the server keeps, posed from the draw pools instead
