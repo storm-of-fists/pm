@@ -136,7 +136,8 @@
       "Bash(awk -F: '$1>1700')",
       "Bash(awk 'NR<=1897 && /task!/ {last=NR} END {print last}' examples/hogs/src/server.rs)",
       "Bash(sed -n \"$\\(awk 'NR<=1897 && /task!/ {last=NR} END {print last}' examples/hogs/src/server.rs\\),+8p\" examples/hogs/src/server.rs)",
-      "Bash(awk '{s+=$4} END {print \"total passed:\", s}')"
+      "Bash(awk '{s+=$4} END {print \"total passed:\", s}')",
+      "Bash(awk '{del+=$2; add+=$1; *)"
     ],
     "defaultMode": "bypassPermissions"
   }

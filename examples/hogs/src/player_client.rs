@@ -1754,10 +1754,10 @@ fn menu(
     }
     // HOST: the old no-arg launch, now behind a menu verb — dedicated
     // thread server bound for the outside world, two bot teammates.
-    let params = flags.params;
+    // (The server loads the params file itself — engine seam.)
     let path = flags.params_path.clone();
     let pw = (!password.is_empty()).then(|| password.clone());
-    std::thread::spawn(move || crate::server::run(true, params, path, HOST_BIND, pw, None, false));
+    std::thread::spawn(move || crate::server::run(true, path, HOST_BIND, pw, None, false));
     std::thread::sleep(std::time::Duration::from_millis(300));
     for n in 0..2 {
         let (link, pw) = (flags.link, password.clone());

@@ -100,6 +100,7 @@ use bytemuck::Pod;
 use crate::blend::{PodErr, PodLerp, PodSchema};
 use crate::math::{Vec3, vec3};
 use crate::journal::Journal;
+use crate::params::{PARAM_SAVE, ParamSet, params_load, params_save};
 use crate::id::Id;
 use crate::kernel::{Pm, PoolHandle, SingleHandle};
 use crate::net::{
@@ -891,12 +892,53 @@ impl<T: Pod + 'static> SingleRx<T> {
     /// carrying it arrives (check [`ClientNet::connected`] or a flag field
     /// if the distinction matters).
     pub fn get(&self) -> T {
-        self.pool
-            .get()
-            .values()
-            .first()
-            .copied()
-            .unwrap_or_else(T::zeroed)
+        self.try_get().unwrap_or_else(T::zeroed)
+    }
+
+    /// The replicated value if a snapshot has delivered one yet — the
+    /// "has the server actually spoken" read (ParamsClient uses it to
+    /// serve shipped defaults instead of zeros before the handshake).
+    pub fn try_get(&self) -> Option<T> {
+        self.pool.get().values().first().copied()
+    }
+}
+
+/// A game's live-tuning surface on the client — the pair
+/// [`PmClient::params`] returns: read the replicated set, ask the
+/// server to change it. Clone freely into tasks.
+pub struct ParamsClient<P: Pod> {
+    pub(crate) replica: SingleRx<P>,
+    pub(crate) tx: EventTx<ParamSet>,
+}
+
+impl<P: Pod> Clone for ParamsClient<P> {
+    fn clone(&self) -> Self {
+        Self {
+            replica: self.replica.clone(),
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl<P: Pod + pm_control_core::Tunable + 'static> ParamsClient<P> {
+    /// The current set: the server's replicated truth, or the shipped
+    /// defaults before the first snapshot delivers it.
+    pub fn get(&self) -> P {
+        self.replica.try_get().unwrap_or_default()
+    }
+
+    /// Ask the server to set param `idx` (its clamp is the record; the
+    /// applied value replicates back to everyone).
+    pub fn set(&self, idx: u32, value: f32) {
+        self.tx.send(ParamSet { idx, value });
+    }
+
+    /// Ask the server to persist the current set to its params file.
+    pub fn save(&self) {
+        self.tx.send(ParamSet {
+            idx: PARAM_SAVE,
+            value: 0.0,
+        });
     }
 }
 
@@ -1195,6 +1237,21 @@ impl PmClient {
         ret
     }
 
+    /// The client half of the engine-hosted params
+    /// ([`PmServer::params`]): the replica single plus the typed write
+    /// path. `get()` serves the pod's SHIPPED DEFAULTS until the first
+    /// snapshot arrives (never zeros), so pre-connect reads at setup
+    /// (interp delay, feel constants) are sane.
+    pub fn params<P>(&mut self) -> ParamsClient<P>
+    where
+        P: Pod + PodSchema + pm_control_core::Tunable + 'static,
+    {
+        ParamsClient {
+            replica: self.sync_single::<P>("pm.params"),
+            tx: self.event::<ParamSet>("pm.param.set"),
+        }
+    }
+
     /// Present this session password at connect. Must match the
     /// server's [`PmServer::password`] or the server closes the
     /// connection ("bad password") — a locked server also drops clients
@@ -1357,6 +1414,57 @@ impl PmServer {
     /// below it. The server-side sibling of [`PmClient::link_tune`].
     pub fn send_tune(&mut self) -> SingleHandle<SendTune> {
         self.pm.single::<SendTune>("net.sendtune")
+    }
+
+    /// Host a [`pm_params!`](pm_control_core::pm_params) pod as THE
+    /// server's live tuning set — the whole stack in one call (engine-
+    /// owned since 2026-07-23; every game had hand-rolled it):
+    /// - loads `path` (clamped `name=value` lines; missing file =
+    ///   shipped defaults),
+    /// - replicates the pod as the `"pm.params"` synced single (the
+    ///   pod's `PodSchema` hash guards the handshake like any channel),
+    /// - runs the CLAMP OF RECORD over the `"pm.param.set"` event:
+    ///   clamped indexed writes, write-gated so the single re-ships
+    ///   only on real change; the [`PARAM_SAVE`](crate::PARAM_SAVE)
+    ///   sentinel rewrites `path`.
+    ///
+    /// Clients pair with [`PmClient::params`]. Sim tasks read the
+    /// returned single; shared steps take `&P` from it (server single /
+    /// client replica — the determinism story params were built on).
+    pub fn params<P>(&mut self, path: &str) -> SingleHandle<P>
+    where
+        P: Pod + PodSchema + pm_control_core::Tunable + 'static,
+    {
+        let single = self.sync_single::<P>("pm.params");
+        *single.get_mut() = params_load::<P>(path);
+        let rx = self.event::<ParamSet>("pm.param.set");
+        let path = path.to_string();
+        let handle = single.clone();
+        self.pm.phase_present("params", move |_pm| {
+            for (_peer, ev) in rx.drain() {
+                if ev.idx == PARAM_SAVE {
+                    match params_save(&path, &*handle.get()) {
+                        Ok(()) => eprintln!("[pm params] saved to {path}"),
+                        Err(e) => eprintln!("[pm params] save FAILED ({path}): {e}"),
+                    }
+                    continue;
+                }
+                // Copy out, clamped indexed write, write back only on a
+                // real change — the single stamps (and ships) only then.
+                // Unknown idx (stale sender): set_clamped says false.
+                let mut p = *handle.get();
+                if p.set_clamped(ev.idx as usize, ev.value) {
+                    *handle.get_mut() = p;
+                    let spec = P::specs()[ev.idx as usize];
+                    eprintln!(
+                        "[pm params] {} = {}",
+                        spec.name,
+                        p.get(ev.idx as usize).unwrap_or(0.0)
+                    );
+                }
+            }
+        });
+        single
     }
 
     /// Give `pool`'s entries a lifetime: any entry not written for `secs`

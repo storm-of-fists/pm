@@ -304,7 +304,6 @@ fn enter_brief(sb: &mut Hunt, level: u32, mission: u32, p: &Params) {
 /// reach the roster (see `PmServer::password`).
 pub fn run(
     quiet: bool,
-    init: Params,
     params_path: String,
     addr: &str,
     password: Option<String>,
@@ -321,6 +320,12 @@ pub fn run(
     if let Some(path) = &record {
         pm.record_to(path);
     }
+    // THE params seam (engine-hosted, 2026-07-23): params file →
+    // replicated "pm.params" single → clamp-of-record over the
+    // "pm.param.set" event (+ save sentinel). `init` = the loaded set,
+    // for the creation-frozen engine knobs below.
+    let params = pm.params::<Params>(&params_path);
+    let init = *params.get();
     // Reconnect: the engine parks a dropped session's PEER ID this long
     // (same token → same id back); the roster parks the VEHICLE for the
     // same window. One knob, both halves.
@@ -347,8 +352,6 @@ pub fn run(
     // caller loaded, replicated to every client, written by the
     // "param.set" event task below. Server tasks read it where the old
     // consts used to be.
-    let params = pm.sync_single::<Params>("params");
-    *params.get_mut() = init;
     // The models registry (models.rs): kind-level shape data. The
     // server's interest is the `collide.*` protos it poses into the
     // collider pool — hitboxes come from the same .glb the clients
@@ -448,7 +451,6 @@ pub fn run(
     let inputs = pm.input::<Drive>("drive");
     let respawns = pm.event::<Respawn>("respawn");
     let sessions = pm.event::<Session>("session");
-    let param_evs = pm.event::<ParamSet>("param.set");
 
     // TODO(refactor): vehicle spawn assembly (pool entry + health + gun
     // + parts + pose + own_set) is hand-rolled 3× (roster, respawn, the
@@ -579,37 +581,12 @@ pub fn run(
     // params file instead. (`param_evs`, the path, and the send-tune
     // handle are moved in, like `respawns` above.)
     let sendtune = pm.send_tune();
-    task!(pm, "params", 12.0, [params], move |_pm| {
-        for (_peer, ev) in param_evs.drain() {
-            if ev.idx == PARAM_SAVE {
-                match params_save(&params_path, &params.get()) {
-                    Ok(()) => {
-                        if !quiet {
-                            eprintln!("[server] params saved to {params_path}");
-                        }
-                    }
-                    Err(e) => eprintln!("[server] params save FAILED ({params_path}): {e}"),
-                }
-                continue;
-            }
-            // Copy out, clamped indexed write, write back only on a real
-            // change — the single stamps (and ships) only then. Unknown
-            // idx (stale schema on the sender): set_clamped says false.
-            let mut p = *params.get();
-            if p.set_clamped(ev.idx as usize, ev.value) {
-                *params.get_mut() = p;
-                if !quiet {
-                    eprintln!(
-                        "[server] param {} = {}",
-                        Params::SPECS[ev.idx as usize].name,
-                        p.get(ev.idx as usize).unwrap_or(0.0)
-                    );
-                }
-            }
-        }
-        // Bridge net_kbps into the engine's flight budget every tick
-        // (write-gated) — this covers both the file-seeded init value
-        // and live knob writes with one compare.
+    // Bridge net_kbps into the engine's flight budget every tick
+    // (write-gated) — covers both the file-seeded value and live knob
+    // writes with one compare. (The rest of the old params task — the
+    // clamp of record, the save sentinel — is ENGINE now:
+    // `PmServer::params`.)
+    task!(pm, "sendtune", 12.0, [params], move |_pm| {
         let kbps = params.get().net_kbps;
         if sendtune.get().kbps != kbps {
             sendtune.get_mut().kbps = kbps;

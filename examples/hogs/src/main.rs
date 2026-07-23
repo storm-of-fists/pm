@@ -125,7 +125,7 @@ fn main() {
         .iter()
         .find_map(|a| a.strip_prefix("params=").map(String::from))
         .unwrap_or_else(|| common::PARAMS_FILE.to_string());
-    let params = common::params_load(&params_path);
+    let params: common::Params = pm::params_load(&params_path);
     // String args, same any-position style as the numeric ones.
     let kvs = |key: &str| args.iter().find_map(|a| a.strip_prefix(key).map(String::from));
     let addr = kvs("addr=").unwrap_or_else(|| common::ADDR.to_string());
@@ -187,7 +187,7 @@ fn main() {
             // connections (the default binds loopback for dev),
             // `password=...` to lock the session. See deploy/.
             let pw = (!password.is_empty()).then_some(password);
-            server::run(false, params, params_path, &addr, pw, record, prof);
+            server::run(false, params_path, &addr, pw, record, prof);
         }
         Some("bot") => {
             let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);

@@ -48,7 +48,7 @@ pub use monitor::{MonFault, MonNode, MonUnlock, Monitor};
 pub use net::{Message, NetHealth, NetStatus, NetworkManager, SegmentPort};
 pub use prof::{PmProf, ProfSpan};
 pub use record::{Playback, Recording, SNAPSHOT_DELAY_MS, SnapshotTrigger};
-pub use params::ParamSpec;
+pub use params::{ParamSpec, Tunable};
 pub use save::SaveSet;
 pub use signal::{
     AnySignal, PmBool, PmF32, PmI32, PmI64, PmSignal, PmString, PmU64, RCursor, Register,

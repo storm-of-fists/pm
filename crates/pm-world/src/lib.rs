@@ -349,6 +349,7 @@ mod blend;
 mod bvh;
 mod camera;
 mod journal;
+mod params;
 mod id;
 mod kernel;
 mod math;
@@ -370,6 +371,8 @@ pub use camera::{
     camera_manager, camera_track,
 };
 pub use blend::{PodErr, PodLerp, PodSchema, schema_hash_str};
+pub use params::{PARAM_SAVE, ParamSet, params_load, params_save};
+pub use pm_control_core::Tunable;
 pub use id::Id;
 pub use kernel::{
     EntryMut, IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
@@ -391,7 +394,7 @@ pub use pm_derive::Wire;
 /// `#[wire(..)]` attribute. See `pm_derive::pod` for the fine print.
 pub use pm_derive::pod;
 pub use netmod::{
-    netdbg_enable,
+    netdbg_enable, ParamsClient,
     ClientNet, EventRx, EventTx, InputRx, InputTx, PmClient, PmServer, JournalHandle,
     ServerNet, SingleRx,
 };

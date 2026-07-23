@@ -42,13 +42,12 @@ pub struct ClientWorld {
     /// End-screen advance (ENTER on won/lost) — the director's door.
     pub session: EventTx<Session>,
     /// Reliable param writes (telemetry knobs → server clamp).
-    pub param_set: EventTx<ParamSet>,
     /// The server's tuning set, replicated (the Params declaration in
     /// common.rs is the design record):
     /// the predictors' steps read it (shared-step constants), and any
     /// client read of a tunable — bot gates, cosmetic gun cadence, aim
     /// line reach — comes off this replica, never a const.
-    pub params: SingleRx<Params>,
+    pub params: pm::ParamsClient<Params>,
     // TODO(refactor): the "whichever predictor is live" or-chain repeats
     // in player_client (input, lamps, title bar), telemetry, and sfx —
     // add ClientWorld helpers (my_pose / my_speed / corrections).
@@ -103,11 +102,10 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     // numbers drive both ends — a live change mispredicts for one
     // snapshot interval and reconciles (the documented blip). The write
     // path is `param_set` below.
-    let params = pm.sync_single::<Params>("params");
+    let params = pm.params::<Params>();
     let input = pm.input::<Drive>("drive");
     let respawn = pm.event::<Respawn>("respawn");
     let session = pm.event::<Session>("session");
-    let param_set = pm.event::<ParamSet>("param.set");
     // The models registry (LOCAL single — never in the handshake):
     // shape data by kind name, same load the server runs.
     let models = pm.single::<Models>("models");
@@ -311,7 +309,6 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
         hunt,
         input,
         respawn,
-        param_set,
         pred,
         pred_heli,
         models,

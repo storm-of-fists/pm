@@ -159,7 +159,7 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
     let pred_heli = w.pred_heli.clone();
     let hunt = w.hunt.clone();
     let bullet = w.bullet.clone();
-    let param_tx = w.param_set.clone();
+    let param_tx = w.params.clone();
     // Last knob values we applied to the game (change-detect).
     let mut applied = (flags.link.0, flags.link.1);
     let mut applied_params = flags.params;
@@ -189,12 +189,12 @@ pub fn install(pm: &mut pm::PmClient, w: &ClientWorld, flags: &Flags) {
         // Param knobs → reliable events; the server is the clamp of
         // record and replicates the applied value back to everyone.
         for (idx, value) in tele.params.drain_changes(&mut applied_params) {
-            param_tx.send(ParamSet { idx, value });
+            param_tx.set(idx, value);
         }
         // The save button: rising past 0.5 asks the server to persist.
         let save_now = tele.params.save.val();
         if save_now >= 0.5 && save_was < 0.5 {
-            param_tx.send(ParamSet { idx: PARAM_SAVE, value: 0.0 });
+            param_tx.save();
         }
         save_was = save_now;
 

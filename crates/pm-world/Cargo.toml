@@ -14,6 +14,7 @@ name = "pm"
 # metadata. No features = no way to get that wrong. SDL lives in pm_sdl.
 
 [dependencies]
+pm-control-core = { path = "../pm-control-core" }
 bytemuck = { version = "1", features = ["derive"] }
 pm-world-derive = { path = "../pm-world-derive" }
 libloading = "0.9"

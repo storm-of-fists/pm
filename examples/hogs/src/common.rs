@@ -62,52 +62,9 @@ pub const PARAMS_FILE: &str = "hogs.params";
 
 /// Load the params file through the generated clamped codec. Missing
 /// file = shipped defaults; unknown names and bad values are skipped
-/// with a COUNT warning (a typo shouldn't be silent).
-pub fn params_load(path: &str) -> Params {
-    let mut p = Params::default();
-    if let Ok(text) = std::fs::read_to_string(path) {
-        let lines = text
-            .lines()
-            .filter(|l| {
-                let l = l.trim();
-                !l.is_empty() && !l.starts_with('#') && l.contains('=')
-            })
-            .count();
-        let applied = p.apply_save_text(&text);
-        if applied < lines {
-            eprintln!(
-                "[params] {path}: {} line(s) ignored (unknown name or bad value)",
-                lines - applied
-            );
-        }
-    }
-    p
-}
-
-/// Rewrite the params file from the authoritative set — the server's
-/// answer to a [`PARAM_SAVE`] event. Whole-file rewrite in the platform
-/// save-set line shape.
-pub fn params_save(path: &str, p: &Params) -> std::io::Result<()> {
-    std::fs::write(
-        path,
-        format!(
-            "# hogs params — name=value, edited live via pm-watch (`set hogs params.<name> V`)\n{}",
-            p.to_save_text()
-        ),
-    )
-}
-
-/// Reliable client→server event: set `params[idx] = value` (the server
-/// clamps to the spec range). `idx ==` [`PARAM_SAVE`] instead persists
-/// the current set to the server's params file.
-#[pm::pod]
-pub struct ParamSet {
-    pub idx: u32,
-    pub value: f32,
-}
-
-/// [`ParamSet::idx`] sentinel: "save the set to disk now".
-pub const PARAM_SAVE: u32 = u32::MAX;
+// (params_load/params_save/ParamSet/PARAM_SAVE moved INTO THE ENGINE
+// 2026-07-23 — `pm::params_load`, `PmServer::params(path)`,
+// `PmClient::params()`; params aren't just for hogs.)
 
 /// Parsed CLI flags every client run cares about (see main.rs header
 /// for the grammar). One struct so signatures stop growing a parameter
@@ -1682,21 +1639,21 @@ mod params_tests {
             "# tuned live\nwave_base=200 1..1000\ngunner_frac=9.5\nnot_a_param=3\nbad line\nhog_fast=oops\n",
         )
         .unwrap();
-        let p = params_load(path);
+        let p: Params = pm::params_load(path);
         assert_eq!(p.wave_base, 200.0); // loaded (metadata ignored)
         assert_eq!(p.gunner_frac, 1.0); // clamped to range
         assert_eq!(p.hog_fast, 11.0); // unparseable: default kept
         assert_eq!(p.wave_grow, 15.0); // absent: default kept
 
         // Save → load is identity for in-range sets.
-        params_save(path, &p).unwrap();
-        assert_eq!(params_load(path), p);
+        pm::params_save(path, &p).unwrap();
+        assert_eq!(pm::params_load::<Params>(path), p);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn params_missing_file_is_the_shipped_defaults() {
-        assert_eq!(params_load("does/not/exist.params"), Params::default());
+        assert_eq!(pm::params_load::<Params>("does/not/exist.params"), Params::default());
     }
 }
 

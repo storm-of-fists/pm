@@ -739,6 +739,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "libloading",
+ "pm-control-core",
  "pm-world-derive",
  "quinn-proto",
  "rcgen",
