@@ -53,7 +53,8 @@ use sdl3::mouse::MouseButton;
 
 use crate::bot_client::client_setup;
 use crate::common::*;
-use crate::models::hull_cage_tris;
+use crate::models::{box_cage_tris, cylinder_cage_tris};
+use crate::phys::{PHYS_HOG_HALF_H, PHYS_HOG_R, PHYS_TRUCK_HALF, PHYS_TRUCK_LIFT};
 
 const W: u32 = 1280;
 const H: u32 = 800;
@@ -433,26 +434,38 @@ fn session(
     // Entity models off the registry single (client_setup loaded it —
     // assets/*.glb when present, else the code definitions in
     // models.rs). Render parts upload here; the same models' collide.*
-    // protos are what the server poses into the collider pool, so the
-    // file IS the shape — visual and hitbox both. Relative shading is
-    // BAKED into part colors; the per-draw tint carries identity/state
-    // (peer color, hp).
+    // boxes are what the server's Box3D world builds hitboxes from, so
+    // the file IS the shape — visual and hitbox both. Relative shading
+    // is BAKED into part colors; the per-draw tint carries
+    // identity/state (peer color, hp).
     let truck_m = w.models.get().upload(&r3d, "truck");
     let heli_m = w.models.get().upload(&r3d, "heli");
     let hog_m = w.models.get().upload(&r3d, "hog");
     let flyer_m = w.models.get().upload(&r3d, "flyer");
-    // Hitbox debug cages (part of the tilde debug view): each
-    // kind's DERIVED hulls off the same registry protos the server
-    // poses into the collider pool — so the cage and the hitbox cannot
-    // disagree. Baked white; the magenta rides the instance tint.
-    let cage = |name: &str| {
-        r3d.upload_mesh(&bake(&hull_cage_tris(w.models.get().protos(name)), (1.0, 1.0, 1.0)))
-            .expect("cage")
+    // Hitbox debug cages (part of the tilde debug view): the SOLVER's
+    // shapes — heli/flyer off the same authored collide.* boxes the
+    // Box3D world builds from, hog capsule and truck box off the phys
+    // constants — so the cage and what the server tests cannot
+    // disagree. (Shot casts additionally grow hogs by HOG_GROW + the
+    // shot's pad; the cage draws the physical body.) Baked white; the
+    // magenta rides the instance tint.
+    let box_cage = |boxes: &[(u8, Vec3, Vec3)]| {
+        let tris: Vec<_> = boxes.iter().flat_map(|&(_, c, h)| box_cage_tris(c, h)).collect();
+        r3d.upload_mesh(&bake(&tris, (1.0, 1.0, 1.0))).expect("cage")
     };
-    let truck_cage = cage("truck");
-    let heli_cage = cage("heli");
-    let hog_cage = cage("hog");
-    let flyer_cage = cage("flyer");
+    let truck_cage = box_cage(&[(
+        0,
+        vec3(0.0, 0.0, 0.0),
+        vec3(PHYS_TRUCK_HALF.0, PHYS_TRUCK_HALF.1, PHYS_TRUCK_HALF.2),
+    )]);
+    let heli_cage = box_cage(&w.models.get().boxes("heli"));
+    let flyer_cage = box_cage(&w.models.get().boxes("flyer"));
+    let hog_cage = r3d
+        .upload_mesh(&bake(
+            &cylinder_cage_tris(PHYS_HOG_R, 0.0, 2.0 * (PHYS_HOG_HALF_H + PHYS_HOG_R)),
+            (1.0, 1.0, 1.0),
+        ))
+        .expect("cage");
     // Bullet tracer: a stretched sliver, centered — bullets carry their
     // own altitude now, so the height rides the translate.
     let tracer_mesh = r3d
@@ -1091,38 +1104,34 @@ fn session(
                     (1.0, 0.92, 0.45),
                 ));
             }
-            // Hitbox debug cages: posed with the SAME (x,y,z,yaw) the
-            // server feeds Proto::pose — yaw-only even for the banking
-            // heli, y=0 for ground vehicles — off the draw pools (what
-            // you see is what favor-shooter lag comp honors). Emissive
-            // so night can't hide a hitbox.
+            // Hitbox debug cages: the solver shapes posed with the
+            // FULL replicated Body pose (pos + rot quat) off the draw
+            // pools — ramps and tumbles just show. `lift` raises the
+            // cage to the solver center for pods whose y is the
+            // ground-contact convention (the truck box rotates about
+            // its center, so the offset stays world-vertical, matching
+            // the readback). Emissive so night can't hide a hitbox.
             let mut cage_inst: Vec<(&pm_sdl::gpu3d::Mesh3, Vec<Instance3>)> = Vec::new();
             if show_debug {
                 let mag = (1.0, 0.25, 1.0);
-                let at = |x: f32, y: f32, z: f32, yaw: f32| {
-                    Instance3::emissive(Mat4::translate(vec3(x, y, z)) * Mat4::rot_y(yaw), mag)
+                let at = |b: &pm::Body, lift: f32| {
+                    Instance3::emissive(
+                        Mat4::translate(b.pos + vec3(0.0, lift, 0.0)) * b.rot.to_mat4(),
+                        mag,
+                    )
                 };
-                let mut hogs = Vec::new();
-                for (_, h) in w.hog_draw.get().iter() {
-                    hogs.push(at(h.body.pos.x, h.body.pos.y, h.body.pos.z, h.heading()));
-                }
-                let mut flyers = Vec::new();
-                for (_, f) in w.flyer_draw.get().iter() {
-                    flyers.push(at(f.body.pos.x, f.body.pos.y, f.body.pos.z, f.heading()));
-                }
-                let mut trucks = Vec::new();
-                for (_, t) in w.truck_draw.get().iter() {
-                    trucks.push(at(t.body.pos.x, 0.0, t.body.pos.z, t.heading()));
-                }
-                let mut helis = Vec::new();
-                for (_, hl) in w.heli_draw.get().iter() {
-                    helis.push(at(
-                        hl.body.pos.x,
-                        hl.body.pos.y,
-                        hl.body.pos.z,
-                        hl.body.yaw(),
-                    ));
-                }
+                let hogs: Vec<_> =
+                    w.hog_draw.get().iter().map(|(_, h)| at(&h.body, 0.0)).collect();
+                let flyers: Vec<_> =
+                    w.flyer_draw.get().iter().map(|(_, f)| at(&f.body, 0.0)).collect();
+                let trucks: Vec<_> = w
+                    .truck_draw
+                    .get()
+                    .iter()
+                    .map(|(_, t)| at(&t.body, PHYS_TRUCK_LIFT))
+                    .collect();
+                let helis: Vec<_> =
+                    w.heli_draw.get().iter().map(|(_, hl)| at(&hl.body, 0.0)).collect();
                 cage_inst.push((&hog_cage, hogs));
                 cage_inst.push((&flyer_cage, flyers));
                 cage_inst.push((&truck_cage, trucks));
@@ -1143,23 +1152,67 @@ fn session(
 
             let mine = net.mine();
             // RANGEFINDER: one dot where the own gun line actually
-            // stops — the first collider on the line (hot color: a
-            // live target under the crosshair), else the first wall /
-            // roof / floor / range end the real bullet would die on
-            // (`tracer_step`'s walls, sampled). Replaces the old
-            // breadcrumb ground line: with an elevating turret the
-            // shot leaves the ground plane, so the feedback has to
-            // live on the LINE, not under it.
+            // stops — the first target on the line (hot color: a live
+            // target under the crosshair), else the first wall / roof
+            // / floor / range end the real bullet would die on
+            // (`tracer_step`'s walls, sampled). HUD FEEDBACK, not the
+            // server's judgment (that's the Box3D cast): each target
+            // is a sphere or two around its draw pod, same
+            // approximation as the bots' hold-fire gate.
             let range_dot = |(mx, my, mz, dir, climb): (f32, f32, f32, f32, f32)| {
-                let reach = gun_range * climb.cos();
-                let dy = gun_range * climb.sin();
-                if let Some(h) = w
-                    .index
-                    .get()
-                    .sweep(mx, mz, my, dir, reach, dy, 0.0, CAT_VEHICLE | CAT_HOG, mine)
+                let from = vec3(mx, my, mz);
+                let d3 =
+                    vec3(dir.sin() * climb.cos(), climb.sin(), dir.cos() * climb.cos());
+                let mut best: Option<f32> = None;
+                let mut consider = |c: pm::Vec3, r: f32| {
+                    let t = (c - from).dot(d3).clamp(0.0, gun_range);
+                    let miss = (c - (from + d3 * t)).len();
+                    if miss < r {
+                        let entry = (t - (r * r - miss * miss).sqrt()).max(0.0);
+                        if best.is_none_or(|b| entry < b) {
+                            best = Some(entry);
+                        }
+                    }
+                };
                 {
-                    return (vec3(h.x, h.y, h.z), true);
+                    let bosses = w.boss.get();
+                    let grow = w.params.get().boss_grow;
+                    for (id, h) in w.hog_draw.get().iter() {
+                        let r =
+                            HOG_R + if bosses.contains(id) { grow } else { 0.0 };
+                        consider(h.body.pos + vec3(0.0, 0.9, 0.0), r + 0.2);
+                    }
+                    for (_, f) in w.flyer_draw.get().iter() {
+                        consider(f.body.pos, FLYER_R + 0.2);
+                    }
+                    for (id, t) in w.truck_draw.get().iter() {
+                        if Some(id) == mine {
+                            continue;
+                        }
+                        let (fx, fz) = (t.heading().sin(), t.heading().cos());
+                        let c = t.body.pos + vec3(0.0, 0.8, 0.0);
+                        consider(c + vec3(fx, 0.0, fz) * 0.9, 1.3);
+                        consider(c - vec3(fx, 0.0, fz) * 0.9, 1.3);
+                    }
+                    for (id, h) in w.heli_draw.get().iter() {
+                        if Some(id) == mine {
+                            continue;
+                        }
+                        let (fx, fz) = (h.body.yaw().sin(), h.body.yaw().cos());
+                        consider(h.body.pos, 1.7);
+                        consider(h.body.pos - vec3(fx, 0.0, fz) * 2.0, 1.0);
+                    }
+                    for (_, d) in w.depot.get().iter() {
+                        consider(vec3(d.x, DEPOT_H * 0.5, d.z), DEPOT_R + 0.3);
+                    }
                 }
+                if let Some(t) = best {
+                    return (from + d3 * t, true);
+                }
+                // TODO(box3d-move): hand 1.5-unit ray march that
+                // ignores ramp wedges — becomes a ray cast on the
+                // client's local solver world (master note atop
+                // phys.rs).
                 let (sx, sz) = (dir.sin() * climb.cos(), dir.cos() * climb.cos());
                 let sy = climb.sin();
                 let step = 1.5;

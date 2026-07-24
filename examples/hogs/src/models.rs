@@ -11,15 +11,14 @@
 //!   art wants. The client uploads and draws these.
 //! - **`collide.*` parts**: deliberately dumb boxes roughed around the
 //!   render geometry (baked magenta so they read as markers in
-//!   Blender; never drawn). The loader derives the game's collision
-//!   vocabulary from each box's bounds — footprint long axis becomes
-//!   the capsule segment, half the short extent the radius, y extent
-//!   the altitude band ([`collide_protos`]) — and the SERVER poses
-//!   those protos into the collider pool every tick. Reshape a tail
-//!   in Blender and its hitbox moves with it; the sweep never learns
-//!   triangles exist.
+//!   Blender; never drawn). The server's Box3D world builds its
+//!   hitbox shapes straight from each box's bounds
+//!   ([`collide_boxes`]); the tilde debug cage draws those SAME boxes
+//!   ([`box_cage_tris`]). Reshape a tail in Blender and its hitbox
+//!   moves with it; game code never learns triangles exist.
 //! The flow, in pm shapes: glb file → [`Models`] SINGLE (kind data,
-//! by name) → collider POOL (instance data, by id) → contact facts.
+//! by name) → phys world BODIES (instance data, by id) → contact
+//! facts.
 //!
 //! Contract with the draw code:
 //! - Vertex colors carry the model's OWN shading (cabin darker than
@@ -55,7 +54,7 @@ use pm_sdl::gpu3d::{Renderer3d, Vertex3, bake, box_tris};
 use pm_sdl::model::{Model3, ModelData, NO_PARENT, PartData, Skeleton, Transform3};
 
 use crate::common::{
-    FLYER_H, FLYER_R, HOG_H, HOG_R, Hull, PART_BODY, PART_ROTOR, PART_TAIL, TRUCK_R,
+    FLYER_H, FLYER_R, HOG_H, HOG_R, PART_BODY, PART_ROTOR, PART_TAIL, TRUCK_R,
 };
 
 /// Marker color for `collide.*` boxes: loud in Blender, never drawn.
@@ -182,113 +181,65 @@ pub fn all() -> [(&'static str, fn() -> ModelData, &'static [&'static str]); 4] 
     ]
 }
 
-// --- collision protos --------------------------------------------------------
+// --- hitbox debug cages -------------------------------------------------------
 
-/// A collision part in MODEL space, derived from a `collide.*` box:
-/// capsule endpoints + radius on the ground plane, altitude band
-/// relative to the entity origin. [`Proto::pose`] is the per-tick step
-/// from KIND data (this) to INSTANCE data (a collider-pool [`Hull`]).
-#[derive(Clone, Copy)]
-pub struct Proto {
-    /// `PART_*` tag, mapped from the node name — response tasks
-    /// branch on it (rotor ×2 damage, tail kick).
-    pub part: u8,
-    pub a: (f32, f32),
-    pub b: (f32, f32),
-    pub r: f32,
-    /// Altitude band relative to the entity origin: ground vehicles
-    /// author it absolute and pose with y = 0, fliers author it about
-    /// their center and pose with their altitude.
-    pub y: (f32, f32),
+/// Cage ribbon thickness — thin enough to read as wireframe.
+const RIB: f32 = 0.06;
+
+/// The hitbox DEBUG CAGE for one solver box (entity space, center +
+/// half extents): this is EXACTLY the box Box3D contacts and casts —
+/// the authored `collide.*` boxes for heli/flyer, the phys constants
+/// for the truck. Model space; the instance pose carries the FULL
+/// replicated `Body` rotation, so a tumbling truck's cage tumbles.
+pub fn box_cage_tris(center: pm::Vec3, half: pm::Vec3) -> Vec<[pm::Vec3; 3]> {
+    let corners = [
+        (center.x + half.x, center.z + half.z),
+        (center.x - half.x, center.z + half.z),
+        (center.x - half.x, center.z - half.z),
+        (center.x + half.x, center.z - half.z),
+    ];
+    cage_tris(&corners, center.y - half.y, center.y + half.y, 1)
 }
 
-impl Proto {
-    /// Pose into a world hull: yaw about the entity origin (heading
-    /// convention — forward is (sin, cos)), then translate.
-    pub fn pose(&self, x: f32, y: f32, z: f32, yaw: f32) -> Hull {
-        let (s, c) = yaw.sin_cos();
-        let rot = |p: (f32, f32)| (x + p.0 * c + p.1 * s, z - p.0 * s + p.1 * c);
-        Hull {
-            a: rot(self.a),
-            b: rot(self.b),
-            r: self.r,
-            y: (y + self.y.0, y + self.y.1),
-        }
-    }
+/// The cage for a solver capsule, drawn as its bounding cylinder:
+/// radius `r` over `[y0, y1]` (the hemispherical caps round off inside
+/// it — close enough for a debug view, exact at the equator where
+/// flat shots live).
+pub fn cylinder_cage_tris(r: f32, y0: f32, y1: f32) -> Vec<[pm::Vec3; 3]> {
+    const SEG: usize = 20;
+    let pts: Vec<(f32, f32)> = (0..SEG)
+        .map(|k| {
+            let a = std::f32::consts::TAU * k as f32 / SEG as f32;
+            (r * a.cos(), r * a.sin())
+        })
+        .collect();
+    cage_tris(&pts, y0, y1, SEG / 8)
 }
 
-/// Pose every proto of a kind — what `parts_add` and the per-tick
-/// re-pose feed straight into the collider pool.
-pub fn posed(protos: &[Proto], x: f32, y: f32, z: f32, yaw: f32) -> Vec<(u8, Hull)> {
-    protos.iter().map(|p| (p.part, p.pose(x, y, z, yaw))).collect()
-}
-
-/// The hitbox DEBUG CAGE for a kind: every proto's swept shape — the
-/// stadium footprint (capsule cross-section) extruded over its altitude
-/// band — as thin ribbon triangles: a ring at the bottom of the band, a
-/// ring at the top, and struts between them. This is the DERIVED hull
-/// the sweep actually tests, not the authored `collide.*` box (the
-/// derivation rounds the box's corners off — exactly the difference a
-/// debug view exists to show). Model space, like the protos: draw with
-/// `translate(x,y,z) * rot_y(yaw)` using the same (x,y,z,yaw) the
-/// server feeds [`Proto::pose`] and the cage lands on the hitbox.
-pub fn hull_cage_tris(protos: &[Proto]) -> Vec<[pm::Vec3; 3]> {
-    /// Ribbon thickness — thin enough to read as wireframe.
-    const RIB: f32 = 0.06;
+/// Ribbon-cage generator over a closed footprint outline: a ring at
+/// the bottom of the band, a ring at the top, and a full-height strut
+/// at every `strut`th outline point (narrow, so box faces stay open).
+fn cage_tris(outline: &[(f32, f32)], y0: f32, y1: f32, strut: usize) -> Vec<[pm::Vec3; 3]> {
     let mut tris = Vec::new();
-    for p in protos {
-        let outline = stadium_outline(p.a, p.b, p.r);
-        let (y0, y1) = p.y;
-        let v = |q: (f32, f32), y: f32| vec3(q.0, y, q.1);
-        let mut quad = |a: pm::Vec3, b: pm::Vec3, c: pm::Vec3, d: pm::Vec3| {
-            tris.push([a, b, c]);
-            tris.push([a, c, d]);
-        };
-        let n = outline.len();
-        for i in 0..n {
-            let (p0, p1) = (outline[i], outline[(i + 1) % n]);
-            quad(v(p0, y0), v(p1, y0), v(p1, y0 + RIB), v(p0, y0 + RIB));
-            quad(v(p0, y1 - RIB), v(p1, y1 - RIB), v(p1, y1), v(p0, y1));
-        }
-        // Struts: every eighth of the outline, a full-height wall one
-        // segment wide.
-        for i in (0..n).step_by((n / 8).max(1)) {
-            let (p0, p1) = (outline[i], outline[(i + 1) % n]);
-            quad(v(p0, y0), v(p1, y0), v(p1, y1), v(p0, y1));
+    let n = outline.len();
+    let v = |q: (f32, f32), y: f32| vec3(q.0, y, q.1);
+    let mut quad = |a: pm::Vec3, b: pm::Vec3, c: pm::Vec3, d: pm::Vec3| {
+        tris.push([a, b, c]);
+        tris.push([a, c, d]);
+    };
+    for i in 0..n {
+        let (p0, p1) = (outline[i], outline[(i + 1) % n]);
+        quad(v(p0, y0), v(p1, y0), v(p1, y0 + RIB), v(p0, y0 + RIB));
+        quad(v(p0, y1 - RIB), v(p1, y1 - RIB), v(p1, y1), v(p0, y1));
+        if i % strut.max(1) == 0 {
+            let (dx, dz) = (p1.0 - p0.0, p1.1 - p0.1);
+            let len = (dx * dx + dz * dz).sqrt().max(1e-6);
+            let w = (3.0 * RIB).min(len) / len;
+            let pw = (p0.0 + dx * w, p0.1 + dz * w);
+            quad(v(p0, y0), v(pw, y0), v(pw, y1), v(p0, y1));
         }
     }
     tris
-}
-
-/// The capsule cross-section's boundary at radius `r` around segment
-/// `a..b`, counter-clockwise in the footprint plane: two half-arcs
-/// joined by the straight sides (a plain circle when the capsule is a
-/// point). Every point is EXACTLY r from the segment — the cage
-/// inherits the hull's precision.
-fn stadium_outline(a: (f32, f32), b: (f32, f32), r: f32) -> Vec<(f32, f32)> {
-    use std::f32::consts::{PI, TAU};
-    const SEG: usize = 10;
-    let (dx, dz) = (b.0 - a.0, b.1 - a.1);
-    let mut pts = Vec::new();
-    if (dx * dx + dz * dz).sqrt() < 1e-6 {
-        for k in 0..2 * SEG {
-            let ang = TAU * k as f32 / (2 * SEG) as f32;
-            pts.push((a.0 + r * ang.cos(), a.1 + r * ang.sin()));
-        }
-    } else {
-        let ab = dz.atan2(dx);
-        // Half-arc capping b (sweeping through b's far side), then the
-        // half-arc capping a; consecutive points bridge the straights.
-        for k in 0..=SEG {
-            let ang = ab + PI / 2.0 - PI * k as f32 / SEG as f32;
-            pts.push((b.0 + r * ang.cos(), b.1 + r * ang.sin()));
-        }
-        for k in 0..=SEG {
-            let ang = ab - PI / 2.0 - PI * k as f32 / SEG as f32;
-            pts.push((a.0 + r * ang.cos(), a.1 + r * ang.sin()));
-        }
-    }
-    pts
 }
 
 /// `collide.*` node name → part tag. Unknown names still collide —
@@ -306,13 +257,12 @@ fn collide_tag(name: &str) -> u8 {
     }
 }
 
-/// Derive a model's collision protos from its `collide.*` parts: each
-/// box's bounds become a capsule + band — the footprint's long axis is
-/// the segment, half the short extent the radius (a near-square
-/// footprint collapses to a point capsule = cylinder), the y extent
-/// the band. The BODY part sorts first (`ids[0]` bite convention).
-pub fn collide_protos(data: &ModelData) -> Vec<Proto> {
-    let mut protos = Vec::new();
+/// A model's `collide.*` parts as the AUTHORED boxes (entity space,
+/// center + half extents), body first — the Box3D door: the solver
+/// casts and overlaps the box exactly as Blender drew it, and the
+/// debug cage draws the same boxes ([`box_cage_tris`]).
+pub fn collide_boxes(data: &ModelData) -> Vec<(u8, pm::Vec3, pm::Vec3)> {
+    let mut boxes = Vec::new();
     for p in data.parts.iter().filter(|p| p.name.starts_with("collide.")) {
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for v in &p.verts {
@@ -321,19 +271,12 @@ pub fn collide_protos(data: &ModelData) -> Vec<Proto> {
                 hi[i] = hi[i].max(v.pos[i]);
             }
         }
-        let (cx, cz) = ((lo[0] + hi[0]) * 0.5, (lo[2] + hi[2]) * 0.5);
-        let (hx, hz) = ((hi[0] - lo[0]) * 0.5, (hi[2] - lo[2]) * 0.5);
-        let (a, b, r) = if (hx - hz).abs() < 0.05 {
-            ((cx, cz), (cx, cz), hx.max(hz))
-        } else if hz > hx {
-            ((cx, cz - (hz - hx)), (cx, cz + (hz - hx)), hx)
-        } else {
-            ((cx - (hx - hz), cz), (cx + (hx - hz), cz), hz)
-        };
-        protos.push(Proto { part: collide_tag(&p.name), a, b, r, y: (lo[1], hi[1]) });
+        let center = vec3((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5);
+        let half = vec3((hi[0] - lo[0]) * 0.5, (hi[1] - lo[1]) * 0.5, (hi[2] - lo[2]) * 0.5);
+        boxes.push((collide_tag(&p.name), center, half));
     }
-    protos.sort_by_key(|p| p.part != PART_BODY);
-    protos
+    boxes.sort_by_key(|b| b.0 != PART_BODY);
+    boxes
 }
 
 // --- the registry ------------------------------------------------------------
@@ -342,11 +285,11 @@ pub fn collide_protos(data: &ModelData) -> Vec<Proto> {
 /// the LOCAL `"models"` single on each `Pm` — the params-single
 /// pattern applied to shape. Name-keyed on purpose: kind is which
 /// POOL an entity lives in, so the join between rendering and physics
-/// happens at the instance level (the collider pool, by id); this
-/// single just answers "what shape is a <name>".
+/// happens at the instance level (the phys world's bodies, by id);
+/// this single just answers "what shape is a <name>".
 #[derive(Default)]
 pub struct Models {
-    entries: Vec<(&'static str, ModelData, Vec<Proto>)>,
+    entries: Vec<(&'static str, ModelData)>,
 }
 
 impl Models {
@@ -356,11 +299,7 @@ impl Models {
         Models {
             entries: all()
                 .into_iter()
-                .map(|(name, fallback, required)| {
-                    let data = load_data(name, fallback, required);
-                    let protos = collide_protos(&data);
-                    (name, data, protos)
-                })
+                .map(|(name, fallback, required)| (name, load_data(name, fallback, required)))
                 .collect(),
         }
     }
@@ -369,9 +308,10 @@ impl Models {
         &self.entries.iter().find(|e| e.0 == name).expect("unknown model").1
     }
 
-    /// The kind's collision protos, body first.
-    pub fn protos(&self, name: &str) -> &[Proto] {
-        &self.entries.iter().find(|e| e.0 == name).expect("unknown model").2
+    /// The kind's authored `collide.*` boxes, body first — what the
+    /// server's Box3D world builds hitbox shapes from.
+    pub fn boxes(&self, name: &str) -> Vec<(u8, pm::Vec3, pm::Vec3)> {
+        collide_boxes(self.data(name))
     }
 
     /// Upload a kind's render parts (the client's side of the split).
@@ -380,12 +320,11 @@ impl Models {
     }
 }
 
-/// The migration's proof: the protos derived from the collide boxes
-/// must reproduce the hand-tuned hulls this game shipped with (truck
-/// capsule ±0.8/r0.9/0..1.6, heli cabin-tail-rotor, hog and flyer
-/// cylinders) — moving shape authoring into the models changed NO
-/// gameplay numbers. If art later CHOOSES to move a hitbox, this test
-/// is the place that documents the baseline it moved from.
+/// The authored-hitbox baseline: the `collide.*` boxes the Box3D world
+/// builds shapes from must reproduce the landed hitboxes (truck slab,
+/// heli cabin/tail/rotor, hog and flyer bands). If art later CHOOSES
+/// to move a hitbox, this test is the place that documents the
+/// baseline it moved from.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,67 +333,54 @@ mod tests {
         (a - b).abs() < 1e-5
     }
 
+    fn boxed(v: pm::Vec3, x: f32, y: f32, z: f32) -> bool {
+        close(v.x, x) && close(v.y, y) && close(v.z, z)
+    }
+
     #[test]
-    fn derived_protos_match_the_landed_hulls() {
-        let t = collide_protos(&truck());
+    fn collide_boxes_match_the_landed_hitboxes() {
+        let t = collide_boxes(&truck());
         assert_eq!(t.len(), 1);
-        assert_eq!(t[0].part, PART_BODY);
-        assert!(close(t[0].r, 0.9) && close(t[0].a.1, -0.8) && close(t[0].b.1, 0.8));
-        assert!(close(t[0].y.0, 0.0) && close(t[0].y.1, 1.6));
+        assert_eq!(t[0].0, PART_BODY);
+        assert!(boxed(t[0].1, 0.0, 0.8, 0.0) && boxed(t[0].2, TRUCK_R, 0.8, 1.7));
 
-        let h = collide_protos(&heli());
+        let h = collide_boxes(&heli());
         assert_eq!(h.len(), 3);
-        assert_eq!((h[0].part, h[1].part, h[2].part), (PART_BODY, PART_TAIL, PART_ROTOR));
-        assert!(close(h[0].r, 1.0) && close(h[0].y.0, -1.0) && close(h[0].y.1, 1.0));
-        let (za, zb) = (h[1].a.1.min(h[1].b.1), h[1].a.1.max(h[1].b.1));
-        assert!(close(h[1].r, 0.45) && close(za, -2.8) && close(zb, -1.2));
-        assert!(close(h[2].r, 1.7) && close(h[2].y.0, 0.6) && close(h[2].y.1, 1.1));
+        assert_eq!((h[0].0, h[1].0, h[2].0), (PART_BODY, PART_TAIL, PART_ROTOR));
+        assert!(boxed(h[0].1, 0.0, 0.0, 0.0) && boxed(h[0].2, 1.0, 1.0, 1.0));
+        assert!(boxed(h[1].1, 0.0, 0.0, -2.0) && boxed(h[1].2, 0.45, 0.45, 1.25));
+        assert!(boxed(h[2].1, 0.0, 0.85, 0.0) && boxed(h[2].2, 1.7, 0.25, 1.7));
 
-        let g = collide_protos(&hog());
+        let g = collide_boxes(&hog());
         assert_eq!(g.len(), 1);
-        assert!(close(g[0].r, HOG_R) && close(g[0].y.0, 0.0) && close(g[0].y.1, HOG_H));
+        assert!(boxed(g[0].1, 0.0, HOG_H * 0.5, 0.0) && boxed(g[0].2, HOG_R, HOG_H * 0.5, HOG_R));
 
-        let f = collide_protos(&flyer());
+        let f = collide_boxes(&flyer());
         assert_eq!(f.len(), 1);
-        assert!(close(f[0].r, FLYER_R) && close(f[0].y.0, -FLYER_H) && close(f[0].y.1, FLYER_H));
+        assert!(boxed(f[0].1, 0.0, 0.0, 0.0) && boxed(f[0].2, FLYER_R, FLYER_H, FLYER_R));
     }
 
-    /// The debug cage must lie ON the hull it visualizes: every vertex
-    /// of the hog's cage sits at exactly HOG_R from the axis and inside
-    /// the altitude band (the tail-boom capsule gets the same check
-    /// against its segment).
+    /// The debug cage must lie ON the shape it visualizes: every box
+    /// cage vertex sits on the box's boundary inside its band, every
+    /// cylinder cage vertex at exactly r from the axis.
     #[test]
-    fn hull_cage_hugs_the_derived_hull() {
-        let g = collide_protos(&hog());
-        for t in hull_cage_tris(&g) {
+    fn cages_hug_their_shapes() {
+        let (_, c, h) = collide_boxes(&hog())[0];
+        for t in box_cage_tris(c, h) {
             for v in t {
-                assert!(((v.x * v.x + v.z * v.z).sqrt() - HOG_R).abs() < 1e-4);
-                assert!(v.y >= g[0].y.0 - 1e-6 && v.y <= g[0].y.1 + 1e-6);
+                let on_x = (v.x.abs() - h.x).abs() < 1e-4;
+                let on_z = (v.z.abs() - h.z).abs() < 1e-4;
+                assert!(on_x || on_z, "cage vertex off the box surface");
+                assert!(v.x.abs() <= h.x + 1e-4 && v.z.abs() <= h.z + 1e-4);
+                assert!(v.y >= c.y - h.y - 1e-6 && v.y <= c.y + h.y + 1e-6);
             }
         }
-        let tail = collide_protos(&heli())[1];
-        for t in hull_cage_tris(&[tail]) {
+        for t in cylinder_cage_tris(0.45, 0.0, 1.5) {
             for v in t {
-                // Distance from (x,z) to the boom segment == r.
-                let (az, bz) = (tail.a.1, tail.b.1);
-                let cz = v.z.clamp(az.min(bz), az.max(bz));
-                let d = (v.x * v.x + (v.z - cz) * (v.z - cz)).sqrt();
-                assert!((d - tail.r).abs() < 1e-4, "cage off the boom hull: {d}");
+                assert!(((v.x * v.x + v.z * v.z).sqrt() - 0.45).abs() < 1e-4);
+                assert!(v.y >= -1e-6 && v.y <= 1.5 + 1e-6);
             }
         }
-    }
-
-    /// Posing: yaw swings the boom behind the heading, altitude
-    /// offsets the band — the kind→instance step in one assert.
-    #[test]
-    fn proto_pose_follows_heading_and_altitude() {
-        let tail = collide_protos(&heli())[1];
-        // Facing +x (yaw = π/2): the boom trails toward −x.
-        let hull = tail.pose(10.0, 5.0, 3.0, std::f32::consts::FRAC_PI_2);
-        let far = hull.a.0.min(hull.b.0);
-        assert!((far - (10.0 - 2.8)).abs() < 1e-4, "boom trails a +x heading, got {far}");
-        assert!((hull.a.1 - 3.0).abs() < 1e-4, "no z drift for an on-axis boom");
-        assert!((hull.y.0 - (5.0 - 0.45)).abs() < 1e-4, "band rides the altitude");
     }
 }
 

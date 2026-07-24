@@ -5,10 +5,10 @@
 //! interesting one: at 300 hogs the byte budget rotates and the interp
 //! delay is what rides the multi-tick gaps between a hog's updates.
 
-use pm::{EventTx, Id, InputTx, Pm, PmClient, PoolHandle, Predictor, SingleHandle, SingleRx};
+use pm::{EventTx, InputTx, Pm, PmClient, PoolHandle, Predictor, SingleHandle, SingleRx};
 
 use crate::common::*;
-use crate::models::{Models, posed};
+use crate::models::Models;
 
 /// Everything a hogs client holds after setup. Fields the headless bot
 /// doesn't read (draw pools, scoreboard) still exist — registration is
@@ -56,33 +56,18 @@ pub struct ClientWorld {
     /// None` — which is also how game code asks "am I flying?".
     pub pred: SingleHandle<Predictor<Truck, Drive>>,
     pub pred_heli: SingleHandle<Predictor<Heli, Drive>>,
-    /// The models registry (models.rs): the client reads the same
-    /// `collide.*` protos the server judges with (hold-fire courtesy)
-    /// and, on the player, uploads the render parts from it.
+    /// The models registry (models.rs): the player uploads render
+    /// parts and instances the debug cages from it.
     pub models: SingleHandle<Models>,
-    /// THE client-side world-query index (`WorldIndex`'s rustdoc is the
-    /// design record): the
-    /// local collider pool below, mirrored into a tree — same struct,
-    /// same verbs, same shapes as the server's, posed from the SMOOTHED
-    /// draw pools (what this client believes the world looks like,
-    /// which is exactly the view the server's lag comp honors for its
-    /// shots). Ask it `sweep`/`nearest`/`touch`; never scan pools for
-    /// geometry.
-    pub index: SingleHandle<WorldIndex>,
 }
 
-// (The old `hulls()` — a Vec of posed hulls rebuilt on every call —
-// died here 2026-07-20: the client now keeps a REAL local collider
-// pool + WorldIndex, posed by the `colliders` task below, and asks it
-// through the same verbs the server uses. The pods-vs-colliders
-// boundary that survived the migration: colliders answer WHERE
-// (line_clear, any geometry question); the pods answer WHAT — bot
-// targeting stays on the replicas because the lead math reads
-// velocity (`heading`/`speed`) and kind-specific gates, which shape
-// data deliberately does not carry. The debug cages stay instanced
-// off per-kind protos for the same reason: a cage MESH is per kind,
-// and the collider pool is kind-erased by design. The WorldIndex
-// rustdoc tells the whole story.)
+// (The client-side collider pool + WorldIndex mirror died with Box3D
+// slice 2, 2026-07-23: collision detection is the SERVER's solver
+// world now, and the only client geometry question left — the bots'
+// hold-fire courtesy — is a sphere check against the teammate draw
+// pods in `run_bot`. The pods-vs-shapes boundary survives: pods
+// answer WHAT (targeting, lead math read velocity and kind gates);
+// the debug cages stay instanced off per-kind protos.)
 
 /// Register the full channel set and install prediction + interpolation.
 /// No connect here — `run` does that once the schema is complete.
@@ -111,36 +96,23 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     let models = pm.single::<Models>("models");
     *models.get_mut() = Models::load();
 
-    // Local vehicle: reconcile against the input-seq echo, replay
-    // unacked sends — the same steps the server runs make it byte-exact.
-    // BOTH vehicles get predictors on the ONE input channel; the one
-    // whose pool holds the avatar runs, the other idles empty.
-    let pred = pm.predict_pool(
-        &truck,
-        &input,
-        {
-            let params = params.clone();
-            move |s, c, dt| truck_step(s, c, dt, &params.get())
-        },
-        1e-4,
-        FIXED_DT,
-    );
-    let pred_heli = pm.predict_pool(
-        &heli,
-        &input,
-        {
-            let params = params.clone();
-            move |s, c, dt| heli_step(s, c, dt, &params.get())
-        },
-        1e-4,
-        FIXED_DT,
-    );
-
     // Remote smoothing, shared delay contract with the server's shot
     // rewind — ONE number, the `interp_ms` param (the replica holds the
     // shipped default until the first snapshot, so pre-connect installs
     // read 33). Capped extrapolation rides loss bursts — and, for the
     // horde, budget-rotation gaps.
+    //
+    // TODO(BUG): THIS ORDER IS LOAD-BEARING — interp_pool MUST register
+    // before the predictors below. Both write the same `<pool>.draw`,
+    // present-phase tasks run in registration order (since the phase
+    // turn), and `pool_interp` overwrites EVERY entry, avatar included.
+    // Registered the other way round, the interp'd (delayed) self
+    // clobbers the predicted one and your own vehicle rides the interp
+    // timeline — ~one-way transit + interp_ms of pure input lag (the
+    // 2026-07-23 regression). The engine should ENFORCE the
+    // interp-before-predict contract its interp_pool doc promises
+    // (skip the predictor-owned avatar id, or structural phase order)
+    // instead of trusting call order here.
     let (interp, extrap) = {
         let p = params.get();
         (f64::from(p.interp_ms) / 1000.0, f64::from(p.extrap_ms) / 1000.0)
@@ -153,143 +125,40 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     // line — interp (plus the extrapolation cap) is plenty.
     let bullet_draw = pm.interp_pool(&bullet, interp, extrap);
 
-    // The client-local collider pool + query index — the SAME
-    // structures the server keeps, posed from the draw pools instead
-    // of the sim. Local pools, never in the
-    // handshake; the shared names make the symmetry legible in
-    // pool_stats. The `colliders` task at 6.5 runs right after the
-    // engine's PRESENT phase refreshes the draw pools, so the index
-    // is exactly as fresh as what's on screen.
-    let colliders = pm.pool::<Collider>("collider");
-    let cparts = pm.pool::<Parts>("vehicle.part");
-    let index = pm.single::<WorldIndex>("collider.index");
-    {
-        let (truck_draw, heli_draw) = (truck_draw.clone(), heli_draw.clone());
-        let (hog_draw, flyer_draw) = (hog_draw.clone(), flyer_draw.clone());
-        let (depot, boss) = (depot.clone(), boss.clone());
-        let (colliders, cparts, index, models) =
-            (colliders.clone(), cparts.clone(), index.clone(), models.clone());
-        let params = params.clone();
-        // Lifecycle edges off the draw pools: vehicles get part child
-        // entities exactly like the server's roster/respawn path; the
-        // horde is self-keyed and just overwrite-posed.
-        let mut truck_adds = pm::Adds::default();
-        let mut heli_adds = pm::Adds::default();
-        let mut truck_removes: pm::Removes<Truck> = Default::default();
-        let mut heli_removes: pm::Removes<Heli> = Default::default();
-        let mut hog_removes: pm::Removes<Hog> = Default::default();
-        let mut flyer_removes: pm::Removes<Flyer> = Default::default();
-        let mut depot_removes: pm::Removes<Depot> = Default::default();
-        pm.task_add("colliders", 6.5, 0.0, move |pm| {
-            let m = models.get();
-            let (tp, hp) = (m.protos("truck"), m.protos("heli"));
-            let (hog_p, flyer_p) = (m.protos("hog")[0], m.protos("flyer")[0]);
-            // Vehicles leaving: free their part children (the pool
-            // entries go with the ids at end-of-tick flush — the same
-            // one-tick ghost window the server's janitor allows).
-            let mut dead: Vec<Id> =
-                truck_removes.drain(&truck_draw.get()).into_iter().map(|(i, _)| i).collect();
-            dead.extend(heli_removes.drain(&heli_draw.get()).into_iter().map(|(i, _)| i));
-            for vid in dead {
-                if let Some(p) = cparts.get_mut().remove(vid) {
-                    for i in 0..p.n as usize {
-                        pm.id_remove(p.ids[i]);
-                    }
-                }
-            }
-            // Vehicles arriving: register parts (no guards held —
-            // parts_add takes the handles itself).
-            let born: Vec<(Id, Truck)> = {
-                let d = truck_draw.get();
-                truck_adds.drain(&d).into_iter().filter_map(|i| d.get(i).map(|t| (i, *t))).collect()
-            };
-            for (vid, t) in born {
-                let hulls = posed(&tp, t.body.pos.x, 0.0, t.body.pos.z, t.heading());
-                parts_add(pm, &colliders, &cparts, vid, CAT_VEHICLE, &hulls);
-            }
-            let born: Vec<(Id, Heli)> = {
-                let d = heli_draw.get();
-                heli_adds.drain(&d).into_iter().filter_map(|i| d.get(i).map(|h| (i, *h))).collect()
-            };
-            for (vid, h) in born {
-                let b = h.body;
-                let hulls = posed(&hp, b.pos.x, b.pos.y, b.pos.z, b.yaw());
-                parts_add(pm, &colliders, &cparts, vid, CAT_VEHICLE, &hulls);
-            }
-            // Re-pose everything at this frame's draw state.
-            {
-                let mut cols = colliders.get_mut();
-                let pts = cparts.get();
-                for (vid, t) in truck_draw.get().iter() {
-                    if let Some(p) = pts.get(vid) {
-                        for (i, proto) in tp.iter().take(p.n as usize).enumerate() {
-                            if let Some(mut c) = cols.get_mut(p.ids[i]) {
-                                c.hull = proto.pose(t.body.pos.x, 0.0, t.body.pos.z, t.heading());
-                            }
-                        }
-                    }
-                }
-                for (vid, h) in heli_draw.get().iter() {
-                    if let Some(p) = pts.get(vid) {
-                        let b = h.body;
-                        for (i, proto) in hp.iter().take(p.n as usize).enumerate() {
-                            if let Some(mut c) = cols.get_mut(p.ids[i]) {
-                                c.hull = proto.pose(b.pos.x, b.pos.y, b.pos.z, b.yaw());
-                            }
-                        }
-                    }
-                }
-                for (id, _) in hog_removes.drain(&hog_draw.get()) {
-                    cols.remove(id);
-                }
-                for (id, _) in flyer_removes.drain(&flyer_draw.get()) {
-                    cols.remove(id);
-                }
-                for (id, h) in hog_draw.get().iter() {
-                    // The boss is a hog wearing a bigger hull — same
-                    // grow the server sweeps, so hold-fire and the
-                    // debug cage agree with what shots actually hit.
-                    let mut hull = hog_p.pose(h.body.pos.x, h.body.pos.y, h.body.pos.z, h.heading());
-                    if boss.get_id(id).is_some() {
-                        hull = hull.grow(params.get().boss_grow);
-                    }
-                    cols.add(
-                        id,
-                        Collider { owner: id, part: PART_BODY, cat: CAT_HOG, hull },
-                    );
-                }
-                for (id, f) in flyer_draw.get().iter() {
-                    cols.add(
-                        id,
-                        Collider {
-                            owner: id,
-                            part: PART_BODY,
-                            cat: CAT_HOG,
-                            hull: flyer_p.pose(f.body.pos.x, f.body.pos.y, f.body.pos.z, f.heading()),
-                        },
-                    );
-                }
-                // The depot: static self-keyed entry off the raw
-                // replica (no interp — it doesn't move), so bot
-                // hold-fire won't spray through it.
-                for (id, _) in depot_removes.drain(&depot.get()) {
-                    cols.remove(id);
-                }
-                for (id, d) in depot.get().iter() {
-                    cols.add(
-                        id,
-                        Collider {
-                            owner: id,
-                            part: PART_BODY,
-                            cat: CAT_VEHICLE,
-                            hull: depot_hull(d),
-                        },
-                    );
-                }
-            }
-            index.get_mut().sync(&colliders.get());
-        });
-    }
+    // Local vehicle: reconcile against the input-seq echo, replay
+    // unacked sends — the same steps the server runs make it byte-exact.
+    // BOTH vehicles get predictors on the ONE input channel; the one
+    // whose pool holds the avatar runs, the other idles empty.
+    // The correction dead zone (`predict_tol`) rides the same replica
+    // the steps read: errors under it are accepted drift (the shared
+    // step approximates the server's solver — see phys.rs), errors
+    // over it rewind-replay. Live-tunable like everything else.
+    let pred = pm.predict_pool(
+        &truck,
+        &input,
+        {
+            let params = params.clone();
+            move |s, c, dt| truck_step(s, c, dt, &params.get())
+        },
+        {
+            let params = params.clone();
+            move || params.get().predict_tol
+        },
+        FIXED_DT,
+    );
+    let pred_heli = pm.predict_pool(
+        &heli,
+        &input,
+        {
+            let params = params.clone();
+            move |s, c, dt| heli_step(s, c, dt, &params.get())
+        },
+        {
+            let params = params.clone();
+            move || params.get().predict_tol
+        },
+        FIXED_DT,
+    );
 
     ClientWorld {
         params,
@@ -312,7 +181,6 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
         pred,
         pred_heli,
         models,
-        index,
     }
 }
 
@@ -349,20 +217,44 @@ pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str, prof: bool)
         let p = w.params.get();
 
         // Trigger discipline — friendly fire is live: hold when a
-        // teammate's (grown) hull crosses the line of fire. Same hulls
-        // and sweep the server judges with, generous margin: a held
-        // shot costs a quarter second, a connected one costs a quarter
-        // of a buddy's hp.
-        // The SAME sweep judgment the server applies to shots, asked of
-        // the client's own index: pad 0.5 as the courtesy margin, own
-        // vehicle skipped the way a shooter's is — one query vocabulary
-        // on both ends of the wire.
+        // teammate (or the depot) sits near the line of fire. A
+        // COURTESY gate, not the server's judgment (that's the Box3D
+        // cast server-side): each protected thing is a sphere or two
+        // around its draw pod, 0.5 of margin baked in — generous on
+        // purpose, since a held shot costs a quarter second and a
+        // connected one costs a quarter of a buddy's hp.
+        //
+        // TODO(box3d-move): hand line-of-fire spheres approximating the
+        // server's solver cast — becomes the same cast on the client's
+        // local solver world (master note atop phys.rs).
         let line_clear = |x: f32, y: f32, z: f32, bearing: f32, pitch: f32, reach: f32| {
-            let dy = pitch.tan() * reach;
-            w.index
-                .get()
-                .sweep(x, z, y, bearing, reach, dy, 0.5, CAT_VEHICLE, net.mine())
-                .is_none()
+            let from = pm::vec3(x, y, z);
+            let dir = pm::vec3(
+                bearing.sin() * pitch.cos(),
+                pitch.sin(),
+                bearing.cos() * pitch.cos(),
+            );
+            // Distance from a sphere center to the shot segment.
+            let clear = |c: pm::Vec3, r: f32| {
+                let t = (c - from).dot(dir).clamp(0.0, reach);
+                (c - (from + dir * t)).len() > r + 0.5
+            };
+            let mine = net.mine();
+            let trucks = w.truck_draw.get();
+            let helis = w.heli_draw.get();
+            let depots = w.depot.get();
+            trucks.iter().filter(|&(id, _)| Some(id) != mine).all(|(_, t)| {
+                let (fx, fz) = (t.heading().sin(), t.heading().cos());
+                let c = t.body.pos + pm::vec3(0.0, 0.8, 0.0);
+                clear(c + pm::vec3(fx, 0.0, fz) * 0.9, 1.3)
+                    && clear(c - pm::vec3(fx, 0.0, fz) * 0.9, 1.3)
+            }) && helis.iter().filter(|&(id, _)| Some(id) != mine).all(|(_, h)| {
+                let (fx, fz) = (h.body.yaw().sin(), h.body.yaw().cos());
+                clear(h.body.pos, 1.7)
+                    && clear(h.body.pos - pm::vec3(fx, 0.0, fz) * 2.0, 1.0)
+            }) && depots
+                .iter()
+                .all(|(_, d)| clear(pm::vec3(d.x, DEPOT_H * 0.5, d.z), DEPOT_R + 0.6))
         };
 
         // Bots n >= 2 are PILOTS: swap to the heli once spawned, then

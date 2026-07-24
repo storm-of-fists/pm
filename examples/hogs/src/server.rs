@@ -1,16 +1,16 @@
 //! Authoritative hogs server. Trucks are player-driven and predicted;
 //! hogs — ground horde and winged flyers alike — are server-owned NPCs
-//! stepped by AI tasks; clients only ever interpolate them. Bullets are real server-owned projectiles (a synced
-//! pool clients render as tracers), and every tick of a bullet's flight
-//! is lag-compensated the way drive's scoring is: the hit test runs
-//! against the COLLIDER frame the SHOOTER was looking at (`acked_tick −
-//! interp_ticks`, rewound through the collider pool's history ring —
-//! hogs and teammates alike, favor-the-shooter), while damage lands in
-//! the present. Collision is the collider-pool architecture (rustdoc
-//! on common.rs `Collider`/`Contact`/`Parts`/`WorldIndex` is the
-//! design record; this file's `bullets` task holds the lag-comp half):
-//! owners register posed collider parts, ONE sweep writes contact
-//! facts, response tasks own every consequence.
+//! stepped by AI tasks; clients only ever interpolate them. Bullets
+//! are real server-owned projectiles (a synced pool clients render as
+//! tracers), and every tick of a bullet's flight is lag-compensated
+//! the way drive's scoring was: the hit test runs against the frame
+//! the SHOOTER was looking at (`acked_tick − interp_ticks`, rewound
+//! through the phys world's pose ring — hogs and teammates alike,
+//! favor-the-shooter), while damage lands in the present. Collision
+//! IS the Box3D world (phys.rs is the design record; this file's
+//! `bullets` task holds the lag-comp half): the solver bodies are the
+//! hitboxes, ONE cast writes contact facts, response tasks own every
+//! consequence.
 //!
 //! Deliberate simplicities (this example is the replication stress lab,
 //! not an AI showcase): hogs don't avoid each other (no separation
@@ -19,7 +19,7 @@
 //! wall for a moment before it swings round.
 
 // TODO(roadmap): named phase constants instead of the float-literal
-// task priorities scattered below (27 index / 28 bites / 31 sweep /
+// task priorities scattered below (26 phys / 28 bites / 31 casts /
 // 32 drain / 33 director / 95 telemetry…) — the same-tick contact
 // contract already has a runtime guard; the numbers deserve names.
 
@@ -28,10 +28,8 @@ use std::collections::HashMap;
 use pm::{Id, Pm, Rng, task};
 
 use crate::common::*;
-use crate::models::{Models, posed};
+use crate::models::Models;
 use crate::phys::Phys;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /// Server-local per-hog state (never replicated — local pools are free,
 /// they don't enter the handshake schema).
@@ -70,7 +68,7 @@ struct HogBrain {
 // TODO(refactor): FlyerBrain = HogBrain + target_alt, and flyer_ai /
 // flyer_hits are near-verbatim clones of hog_ai / hog_hits (~200
 // lines) — extract shared NPC verbs (cooldown tick, wander, steer-and-
-// move, shove decay, wall clamp, building slide, bite-via-collider) so
+// move, shove decay, wall clamp, building slide, bite-via-touch) so
 // each AI task shrinks to ~40 lines of composition and the flyer's
 // genuinely-3D lines stay visible.
 /// Server-local per-flyer state — the airborne sibling of [`HogBrain`]:
@@ -116,25 +114,9 @@ struct Shot {
     /// Hit-circle padding for this shot (`HIT_PAD_*` by shooter platform).
     pad: f32,
     /// Category bits this shot tests (the query carries its filter —
-    /// `Collider::cat`'s contract): player rounds sweep vehicles AND hogs;
+    /// the phys categories' contract): player rounds sweep vehicles AND hogs;
     /// gunner-hog rounds sweep vehicles only (no hog-on-hog carnage).
     mask: u8,
-}
-
-/// The janitor (the `Parts` lifecycle convention): one walk over the collider pool
-/// per tick removes entries whose owner id died — the cull half of the
-/// parent→child convention, `pm.id_alive` being the generation check
-/// that answers "is this id current" without knowing pools. A part
-/// spends at most one tick as a ghost (and one historical frame; a
-/// rewound hit on it is discarded at contact-write by the same
-/// `id_alive` check). Self-keyed entries (hogs) never appear here —
-/// their entry dies with their entity.
-fn cull_colliders(pm: &mut Pm, collider: &pm::PoolHandle<Collider>) {
-    for (cid, c) in collider.get().iter() {
-        if !pm.id_alive(c.owner) {
-            pm.id_remove(cid); // deferred; the pool entry goes with the id
-        }
-    }
 }
 
 /// A roam destination: anywhere in the arena that isn't inside a
@@ -282,9 +264,10 @@ fn spawn_boss(
     boss.get_mut().add(id, Boss { hp: p.boss_hp });
 }
 
-/// Clear the field between missions: horde, flock, and the depot (its
-/// self-keyed collider entry dies with the id). Bullets and impacts
-/// expire on their own clocks; vehicles are the players', untouched.
+/// Clear the field between missions: horde, flock, and the depot (the
+/// phys world retires their bodies with the pool entries). Bullets and
+/// impacts expire on their own clocks; vehicles are the players',
+/// untouched.
 fn purge_npcs(
     pm: &mut Pm,
     hog: &pm::PoolHandle<Hog>,
@@ -373,10 +356,10 @@ pub fn run(
     // "param.set" event task below. Server tasks read it where the old
     // consts used to be.
     // The models registry (models.rs): kind-level shape data. The
-    // server's interest is the `collide.*` protos it poses into the
-    // collider pool — hitboxes come from the same .glb the clients
-    // draw (LOCAL single, never synced: each side reads its own file;
-    // the server's copy is simply the authoritative one).
+    // server's interest is the `collide.*` boxes the phys world builds
+    // its hitbox bodies from — hitboxes come from the same .glb the
+    // clients draw (LOCAL single, never synced: each side reads its
+    // own file; the server's copy is simply the authoritative one).
     let models = pm.single::<Models>("models");
     *models.get_mut() = Models::load();
     // Server-only state: per-hog brains, per-truck gun cooldowns,
@@ -386,46 +369,41 @@ pub fn run(
     let fbrain = pm.pool::<FlyerBrain>("flyer.brain");
     let gun = pm.pool::<f32>("truck.gun");
     let shot = pm.pool::<Shot>("bullet.shot");
-    // The collider pool (rustdoc on `Collider` is the design record):
-    // one entry per PART, keyed
-    // by the part's own id, posed by its owner every tick, swept by the
-    // bullets task. `parts` is the parent→child link (vehicle id → its
-    // part ids: one for a truck, three for a heli) so the step task can
-    // find its entries. Contacts are each tick's OUTPUT — facts on
-    // fresh ids, written at prios 28 (bites) and 31 (the sweep),
-    // drained by the response tasks at 32 the same tick.
-    let collider = pm.pool::<Collider>("collider");
+    // Contacts are each tick's OUTPUT — facts on fresh ids, written at
+    // prios 28 (bites) and 31 (the shot casts), drained by the
+    // response tasks at 32 the same tick. Detection itself lives in
+    // the phys world now (Box3D slice 2) — the old collider pool /
+    // parts link / query-tree mirror are gone.
     let contact = pm.pool::<Contact>("contact");
-    let parts = pm.pool::<Parts>("vehicle.part");
-    // THE query seam (common.rs `WorldIndex`, whose rustdoc is the record):
-    // the collider pool mirrored into a pm::DynamicTree, asked by every
-    // targeting/bite question below. LOCAL single — derived state,
-    // never on the wire.
-    let index = pm.single::<WorldIndex>("collider.index");
     // Sparse gunner pool: membership IS the "armed" flag (the pm idiom
     // for "some hogs have guns"), value = refire cooldown. Keyed by the
     // hog id, so death disarms with everything else.
     let gunner = pm.pool::<f32>("hog.gunner");
 
-    // THE SERVER'S PHYSICAL WORLD (Box3D slice 1, 2026-07-23): one
-    // solver world in an Rc the physics-adjacent tasks share — the
-    // client-renderer capture idiom, server-side. Runs EARLY (prio 26):
-    // membership diff → step LAST tick's velocities/forces → readback
-    // poses into pods, so hog_ai (28) and drive (30) see fresh truth
-    // and their writes land in next tick's step. See phys.rs for the
-    // whole doctrine (statics, hog idiom, wheels-down truck, heli
-    // mirror, and the prediction-approximation experiment).
-    let phys_rc = Rc::new(RefCell::new(Phys::new()));
-    {
-        let phys = phys_rc.clone();
-        task!(pm, "phys", 26.0, [hog, truck, heli], move |_pm| {
-            phys.borrow_mut().tick(&mut hog.get_mut(), &mut truck.get_mut(), &mut heli.get_mut());
-        });
-    }
-    // A second of COLLIDER history — the rewind memory every shot is
-    // judged in (the bullets task is the lag-comp record): hogs and vehicles in one
-    // uniform ring, favor-the-shooter, decided 2026-07-17.
-    let hist = pm.journal_pool(&collider, 1.0);
+    // THE SERVER'S PHYSICAL WORLD (Box3D slices 1+2, 2026-07-23): one
+    // solver world in a LOCAL single — an ordinary handle any task
+    // captures, the models-registry pattern (Default is an empty
+    // placeholder; this line is the real construction). Runs EARLY
+    // (prio 26): membership diff → step LAST tick's velocities/forces
+    // → readback poses into pods → record the lag-comp frame, so
+    // hog_ai (28) and drive (30) see fresh truth and their writes land
+    // in next tick's step. It is ALSO the collision authority:
+    // bullets, bites, and targeting all ask it (see phys.rs for the
+    // whole doctrine).
+    let phys = pm.single::<Phys>("phys");
+    *phys.get_mut() = Phys::new(&models.get());
+    task!(pm, "phys", 26.0, [phys, hog, truck, heli, flyer, depot, boss, params], move |pm| {
+        phys.get_mut().tick(
+            pm.tick(),
+            &mut hog.get_mut(),
+            &mut truck.get_mut(),
+            &mut heli.get_mut(),
+            &flyer.get(),
+            &depot.get(),
+            &boss.get(),
+            params.get().boss_grow,
+        );
+    });
 
     if !quiet {
         eprintln!(
@@ -489,7 +467,7 @@ pub fn run(
     let sessions = pm.event::<Session>("session");
 
     // TODO(refactor): vehicle spawn assembly (pool entry + health + gun
-    // + parts + pose + own_set) is hand-rolled 3× (roster, respawn, the
+    // + own_set) is hand-rolled 3× (roster, respawn, the
     // drive task's two death branches), and death consequences (fresh
     // spawn + death_cost + boom impact + log) are twins in drive —
     // extract spawn_vehicle() / vehicle_died() helpers.
@@ -504,7 +482,7 @@ pub fn run(
     // removes the wreck. Lefts run BEFORE joins: the engine orders a
     // same-tick reclaim leave-first.
     let mut parked: HashMap<u8, (Id, u32)> = HashMap::new();
-    task!(pm, "roster", 10.0, [truck, health, gun, collider, parts, net, models, params], move |pm| {
+    task!(pm, "roster", 10.0, [truck, health, gun, net, params], move |pm| {
         let grace = params.get().reconnect_grace;
         for p in net.left() {
             if let Some(id) = net.own(p) {
@@ -542,9 +520,6 @@ pub fn run(
             truck.get_mut().add(id, t);
             health.get_mut().add(id, Health { hp: params.get().truck_hp });
             gun.get_mut().add(id, 0.0);
-            let hulls =
-                posed(models.get().protos("truck"), t.body.pos.x, 0.0, t.body.pos.z, t.heading());
-            parts_add(pm, &collider, &parts, id, CAT_VEHICLE, &hulls);
             net.own_set(p, id);
             if !quiet {
                 eprintln!("[server] peer {p} joined");
@@ -575,35 +550,21 @@ pub fn run(
     // membership — swap the entity, and the removal log plus the
     // ownership table tell every client the whole story. (`respawns`
     // isn't in the capture list: not a shared handle, just moved in.)
-    task!(pm, "respawn", 11.0, [truck, heli, health, gun, collider, parts, net, models, params], move |pm| {
+    task!(pm, "respawn", 11.0, [truck, heli, health, gun, net, params], move |pm| {
         let p = *params.get();
         for (peer, ev) in respawns.drain() {
             let Some(old) = net.own(peer) else {
                 continue;
             };
-            // The old vehicle's part outlives this removal by one tick
-            // (it has its OWN id) — the janitor in the bullets task
-            // reaps it once `id_alive(owner)` fails.
-            pm.id_remove(old); // truck/heli + health + gun + parts link go with it
+            // The old vehicle's solver body outlives this removal as a
+            // retired ghost (phys graveyard) until its history frames
+            // expire — rewound shots still land on what the shooter saw.
+            pm.id_remove(old); // truck/heli + health + gun go with it
             let id = pm.id_add();
             if ev.vehicle == VEH_HELI {
-                let h = spawn_heli(peer, &p);
-                heli.get_mut().add(id, h);
-                let b = h.body;
-                let hulls =
-                    posed(models.get().protos("heli"), b.pos.x, b.pos.y, b.pos.z, b.yaw());
-                parts_add(pm, &collider, &parts, id, CAT_VEHICLE, &hulls);
+                heli.get_mut().add(id, spawn_heli(peer, &p));
             } else {
-                let t = spawn_truck(peer);
-                truck.get_mut().add(id, t);
-                let hulls = posed(
-                    models.get().protos("truck"),
-                    t.body.pos.x,
-                    0.0,
-                    t.body.pos.z,
-                    t.heading(),
-                );
-                parts_add(pm, &collider, &parts, id, CAT_VEHICLE, &hulls);
+                truck.get_mut().add(id, spawn_truck(peer));
             }
             health.get_mut().add(id, Health { hp: p.truck_hp });
             gun.get_mut().add(id, 0.0);
@@ -633,17 +594,10 @@ pub fn run(
     // is in aggro range, charge it, bite on contact, break off after a
     // bite. Every hog MOVES every tick — deliberately: at horde scale
     // that makes the hog pool change-dense, which is exactly the
-    // byte-budget-rotation workload this example exists to produce. But
-    // The index sync (prio 27, FIRST in the frame's sim block): mirror
-    // the collider pool into the query tree before anyone asks it.
-    // Owners posed their hulls at 28-30 LAST tick and deferred removals
-    // flushed at tick end, so this snapshot is exactly the world the
-    // old direct pool reads saw — one tick behind the poses this tick
-    // will write, which is the staleness targeting always had.
-    task!(pm, "index", 27.0, [collider, index], move |_pm| {
-        index.get_mut().sync(&collider.get());
-    });
-
+    // byte-budget-rotation workload this example exists to produce.
+    // Targeting and bites ask the phys world (`nearest_unit` /
+    // `touch_unit`) — the solver bodies ARE the hitboxes, posed at
+    // prio 26, so the AI sees this tick's readback truth.
     // hogs only THINK (target scan, steering trig, bite check) every
     // `ai_stride`th tick, in slot-staggered cohorts — the expensive
     // decision work drops to 1/stride per tick while the motion stays
@@ -652,16 +606,16 @@ pub fn run(
     // bought the headroom; re-profile before reaching for the parked
     // opt-in threading design. Threading is still the eventual answer
     // if hordes grow 10x.
-    let phys = phys_rc.clone();
     task!(
         pm,
         "hog_ai",
         28.0,
-        [hog, brain, boss, index, collider, contact, params, models],
+        [phys, hog, brain, boss, contact, params],
         move |pm| {
             // One phys borrow for the whole horde pass (velocities in,
-            // poses already read back at prio 26).
-            let mut ph = phys.borrow_mut();
+            // poses already read back at prio 26; targeting and bite
+            // queries answered by the same borrow).
+            let mut ph = phys.get_mut();
             let now = pm.tick() as f32 * FIXED_DT;
             let p = *params.get(); // copy out: the each_with closure below borrows pools
             let stride = (p.ai_stride.round() as u32).clamp(1, 8);
@@ -669,18 +623,8 @@ pub fn run(
             // Decisions cover the whole gap between thinks.
             let think_dt = stride as f32 * FIXED_DT;
             let mut rng = Rng::new(pm.tick().wrapping_mul(0x51D7_ACE5) | 1);
-            // Everything a hog can chase IS everything it could bite:
-            // the query band `[0, hog_leap]` — helis that climb past
-            // leaping range stop existing for the horde (that's the
-            // heli's whole trade), and a new vehicle kind is chaseable
-            // the moment it registers collider parts.
-            let idx = index.get();
-            // The kind's hitbox, poseable (Proto is Copy — the guard
-            // drops before the pool borrows below).
-            let hog_proto = models.get().protos("hog")[0];
             let mut hogs = hog.get_mut();
             let mut brains = brain.get_mut();
-            let mut cols = collider.get_mut();
             // each_with is the hog<->brain join; bite consequences apply
             // INLINE because they only touch OTHER pools (fine while hogs
             // is borrowed) and id_add/id_remove never borrow pools at all
@@ -695,10 +639,13 @@ pub fn run(
                 // THINK (this hog's cohort tick only): scan targets,
                 // decide where to go and how fast, and check the bite.
                 // The decision lands in the brain; the per-tick motion
-                // below chases it.
+                // below chases it. Everything a hog can chase IS
+                // everything it could bite: the band `[0, hog_leap]` —
+                // helis that climb past leaping range stop existing
+                // for the horde (that's the heli's whole trade).
                 if id.index() % stride == phase {
                     let nearest =
-                        idx.nearest(h.body.pos.x, h.body.pos.y, h.body.pos.z, 4.0 * ARENA, (0.0, p.hog_leap), CAT_VEHICLE);
+                        ph.nearest_unit(h.body.pos, 4.0 * ARENA, (0.0, p.hog_leap), CAT_VEHICLE);
 
                     // Pick a desired heading and speed.
                     let (desired, target_speed) = match nearest {
@@ -723,22 +670,28 @@ pub fn run(
                     b.desired = desired;
                     b.target_speed = target_speed;
 
-                    // Bite: any vehicle part overlapping the reach
-                    // circle+band while off cooldown — the SAME query
-                    // family as the chase above, so aggro and bite
-                    // finally share one reach criterion. The seam hands
-                    // back the part (a hog flanking a heli bites the
-                    // tail it's next to); the CONSEQUENCES are the
-                    // response tasks' business, so nothing applies
-                    // here: a bite is a written fact. Think-cadence
-                    // checking delays a bite ≤ stride-1 ticks — noise
-                    // next to BITE_CD.
+                    // Bite: any vehicle shape overlapping the reach
+                    // capsule (the old circle+band, spoken as solver
+                    // geometry) while off cooldown — aggro and bite
+                    // share one reach criterion. The verb hands back
+                    // the part (a hog flanking a heli bites the tail
+                    // it's next to); the CONSEQUENCES are the response
+                    // tasks' business, so nothing applies here: a bite
+                    // is a written fact. Think-cadence checking delays
+                    // a bite ≤ stride-1 ticks — noise next to BITE_CD.
                     // The boss's jaws reach as far as its grown hull.
                     let reach = if is_boss { HOG_R + p.boss_grow } else { HOG_R };
                     let bitten = (b.bite_cd <= 0.0)
-                        .then(|| idx.touch(h.body.pos.x, h.body.pos.z, reach, (0.0, p.hog_leap), CAT_VEHICLE))
+                        .then(|| {
+                            ph.touch_unit(
+                                pm::vec3(h.body.pos.x, 0.0, h.body.pos.z),
+                                pm::vec3(h.body.pos.x, p.hog_leap, h.body.pos.z),
+                                reach,
+                                CAT_VEHICLE,
+                            )
+                        })
                         .flatten();
-                    if let Some(n) = bitten {
+                    if let Some((owner, part)) = bitten {
                         b.bite_cd = p.bite_cd;
                         if !is_boss {
                             b.flee = p.hog_flee;
@@ -747,12 +700,12 @@ pub fn run(
                         contact.get_mut().add(
                             cid,
                             Contact {
-                                owner: n.owner,
-                                part: n.part,
+                                owner,
+                                part,
                                 kind: KIND_BITE,
                                 source_peer: 0,
                                 x: h.body.pos.x,
-                                y: n.band.0.max(0.0),
+                                y: 0.0,
                                 z: h.body.pos.z,
                                 heading: b.heading,
                             },
@@ -792,22 +745,6 @@ pub fn run(
                     }
                 }
                 ph.hog_velocity(id, vx, vz);
-
-                // Pose the collider: a hog is
-                // its own single part — the entry is keyed by the hog's
-                // OWN id, so death cleans it with the entity and the
-                // janitor never has work here. Upsert every tick, the
-                // pool is local — no wire cost to the change-density.
-                let mut hull = hog_proto.pose(h.body.pos.x, h.body.pos.y, h.body.pos.z, b.heading);
-                if is_boss {
-                    // The hitbox matches the spectacle (p.boss_scale on
-                    // the client's model).
-                    hull = hull.grow(p.boss_grow);
-                }
-                cols.add(
-                    id,
-                    Collider { owner: id, part: PART_BODY, cat: CAT_HOG, hull },
-                );
             });
         }
     );
@@ -824,37 +761,29 @@ pub fn run(
         pm,
         "flyer_ai",
         28.0,
-        [flyer, fbrain, index, collider, contact, params, models],
+        [phys, flyer, fbrain, contact, params],
         move |pm| {
+            let ph = phys.get();
             let now = pm.tick() as f32 * FIXED_DT;
             let p = *params.get();
             let stride = (p.ai_stride.round() as u32).clamp(1, 8);
             let phase = pm.tick() % stride;
             let think_dt = stride as f32 * FIXED_DT;
             let mut rng = Rng::new(pm.tick().wrapping_mul(0xB1E5_51ED) | 1);
-            // Anything with a heartbeat below the shed ceiling — the
-            // flyer's query band is `[0, flyer_ceil]`; climb above it
-            // and you're in the refuge.
-            let idx = index.get();
-            let flyer_proto = models.get().protos("flyer")[0];
             let mut flyers = flyer.get_mut();
             let mut brains = fbrain.get_mut();
-            let mut cols = collider.get_mut();
             flyers.each_with(&mut brains, |id, mut f, mut b| {
                 b.bite_cd = (b.bite_cd - FIXED_DT).max(0.0);
                 b.flee = (b.flee - FIXED_DT).max(0.0);
 
                 // THINK (this flyer's cohort tick): scan in 3D, decide
                 // heading, speed, AND altitude; check the bite.
+                // Anything with a heartbeat below the shed ceiling —
+                // the flyer's band is `[0, flyer_ceil]`; climb above
+                // it and you're in the refuge.
                 if id.index() % stride == phase {
-                    let nearest = idx.nearest(
-                        f.body.pos.x,
-                        f.body.pos.y,
-                        f.body.pos.z,
-                        4.0 * ARENA,
-                        (0.0, p.flyer_ceil),
-                        CAT_VEHICLE,
-                    );
+                    let nearest =
+                        ph.nearest_unit(f.body.pos, 4.0 * ARENA, (0.0, p.flyer_ceil), CAT_VEHICLE);
 
                     let (desired, target_speed, target_alt) = match nearest {
                         // Broken off: away and back upstairs.
@@ -889,30 +818,29 @@ pub fn run(
                     b.target_speed = target_speed;
                     b.target_alt = target_alt.clamp(1.0, p.flyer_ceil);
 
-                    // Bite: same verb as the horde — any part inside
-                    // the reach circle+band, consequences behind the
-                    // contact. Only the band differs: it rides the
+                    // Bite: same verb as the horde — any vehicle shape
+                    // inside the reach capsule, consequences behind
+                    // the contact. Only the band differs: it rides the
                     // flyer's altitude, not the ground.
                     let bitten = (b.bite_cd <= 0.0)
                         .then(|| {
-                            idx.touch(
-                                f.body.pos.x,
-                                f.body.pos.z,
+                            ph.touch_unit(
+                                pm::vec3(f.body.pos.x, f.body.pos.y - p.flyer_reach, f.body.pos.z),
+                                pm::vec3(f.body.pos.x, f.body.pos.y + p.flyer_reach, f.body.pos.z),
                                 FLYER_R,
-                                (f.body.pos.y - p.flyer_reach, f.body.pos.y + p.flyer_reach),
                                 CAT_VEHICLE,
                             )
                         })
                         .flatten();
-                    if let Some(n) = bitten {
+                    if let Some((owner, part)) = bitten {
                         b.bite_cd = p.bite_cd;
                         b.flee = p.hog_flee;
                         let cid = pm.id_add();
                         contact.get_mut().add(
                             cid,
                             Contact {
-                                owner: n.owner,
-                                part: n.part,
+                                owner,
+                                part,
                                 kind: KIND_BITE,
                                 source_peer: 0,
                                 x: f.body.pos.x,
@@ -973,26 +901,16 @@ pub fn run(
                 f.body.vel = (pos - f.body.pos) * (1.0 / FIXED_DT);
                 f.body.pos = pos;
                 f.body.rot = pm::Quat::from_yaw(b.heading);
-
-                // Pose the collider: self-keyed single part like the
-                // ground horde, so death cleans it with the entity —
-                // and the history ring makes rewound shots hit it.
-                cols.add(
-                    id,
-                    Collider {
-                        owner: id,
-                        part: PART_BODY,
-                        cat: CAT_HOG,
-                        hull: flyer_proto.pose(f.body.pos.x, f.body.pos.y, f.body.pos.z, b.heading),
-                    },
-                );
+                // (The phys world mirrors this pod into the flyer's
+                // cast-only hitbox body at the next prio-26 tick — and
+                // the frame ring makes rewound shots hit it.)
             });
         }
     );
 
     // Gunner hogs (prio 29, after the brains have moved): each armed
     // hog fires a REAL bullet — same pool as the players', so tracers,
-    // bangs, building hits, and the collider sweep all come free — at
+    // bangs, building hits, and the shot cast all come free — at
     // the nearest vehicle inside its 3D envelope. Bad shots by design
     // (no lead, angular spread); the danger is volume: on the deck a
     // heli is inside a dozen envelopes at once, at altitude it's
@@ -1000,9 +918,9 @@ pub fn run(
     // ride PRESENT-time frames — `view` starts at the current tick, so
     // the per-tick advance tracks the newest frame; a server-side
     // shooter has no lag to compensate.
-    task!(pm, "hog_guns", 29.0, [hog, gunner, index, bullet, shot, params], move |pm| {
+    task!(pm, "hog_guns", 29.0, [phys, hog, gunner, bullet, shot, params], move |pm| {
         let p = *params.get();
-        let idx = index.get();
+        let ph = phys.get();
         let mut rng = Rng::new(pm.tick().wrapping_mul(0xC0FF_EE01) | 1);
         let hogs = hog.get();
         let mut guns = gunner.get_mut();
@@ -1013,14 +931,12 @@ pub fn run(
             }
             let Some(h) = hogs.get(id) else { continue };
             let (mx, my, mz) = (h.body.pos.x, h.body.pos.y + p.hoggun_y, h.body.pos.z);
-            // Nearest vehicle part in range, ANY altitude (the range
-            // sphere is the envelope) — the aim point is the hull's
-            // closest axis point, muzzle height clamped into the band:
-            // a level shot at a truck, a belly shot at a passing heli.
-            let Some(n) = idx.nearest(
-                mx,
-                my,
-                mz,
+            // Nearest vehicle in range, ANY altitude (the range sphere
+            // is the envelope) — the aim point's y is the muzzle
+            // height clamped into the target's extent: a level shot at
+            // a truck, a belly shot at a passing heli.
+            let Some(n) = ph.nearest_unit(
+                pm::vec3(mx, my, mz),
                 p.hoggun_range,
                 (f32::NEG_INFINITY, f32::INFINITY),
                 CAT_VEHICLE,
@@ -1057,36 +973,14 @@ pub fn run(
     // death check, and the turret. Firing just spawns a bullet at the
     // muzzle — the flight and the (lag-compensated) hit test live in the
     // bullets task below.
-    let phys = phys_rc.clone();
     task!(
         pm,
         "drive",
         30.0,
-        [truck, heli, health, bullet, gun, shot, impact, hunt, collider, parts, net, params, models],
+        [phys, truck, heli, health, bullet, gun, shot, impact, hunt, net, params],
         move |pm| {
-            let mut ph = phys.borrow_mut();
+            let mut ph = phys.get_mut();
             let p = *params.get();
-            // Kind hitboxes, posed per vehicle below (the guard is a
-            // read borrow on the single — held across the loop, fine).
-            let mg = models.get();
-            let (tp, hp) = (mg.protos("truck"), mg.protos("heli"));
-            // Owners keep their parts current (the `Collider` contract):
-            // every exit from the step below re-poses the vehicle's
-            // collider hulls, so the sweep at 31 never looks up a pose.
-            // Each registered part finds its hull by tag — stage 4's
-            // multi-part heli and the one-part truck share the loop.
-            let pose = |id: Id, hulls: &[(u8, Hull)]| {
-                let Some(p) = parts.get_id(id).map(|p| *p) else {
-                    return;
-                };
-                for pid in &p.ids[..p.n as usize] {
-                    if let Some(mut c) = collider.get_id_mut(*pid)
-                        && let Some(&(_, hull)) = hulls.iter().find(|&&(tag, _)| tag == c.part)
-                    {
-                        c.hull = hull;
-                    }
-                }
-            };
             for (peer, id) in net.owned() {
                 let cmd = inputs.pop(peer);
 
@@ -1126,10 +1020,6 @@ pub fn run(
                         if let Some(mut t) = truck.get_id_mut(id) {
                             *t = fresh;
                         }
-                        pose(
-                            id,
-                            &posed(tp, fresh.body.pos.x, 0.0, fresh.body.pos.z, fresh.heading()),
-                        );
                         if let Some(mut v) = health.get_id_mut(id) {
                             v.hp = p.truck_hp;
                         }
@@ -1143,20 +1033,6 @@ pub fn run(
                         }
                         continue;
                     }
-                    // y rides the body now (ramps): an airborne truck's
-                    // parts fly with it — bullets track it, and the
-                    // horde's 0..hog_leap bite band loses it, the same
-                    // altitude rule the heli plays by.
-                    pose(
-                        id,
-                        &posed(
-                            tp,
-                            shooter.body.pos.x,
-                            shooter.body.pos.y,
-                            shooter.body.pos.z,
-                            shooter.heading(),
-                        ),
-                    );
                     (truck_muzzle(&shooter), p.hit_pad_truck)
                 } else if let Some(shooter) = heli.get_id_mut(id).map(|mut hl| {
                     heli_step(&mut hl, cmd, FIXED_DT, &p);
@@ -1168,8 +1044,6 @@ pub fn run(
                         if let Some(mut hl) = heli.get_id_mut(id) {
                             *hl = fresh;
                         }
-                        let fb = fresh.body;
-                        pose(id, &posed(hp, fb.pos.x, fb.pos.y, fb.pos.z, fb.yaw()));
                         if let Some(mut v) = health.get_id_mut(id) {
                             v.hp = p.truck_hp;
                         }
@@ -1193,7 +1067,6 @@ pub fn run(
                         }
                         continue;
                     }
-                    pose(id, &posed(hp, b.pos.x, b.pos.y, b.pos.z, b.yaw()));
                     (heli_muzzle(&shooter), p.hit_pad_heli)
                 } else {
                     continue;
@@ -1246,39 +1119,40 @@ pub fn run(
         }
     );
 
-    // Bullets (prio 31, right after the guns fire): THE collisions
-    // sweep, and the LAG-COMP design record. Each bullet's per-tick
-    // travel is judged in the collider frame its SHOOTER was looking
-    // at (acked tick minus their interp delay, out of the history
-    // ring) — hogs AND teammates in the same rewound frame,
-    // favor-the-shooter, one timeline per shot. Decided 2026-07-17,
-    // with eyes open: "I was behind cover on my own screen" loses to
-    // sim consistency, the genre default (Source rewinds ALL players).
-    // The Source guardrails came along: rewind bounded by ring depth
-    // (1 s), restore exact for free (the sweep only READS old frames,
-    // nothing is mutated), and the teleport guard falls out of id
-    // generations — a vehicle swap is a fresh entity, so stale frames
-    // simply miss. Historying the COLLIDER pool (pose data, never a
+    // Bullets (prio 31, right after the guns fire): THE shot
+    // judgment, and the LAG-COMP design record. Each bullet's
+    // per-tick travel is judged in the frame its SHOOTER was looking
+    // at (acked tick minus their interp delay, out of the phys
+    // world's pose ring) — hogs AND teammates in the same rewound
+    // frame, favor-the-shooter, one timeline per shot. Decided
+    // 2026-07-17, with eyes open: "I was behind cover on my own
+    // screen" loses to sim consistency, the genre default (Source
+    // rewinds ALL players). The Source guardrails came along: rewind
+    // bounded by ring depth (1 s), restore exact for free (casts READ
+    // old poses; the live world is never rewound), and the teleport
+    // guard falls out of id generations — a vehicle swap is a fresh
+    // entity, so stale frames simply miss. Historying POSES (never a
     // physics world) is precisely Source's hitbox-only rewind, and
     // Unity DOTS ships the uniform version (PhysicsWorldHistory-
-    // Singleton) — shipped precedent on both ends. Ring cost = parts
-    // × depth: fine while swarm entities stay single-part; don't give
-    // every hog four parts because it got easy.
+    // Singleton) — shipped precedent on both ends. Since Box3D slice
+    // 2 the geometry is the solver's own: `Phys::cast_shot` sphere-
+    // casts each unit body at its rewound transform (the sphere
+    // radius is the shot's forgiveness — pads fatten HOGS only, never
+    // a teammate), and statics clip the travel with a plain world ray
+    // (buildings and arena walls stop bullets in present time — they
+    // don't move; the old building_top math is gone).
     //
-    // The sweep iterates collider entries — a new vehicle registers
-    // its part and is swept without this task changing — writes
-    // Contact facts, and applies NOTHING; the response tasks below own
-    // every consequence. Damage lands on the PRESENT entity (id_alive-
-    // gated); only the hit test rewinds. Ghosts eat rounds
-    // deliberately: a part outliving its owner by a tick is still hit
-    // in old frames — the shooter saw it there — but no contact
-    // reaches a dead owner. Buildings and arena walls stop bullets in
-    // present time (they don't move).
+    // The cast writes Contact facts and applies NOTHING; the response
+    // tasks below own every consequence. Damage lands on the PRESENT
+    // entity (id_alive-gated); only the hit test rewinds. Corpses eat
+    // rounds deliberately: a retired body is still hit in old frames
+    // — the shooter saw it there — but no contact reaches a dead
+    // owner.
     task!(
         pm,
         "bullets",
         31.0,
-        [bullet, shot, collider, contact, impact, net, params],
+        [phys, bullet, shot, contact, impact, net, params],
         move |pm| {
             let p = *params.get();
             // Same-tick contract check: the response tasks at 32 drain
@@ -1304,8 +1178,8 @@ pub fn run(
                     pm.id_remove(cid);
                 }
             }
-            cull_colliders(pm, &collider);
-            let step = params.get().bullet_speed * FIXED_DT;
+            let ph = phys.get();
+            let step = p.bullet_speed * FIXED_DT;
             let mut bullets = bullet.get_mut();
             let mut shots = shot.get_mut();
             // Everything applies inline mid-iteration: id_remove is
@@ -1315,47 +1189,22 @@ pub fn run(
                 // One steady tick along the shooter's timeline per
                 // flight tick — never re-read from acked (bursty).
                 s.view = s.view.saturating_add(1);
-                let view = s.view;
-                // 3D flight: the climb angle splits the tick's travel
-                // into a ground-plane sweep (the existing 2D ray) and a
-                // vertical component; a hit only counts if the shot's
-                // altitude at the hit point is inside the hog's band.
-                let hstep = b.pitch.cos() * step;
-                let dy = b.pitch.sin() * step;
-                // THE sweep: the shot is judged
-                // in its shooter's rewound collider frame — hogs AND
-                // teammates, one timeline, favor-the-shooter. Two
-                // passes because the pad differs (hog forgiveness never
-                // fattens a teammate); nearest hit along the travel
-                // wins, so a hog can shield a truck and vice versa.
+                let dir = pm::vec3(
+                    b.heading.sin() * b.pitch.cos(),
+                    b.pitch.sin(),
+                    b.heading.cos() * b.pitch.cos(),
+                );
+                let from = pm::vec3(b.x, b.y, b.z);
                 let skip = net.own(b.owner as u8);
-                let hit = hist.frame(view).and_then(|f| {
-                    let ff = (s.mask & CAT_VEHICLE != 0)
-                        .then(|| {
-                            sweep_colliders(
-                                b.x, b.z, b.y, b.heading, hstep, dy, 0.0, CAT_VEHICLE, skip, &f,
-                            )
-                        })
-                        .flatten();
-                    let hg = (s.mask & CAT_HOG != 0)
-                        .then(|| {
-                            sweep_colliders(
-                                b.x, b.z, b.y, b.heading, hstep, dy, s.pad, CAT_HOG, None, &f,
-                            )
-                        })
-                        .flatten();
-                    [ff, hg]
-                        .into_iter()
-                        .flatten()
-                        .min_by(|a, b| a.frac.total_cmp(&b.frac))
-                });
+                let (hit, wall) = ph.cast_shot(s.view, from, dir, step, s.pad, s.mask, skip);
                 if let Some(hit) = hit {
                     pm.id_remove(id); // the shot ends either way
-                    // A ghost in an old frame (it died since that view)
-                    // eats the round — the shooter SAW it there — but
-                    // hurts nothing: stale ids fail the gen check, and
-                    // no contact means no response. Damage stays in the
-                    // PRESENT; the response tasks re-check at drain.
+                    // A corpse in an old frame (it died since that
+                    // view) eats the round — the shooter SAW it there
+                    // — but hurts nothing: stale ids fail the gen
+                    // check, and no contact means no response. Damage
+                    // stays in the PRESENT; the response tasks
+                    // re-check at drain.
                     if pm.id_alive(hit.owner) {
                         let cid = pm.id_add();
                         contact.get_mut().add(
@@ -1374,26 +1223,21 @@ pub fn run(
                     }
                     return;
                 }
-                b.x += b.heading.sin() * hstep;
-                b.z += b.heading.cos() * hstep;
-                b.y += dy;
-                s.left -= step;
-                if b.y <= 0.0 || (b.y < building_top(b.x, b.z) && in_building(b.x, b.z, 0.0)) {
-                    // Dirt and wall hits flash too — with real tracers,
-                    // seeing WHERE the shot died is most of the feedback.
-                    // Above the roofline the shot overflies the block.
+                if let Some(wp) = wall {
+                    // Dirt, building, and wall hits flash — with real
+                    // tracers, seeing WHERE the shot died is most of
+                    // the feedback. (Real geometry now: a shot over
+                    // the roofline simply never meets a static.)
                     pm.id_remove(id);
                     let mid = pm.id_add();
-                    impact.get_mut().add(
-                        mid,
-                        Impact {
-                            x: b.x,
-                            z: b.z,
-                            kind: IMPACT_HIT,
-                        },
-                    );
-                } else if s.left <= 0.0 || b.x.abs() > ARENA || b.z.abs() > ARENA || b.y > p.heli_ceil
-                {
+                    impact.get_mut().add(mid, Impact { x: wp.x, z: wp.z, kind: IMPACT_HIT });
+                    return;
+                }
+                b.x += dir.x * step;
+                b.y += dir.y * step;
+                b.z += dir.z * step;
+                s.left -= step;
+                if s.left <= 0.0 || b.x.abs() > ARENA || b.z.abs() > ARENA || b.y > p.heli_ceil {
                     pm.id_remove(id);
                 }
             });
@@ -1480,7 +1324,7 @@ pub fn run(
     });
     // TODO(roadmap): part behavior as data — small, worth doing. The
     // damage multipliers and the tail kick below live as match arms;
-    // moving `dmg_mul`/`kick` onto the part's collider entry means new
+    // moving `dmg_mul`/`kick` onto per-part unit data in phys means new
     // vehicles get part behavior without touching response tasks, and
     // the numbers become params-tunable.
     task!(pm, "heli_hits", 32.0, [contact, heli, health, hunt, impact, net, params], move |pm| {
@@ -1591,7 +1435,7 @@ pub fn run(
                         h.hp = (hp_left / p.boss_hp).clamp(0.01, 1.0) * p.hog_hp;
                     }
                 } else {
-                    pm.id_remove(c.owner); // brain + boss entry + collider go with it
+                    pm.id_remove(c.owner); // brain + boss entry go; the body retires
                     hunt.get_mut().points += p.kill_points * 10.0;
                     if !quiet {
                         eprintln!("[server] BOSS down at ({:.1},{:.1}) now={now}", c.x, c.z);
@@ -1624,7 +1468,7 @@ pub fn run(
                 br.shove = (c.heading.sin() * p.knock, c.heading.cos() * p.knock);
             }
             if killed {
-                pm.id_remove(c.owner); // brain + collider entries go with it
+                pm.id_remove(c.owner); // the brain goes; the phys body retires
                 hunt.get_mut().points += p.kill_points;
                 if !quiet {
                     eprintln!("[server] hog down at ({:.1},{:.1}) now={now}", c.x, c.z);
@@ -1674,7 +1518,7 @@ pub fn run(
                 br.shove = (c.heading.sin() * p.knock, c.heading.cos() * p.knock);
             }
             if killed {
-                pm.id_remove(c.owner); // brain + collider go with it
+                pm.id_remove(c.owner); // the brain goes; the phys body retires
                 hunt.get_mut().points += p.kill_points;
                 if !quiet {
                     eprintln!("[server] flyer down at ({:.1},{:.1}) now={now}", c.x, c.z);
@@ -1748,7 +1592,7 @@ pub fn run(
         pm,
         "director",
         33.0,
-        [hog, brain, gunner, flyer, fbrain, truck, heli, hunt, params, depot, boss, collider],
+        [hog, brain, gunner, flyer, fbrain, truck, heli, hunt, params, depot, boss],
         move |pm| {
             let p = *params.get();
             let mut go = false;
@@ -1787,22 +1631,18 @@ pub fn run(
                         // Mission furniture goes live with the phase.
                         match m.kind {
                             MISSION_DEFEND => {
+                                // One pool entry IS the whole defend
+                                // mission: the phys world grows a
+                                // static CAT_VEHICLE body from it, so
+                                // hog aggro, bites, and gunner fire
+                                // route to it through seams that
+                                // already exist — and the horde
+                                // physically bumps it now.
                                 let id = pm.id_add();
-                                let d = Depot { x: DEPOT_POS.0, z: DEPOT_POS.1, hp: p.depot_hp };
-                                // Static self-keyed CAT_VEHICLE part —
-                                // the whole defend mission: hog aggro,
-                                // bites, and gunner fire route to it
-                                // through seams that already exist.
-                                collider.get_mut().add(
+                                depot.get_mut().add(
                                     id,
-                                    Collider {
-                                        owner: id,
-                                        part: PART_BODY,
-                                        cat: CAT_VEHICLE,
-                                        hull: depot_hull(&d),
-                                    },
+                                    Depot { x: DEPOT_POS.0, z: DEPOT_POS.1, hp: p.depot_hp },
                                 );
-                                depot.get_mut().add(id, d);
                             }
                             MISSION_BOSS => {
                                 spawn_boss(pm, &hog, &brain, &boss, &p);
@@ -2021,48 +1861,4 @@ pub fn run(
         eprintln!("(a previous hogs may still be running: pkill -x hogs)");
         std::process::exit(1);
     });
-}
-
-/// The parent→child lifecycle convention, pinned (see `Parts` in
-/// common.rs): a part has its OWN id, so removing the owner leaves a ghost
-/// for exactly one flush — the janitor must filter it from the live
-/// list immediately and free it next tick.
-#[cfg(test)]
-mod collider_tests {
-    use super::*;
-
-    const DT: f32 = 1.0 / 60.0;
-
-    #[test]
-    fn janitor_culls_ghost_parts() {
-        let mut pm = Pm::new();
-        let collider = pm.pool::<Collider>("collider");
-        let owner = pm.id_add();
-        let part = pm.id_add();
-        collider.get_mut().add(
-            part,
-            Collider {
-                owner,
-                part: PART_BODY,
-                cat: CAT_VEHICLE,
-                hull: crate::models::collide_protos(&crate::models::truck())[0]
-                    .pose(0.0, 0.0, 0.0, 0.0),
-            },
-        );
-        cull_colliders(&mut pm, &collider);
-        pm.loop_once(DT);
-        assert!(collider.get().contains(part), "a live owner's part stays");
-
-        pm.id_remove(owner);
-        pm.loop_once(DT); // flush: the owner dies, the part survives it
-        assert!(
-            collider.get().contains(part),
-            "the part has its own id — the owner's removal can't reach it"
-        );
-        assert!(!pm.id_alive(owner), "the sweep's contact-write guard fails here");
-        cull_colliders(&mut pm, &collider);
-        pm.loop_once(DT); // flush the janitor's id_remove
-        assert!(!collider.get().contains(part), "the janitor freed the entry");
-        assert!(!pm.id_alive(part), "and the id itself");
-    }
 }

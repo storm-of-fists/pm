@@ -221,6 +221,17 @@ pm_control_core::pm_params! {
         /// strobing under loss. A choice, not a law. Takes effect per
         /// session (interp buffers capture it at install).
         pub interp_ms: 33.0 in 0.0..200.0,
+        /// Prediction-correction DEAD ZONE (2026-07-23, the spike-4
+        /// answer): reconcile only rewinds/replays when the pod error
+        /// (`pod_err`: |pos| + |vel| + rot×8 + |ang|, summed) exceeds
+        /// this. The client's shared step is an APPROXIMATION of the
+        /// server's Box3D truth — mm-scale drift at cruise is
+        /// permanent and harmless, and correcting it every snapshot
+        /// dragged the own-pose feel behind the stick (the input-lag
+        /// complaint). Real events (ramps, shoves, tumbles, tail
+        /// kicks) blow past this and still correct. 0 restores
+        /// correct-on-everything.
+        pub predict_tol: 0.5 in 0.0..5.0,
         // --- THE PARAMS SWEEP batch 1 (2026-07-23): everything below
         // was a `pub const` wearing tuning clothing; the const/param
         // split is FINAL (see common.rs) — consts are for enum
@@ -591,6 +602,8 @@ pub const BUILDINGS: [(f32, f32, f32, f32, f32); 14] = [
 ];
 
 /// Whether `(x, z)` is inside any building footprint grown by `pad`.
+/// TODO(box3d-move): hand footprint test — becomes a statics query on
+/// the client's local solver world (master note atop hogs phys.rs).
 pub fn in_building(x: f32, z: f32, pad: f32) -> bool {
     BUILDINGS
         .iter()
@@ -604,6 +617,11 @@ pub fn in_building(x: f32, z: f32, pad: f32) -> bool {
 /// altitude 0: no roof sits below it, so the roofline skip never fires
 /// and this IS `building_push_below` at y = 0 — same compiled math, so
 /// prediction byte-exactness survives (the golden replays pin it).
+///
+/// TODO(box3d-move): hand closest-point push-out (this fn and
+/// `building_push_below`) — dies when the predicted step runs on the
+/// client's local solver and contacts do this (master note atop hogs
+/// phys.rs).
 pub fn building_push(x: f32, z: f32, r: f32) -> (f32, f32, f32, f32) {
     building_push_below(x, z, r, 0.0)
 }
@@ -669,10 +687,16 @@ pub const RAMPS: [(f32, f32, f32, f32, f32, f32); 4] = [
 /// truck step drives on (shared, so ramp launches predict byte-exact).
 /// Overlapping ramps resolve tallest-wins, like `building_top`.
 ///
-/// TODO(ship): bullets and hog walkers ignore ramps — a shot skims
-/// through a wedge and hogs clip through it visually. Both want this
-/// probe (bullet altitude gate; hog y posing) when it starts to read
-/// wrong in play.
+/// TODO(box3d-move) (Connor, 2026-07-23, DECIDED — master note atop
+/// hogs phys.rs): dies with client local solving. The statics world
+/// already holds these SAME wedges as real hulls and the server's
+/// bullets and hogs judge against those (the old "bullets and hog
+/// walkers ignore ramps" TODO(ship) died with collisions slice 2);
+/// only client prediction keeps this fn alive — the shared truck step
+/// runs on clients, which have no solver world YET. Until the local
+/// solver lands this stays byte-shared math — don't fork it, and don't
+/// let the RAMPS/BUILDINGS tables drift from the bodies phys.rs builds
+/// from them.
 pub fn ground_probe(x: f32, z: f32) -> (f32, pm::Vec3) {
     let (mut h, mut n) = (0.0f32, vec3(0.0, 1.0, 0.0));
     for &(rx, rz, yaw, hw, hl, rh) in &RAMPS {
@@ -711,6 +735,11 @@ pub const FOLLOW_DROP: f32 = 0.45;
 
 /// Roof height at `(x, z)`: the tallest building whose footprint covers
 /// the point, 0.0 in the open — the bullets' altitude gate for walls.
+///
+/// TODO(box3d-move): no server users left (bullets ray-cast the solver
+/// since collisions slice 2) — only the client tracer/reticle marchers
+/// read this; becomes a statics query on the client's local solver
+/// world (master note atop hogs phys.rs).
 pub fn building_top(x: f32, z: f32) -> f32 {
     BUILDINGS
         .iter()
@@ -896,6 +925,9 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
         y += vy * dt;
     }
 
+    // TODO(box3d-move): hand arena-wall clamp — the solver world has
+    // real walls; dies when this step runs on the client's local
+    // solver (master note atop hogs phys.rs).
     if x.abs() > ARENA {
         x = x.clamp(-ARENA, ARENA);
         vx *= 0.4;
@@ -1097,6 +1129,9 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
         b.vel.y = b.vel.y.min(0.0);
     }
     // Arena walls stop you in the air too (biomod containment field).
+    // TODO(box3d-move): hand clamp, same story as the truck's (master
+    // note atop hogs phys.rs) — and the heli itself is on that list
+    // (kinematic mirror → real solver body).
     if b.pos.x.abs() > ARENA {
         b.pos.x = b.pos.x.clamp(-ARENA, ARENA);
         b.vel.x *= -0.2;

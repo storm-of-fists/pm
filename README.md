@@ -25,6 +25,8 @@ grep -rn "TODO(roadmap)" crates/ examples/   # engine queue — only if blocking
 grep -rn "TODO(v2)" crates/                  # engine-v2 adoption — greenlit, in flight
 grep -rn "TODO(story)" examples/             # the lore — Connor authors this
 grep -rn "TODO(simplify)" crates/ examples/  # zoom-outs/generalizations noticed while working — the standing simplification track
+grep -rn "TODO(BUG)" crates/ examples/       # known landmines — a fix in place that only holds by convention (load-bearing ordering, fragile contract); each one names the engine enforcement that retires it
+grep -rn "TODO(box3d-move)" examples/        # hand-rolled geometry earmarked for the solver — NEXT UP: clients predict by stepping a local Box3D world (DECIDED 2026-07-23; master note atop examples/hogs/src/phys.rs)
 grep -rn "STYLE(" crates/ examples/          # style notes — where a feel or design deliberately chases a named inspiration (STYLE(motorstorm), STYLE(source), ...): what we're mimicking and which parts of it we want
 ```
 

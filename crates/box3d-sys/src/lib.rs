@@ -133,8 +133,17 @@ pub struct JointId(u64);
 /// poses out) — nothing here is thread-aware because pm tasks aren't.
 pub struct World(u32);
 
+/// Box3D's world table is a process-global array scanned WITHOUT locks
+/// (`b3_worlds` in b3CreateWorld) — two threads creating worlds at
+/// once can claim the same slot. Serialize create/destroy here so
+/// multi-threaded TESTS can't race it; game code runs one world on one
+/// thread and never contends. (Stepping/querying different worlds
+/// concurrently remains unsupported — pm tasks aren't threaded.)
+static WORLD_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl World {
     pub fn new(gravity: Vec3) -> World {
+        let _gate = WORLD_GATE.lock().unwrap();
         World(unsafe { pmb3_world_create(gravity.x, gravity.y, gravity.z) })
     }
 
@@ -345,6 +354,7 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
+        let _gate = WORLD_GATE.lock().unwrap();
         unsafe { pmb3_world_destroy(self.0) }
     }
 }
