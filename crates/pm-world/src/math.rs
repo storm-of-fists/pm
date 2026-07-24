@@ -583,6 +583,18 @@ impl Quat {
         v + t * self.w + u.cross(t)
     }
 
+    /// Conjugate — the inverse rotation for a unit quat. `conj().rotate`
+    /// carries a world-frame vector into the body frame (what diagonal
+    /// body-frame inertia in [`Forces::apply`] needs).
+    pub fn conj(self) -> Quat {
+        Quat {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+            w: self.w,
+        }
+    }
+
     /// Normalized lerp along the SHORT arc — the pool-interp / attitude-
     /// easing workhorse (slerp's constant angular velocity isn't worth
     /// its cost at snapshot-interval deltas; if a use case ever shows
@@ -636,19 +648,23 @@ impl Mul for Quat {
     }
 }
 
-/// Rigid-body kinematic state: position, velocity, orientation — the
-/// shared chunk every vehicle pod EMBEDS (composition, deliberately not
-/// a separate pool: the predicted-pod contract needs pose and velocity
-/// inside the pod its step evolves). Step functions map input to forces
-/// and rates, mutate `vel`/`rot`, then [`integrate`](Body::integrate);
-/// rendering takes [`model`](Body::model). This is the seam a future
-/// physics layer grows behind — angular velocity joins when a vehicle
-/// (jets) actually integrates it.
+/// Rigid-body kinematic state: position, velocity, orientation, angular
+/// velocity — the shared chunk every vehicle pod EMBEDS (composition,
+/// deliberately not a separate pool: the predicted-pod contract needs
+/// pose and velocity inside the pod its step evolves). Step functions
+/// map input to forces and rates — through [`Forces`] when the forces
+/// act on PARTS of a combined body (a rotor above the roof, a tail
+/// thruster on a boom) — then [`integrate`](Body::integrate); rendering
+/// takes [`model`](Body::model). `ang` joined 2026-07-23 (the heli
+/// integrates it now); a constrained vehicle that scripts its own
+/// rotation (the truck's pure-yaw heading) projects `ang` back to zero
+/// each step, the same way it projects `pos.y`.
 ///
 /// The physics stance: physics is **library functions, not a system**
 /// — there is no rigid-body world to register into, just `Body`,
 /// [`Quat`], and step functions games call from their own tasks, in
-/// three tiers (Source's split):
+/// three tiers (STYLE(source): independently identical to Source's
+/// QPhysics / VPhysics / client-ragdoll split, which validates it):
 /// 1. **Predicted-kinematic** — player vehicles: deterministic pure
 ///    steps, shared byte-identical by server and prediction replay.
 /// 2. **Server-dynamic** — NPC impulses (knockback, shoves): the
@@ -666,6 +682,9 @@ pub struct Body {
     pub pos: Vec3,
     pub vel: Vec3,
     pub rot: Quat,
+    /// Angular velocity, WORLD frame, rad/s (axis = spin axis, length =
+    /// rate). Zero for vehicles that script their rotation directly.
+    pub ang: Vec3,
 }
 
 impl Body {
@@ -684,14 +703,96 @@ impl Body {
         self.rot.to_yaw_pitch_roll().0
     }
 
-    /// Advance position by velocity.
+    /// Advance position by velocity and orientation by angular velocity
+    /// (`q̇ = ½ ω q`, then renormalize). The rotation half is skipped at
+    /// exactly `ang == 0` so a yaw-scripted vehicle's `rot` bytes never
+    /// move through a needless renorm (prediction is byte-exact).
     pub fn integrate(&mut self, dt: f32) {
         self.pos = self.pos + self.vel * dt;
+        if self.ang != Vec3::ZERO {
+            let h = self.ang * (0.5 * dt);
+            let w = Quat { x: h.x, y: h.y, z: h.z, w: 0.0 } * self.rot;
+            self.rot = Quat {
+                x: self.rot.x + w.x,
+                y: self.rot.y + w.y,
+                z: self.rot.z + w.z,
+                w: self.rot.w + w.w,
+            }
+            .norm();
+        }
+    }
+
+    /// Apply an instantaneous impulse `j` (mass·u/s, world frame) at
+    /// `at`, world-frame offset from the center of mass — the one-shot
+    /// form of [`Forces::at`] for hits: `vel` takes `j/mass`, `ang`
+    /// takes `I⁻¹ (at × j)`. A shot clipping the far end of a boom
+    /// spins the machine; the same shot square into the hub just shoves
+    /// it — obliquity falls out of the cross product, nobody hand-codes
+    /// a `sin()`.
+    pub fn impulse_at(&mut self, j: Vec3, at: Vec3, mass: f32, inertia: Vec3) {
+        self.vel = self.vel + j * (1.0 / mass);
+        let l = self.rot.conj().rotate(at.cross(j)); // body frame
+        let spin = vec3(l.x / inertia.x, l.y / inertia.y, l.z / inertia.z);
+        self.ang = self.ang + self.rot.rotate(spin);
     }
 
     /// Model matrix: rotate, then place.
     pub fn model(self) -> Mat4 {
         Mat4::translate(self.pos) * self.rot.to_mat4()
+    }
+}
+
+/// One tick's worth of forces on a COMBINED body — parts bolted to one
+/// rigid frame (rotor above the cabin, thruster on the tail boom). Feed
+/// it forces at part offsets, then [`apply`](Forces::apply) once: each
+/// force lands twice, as linear acceleration through the center of mass
+/// and as torque `r × F` about it — push the tail, the nose comes
+/// around. This is the library-not-a-system stance for tier-1 physics:
+/// no rigid-body world to register into, just an accumulator a step
+/// function fills and applies inside its own math.
+///
+/// Mass properties live at the call site (a const per vehicle), not in
+/// [`Body`] — pods carry state, not configuration. `inertia` is the
+/// diagonal of the body-frame inertia tensor (pitch `x`, yaw `y`, roll
+/// `z` for a +Z-forward vehicle); the gyroscopic `ω × Iω` term is
+/// deliberately dropped — arcade vehicles want controllability, and
+/// nothing here spins fast enough to precess visibly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Forces {
+    pub force: Vec3,
+    pub torque: Vec3,
+}
+
+impl Forces {
+    /// A force through the center of mass (gravity, drag): no torque.
+    pub fn central(&mut self, f: Vec3) {
+        self.force = self.force + f;
+    }
+
+    /// A force on a part: `at` is the part's offset from the center of
+    /// mass, WORLD frame (rotate the model-space mount point through
+    /// `body.rot` first). Adds the full force linearly plus `at × f` as
+    /// torque — the propagation that makes a combined body one body.
+    pub fn at(&mut self, f: Vec3, at: Vec3) {
+        self.force = self.force + f;
+        self.torque = self.torque + at.cross(f);
+    }
+
+    /// A pure torque (world frame) with no linear component — for
+    /// control moments modeled without a mount point.
+    pub fn torque(&mut self, t: Vec3) {
+        self.torque = self.torque + t;
+    }
+
+    /// Integrate the accumulated forces into the body's velocities
+    /// (`vel += F/m·dt`, `ang += R I⁻¹ Rᵀ τ·dt`). Position and attitude
+    /// advance in [`Body::integrate`], which the step calls after its
+    /// drags and caps.
+    pub fn apply(self, b: &mut Body, mass: f32, inertia: Vec3, dt: f32) {
+        b.vel = b.vel + self.force * (dt / mass);
+        let l = b.rot.conj().rotate(self.torque); // body frame
+        let spin = vec3(l.x / inertia.x, l.y / inertia.y, l.z / inertia.z);
+        b.ang = b.ang + b.rot.rotate(spin) * dt;
     }
 }
 
@@ -792,6 +893,77 @@ mod tests3d {
         // model() places after rotating.
         let p = b.model().transform_point(vec3(0.0, 0.0, 1.0));
         assert!(p.dist(vec3(1.0, 0.0, 5.0)) < 1e-5);
+    }
+
+    #[test]
+    fn ang_integrates_rotation() {
+        let mut b = Body {
+            ang: vec3(0.0, std::f32::consts::FRAC_PI_2, 0.0),
+            ..Body::default()
+        };
+        for _ in 0..60 {
+            b.integrate(1.0 / 60.0);
+        }
+        // π/2 rad/s about +y for 1 s ≈ a quarter turn of yaw (small
+        // first-order integration error is fine, byte-exactness is the
+        // golden tests' job).
+        assert!(
+            (b.yaw() - std::f32::consts::FRAC_PI_2).abs() < 0.01,
+            "yaw after 1 s at π/2 rad/s: {}",
+            b.yaw()
+        );
+    }
+
+    #[test]
+    fn force_on_a_part_shoves_and_spins() {
+        // A sideways force on a tail boom 3 u behind the CoM: the whole
+        // body drifts sideways AND yaws — one force, both motions.
+        let mut b = Body::default();
+        let mut f = Forces::default();
+        f.at(vec3(2.0, 0.0, 0.0), vec3(0.0, 0.0, -3.0));
+        f.apply(&mut b, 2.0, vec3(1.0, 1.5, 1.0), 0.5);
+        assert!((b.vel.x - 0.5).abs() < 1e-6, "F/m·dt = 2/2·0.5");
+        // τ = r × F = (0,0,-3)×(2,0,0) = (0,-6,0); ang = τ/I_y·dt = -2.
+        assert!((b.ang.y + 2.0).abs() < 1e-6, "got {}", b.ang.y);
+        // The same force through the CoM: shove only, no spin.
+        let mut b2 = Body::default();
+        let mut f2 = Forces::default();
+        f2.central(vec3(2.0, 0.0, 0.0));
+        f2.apply(&mut b2, 2.0, vec3(1.0, 1.5, 1.0), 0.5);
+        assert_eq!(b2.ang, Vec3::ZERO);
+        assert_eq!(b2.vel, b.vel);
+    }
+
+    #[test]
+    fn torque_maps_through_body_frame_inertia() {
+        // Yaw the body 90°: its boom (body −z) now lies along world +x,
+        // so a world-z torque works against the BODY's pitch inertia
+        // (x axis), not roll. The frame round-trip is what this pins.
+        let mut b = Body {
+            rot: Quat::from_yaw(std::f32::consts::FRAC_PI_2),
+            ..Body::default()
+        };
+        let mut f = Forces::default();
+        f.torque(vec3(0.0, 0.0, 4.0));
+        f.apply(&mut b, 1.0, vec3(2.0, 1.0, 0.5), 1.0);
+        // World z maps to body x (pitch, I=2): |ang| = 4/2 = 2, still
+        // about world z after mapping back.
+        assert!(b.ang.dist(vec3(0.0, 0.0, 2.0)) < 1e-5, "got {:?}", b.ang);
+    }
+
+    #[test]
+    fn impulse_obliquity_falls_out_of_the_cross() {
+        let (mass, inertia) = (1.0, vec3(1.0, 2.0, 1.0));
+        let tail = vec3(0.0, 0.0, -3.0);
+        // Square hit across the boom: full yaw kick.
+        let mut b = Body::default();
+        b.impulse_at(vec3(1.0, 0.0, 0.0), tail, mass, inertia);
+        assert!((b.ang.y + 1.5).abs() < 1e-6, "r×j/I = 3/2, got {}", b.ang.y);
+        // Down the boom's own axis: pure shove, zero spin.
+        let mut b2 = Body::default();
+        b2.impulse_at(vec3(0.0, 0.0, -1.0), tail, mass, inertia);
+        assert_eq!(b2.ang, Vec3::ZERO);
+        assert!((b2.vel.z + 1.0).abs() < 1e-6);
     }
 
     #[test]

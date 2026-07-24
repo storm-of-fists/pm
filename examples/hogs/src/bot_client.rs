@@ -90,8 +90,8 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
     let truck = pm.sync_pool::<Truck>("truck");
     let heli = pm.sync_pool::<Heli>("heli");
     let health = pm.sync_pool::<Health>("truck.health");
-    let hog = pm.wire_pool::<Hog>("hog");
-    let flyer = pm.wire_pool::<Flyer>("flyer");
+    let hog = pm.sync_pool::<Hog>("hog");
+    let flyer = pm.sync_pool::<Flyer>("flyer");
     let bullet = pm.wire_pool::<Bullet>("bullet");
     let impact = pm.wire_pool::<Impact>("impact");
     let depot = pm.sync_pool::<Depot>("depot");
@@ -249,7 +249,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
                     // The boss is a hog wearing a bigger hull — same
                     // grow the server sweeps, so hold-fire and the
                     // debug cage agree with what shots actually hit.
-                    let mut hull = hog_p.pose(h.x, 0.0, h.z, h.heading);
+                    let mut hull = hog_p.pose(h.body.pos.x, h.body.pos.y, h.body.pos.z, h.heading());
                     if boss.get_id(id).is_some() {
                         hull = hull.grow(params.get().boss_grow);
                     }
@@ -265,7 +265,7 @@ pub fn client_setup(pm: &mut PmClient) -> ClientWorld {
                             owner: id,
                             part: PART_BODY,
                             cat: CAT_HOG,
-                            hull: flyer_p.pose(f.x, f.y, f.z, f.heading),
+                            hull: flyer_p.pose(f.body.pos.x, f.body.pos.y, f.body.pos.z, f.heading()),
                         },
                     );
                 }
@@ -382,13 +382,13 @@ pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str, prof: bool)
                     .get()
                     .values()
                     .iter()
-                    .map(|h| (h.x, h.z, 0.0, false))
+                    .map(|h| (h.body.pos.x, h.body.pos.z, h.body.pos.y, false))
                     .chain(
                         w.flyer
                             .get()
                             .values()
                             .iter()
-                            .map(|f| (f.x, f.z, f.y, true)),
+                            .map(|f| (f.body.pos.x, f.body.pos.z, f.body.pos.y, true)),
                     )
                     .map(|(x, z, y, air)| {
                         let (dx, dz) = (x - b.pos.x, z - b.pos.z);
@@ -472,32 +472,28 @@ pub fn run_bot(n: u32, link: (f32, f32), addr: &str, password: &str, prof: bool)
             .get()
             .values()
             .iter()
-            .map(|h| (h.x, h.z, h.heading, h.speed, 1.45))
+            .map(|h| (h.body.pos.x, h.body.pos.z, h.body.vel.x, h.body.vel.z, 1.45))
             .chain(
                 w.flyer
                     .get()
                     .values()
                     .iter()
-                    .map(|f| (f.x, f.z, f.heading, f.speed, f.y)),
+                    .map(|f| (f.body.pos.x, f.body.pos.z, f.body.vel.x, f.body.vel.z, f.body.pos.y)),
             )
-            .map(|(x, z, heading, speed, y)| {
+            .map(|(x, z, vx, vz, y)| {
                 let (dx, dz) = (x - me.body.pos.x, z - me.body.pos.z);
-                ((x, z, heading, speed, y), (dx * dx + dz * dz).sqrt())
+                ((x, z, vx, vz, y), (dx * dx + dz * dz).sqrt())
             })
             .min_by(|a, b| a.1.total_cmp(&b.1));
 
         let (mut turn, mut thrust, mut fire, aim_pitch) = match target {
-            Some(((hx, hz, hheading, hspeed, hy), d)) => {
+            Some(((hx, hz, hvx, hvz, hy), d)) => {
                 // Lead the shot: aim where the hog will be when the
-                // bullet arrives, not where it is — the pod carries its
-                // velocity. (Humans lead by watching tracers; a bot that
-                // insta-aims at the current bearing only ever hits hogs
-                // charging straight down the ray.)
+                // bullet arrives, not where it is — the pod carries the
+                // ACTUAL velocity now (the Body-on-the-wire format), so
+                // the lead uses solver truth instead of heading×speed.
                 let tof = d / p.bullet_speed;
-                let (lx, lz) = (
-                    hx + hheading.sin() * hspeed * tof,
-                    hz + hheading.cos() * hspeed * tof,
-                );
+                let (lx, lz) = (hx + hvx * tof, hz + hvz * tof);
                 let bearing = (lx - me.body.pos.x).atan2(lz - me.body.pos.z);
                 let err = wrap_angle(bearing - me.heading());
                 // Only pull the trigger when the hog's body actually

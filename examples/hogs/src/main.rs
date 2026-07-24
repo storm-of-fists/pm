@@ -103,6 +103,7 @@
 mod bot_client;
 mod common;
 mod models;
+mod phys;
 mod player_client;
 mod server;
 mod sfx;

@@ -31,7 +31,7 @@ pub use pm::{lerp_angle, wrap_angle};
 /// change bumps the version and re-records the hashes (the failing test
 /// prints them); an unintentional change is a red test — which is the
 /// entire point of the boundary.
-pub const SIM_VERSION: u32 = 1;
+pub const SIM_VERSION: u32 = 4; // v2: thruster heli; v3: truck terrain/RAMPS; v4: heli skids ride ramp surfaces (playtest 1)
 
 /// Fixed simulation step on both sides (prediction replays it).
 pub const FIXED_DT: f32 = 1.0 / 60.0;
@@ -169,8 +169,12 @@ pm_control_core::pm_params! {
         pub hoggun_range: 28.0 in 5.0..80.0,
         /// Gunner-hog chip per hit (lighter than a teammate's cannon).
         pub hoggun_dmg: 0.12 in 0.0..1.0,
-        /// Tail-boom hit: yaw kick scale (torque scales with obliquity).
-        pub heli_tail_kick: 0.5 in 0.0..2.0,
+        /// Tail-boom hit: bullet impulse (mass·u/s) applied at the tail
+        /// thruster mount along the shot line — `Body::impulse_at`
+        /// turns it into the yaw swing (obliquity falls out of r × J).
+        /// Default re-tuned 2026-07-23 for the unit change (was 0.5 rad
+        /// of instant yaw): 1.5 peaks ~0.4 rad before the FBW wins.
+        pub heli_tail_kick: 1.5 in 0.0..6.0,
         /// Hog reach ceiling: bites and aggro only reach a heli hovering
         /// below this altitude — climb and the horde loses you.
         pub hog_leap: 2.4 in 0.5..8.0,
@@ -194,14 +198,18 @@ pm_control_core::pm_params! {
         /// (powerslide).
         pub truck_grip: 8.0 in 0.5..20.0,
         pub truck_grip_boost: 3.2 in 0.5..20.0,
-        /// Heat per second while boosting / cooling per second while not.
+        /// Heat per second while boosting / cooling per second while
+        /// not. STYLE(motorstorm): this pair IS the MotorStorm boost
+        /// bar — ride the edge for speed, overcook it and the server
+        /// explodes you.
         pub heat_rate: 0.4 in 0.05..2.0,
         pub heat_cool: 0.25 in 0.05..2.0,
         /// Collective authority above/below hover trim, and the total
         /// thrust ceiling.
         pub heli_lift: 16.0 in 4.0..40.0,
         pub heli_t_max: 34.0 in 10.0..80.0,
-        /// Tail-rotor yaw rate (rad/s).
+        /// Commanded yaw rate at full stick (rad/s) — the tail
+        /// thruster's rate loop chases it.
         pub heli_yaw: 1.9 in 0.5..5.0,
         /// Remote interpolation delay, ms — ONE replicated number for
         /// the whole lag-comp contract: clients render remotes this far
@@ -227,7 +235,8 @@ pm_control_core::pm_params! {
         /// flyers overhead beat ditch-aiming).
         pub truck_aim_up: 0.9 in 0.1..1.5,
         pub truck_aim_down: 0.35 in 0.0..1.0,
-        /// Heli fly-by-wire attitude filter gain.
+        /// Heli fly-by-wire attitude P gain: cyclic tilt per radian of
+        /// attitude error (rate damping is the `HELI_CYC_D` const).
         pub heli_att_k: 5.0 in 1.0..15.0,
         /// Commanded attitude limits, rad.
         pub heli_pitch_max: 0.70 in 0.1..1.2,
@@ -357,8 +366,10 @@ impl Truck {
 /// the extraction and integrate body rates on the quat directly).
 /// Deliberately NOT quantized: predicted pools stay full precision so
 /// reconcile error never sits at the quantization step. Flight model:
-/// one rotor-thrust vector along body-up vs gravity, fly-by-wire hover
-/// trim, collective burns above it — see `heli_step`.
+/// a COMBINED BODY — rotor thruster at the hub (cyclic tilts it) and a
+/// tail thruster on the boom, every force propagated `r × F` through
+/// `pm::Forces`, fly-by-wire on top — see `heli_step`. The body's
+/// `ang` is live state here (the first vehicle to integrate it).
 #[pm::pod]
 pub struct Heli {
     pub body: Body,
@@ -390,6 +401,10 @@ pub struct Drive {
     // connection is the input doctrine, so the pod is the union of every
     // vehicle's axes and each step reads its own — the seam input-map
     // will eventually own (per-vehicle key contexts live client-side).
+    // STYLE(unreal): the whole input model deliberately matches UE —
+    // unreliable+redundant intent structs and resim (their CMC/Mover),
+    // never reliable forces; input-map = Enhanced Input on this seam
+    // (re-litigated against UE docs 2026-07-16 and confirmed).
     pub pitch: f32, // -1..1: nose down (forward) / up (heli only)
     pub lift: f32,  // -1..1: collective climb / descend (heli only)
     /// Gun elevation off level — the heli chin gun (±p.heli_aim_pitch)
@@ -421,6 +436,41 @@ pub const TRUCK_R: f32 = 0.9;
 /// model now (models.rs derives and poses them).
 pub const HELI_R: f32 = 1.4;
 
+// The heli as a COMBINED BODY (2026-07-23): two thrusters bolted to one
+// rigid frame, every force propagated through `pm::Forces` (r × F —
+// push the tail, the nose comes around). Mass properties and mount
+// points are STRUCTURAL consts, not params: the steps replay them
+// byte-exact on both ends (the `TRUCK_R` rule), and they must roughly
+// match the authored model (models.rs boxes), which live tuning can't.
+
+/// Mass 1.0 so thrust params keep reading as accelerations — the
+/// numbers Connor tuned don't change meaning under the new model.
+pub const HELI_MASS: f32 = 1.0;
+/// Diagonal body-frame inertia (x pitch, y yaw, z roll): boom-heavy —
+/// yaw carries the most metal, roll the least.
+pub const HELI_INERTIA: pm::Vec3 = vec3(0.7, 1.4, 0.4);
+/// Rotor hub, model-space offset from the CoM — the main thruster's
+/// mount. Its height IS the cyclic's lever arm.
+pub const HELI_ROTOR: pm::Vec3 = vec3(0.0, 1.3, 0.0);
+/// Tail thruster on the boom (matches the model's `collide.tail` reach).
+/// The 3.3 u arm is the yaw authority; the 0.6 u height couples a
+/// little roll into hard yaws — combined-body flavor, FBW trims it.
+pub const HELI_TAIL: pm::Vec3 = vec3(0.0, 0.6, -3.3);
+
+/// Cyclic authority: how far the rotor thrust vector may tilt off the
+/// mast, rad. Control internals (the taxonomy on `Params`), not feel
+/// knobs — `heli_att_k` is the param that shapes response.
+pub const HELI_CYCLIC: f32 = 0.5;
+/// Cyclic rate damping (the D to `heli_att_k`'s P — sized near critical
+/// for the hover-thrust torque at `HELI_INERTIA`).
+pub const HELI_CYC_D: f32 = 1.1;
+/// Tail thruster: rate-loop gain (force per rad/s of yaw-rate error)
+/// and force cap.
+pub const HELI_YAW_P: f32 = 3.0;
+pub const HELI_TAIL_MAX: f32 = 3.0;
+/// Rotational air drag, 1/s — spins decay even with the FBW saturated.
+pub const HELI_ANG_DRAG: f32 = 0.6;
+
 // --- buildings ---------------------------------------------------------------
 
 /// Static obstacles as `(center x, center z, half w, half d, height)`.
@@ -434,23 +484,95 @@ pub const HELI_R: f32 = 1.4;
 /// must be replicated state; `&Params` proved the seam, and a collapse
 /// mispredicts for one blip, the documented params contract). The
 /// prerequisite for ANY destructibility, engine choice independent.
-/// Behind that: a Box3D server-side spike for tier-2 dynamics only
-/// (collapsing buildings, gameplay debris) — the server steps a Box3D
-/// world, poses stream out as quantized pods, sleeping bodies are free
-/// bandwidth. Vehicles STAY on the shared steps: solver state can't
-/// replay, traces can (the engine-survey lesson on the server's
-/// bullets task); rollback physics would be its own future project.
-/// DECIDED 2026-07-20 (source review of erincatto/box3d): if this gets
-/// demanded, FFI the real thing (`cc` + bindgen, pin a commit, one
-/// world owned by a server task) — NEVER rewrite the solver (~15k
-/// lines of manifolds/TGS/islands; a Rust-native solver means
-/// evaluating Rapier, not hand-porting). Box3D's own FAQ rules out
-/// rollback determinism, which confirms this boundary from their side:
-/// the predicted steps and the rewound hit path stay pm's, pods in,
-/// poses out. AND: under ship-mode, cosmetic client-local chaos
-/// (ragdolls, gibs, shake) delivers most of the felt physics at ~zero
-/// cost — do that first; this spike only if destruction is a design
-/// PILLAR.
+///
+/// TODO(roadmap): BOX3D FFI — GREENLIT 2026-07-23 (was "only if
+/// demanded"; Connor pulled the trigger for the initial release after
+/// the four qualifiers below). The 2026-07-20 doctrine stands: FFI the
+/// real thing (`cc` + bindings, PIN a commit, one world owned by a
+/// server task, pods in / poses out) — NEVER rewrite the solver.
+/// Vehicle FEEL stays pm code (our steps become force generators
+/// driving Box3D bodies); the netcode pillar stays (self-prediction is
+/// spike 4's question — candidate (a) predict-self-vs-static-world,
+/// candidate (b) rollback resim if state save/restore is cheap,
+/// fallback (c) pm steps + Box3D contact as server shoves through the
+/// bite-scrub seam). We keep OUR lag-comp history ring, filled with
+/// Box3D poses.
+///
+/// STYLE(connor-qualifiers-2026-07-23): the release bar that fired the
+/// trigger — treat these as feel targets on par with STYLE(motorstorm):
+///   1. tank-v-tank = ram-as-combat-verb AND sustained wrestling
+///      (door-to-door grinding, pinning) — MotorStorm had both;
+///   2. horde = MASS YOU CAN FEEL: hogs shove each other and bog the
+///      truck down, a charging wall has momentum;
+///   3. vehicles FULLY TUMBLE: flips/rolls/roof-landings are real
+///      states with recovery gameplay;
+///   4. world goes MULTI-LEVEL: bridges, overpasses, drive-unders —
+///      the answer that structurally retires capsule+band collision.
+///
+/// The spikes, in order, each a kill/reshape gate:
+/// (1) FFI skeleton — DONE 2026-07-23: crates/box3d-sys, vendored pin,
+///     pmb3 shim (no bindgen/libclang, b3* never reaches Rust),
+///     50-box pile settles + island-sleeps, two runs BIT-IDENTICAL,
+///     windows-gnu cross-compiles.
+/// (2) horde scale — DONE 2026-07-23 (tests/horde.rs): 300 wandering
+///     colliding hog capsules = 254 µs/step release (1.5% of the 60 Hz
+///     tick), settled horde = 0 µs and 300/300 asleep; bog-down proof
+///     = force-driven truck 10.0 m/s open → 5.7 m/s through 200 packed
+///     hogs with 45 shoved aside — qualifier 2 is PHYSICS, zero
+///     gameplay code. THE HOG IDIOM: capsule + FULL angular lock (yaw
+///     is collision-irrelevant on a y-symmetric shape, heading stays
+///     pod data) — upright-only locks left hogs spinning forever
+///     (no torsional friction) and blocked island sleep.
+/// (3) feel parity — DONE 2026-07-23 (tests/truck_feel.rs): the pm
+///     drive laws re-expressed as forces on a free solver body pass
+///     the pm invariants (grip bleeds a 10 m/s shove in 1 s, top
+///     speed at the accel/drag equilibrium, boost powerslides) — the
+///     feel survives the solver. FULL TUMBLE proven: a boosted kicker
+///     launch flips the truck onto its ROOF, at rest, a real state.
+///     THE WHEELS-DOWN GATE is doctrine: engine/grip/steer forces
+///     exist only while body-up·world-up > 0.5 — a roof-landed truck
+///     is a wreck until recovered (the qualifier-3 moment). Solver
+///     contact friction combines √(μa·μb): keep vehicle μ tiny, OUR
+///     grip forces are the tire model. Multi-level sanity passed
+///     (drove under a slab with a crate asleep on it). b3WheelJoint
+///     audition drives + absorbs a curb (spin sign: +x spin rolls −z)
+///     — real suspension exists when MotorStorm chatter gets built.
+/// SLICE 2, THE REPLICATED-BODY FORMAT — LANDED 2026-07-23 (Connor's
+///     qualifier answers: full pose always / one format for
+///     everything / ~150 scale / spend-now-tighten-later): Hog and
+///     Flyer pods carry the full pm::Body (pos/vel/quat/ang) at FULL
+///     precision — quantized wire_pool repr and heading/speed fields
+///     dissolved (they're derivations now; steering scalars live in
+///     the server-local brains). One format, one interp path; what
+///     the solver knows, clients see — a future hog knockdown is
+///     "unlock + let readback carry the quat", zero wire changes.
+///     Bots lead targets with REAL velocity off the wire. Bandwidth
+///     diet = dirty-tracking + solver sleep; if the horde starves the
+///     flight under load, net_kbps is the live knob.
+/// INTEGRATION SLICE 1 — LANDED 2026-07-23 (Connor: "just send it"):
+///     hogs/src/phys.rs owns THE server physical world. Statics =
+///     ground/walls/BUILDINGS/RAMP wedge hulls; ground hogs = dynamic
+///     capsules (AI writes velocities, solver integrates — the hand
+///     integration, wall clamp, and hog building_push are DELETED
+///     from hog_ai); trucks = dynamic boxes driven by the spike-3
+///     force laws (truck_step still evolves turret/heat on a scratch
+///     copy; the body is the solver's); helis = kinematic mirrors of
+///     the pm-stepped pod. Hog pod grew `y` (they climb ramps now).
+///     Task order: phys (26) = membership diff → step → readback,
+///     then hog_ai (28) / drive (30) write next tick's intents.
+///     Soaked 45 s headless: 117-hog wave stable, kills flowing, no
+///     panics. NOT play-verified.
+/// (4) prediction seam — NOW LIVE as an approximation experiment:
+///     clients predict with the shared steps against ground_probe
+///     while the server's truth is the solver. Judge at lag=80/
+///     loss=3% in-chair; if corrections blip too hard, promote to
+///     (a) client-side self world or (b) rollback resim (recon:
+///     b3RecPlayer keyframe ring + hash-verified replay is candidate
+///     (b) machinery).
+/// Known costs beyond physics: hog navigation on multi-level
+/// (navmesh-shaped, Box3D doesn't touch it), level authoring (const
+/// tables → glb levels through the models pipeline), Box3D is
+/// weeks-old ALPHA (Catto pedigree, but wrap it behind our own seam).
 pub const BUILDINGS: [(f32, f32, f32, f32, f32); 14] = [
     (10.0, 8.0, 4.0, 4.0, 11.0), // the downtown tower
     (0.0, -22.0, 11.0, 4.0, 6.0),
@@ -526,6 +648,67 @@ pub fn building_push_below(x: f32, z: f32, r: f32, y: f32) -> (f32, f32, f32, f3
     (x, z, nx, nz)
 }
 
+// --- ramps -------------------------------------------------------------------
+
+/// Jump ramps as `(center x, center z, yaw, half w, half l, height)`:
+/// a wedge rotated by `yaw` — local +z runs UP the slope, entry lip at
+/// local z = −hl (ground) rising to `height` at the top edge. Shared
+/// const geometry like [`BUILDINGS`] (and the same destructibility
+/// TODO applies): both sides drive the same terrain, nothing
+/// replicates. Placed in open lanes clear of the building field; the
+/// south spawn strip stays flat.
+pub const RAMPS: [(f32, f32, f32, f32, f32, f32); 4] = [
+    (-45.0, 40.0, 1.9, 4.0, 7.0, 3.0),
+    (30.0, -8.0, -0.7, 4.0, 7.0, 3.0),
+    (0.0, 62.0, 3.6, 4.5, 8.0, 3.4),
+    (66.0, -55.0, 0.0, 4.0, 7.0, 2.8),
+];
+
+/// The ground surface under `(x, z)`: height and unit normal — the
+/// flat arena with ramp wedges rising out of it. THE terrain query the
+/// truck step drives on (shared, so ramp launches predict byte-exact).
+/// Overlapping ramps resolve tallest-wins, like `building_top`.
+///
+/// TODO(ship): bullets and hog walkers ignore ramps — a shot skims
+/// through a wedge and hogs clip through it visually. Both want this
+/// probe (bullet altitude gate; hog y posing) when it starts to read
+/// wrong in play.
+pub fn ground_probe(x: f32, z: f32) -> (f32, pm::Vec3) {
+    let (mut h, mut n) = (0.0f32, vec3(0.0, 1.0, 0.0));
+    for &(rx, rz, yaw, hw, hl, rh) in &RAMPS {
+        let (s, c) = yaw.sin_cos();
+        // World → ramp-local (the transpose of the heading basis:
+        // local +z maps to world (sin, cos)).
+        let (dx, dz) = (x - rx, z - rz);
+        let (lx, lz) = (dx * c - dz * s, dx * s + dz * c);
+        if lx.abs() > hw || lz.abs() > hl {
+            continue;
+        }
+        let slope = rh / (2.0 * hl);
+        let hh = (lz + hl) * slope;
+        if hh > h {
+            h = hh;
+            // Local surface normal (0, 1, −slope) normalized, carried
+            // back to world by the same yaw.
+            let inv = 1.0 / (1.0 + slope * slope).sqrt();
+            let nz = -slope * inv;
+            n = vec3(nz * s, inv, nz * c);
+        }
+    }
+    (h, n)
+}
+
+/// Just the height — arena floor 0, wedge surface on a ramp.
+pub fn ground_height(x: f32, z: f32) -> f32 {
+    ground_probe(x, z).0
+}
+
+/// Terrain-follow limits for the truck's tires: a rise steeper than
+/// `CLIMB_STEP` per tick is a WALL (the back face of a ramp), a drop
+/// deeper than `FOLLOW_DROP` breaks contact (you're flying).
+pub const CLIMB_STEP: f32 = 0.5;
+pub const FOLLOW_DROP: f32 = 0.45;
+
 /// Roof height at `(x, z)`: the tallest building whose footprint covers
 /// the point, 0.0 in the open — the bullets' altitude gate for walls.
 pub fn building_top(x: f32, z: f32) -> f32 {
@@ -543,14 +726,18 @@ pub fn building_top(x: f32, z: f32) -> f32 {
 /// the click from PREDICTED pose) leave the same barrel the same way.
 /// Turret muzzle at the barrel tip, elevated by the turret pitch: the
 /// barrel pivots at (0, 1.45, 0) in truck space (where the mesh's
-/// barrel box starts), so the tip rises along the aimed line.
+/// barrel box starts), so the tip rises along the aimed line. The
+/// turret is STABILIZED: the fire line is heading + aim regardless of
+/// chassis pitch on a ramp or in the air (tank stabilization — and the
+/// barrel draw uses the same flat frame, so what you see is the line
+/// you shoot); only the pivot height rides `pos.y`.
 pub fn truck_muzzle(t: &Truck) -> (f32, f32, f32, f32, f32) {
     let dir = t.heading() + t.aim;
     let p = t.aim_pitch;
     let (x, z) = (t.body.pos.x, t.body.pos.z);
     (
         x + dir.sin() * 1.9 * p.cos(),
-        1.45 + 1.9 * p.sin(),
+        t.body.pos.y + 1.45 + 1.9 * p.sin(),
         z + dir.cos() * 1.9 * p.cos(),
         dir,
         p,
@@ -584,9 +771,34 @@ pub fn heli_muzzle(h: &Heli) -> (f32, f32, f32, f32, f32) {
 /// grip (lateral velocity decays at `TRUCK_GRIP`), so hard corners at
 /// speed carry sideways momentum, boost loosens into a powerslide, and a
 /// server shove (bite scrub, knockback) is real momentum the tires then
-/// grip out — friction, not scripting. Ground constraints still project
-/// into the shared `Body` (pos.y = 0, rot pure yaw); `vel` is now the
-/// true 2D momentum, and `Truck::speed()` reads its forward component.
+/// grip out — friction, not scripting.
+///
+/// STYLE(motorstorm): the truck's feel target is MotorStorm (Connor's
+/// call, 2026-07-23) — heavyweight off-road arcade: momentum first,
+/// the chassis always talking (lean, dive, big stupid air), boost as
+/// a risk economy you cash in or explode on, and landings that
+/// matter. Already convergent: heat 1.0 = explosion IS MotorStorm's
+/// boost bar, grip-loosens-under-boost is the powerslide, ramps +
+/// downhill pull landed 2026-07-23. Still owed to the feel: weight
+/// transfer (accel pitches the nose up, braking dives it, cornering
+/// rolls — scripted attitude on top of the terrain ease, zero wire),
+/// mid-air attitude control on the truck-dead `Drive.pitch` axis with
+/// landing quality (flat landing keeps speed, nose-first scrubs it),
+/// surface types out of `ground_probe` (mud lanes), and — the big
+/// rock — vehicle-vehicle ramming, which is the day bodies trade
+/// momentum and masses become real ratios (see `HELI_MASS`).
+///
+/// TERRAIN (2026-07-23): the ground constraint generalized from the
+/// plane y = 0 to [`ground_probe`] — the truck DRIVES the surface
+/// (tires follow height, gravity's in-plane component pulls the
+/// momentum downhill, the chassis eases onto the slope) until the
+/// ground falls away faster than [`FOLLOW_DROP`], and then it FLIES:
+/// ballistic arc, no tire authority, nose easing along the arc, until
+/// touchdown. Run a ramp fast and the launch pop is just the climb
+/// rate the slope was already imparting — nothing scripted. The truck
+/// stays a CONSTRAINED body (attitude scripted from terrain/arc, `ang`
+/// projected to zero like `pos.y` used to be); the combined-body
+/// force path is for vehicles whose attitude is theirs to lose.
 pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
     // COMPILE-TIME COVERAGE: an exhaustive destructure (no `..`), so
     // adding a Truck field refuses to compile until it's named here —
@@ -623,10 +835,16 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
     t.aim += (want - t.aim).clamp(-slew, slew);
     let want = cmd.aim_pitch.clamp(-p.truck_aim_down, p.truck_aim_up);
     t.aim_pitch += (want - t.aim_pitch).clamp(-slew, slew);
-    // Boost: extra shove and a higher ceiling, paid in heat. Heat is
+
+    // Where the tires stand decides the tick: DRIVING or FLYING.
+    let (gh, n) = ground_probe(t.body.pos.x, t.body.pos.z);
+    let grounded = t.body.pos.y <= gh + 0.05;
+
+    // Boost: extra shove and a higher ceiling, paid in heat — wheels
+    // need ground to push (held boost midair just cools). Heat is
     // predicted state (this is THE shared step), so the client's meter
     // is live; the EXPLOSION at 1.0 is the server's move alone.
-    let boosting = cmd.boost > 0.5 && cmd.thrust > 0.0 && t.heat < 1.0;
+    let boosting = grounded && cmd.boost > 0.5 && cmd.thrust > 0.0 && t.heat < 1.0;
     t.heat = if boosting {
         (t.heat + p.heat_rate * dt).min(1.0)
     } else {
@@ -637,25 +855,47 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
     } else {
         (14.0, p.vmax)
     };
-    // Steering turns the chassis (front-wheel authority still scales
-    // with forward speed) — the momentum vector is caught up below.
-    let authority = (speed.abs() / 6.0).min(1.0);
-    heading = wrap_angle(heading + t.steer * 2.2 * authority * dt * speed.signum());
-    // Decompose the world-frame momentum against the NEW chassis axes:
-    // engine force + rolling drag act along forward, tire grip bleeds
-    // whatever is left pointing out the doors.
+
     let (mut vx, mut vz) = (t.body.vel.x, t.body.vel.z);
-    let (fx, fz) = (heading.sin(), heading.cos());
-    let (rx, rz) = (heading.cos(), -heading.sin());
-    let vf = ((vx * fx + vz * fz) + cmd.thrust * accel * dt) * (1.0 - 1.2 * dt);
-    let vf = vf.clamp(-7.0, vmax);
-    let grip = if boosting { p.truck_grip_boost } else { p.truck_grip };
-    let vl = (vx * rx + vz * rz) * (-grip * dt).exp();
-    vx = fx * vf + rx * vl;
-    vz = fz * vf + rz * vl;
+    let mut vy = t.body.vel.y;
     let (mut x, mut z) = (t.body.pos.x, t.body.pos.z);
-    x += vx * dt;
-    z += vz * dt;
+    let mut y = t.body.pos.y;
+    let (_, pitch0, roll0) = t.body.rot.to_yaw_pitch_roll();
+    let (pitch, roll);
+
+    if grounded {
+        // Steering turns the chassis (front-wheel authority still
+        // scales with forward speed) — the momentum vector is caught
+        // up below.
+        let authority = (speed.abs() / 6.0).min(1.0);
+        heading = wrap_angle(heading + t.steer * 2.2 * authority * dt * speed.signum());
+        // Decompose the world-frame momentum against the NEW chassis
+        // axes: engine force + rolling drag act along forward, tire
+        // grip bleeds whatever is left pointing out the doors.
+        let (fx, fz) = (heading.sin(), heading.cos());
+        let (rx, rz) = (heading.cos(), -heading.sin());
+        let vf = ((vx * fx + vz * fz) + cmd.thrust * accel * dt) * (1.0 - 1.2 * dt);
+        let vf = vf.clamp(-7.0, vmax);
+        let grip = if boosting { p.truck_grip_boost } else { p.truck_grip };
+        let vl = (vx * rx + vz * rz) * (-grip * dt).exp();
+        vx = fx * vf + rx * vl;
+        vz = fz * vf + rz * vl;
+        // Slopes are real: gravity's in-plane component pulls the
+        // momentum downhill (exactly zero on flat ground) — park on a
+        // ramp and you roll back off it.
+        vx += p.gravity * n.y * n.x * dt;
+        vz += p.gravity * n.y * n.z * dt;
+        x += vx * dt;
+        z += vz * dt;
+    } else {
+        // FLYING: gravity owns the arc, the tires own nothing —
+        // heading holds, momentum carries.
+        vy -= p.gravity * dt;
+        x += vx * dt;
+        z += vz * dt;
+        y += vy * dt;
+    }
+
     if x.abs() > ARENA {
         x = x.clamp(-ARENA, ARENA);
         vx *= 0.4;
@@ -669,6 +909,9 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
     // Buildings: same shared step on both sides, so driving into one
     // predicts byte-exact. The truck collides as a circle — close enough
     // at driving speeds, and capsule-vs-box isn't worth the code here.
+    // Airborne too, at full height: no ramp jump clears the shortest
+    // roof by enough to land on it, so the flat push keeps every
+    // trajectory out of the interiors.
     let (px, pz, nx, nz) = building_push(x, z, TRUCK_R + 0.3);
     if nx != 0.0 || nz != 0.0 {
         x = px;
@@ -684,22 +927,88 @@ pub fn truck_step(t: &mut Truck, cmd: Drive, dt: f32, p: &Params) {
         vx *= 1.0 - 1.6 * dt;
         vz *= 1.0 - 1.6 * dt;
     }
-    // Project back into the shared body under the ground constraints.
-    t.body.pos = vec3(x, 0.0, z);
-    t.body.rot = Quat::from_yaw(heading);
-    t.body.vel = vec3(vx, 0.0, vz);
+
+    // Terrain resolution at the new footprint.
+    let (gh1, n1) = ground_probe(x, z);
+    if grounded {
+        if gh1 - y > CLIMB_STEP {
+            // The back face of a ramp is a wall, not a climb: stay
+            // put, bounce a little of the speed back.
+            x = t.body.pos.x;
+            z = t.body.pos.z;
+            vx *= -0.1;
+            vz *= -0.1;
+            vy = 0.0;
+        } else if y - gh1 <= FOLLOW_DROP {
+            // Tires follow the surface; the implied vertical rate IS
+            // the launch pop when the ground later falls away.
+            vy = (gh1 - y) / dt;
+            y = gh1;
+        }
+        // else: drove off an edge — y and the climb rate carry into
+        // next tick's flying branch.
+
+        // Chassis eases onto the slope under the heading (fast — the
+        // suspension settling), rebuilt with the authoritative yaw.
+        let (gx, gz) = (-n1.x / n1.y, -n1.z / n1.y); // surface gradient
+        let (fx, fz) = (heading.sin(), heading.cos());
+        let (rx, rz) = (heading.cos(), -heading.sin());
+        let k = 1.0 - (-10.0 * dt).exp();
+        pitch = pitch0 + (-(fx * gx + fz * gz).atan() - pitch0) * k;
+        roll = roll0 + ((rx * gx + rz * gz).atan() - roll0) * k;
+    } else {
+        if y <= gh1 {
+            // Touchdown: the tires catch, vertical momentum is spent,
+            // grip takes it from here next tick.
+            y = gh1;
+            vy = 0.0;
+        }
+        // Nose eases along the flight arc (half of it — trucks are
+        // not darts), wings level out.
+        let hs = (vx * vx + vz * vz).sqrt();
+        let k = 1.0 - (-3.0 * dt).exp();
+        let pitch_t = if hs > 1.0 { ((-vy).atan2(hs) * 0.5).clamp(-0.55, 0.55) } else { pitch0 };
+        pitch = pitch0 + (pitch_t - pitch0) * k;
+        roll = roll0 + (0.0 - roll0) * k;
+    }
+
+    // Project back into the shared body under the tire constraints:
+    // attitude is SCRIPTED (terrain/arc), so ang projects to zero the
+    // way pos.y used to — which also keeps `integrate`'s rotation half
+    // byte-inert for trucks.
+    t.body.pos = vec3(x, y, z);
+    t.body.rot = Quat::from_yaw_pitch_roll(heading, pitch, roll).norm();
+    t.body.vel = vec3(vx, vy, vz);
+    t.body.ang = pm::Vec3::ZERO;
 }
 
 // --- THE heli step -----------------------------------------------------------
 
 /// THE heli step — same contract as `truck_step`: shared by the server
-/// and client prediction, so flying is byte-exact under replay. Rotor
-/// physics: the tail rotor is the yaw rate, the cyclic servos attitude
-/// (extract → clamp → rebuild on the quat), and the main rotor is ONE
-/// thrust vector along body-up fighting real gravity — a fly-by-wire
-/// collective trims it to hover at centered stick, the lift stick burns
-/// above/below trim, and tilt vectors the force. Skids catch the ground,
-/// buildings shove the hull only below their roofline.
+/// and client prediction, so flying is byte-exact under replay.
+///
+/// COMBINED-BODY flight model (2026-07-23, replacing the servo-attitude
+/// version): the airframe is one rigid body with two THRUSTERS bolted
+/// to it, and every newton lands through [`pm::Forces`] — linearly
+/// through the center of mass and as `r × F` torque about it.
+///
+/// - **Main rotor** at [`HELI_ROTOR`]: collective sets the magnitude,
+///   cyclic TILTS the thrust vector inside the disc (±[`HELI_CYCLIC`]).
+///   The tilted component at the hub's lever arm is what pitches and
+///   rolls the machine — the same force that torques you over then
+///   vectors you forward once you're tipped, like the real article.
+/// - **Tail thruster** at [`HELI_TAIL`]: sideways force on the boom;
+///   3.3 u of lever arm turns it into yaw (plus a touch of roll from
+///   its height, plus real tail drift while it burns).
+///
+/// Fly-by-wire keeps the STICK SEMANTICS of the old model: pitch/turn
+/// command attitude and yaw RATE, a PD loop (`heli_att_k` P, const D)
+/// works the cyclic, a rate loop works the tail, and the collective
+/// trims thrust to hover at centered stick (trim = G / axis.y — tip
+/// over and climb authority pays for it). The difference is that
+/// disturbances are now real: a tail hit is an angular impulse the FBW
+/// visibly fights back to level. Skids catch the ground, buildings
+/// shove the hull only below their roofline.
 pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
     // COMPILE-TIME COVERAGE — the predicted-pod contract, same as
     // truck_step: every field here is evolved from the command by THIS
@@ -717,31 +1026,55 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
     h.aim_pitch = cmd.aim_pitch.clamp(-p.heli_aim_pitch, p.heli_aim_pitch);
     let b = &mut h.body;
 
-    // Attitude on the quat via the constrained-vehicle path: extract,
-    // steer, rebuild. Yaw wraps at the write like every angle; pitch
-    // and roll ease toward the stick (yaw input banks the roll).
-    let (yaw0, pitch0, roll0) = b.rot.to_yaw_pitch_roll();
-    let yaw = wrap_angle(yaw0 + cmd.turn * p.heli_yaw * dt);
-    let k = 1.0 - (-p.heli_att_k * dt).exp();
-    let pitch = pitch0 + (cmd.pitch.clamp(-1.0, 1.0) * p.heli_pitch_max - pitch0) * k;
-    let roll = roll0 + (-cmd.turn.clamp(-1.0, 1.0) * p.heli_roll_max - roll0) * k;
-    b.rot = Quat::from_yaw_pitch_roll(yaw, pitch, roll).norm();
+    // FBW sensors: attitude (yaw unused — yaw is the tail loop's, and
+    // it reads a RATE) and body-frame rates (x pitch, y yaw, z roll).
+    let (_, pitch, roll) = b.rot.to_yaw_pitch_roll();
+    let w = b.rot.conj().rotate(b.ang);
 
-    // Main rotor: ONE thrust vector along body-up, against real gravity.
-    // Fly-by-wire collective trims to exactly cancel gravity at centered
-    // stick (trim = G / up.y — hands-off hover by construction, level or
-    // tilted); the lift stick burns above/below trim. The tilt DIRECTION
-    // does everything else: nose-down vectors those newtons forward,
-    // banking slides you into the turn (the tail-rotor yaw above banks
-    // the roll, so turns are coordinated), and because trim follows
-    // attitude, a hard dive costs you climb authority — the machine has
-    // momentum and a weight now, not axes.
-    let up = b.up();
-    let trim = p.gravity / up.y.clamp(0.6, 1.0);
+    // Cyclic: PD from commanded attitude to a rotor-disc tilt. Yaw
+    // input still banks the roll, so turns stay coordinated.
+    let pitch_cmd = cmd.pitch.clamp(-1.0, 1.0) * p.heli_pitch_max;
+    let roll_cmd = -cmd.turn.clamp(-1.0, 1.0) * p.heli_roll_max;
+    let tilt_p =
+        (p.heli_att_k * (pitch_cmd - pitch) - HELI_CYC_D * w.x).clamp(-HELI_CYCLIC, HELI_CYCLIC);
+    let tilt_r =
+        (p.heli_att_k * (roll_cmd - roll) - HELI_CYC_D * w.z).clamp(-HELI_CYCLIC, HELI_CYCLIC);
+    // The thrust axis: body-up tilted by the two cyclic angles
+    // (R_roll · R_pitch · ŷ), carried to world.
+    let axis = b.rot.rotate(vec3(
+        -tilt_r.sin() * tilt_p.cos(),
+        tilt_r.cos() * tilt_p.cos(),
+        tilt_p.sin(),
+    ));
+
+    // Collective: trim cancels gravity exactly at centered stick —
+    // hands-off hover by construction — and the lift stick burns
+    // above/below trim, all capped by the rotor's ceiling.
+    let trim = HELI_MASS * p.gravity / axis.y.clamp(0.6, 1.0);
     let thrust = (trim + cmd.lift.clamp(-1.0, 1.0) * p.heli_lift).clamp(0.0, p.heli_t_max);
-    b.vel.x = (b.vel.x + up.x * thrust * dt) * (1.0 - p.heli_hdrag * dt);
-    b.vel.z = (b.vel.z + up.z * thrust * dt) * (1.0 - p.heli_hdrag * dt);
-    b.vel.y = (b.vel.y + (up.y * thrust - p.gravity) * dt) * (1.0 - p.heli_vdrag * dt);
+
+    // Tail thruster: a rate loop — force per rad/s of yaw-rate error,
+    // pushed the way that swings the NOSE toward the command (+x force
+    // at −z lever = −y torque, hence the sign).
+    let tail =
+        (HELI_YAW_P * (cmd.turn.clamp(-1.0, 1.0) * p.heli_yaw - w.y)).clamp(-HELI_TAIL_MAX, HELI_TAIL_MAX);
+
+    // Every force lands on the ONE body: gravity through the CoM, each
+    // thruster at its mount — r × F propagates the parts' pushes into
+    // the whole machine's motion.
+    let mut f = pm::Forces::default();
+    f.central(vec3(0.0, -HELI_MASS * p.gravity, 0.0));
+    f.at(axis * thrust, b.rot.rotate(HELI_ROTOR));
+    f.at(b.rot.rotate(vec3(-tail, 0.0, 0.0)), b.rot.rotate(HELI_TAIL));
+    f.apply(b, HELI_MASS, HELI_INERTIA, dt);
+
+    // Airframe drags: the old horizontal/vertical split on the linear
+    // half, plus rotational drag so a spin decays even at cyclic
+    // saturation.
+    b.vel.x *= 1.0 - p.heli_hdrag * dt;
+    b.vel.z *= 1.0 - p.heli_hdrag * dt;
+    b.vel.y *= 1.0 - p.heli_vdrag * dt;
+    b.ang = b.ang * (1.0 - HELI_ANG_DRAG * dt);
     // Advancing-blade cap: full collective + full tilt can't run away.
     let h2 = b.vel.x * b.vel.x + b.vel.z * b.vel.z;
     if h2 > p.heli_vcap * p.heli_vcap {
@@ -752,12 +1085,13 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
     b.integrate(dt);
 
     // Altitude band: skids on the deck (extra drag — parked, not
-    // sliding), hard ceiling.
+    // sliding, and the skids resist spinning too), hard ceiling.
     if b.pos.y <= p.heli_ground {
         b.pos.y = p.heli_ground;
         b.vel.y = b.vel.y.max(0.0);
         b.vel.x *= 1.0 - 3.0 * dt;
         b.vel.z *= 1.0 - 3.0 * dt;
+        b.ang = b.ang * (1.0 - 6.0 * dt);
     } else if b.pos.y >= p.heli_ceil {
         b.pos.y = p.heli_ceil;
         b.vel.y = b.vel.y.min(0.0);
@@ -783,6 +1117,22 @@ pub fn heli_step(h: &mut Heli, cmd: Drive, dt: f32, p: &Params) {
         if into < 0.0 {
             b.vel.x -= into * nx;
             b.vel.z -= into * nz;
+        }
+    }
+    // Ramps are terrain for the skids too (playtest 1: a heli used to
+    // hover INSIDE a wedge — the flat `heli_ground` clamp was its whole
+    // idea of the floor). Below the local surface, ride it: pop to the
+    // surface, kill the into-slope velocity, keep the slide — same
+    // shared const geometry as the trucks and the solver, so prediction
+    // stays byte-exact.
+    let (gh, n) = ground_probe(b.pos.x, b.pos.z);
+    if gh > 0.0 && b.pos.y < gh + p.heli_ground {
+        b.pos.y = gh + p.heli_ground;
+        let into = b.vel.x * n.x + b.vel.y * n.y + b.vel.z * n.z;
+        if into < 0.0 {
+            b.vel.x -= into * n.x;
+            b.vel.y -= into * n.y;
+            b.vel.z -= into * n.z;
         }
     }
 }

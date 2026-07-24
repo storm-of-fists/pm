@@ -1463,6 +1463,26 @@ pub fn box_tris(min: Vec3, max: Vec3) -> Vec<[Vec3; 3]> {
         .collect()
 }
 
+/// Wedge (ramp) between `min` and `max`: a box whose top face is
+/// hinged down to `min.y` along the `min.z` edge — flat entry lip at
+/// −z rising to full height at +z. Same winding conventions as
+/// [`box_tris`]; rotate/scale via the model matrix like any mesh.
+pub fn wedge_tris(min: Vec3, max: Vec3) -> Vec<[Vec3; 3]> {
+    let a = vec3(min.x, min.y, min.z); // entry lip, ground
+    let b = vec3(max.x, min.y, min.z);
+    let c = vec3(max.x, min.y, max.z); // back bottom
+    let d = vec3(min.x, min.y, max.z);
+    let e = vec3(max.x, max.y, max.z); // back top
+    let f = vec3(min.x, max.y, max.z);
+    vec![
+        [d, a, b], [d, b, c], // bottom
+        [a, f, e], [a, e, b], // slope
+        [c, e, f], [c, f, d], // back (+z) face
+        [d, f, a],            // -x side
+        [b, e, c],            // +x side
+    ]
+}
+
 /// Checkerboard ground on y=0, `half` cells in each direction from the
 /// origin, `cell` units per cell, alternating the two colors.
 pub fn checker_ground(

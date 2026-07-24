@@ -29,6 +29,9 @@ use pm::{Id, Pm, Rng, task};
 
 use crate::common::*;
 use crate::models::{Models, posed};
+use crate::phys::Phys;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Server-local per-hog state (never replicated — local pools are free,
 /// they don't enter the handshake schema).
@@ -56,6 +59,11 @@ struct HogBrain {
     /// horde stays change-dense on the wire (the workload this example
     /// exists to produce).
     desired: f32,
+    /// The hog's actual facing and gait speed — AI state now, not pod
+    /// fields: the replicated pod carries the full `Body` (heading =
+    /// its yaw), and the AI steers these then writes body.rot/velocity.
+    heading: f32,
+    speed: f32,
     target_speed: f32,
 }
 
@@ -82,6 +90,10 @@ struct FlyerBrain {
     desired: f32,
     target_speed: f32,
     target_alt: f32,
+    /// Facing + speed as AI state (same move as HogBrain — the pod
+    /// replicates the Body, the brain owns the steering scalars).
+    heading: f32,
+    speed: f32,
 }
 
 /// Bullet-hit knockback decay rate (1/s); the speed is `Params::knock`.
@@ -172,11 +184,11 @@ fn spawn_wave(
             flyer.get_mut().add(
                 id,
                 Flyer {
-                    x,
-                    y: p.flyer_alt,
-                    z,
-                    heading: (-x).atan2(-z),
-                    speed: p.flyer_speed * 0.55,
+                    body: pm::Body {
+                        pos: pm::vec3(x, p.flyer_alt, z),
+                        rot: pm::Quat::from_yaw((-x).atan2(-z)),
+                        ..Default::default()
+                    },
                     hp: p.flyer_hp,
                 },
             );
@@ -198,10 +210,11 @@ fn spawn_wave(
         hog.get_mut().add(
             id,
             Hog {
-                x,
-                z,
-                heading: (-x).atan2(-z),
-                speed: p.hog_roam,
+                body: pm::Body {
+                    pos: pm::vec3(x, 0.0, z),
+                    rot: pm::Quat::from_yaw((-x).atan2(-z)),
+                    ..Default::default()
+                },
                 hp: p.hog_hp,
             },
         );
@@ -246,7 +259,14 @@ fn spawn_boss(
     let id = pm.id_add();
     hog.get_mut().add(
         id,
-        Hog { x, z, heading: (-x).atan2(-z), speed: p.hog_roam, hp: p.hog_hp },
+        Hog {
+            body: pm::Body {
+                pos: pm::vec3(x, 0.0, z),
+                rot: pm::Quat::from_yaw((-x).atan2(-z)),
+                ..Default::default()
+            },
+            hp: p.hog_hp,
+        },
     );
     brain.get_mut().add(
         id,
@@ -336,8 +356,8 @@ pub fn run(
     let truck = pm.sync_pool::<Truck>("truck");
     let heli = pm.sync_pool::<Heli>("heli");
     let health = pm.sync_pool::<Health>("truck.health");
-    let hog = pm.wire_pool::<Hog>("hog");
-    let flyer = pm.wire_pool::<Flyer>("flyer");
+    let hog = pm.sync_pool::<Hog>("hog");
+    let flyer = pm.sync_pool::<Flyer>("flyer");
     let bullet = pm.wire_pool::<Bullet>("bullet");
     let impact = pm.wire_pool::<Impact>("impact");
     pm.ttl_pool(&impact, init.impact_ttl);
@@ -386,6 +406,22 @@ pub fn run(
     // for "some hogs have guns"), value = refire cooldown. Keyed by the
     // hog id, so death disarms with everything else.
     let gunner = pm.pool::<f32>("hog.gunner");
+
+    // THE SERVER'S PHYSICAL WORLD (Box3D slice 1, 2026-07-23): one
+    // solver world in an Rc the physics-adjacent tasks share — the
+    // client-renderer capture idiom, server-side. Runs EARLY (prio 26):
+    // membership diff → step LAST tick's velocities/forces → readback
+    // poses into pods, so hog_ai (28) and drive (30) see fresh truth
+    // and their writes land in next tick's step. See phys.rs for the
+    // whole doctrine (statics, hog idiom, wheels-down truck, heli
+    // mirror, and the prediction-approximation experiment).
+    let phys_rc = Rc::new(RefCell::new(Phys::new()));
+    {
+        let phys = phys_rc.clone();
+        task!(pm, "phys", 26.0, [hog, truck, heli], move |_pm| {
+            phys.borrow_mut().tick(&mut hog.get_mut(), &mut truck.get_mut(), &mut heli.get_mut());
+        });
+    }
     // A second of COLLIDER history — the rewind memory every shot is
     // judged in (the bullets task is the lag-comp record): hogs and vehicles in one
     // uniform ring, favor-the-shooter, decided 2026-07-17.
@@ -442,9 +478,9 @@ pub fn run(
             1.0 / (1.0 + dx * dx + dz * dz)
         };
         let n = near.clone();
-        pm.interest_pool(&hog, move |p, _, h: &Hog| n(p, h.x, h.z));
+        pm.interest_pool(&hog, move |p, _, h: &Hog| n(p, h.body.pos.x, h.body.pos.z));
         let n = near.clone();
-        pm.interest_pool(&flyer, move |p, _, f: &Flyer| n(p, f.x, f.z));
+        pm.interest_pool(&flyer, move |p, _, f: &Flyer| n(p, f.body.pos.x, f.body.pos.z));
         pm.interest_pool(&bullet, move |p, _, b: &Bullet| near(p, b.x, b.z));
     }
 
@@ -616,12 +652,16 @@ pub fn run(
     // bought the headroom; re-profile before reaching for the parked
     // opt-in threading design. Threading is still the eventual answer
     // if hordes grow 10x.
+    let phys = phys_rc.clone();
     task!(
         pm,
         "hog_ai",
         28.0,
         [hog, brain, boss, index, collider, contact, params, models],
         move |pm| {
+            // One phys borrow for the whole horde pass (velocities in,
+            // poses already read back at prio 26).
+            let mut ph = phys.borrow_mut();
             let now = pm.tick() as f32 * FIXED_DT;
             let p = *params.get(); // copy out: the each_with closure below borrows pools
             let stride = (p.ai_stride.round() as u32).clamp(1, 8);
@@ -658,13 +698,13 @@ pub fn run(
                 // below chases it.
                 if id.index() % stride == phase {
                     let nearest =
-                        idx.nearest(h.x, 0.0, h.z, 4.0 * ARENA, (0.0, p.hog_leap), CAT_VEHICLE);
+                        idx.nearest(h.body.pos.x, h.body.pos.y, h.body.pos.z, 4.0 * ARENA, (0.0, p.hog_leap), CAT_VEHICLE);
 
                     // Pick a desired heading and speed.
                     let (desired, target_speed) = match nearest {
-                        Some(n) if b.flee > 0.0 => ((h.x - n.x).atan2(h.z - n.z), p.hog_fast),
+                        Some(n) if b.flee > 0.0 => ((h.body.pos.x - n.x).atan2(h.body.pos.z - n.z), p.hog_fast),
                         Some(n) if is_boss || n.dist < p.hog_aggro => {
-                            ((n.x - h.x).atan2(n.z - h.z), p.hog_fast)
+                            ((n.x - h.body.pos.x).atan2(n.z - h.body.pos.z), p.hog_fast)
                         }
                         // Roaming: walk to a goal point, pick a fresh one
                         // on arrival or timeout — the horde spreads over
@@ -672,7 +712,7 @@ pub fn run(
                         // sine wobble stays so the walk reads organic.
                         _ => {
                             b.repick -= think_dt;
-                            let (gx, gz) = (b.goal.0 - h.x, b.goal.1 - h.z);
+                            let (gx, gz) = (b.goal.0 - h.body.pos.x, b.goal.1 - h.body.pos.z);
                             if b.repick <= 0.0 || gx * gx + gz * gz < 9.0 {
                                 b.goal = roam_goal(&mut rng);
                                 b.repick = rng.rfr(0.5, 1.0) * p.roam_repick;
@@ -696,7 +736,7 @@ pub fn run(
                     // The boss's jaws reach as far as its grown hull.
                     let reach = if is_boss { HOG_R + p.boss_grow } else { HOG_R };
                     let bitten = (b.bite_cd <= 0.0)
-                        .then(|| idx.touch(h.x, h.z, reach, (0.0, p.hog_leap), CAT_VEHICLE))
+                        .then(|| idx.touch(h.body.pos.x, h.body.pos.z, reach, (0.0, p.hog_leap), CAT_VEHICLE))
                         .flatten();
                     if let Some(n) = bitten {
                         b.bite_cd = p.bite_cd;
@@ -711,30 +751,39 @@ pub fn run(
                                 part: n.part,
                                 kind: KIND_BITE,
                                 source_peer: 0,
-                                x: h.x,
+                                x: h.body.pos.x,
                                 y: n.band.0.max(0.0),
-                                z: h.z,
-                                heading: h.heading,
+                                z: h.body.pos.z,
+                                heading: b.heading,
                             },
                         );
                     }
                 }
 
-                // MOVE (every tick): steer toward the cached decision at
-                // full per-tick turn authority, then integrate.
-                let turn = wrap_angle(b.desired - h.heading)
+                // MOVE (every tick): steer toward the cached decision;
+                // the SOLVER integrates (Box3D slice 1) — the desired
+                // velocity contends with the crowd, walls, buildings,
+                // ramps, and vehicle mass out in the phys world, and
+                // the readback at prio 26 wrote this tick's x/y/z.
+                // The old hand integration, wall clamp, and
+                // building_push-with-heading-slide are GONE: jostling
+                // and shouldering are contact now.
+                let turn = wrap_angle(b.desired - b.heading)
                     .clamp(-p.hog_turn * FIXED_DT, p.hog_turn * FIXED_DT);
-                // Wrap at the write: the quantized wire repr saturates
-                // past ±3.27 rad, and += would walk out of range circling.
-                h.heading = wrap_angle(h.heading + turn);
-                h.speed += (b.target_speed - h.speed) * (3.0 * FIXED_DT).min(1.0);
-                h.x += h.heading.sin() * h.speed * FIXED_DT;
-                h.z += h.heading.cos() * h.speed * FIXED_DT;
+                b.heading = wrap_angle(b.heading + turn);
+                b.speed += (b.target_speed - b.speed) * (3.0 * FIXED_DT).min(1.0);
+                // The pod's attitude: AI yaw (the capsule is
+                // angular-locked, so the solver has no opinion until a
+                // future knockdown unlocks it and the readback carries
+                // the tumble instead).
+                h.body.rot = pm::Quat::from_yaw(b.heading);
+                let (mut vx, mut vz) =
+                    (b.heading.sin() * b.speed, b.heading.cos() * b.speed);
                 // Knockback rides on top of locomotion and decays fast —
                 // a hit visibly staggers the hog without stun-locking it.
                 if b.shove.0 != 0.0 || b.shove.1 != 0.0 {
-                    h.x += b.shove.0 * FIXED_DT;
-                    h.z += b.shove.1 * FIXED_DT;
+                    vx += b.shove.0;
+                    vz += b.shove.1;
                     let k = 1.0 - (KNOCK_DECAY * FIXED_DT).min(1.0);
                     b.shove.0 *= k;
                     b.shove.1 *= k;
@@ -742,36 +791,14 @@ pub fn run(
                         b.shove = (0.0, 0.0);
                     }
                 }
-                // Walls: clamp and head back toward the middle.
-                if h.x.abs() > ARENA || h.z.abs() > ARENA {
-                    h.x = h.x.clamp(-ARENA, ARENA);
-                    h.z = h.z.clamp(-ARENA, ARENA);
-                    h.heading = (-h.x).atan2(-h.z);
-                }
-                // Buildings: push out, then slide the heading along
-                // the wall tangent (keeping the component of travel
-                // that isn't INTO the wall) — cheap avoidance that
-                // reads as the hog shouldering round the corner.
-                let (px, pz, nx, nz) = building_push(h.x, h.z, HOG_R);
-                if nx != 0.0 || nz != 0.0 {
-                    h.x = px;
-                    h.z = pz;
-                    let (fx, fz) = (h.heading.sin(), h.heading.cos());
-                    let into = fx * nx + fz * nz;
-                    if into < 0.0 {
-                        let (tx, tz) = (fx - nx * into, fz - nz * into);
-                        if tx * tx + tz * tz > 1e-6 {
-                            h.heading = tx.atan2(tz);
-                        }
-                    }
-                }
+                ph.hog_velocity(id, vx, vz);
 
                 // Pose the collider: a hog is
                 // its own single part — the entry is keyed by the hog's
                 // OWN id, so death cleans it with the entity and the
                 // janitor never has work here. Upsert every tick, the
                 // pool is local — no wire cost to the change-density.
-                let mut hull = hog_proto.pose(h.x, 0.0, h.z, h.heading);
+                let mut hull = hog_proto.pose(h.body.pos.x, h.body.pos.y, h.body.pos.z, b.heading);
                 if is_boss {
                     // The hitbox matches the spectacle (p.boss_scale on
                     // the client's model).
@@ -821,9 +848,9 @@ pub fn run(
                 // heading, speed, AND altitude; check the bite.
                 if id.index() % stride == phase {
                     let nearest = idx.nearest(
-                        f.x,
-                        f.y,
-                        f.z,
+                        f.body.pos.x,
+                        f.body.pos.y,
+                        f.body.pos.z,
                         4.0 * ARENA,
                         (0.0, p.flyer_ceil),
                         CAT_VEHICLE,
@@ -832,7 +859,7 @@ pub fn run(
                     let (desired, target_speed, target_alt) = match nearest {
                         // Broken off: away and back upstairs.
                         Some(n) if b.flee > 0.0 => {
-                            ((f.x - n.x).atan2(f.z - n.z), p.flyer_speed, p.flyer_alt)
+                            ((f.body.pos.x - n.x).atan2(f.body.pos.z - n.z), p.flyer_speed, p.flyer_alt)
                         }
                         // The swoop: run the bearing, match the target's
                         // altitude — n.y is the flyer's own height
@@ -840,13 +867,13 @@ pub fn run(
                         // levels off at a truck's deck or a heli's
                         // cabin edge instead of a hardcoded aim height.
                         Some(n) if n.dist < p.flyer_aggro => {
-                            ((n.x - f.x).atan2(n.z - f.z), p.flyer_speed, n.y)
+                            ((n.x - f.body.pos.x).atan2(n.z - f.body.pos.z), p.flyer_speed, n.y)
                         }
                         // Roam like the horde, one story up: the same
                         // goal walk plus a lazy altitude bob.
                         _ => {
                             b.repick -= think_dt;
-                            let (gx, gz) = (b.goal.0 - f.x, b.goal.1 - f.z);
+                            let (gx, gz) = (b.goal.0 - f.body.pos.x, b.goal.1 - f.body.pos.z);
                             if b.repick <= 0.0 || gx * gx + gz * gz < 9.0 {
                                 b.goal = roam_goal(&mut rng);
                                 b.repick = rng.rfr(0.5, 1.0) * p.roam_repick;
@@ -869,10 +896,10 @@ pub fn run(
                     let bitten = (b.bite_cd <= 0.0)
                         .then(|| {
                             idx.touch(
-                                f.x,
-                                f.z,
+                                f.body.pos.x,
+                                f.body.pos.z,
                                 FLYER_R,
-                                (f.y - p.flyer_reach, f.y + p.flyer_reach),
+                                (f.body.pos.y - p.flyer_reach, f.body.pos.y + p.flyer_reach),
                                 CAT_VEHICLE,
                             )
                         })
@@ -888,27 +915,33 @@ pub fn run(
                                 part: n.part,
                                 kind: KIND_BITE,
                                 source_peer: 0,
-                                x: f.x,
-                                y: f.y,
-                                z: f.z,
-                                heading: f.heading,
+                                x: f.body.pos.x,
+                                y: f.body.pos.y,
+                                z: f.body.pos.z,
+                                heading: b.heading,
                             },
                         );
                     }
                 }
 
                 // MOVE (every tick): heading and speed like the horde;
-                // altitude chases the decision on its own axis.
-                let turn = wrap_angle(b.desired - f.heading)
+                // altitude chases the decision on its own axis. Flyers
+                // stay AI-integrated (no solver body), but they SPEAK
+                // the Body format: pos integrated here, the velocity
+                // they flew recorded for interp/extrapolation and bot
+                // lead, rot = yaw of the flight heading.
+                let turn = wrap_angle(b.desired - b.heading)
                     .clamp(-p.flyer_turn * FIXED_DT, p.flyer_turn * FIXED_DT);
-                f.heading = wrap_angle(f.heading + turn);
-                f.speed += (b.target_speed - f.speed) * (3.0 * FIXED_DT).min(1.0);
-                f.x += f.heading.sin() * f.speed * FIXED_DT;
-                f.z += f.heading.cos() * f.speed * FIXED_DT;
-                f.y += (b.target_alt - f.y).clamp(-p.flyer_climb * FIXED_DT, p.flyer_climb * FIXED_DT);
+                b.heading = wrap_angle(b.heading + turn);
+                b.speed += (b.target_speed - b.speed) * (3.0 * FIXED_DT).min(1.0);
+                let (mut vx, mut vz) =
+                    (b.heading.sin() * b.speed, b.heading.cos() * b.speed);
+                let vy = (b.target_alt - f.body.pos.y)
+                    .clamp(-p.flyer_climb * FIXED_DT, p.flyer_climb * FIXED_DT)
+                    / FIXED_DT;
                 if b.shove.0 != 0.0 || b.shove.1 != 0.0 {
-                    f.x += b.shove.0 * FIXED_DT;
-                    f.z += b.shove.1 * FIXED_DT;
+                    vx += b.shove.0;
+                    vz += b.shove.1;
                     let k = 1.0 - (KNOCK_DECAY * FIXED_DT).min(1.0);
                     b.shove.0 *= k;
                     b.shove.1 *= k;
@@ -916,26 +949,30 @@ pub fn run(
                         b.shove = (0.0, 0.0);
                     }
                 }
-                if f.x.abs() > ARENA || f.z.abs() > ARENA {
-                    f.x = f.x.clamp(-ARENA, ARENA);
-                    f.z = f.z.clamp(-ARENA, ARENA);
-                    f.heading = (-f.x).atan2(-f.z);
+                let mut pos = f.body.pos + pm::vec3(vx, vy, vz) * FIXED_DT;
+                if pos.x.abs() > ARENA || pos.z.abs() > ARENA {
+                    pos.x = pos.x.clamp(-ARENA, ARENA);
+                    pos.z = pos.z.clamp(-ARENA, ARENA);
+                    b.heading = (-pos.x).atan2(-pos.z);
                 }
                 // Buildings shove only below the roofline — cruise
                 // altitude clears everything but the downtown tower.
-                let (px, pz, nx, nz) = building_push_below(f.x, f.z, FLYER_R, f.y);
+                let (px, pz, nx, nz) = building_push_below(pos.x, pos.z, FLYER_R, pos.y);
                 if nx != 0.0 || nz != 0.0 {
-                    f.x = px;
-                    f.z = pz;
-                    let (fx, fz) = (f.heading.sin(), f.heading.cos());
+                    pos.x = px;
+                    pos.z = pz;
+                    let (fx, fz) = (b.heading.sin(), b.heading.cos());
                     let into = fx * nx + fz * nz;
                     if into < 0.0 {
                         let (tx, tz) = (fx - nx * into, fz - nz * into);
                         if tx * tx + tz * tz > 1e-6 {
-                            f.heading = tx.atan2(tz);
+                            b.heading = tx.atan2(tz);
                         }
                     }
                 }
+                f.body.vel = (pos - f.body.pos) * (1.0 / FIXED_DT);
+                f.body.pos = pos;
+                f.body.rot = pm::Quat::from_yaw(b.heading);
 
                 // Pose the collider: self-keyed single part like the
                 // ground horde, so death cleans it with the entity —
@@ -946,7 +983,7 @@ pub fn run(
                         owner: id,
                         part: PART_BODY,
                         cat: CAT_HOG,
-                        hull: flyer_proto.pose(f.x, f.y, f.z, f.heading),
+                        hull: flyer_proto.pose(f.body.pos.x, f.body.pos.y, f.body.pos.z, b.heading),
                     },
                 );
             });
@@ -975,7 +1012,7 @@ pub fn run(
                 continue;
             }
             let Some(h) = hogs.get(id) else { continue };
-            let (mx, my, mz) = (h.x, p.hoggun_y, h.z);
+            let (mx, my, mz) = (h.body.pos.x, h.body.pos.y + p.hoggun_y, h.body.pos.z);
             // Nearest vehicle part in range, ANY altitude (the range
             // sphere is the envelope) — the aim point is the hull's
             // closest axis point, muzzle height clamped into the band:
@@ -1020,12 +1057,14 @@ pub fn run(
     // death check, and the turret. Firing just spawns a bullet at the
     // muzzle — the flight and the (lag-compensated) hit test live in the
     // bullets task below.
+    let phys = phys_rc.clone();
     task!(
         pm,
         "drive",
         30.0,
         [truck, heli, health, bullet, gun, shot, impact, hunt, collider, parts, net, params, models],
         move |pm| {
+            let mut ph = phys.borrow_mut();
             let p = *params.get();
             // Kind hitboxes, posed per vehicle below (the guard is a
             // read borrow on the single — held across the loop, fine).
@@ -1059,7 +1098,24 @@ pub fn run(
                 // spawn slot; prediction snaps the owner home.
                 let ((mx, my, mz, dir, climb), pad) = if let Some(shooter) =
                     truck.get_id_mut(id).map(|mut t| {
-                        truck_step(&mut t, cmd, FIXED_DT, &p);
+                        // Box3D slice 1: the BODY is the solver's now.
+                        // The shared step still evolves the non-body
+                        // fields (turret slew, heat, steer filter) on a
+                        // scratch copy — one law, no drift — and the
+                        // drive forces go to the phys world (consumed
+                        // by next tick's step). Client prediction still
+                        // runs the full step as an APPROXIMATION of
+                        // solver truth; reconcile eats the difference
+                        // (the live spike-4 experiment — see phys.rs).
+                        let mut scratch = *t;
+                        truck_step(&mut scratch, cmd, FIXED_DT, &p);
+                        t.steer = scratch.steer;
+                        t.aim = scratch.aim;
+                        t.aim_pitch = scratch.aim_pitch;
+                        t.heat = scratch.heat;
+                        let boosting =
+                            cmd.boost > 0.5 && cmd.thrust > 0.0 && t.heat < 1.0;
+                        ph.truck_drive(id, &t, cmd, boosting, &p);
                         *t
                     }) {
                     let (x, z) = (shooter.body.pos.x, shooter.body.pos.z);
@@ -1087,9 +1143,19 @@ pub fn run(
                         }
                         continue;
                     }
+                    // y rides the body now (ramps): an airborne truck's
+                    // parts fly with it — bullets track it, and the
+                    // horde's 0..hog_leap bite band loses it, the same
+                    // altitude rule the heli plays by.
                     pose(
                         id,
-                        &posed(tp, shooter.body.pos.x, 0.0, shooter.body.pos.z, shooter.heading()),
+                        &posed(
+                            tp,
+                            shooter.body.pos.x,
+                            shooter.body.pos.y,
+                            shooter.body.pos.z,
+                            shooter.heading(),
+                        ),
                     );
                     (truck_muzzle(&shooter), p.hit_pad_truck)
                 } else if let Some(shooter) = heli.get_id_mut(id).map(|mut hl| {
@@ -1445,16 +1511,19 @@ pub fn run(
                     if let Some(mut v) = health.get_id_mut(c.owner) {
                         v.hp -= dmg;
                     }
-                    // Tail kick: torque scales with obliquity (a shot
-                    // down the boom's axis barely turns it). A
-                    // server-side write to a predicted pod — the owner
-                    // reconciles, the same seam as the bite scrub.
+                    // Tail kick: a REAL impulse along the shot line at
+                    // the tail thruster's mount — r × J propagates it
+                    // into a yaw swing (obliquity falls out of the
+                    // cross product; a shot down the boom's axis just
+                    // shoves) and the owner's FBW visibly fights the
+                    // nose back around. A server-side write to a
+                    // predicted pod — the owner reconciles, the same
+                    // seam as the bite scrub.
                     if c.part == PART_TAIL && let Some(mut hl) = heli.get_id_mut(c.owner) {
                         let b = &mut hl.body;
-                        let (yaw, pitch, roll) = b.rot.to_yaw_pitch_roll();
-                        let kick = p.heli_tail_kick * (yaw - c.heading).sin();
-                        b.rot = pm::Quat::from_yaw_pitch_roll(wrap_angle(yaw + kick), pitch, roll)
-                            .norm();
+                        let j = pm::vec3(c.heading.sin(), 0.0, c.heading.cos()) * p.heli_tail_kick;
+                        let at = b.rot.rotate(HELI_TAIL);
+                        b.impulse_at(j, at, HELI_MASS, HELI_INERTIA);
                     }
                     if !quiet
                         && c.source_peer != 0

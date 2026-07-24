@@ -731,6 +731,14 @@ impl ClientNet {
         self.status.get().snapshots
     }
 
+    /// Cumulative UDP bytes (sent, received) since connect — totals on
+    /// purpose: difference them over your own window for a rate (the
+    /// hogs debug panel does, against the `net_kbps` budget).
+    pub fn traffic(&self) -> (u64, u64) {
+        let st = self.status.get();
+        (st.bytes_up, st.bytes_down)
+    }
+
     /// This peer's id, as assigned at handshake (0 before connected).
     pub fn peer(&self) -> u8 {
         self.status.get().peer
@@ -1801,6 +1809,10 @@ pub(crate) struct NetStatus {
     pub peer: u8,
     pub rtt_ms: f32,
     pub snapshots: u32,
+    /// Cumulative UDP bytes this client has sent / received — totals,
+    /// not rates (HUDs difference them over their own window).
+    pub bytes_up: u64,
+    pub bytes_down: u64,
     pub connected: bool,
     /// Why the connection ended, once it has ("server closed…", a QUIC
     /// error). The net task fills this and quits the loop; the single
@@ -2258,7 +2270,13 @@ impl NetClient {
                 *accum += pm.loop_dt();
                 status.get_mut().input_alpha = *accum * input_hz;
             }
-            status.get_mut().rtt_ms = quic.rtt().as_secs_f32() * 1e3;
+            {
+                let (up, down) = quic.traffic();
+                let mut st = status.get_mut();
+                st.rtt_ms = quic.rtt().as_secs_f32() * 1e3;
+                st.bytes_up = up;
+                st.bytes_down = down;
+            }
             if netdbg() && pm.tick() % 300 == 0 {
                 let snaps = status.get().snapshots;
                 // labels+N vs ~300 loop ticks is the STALENESS gauge: at

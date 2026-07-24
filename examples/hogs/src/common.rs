@@ -10,7 +10,7 @@
 pub use hogs_sim::*;
 // The generated blend methods' traits — in scope wherever pods go.
 
-use pm::{Id, vec3};
+use pm::{Body, Id, vec3};
 
 // (`addr=` + `password=` landed 2026-07-20 — menu Join field, CLI args,
 // and the deploy/ box all dial anywhere now. Reconnect-in-place landed
@@ -127,35 +127,37 @@ pub struct Health {
 }
 
 /// A biomod feral hog: server-owned, never predicted — clients read it
-/// through `interp_pool` only. At horde scale this pod IS the bandwidth
-/// experiment, so it rides the wire quantized (the `#[wire]` field
-/// attributes make `#[pm::pod]` derive `pm::Wire`; register with
-/// `wire_pool`): 20 B of f32s → a 9 B repr, 13 B/entry with the id →
-/// ~90 entities per 1200 B snapshot instead of ~45. Coords at 1/64 u
-/// (±512 u range — the walls sit at ±ARENA), angles at 1e-4 rad (the
-/// server wraps `heading` to [-pi, pi) at every write — i16 saturates
-/// past ±3.27), hp at 1/200 over its 0..=p.hog_hp range.
+/// through `interp_pool` only.
 ///
-/// The deliberate asymmetry: predicted pools (`Truck`, `Heli`) are
-/// NOT quantized — reconcile error must be able to reach zero, and a
-/// quantization step would leave prediction permanently correcting
-/// against rounded truth. Try it: change x/z scale from 64 to 8 and
-/// play — 1/8-unit position steps make the horde visibly jitter.
-/// Quantization is a *visible* budget decision.
+/// THE REPLICATED PHYSICS-ENTITY FORMAT (Connor's call, 2026-07-23,
+/// with the Box3D adoption): every physical entity carries the full
+/// shared [`pm::Body`] on the wire — position, velocity, orientation
+/// quaternion, angular velocity — plus its per-kind gameplay fields.
+/// One format, one interp path (`Body`'s PodLerp nlerps attitude), one
+/// packer story; what the solver knows, every client sees. Full
+/// precision for now (spend-now-tighten-later stance at the ~150-hog
+/// scale target): dirty-tracking plus solver SLEEP is the bandwidth
+/// diet — a settled hog stops changing and falls off the wire.
+/// `heading`/`speed` stopped being fields: yaw and speed are
+/// DERIVATIONS of the body ([`Hog::heading`]); the AI's steering
+/// scalars live server-side in the brain pods.
 #[pm::pod]
 pub struct Hog {
-    #[wire(i16, scale = 64.0)]
-    pub x: f32,
-    #[wire(i16, scale = 64.0)]
-    pub z: f32,
-    #[wire(i16, scale = 10000.0)]
-    #[lerp(angle)]
-    pub heading: f32,
-    #[wire(i16, scale = 256.0)]
-    pub speed: f32,
+    pub body: Body,
     /// 0..p.hog_hp; clients tint by it. Dead hogs are REMOVED, not hp==0.
-    #[wire(u8, scale = 200.0)]
     pub hp: f32,
+}
+
+impl Hog {
+    /// The 2D bearing gameplay reads (yaw of the body).
+    pub fn heading(&self) -> f32 {
+        self.body.yaw()
+    }
+
+    /// Ground speed — the horizontal velocity magnitude.
+    pub fn speed(&self) -> f32 {
+        (self.body.vel.x * self.body.vel.x + self.body.vel.z * self.body.vel.z).sqrt()
+    }
 }
 
 /// Server-owned co-op scoreboard AND session state, replicated as a
@@ -540,26 +542,28 @@ pub const HOG_H: f32 = 1.8;
 // lag-compensated with zero new sweep code.
 
 /// A winged biomod hog: server-owned like the ground horde, clients
-/// interp only. Same quantization scheme as [`Hog`] plus the altitude
-/// (this pool joins the change-dense workload, so it rides the wire
-/// small: 15 B of payload/entry).
+/// interp only.
+///
+/// Same replicated-body format as [`Hog`] — flyers aren't solver
+/// bodies (yet; their flight is AI-scripted), but the WIRE speaks one
+/// language: the AI fills `body` (pos, velocity, yaw quat) and clients
+/// interp/render it exactly like everything else.
 #[pm::pod]
 pub struct Flyer {
-    #[wire(i16, scale = 64.0)]
-    pub x: f32,
-    #[wire(i16, scale = 64.0)]
-    pub y: f32,
-    #[wire(i16, scale = 64.0)]
-    pub z: f32,
-    #[wire(i16, scale = 10000.0)]
-    #[lerp(angle)]
-    pub heading: f32,
-    #[wire(i16, scale = 256.0)]
-    pub speed: f32,
+    pub body: Body,
     /// 0..p.flyer_hp; clients tint by it. Dead flyers are REMOVED — the
     /// client's falling ragdoll is the death animation.
-    #[wire(u8, scale = 200.0)]
     pub hp: f32,
+}
+
+impl Flyer {
+    pub fn heading(&self) -> f32 {
+        self.body.yaw()
+    }
+
+    pub fn speed(&self) -> f32 {
+        (self.body.vel.x * self.body.vel.x + self.body.vel.z * self.body.vel.z).sqrt()
+    }
 }
 
 /// Flyer body radius, and the collider's altitude half-band about the
@@ -1596,14 +1600,30 @@ mod pod_blend_tests {
     }
 
     #[test]
-    fn hog_heading_lerps_the_short_way() {
-        let a = Hog { x: 0.0, z: 0.0, heading: 3.0, speed: 1.0, hp: 1.0 };
-        let b = Hog { heading: -3.0, x: 1.0, ..a };
+    fn hog_attitude_lerps_the_short_way() {
+        // The Body-format hog: attitude is a quat now, and nlerp takes
+        // the short arc across ±π by construction — the property the
+        // old #[lerp(angle)] heading field hand-guaranteed.
+        let a = Hog {
+            body: Body { rot: Quat::from_yaw(3.0), ..Default::default() },
+            hp: 1.0,
+        };
+        let b = Hog {
+            body: Body {
+                pos: pm::vec3(1.0, 0.0, 0.0),
+                rot: Quat::from_yaw(-3.0),
+                ..Default::default()
+            },
+            ..a
+        };
         let l = a.pod_lerp(&b, 0.5);
         // 3.0 → -3.0 short way crosses ±π, never passes 0.
-        assert!(l.heading.abs() > 3.0 || (l.heading - std::f32::consts::PI).abs() < 0.3,
-            "wrapped midpoint, got {}", l.heading);
-        assert_eq!(l.x, 0.5);
+        assert!(
+            l.heading().abs() > 3.0 || (l.heading() - std::f32::consts::PI).abs() < 0.3,
+            "wrapped midpoint, got {}",
+            l.heading()
+        );
+        assert_eq!(l.body.pos.x, 0.5);
     }
 
     #[test]

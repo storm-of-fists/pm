@@ -6,6 +6,7 @@ members = [
     "crates/pm-world-sdl",
     "crates/pm-control-core",
     "crates/pm-control-host",
+    "crates/box3d-sys",
     "examples/hogs",
     "examples/hogs/sim",
     "examples/solids",

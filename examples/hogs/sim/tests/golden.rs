@@ -57,8 +57,8 @@ fn script(tick: u32, rng: &mut u64) -> Drive {
 /// clamp/push branches are inside the hash, not just open-field math.
 const TICKS: u32 = 1800;
 
-const GOLDEN_TRUCK: u64 = 0xc896e50f56d24d9a; // recorded at SIM_VERSION 1
-const GOLDEN_HELI: u64 = 0xeaf3a043d1b078bd; // recorded at SIM_VERSION 1
+const GOLDEN_TRUCK: u64 = 0x74ad12f86ed3af6c; // recorded at SIM_VERSION 3
+const GOLDEN_HELI: u64 = 0x26aaf6d0d52c74f7; // recorded at SIM_VERSION 2
 
 #[test]
 fn truck_replay_is_golden() {

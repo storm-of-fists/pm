@@ -377,7 +377,7 @@ pub use id::Id;
 pub use kernel::{
     EntryMut, IntoTaskResult, Pm, PoolHandle, SingleHandle, TaskError, TaskFault, TaskStat,
 };
-pub use math::{Body, Mat4, Quat, Rng, Vec2, Vec3, lerp_angle, vec2, vec3, wrap_angle};
+pub use math::{Body, Forces, Mat4, Quat, Rng, Vec2, Vec3, lerp_angle, vec2, vec3, wrap_angle};
 pub use modload::{
     BUILD_ID, BUILD_MANIFEST, MOD_ABI, ModLoader, build_manifest, mod_abi, mod_manifest_ptr,
 };

@@ -25,6 +25,7 @@ grep -rn "TODO(roadmap)" crates/ examples/   # engine queue — only if blocking
 grep -rn "TODO(v2)" crates/                  # engine-v2 adoption — greenlit, in flight
 grep -rn "TODO(story)" examples/             # the lore — Connor authors this
 grep -rn "TODO(simplify)" crates/ examples/  # zoom-outs/generalizations noticed while working — the standing simplification track
+grep -rn "STYLE(" crates/ examples/          # style notes — where a feel or design deliberately chases a named inspiration (STYLE(motorstorm), STYLE(source), ...): what we're mimicking and which parts of it we want
 ```
 
 New here (or want the whole system explained start to finish)? Open the

@@ -372,6 +372,13 @@ struct LagSocket {
     rng: u32,
     out_q: VecDeque<(Instant, SocketAddr, Vec<u8>)>,
     in_q: VecDeque<(Instant, SocketAddr, Vec<u8>)>,
+    /// Cumulative UDP payload bytes through this socket, both ways —
+    /// counted at the one choke point every packet crosses (before the
+    /// lag-sim queues, so dropped-by-sim packets still count as sent:
+    /// they DID leave the app's budget). HUD bandwidth meters read
+    /// these as totals and difference them per second.
+    bytes_up: u64,
+    bytes_down: u64,
 }
 
 impl LagSocket {
@@ -388,6 +395,8 @@ impl LagSocket {
             rng: seed,
             out_q: VecDeque::new(),
             in_q: VecDeque::new(),
+            bytes_up: 0,
+            bytes_down: 0,
         }
     }
 
@@ -406,6 +415,7 @@ impl LagSocket {
     }
 
     fn send_to(&mut self, now: Instant, buf: &[u8], dest: SocketAddr) {
+        self.bytes_up += buf.len() as u64;
         if self.plain() {
             let _ = self.socket.send_to(buf, dest);
             return;
@@ -426,12 +436,17 @@ impl LagSocket {
 
     fn recv_from(&mut self, now: Instant, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         if self.plain() {
-            return self.socket.recv_from(buf);
+            let got = self.socket.recv_from(buf);
+            if let Ok((n, _)) = got {
+                self.bytes_down += n as u64;
+            }
+            return got;
         }
         let mut tmp = [0u8; 4096];
         loop {
             match self.socket.recv_from(&mut tmp) {
                 Ok((len, from)) => {
+                    self.bytes_down += len as u64;
                     if !self.drop_roll() {
                         self.in_q
                             .push_back((now + self.delay, from, tmp[..len].to_vec()));
@@ -1141,6 +1156,12 @@ impl QuicClient {
 
     pub fn rtt(&self) -> Duration {
         self.conn.rtt()
+    }
+
+    /// Cumulative UDP payload bytes (sent, received) on this socket —
+    /// HUD bandwidth meters difference these per second.
+    pub fn traffic(&self) -> (u64, u64) {
+        (self.socket.bytes_up, self.socket.bytes_down)
     }
 
     /// Simulate link conditions: one-way `delay` and packet `loss` (0..1)

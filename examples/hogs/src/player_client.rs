@@ -43,7 +43,9 @@ use std::time::{Duration, Instant};
 use pm::{
     CamAnchor, CamRig, CamView, Mat4, Pm, Vec3, camera_install, camera_manager, camera_track, vec3,
 };
-use pm_sdl::gpu3d::{Frame3, Instance3, Renderer3d, bake, box_tris, checker_ground, panini_for_fov};
+use pm_sdl::gpu3d::{
+    Frame3, Instance3, Renderer3d, bake, box_tris, checker_ground, panini_for_fov, wedge_tris,
+};
 use pm_sdl::sdl3;
 use sdl3::event::Event;
 use sdl3::keyboard::Scancode;
@@ -65,7 +67,9 @@ const H: u32 = 800;
 const CAM_PITCH_FOLLOW: f32 = 0.35;
 
 fn hog_model(h: &Hog) -> Mat4 {
-    Mat4::translate(vec3(h.x, 0.0, h.z)) * Mat4::rot_y(h.heading)
+    // Full replicated pose: when a hog tumbles server-side, the quat
+    // carries it here untouched.
+    h.body.model()
 }
 
 // TODO(refactor): Corpse is a hand-rolled entity type in a Vec captured
@@ -98,15 +102,15 @@ const CORPSE_LIFE: f32 = 2.6;
 impl Corpse {
     fn from_hog(h: &Hog, rng: &mut pm::Rng) -> Corpse {
         Corpse {
-            x: h.x,
-            y: 0.45,
-            z: h.z,
-            // Launched along its final run plus a pop upward — reads as
-            // the killing shot bowling it over.
-            vx: h.heading.sin() * h.speed * 0.9 + rng.rfr(-1.5, 1.5),
+            x: h.body.pos.x,
+            y: 0.45 + h.body.pos.y,
+            z: h.body.pos.z,
+            // Launched along its final REAL velocity plus a pop upward
+            // — reads as the killing shot bowling it over.
+            vx: h.body.vel.x * 0.9 + rng.rfr(-1.5, 1.5),
             vy: rng.rfr(4.0, 7.0),
-            vz: h.heading.cos() * h.speed * 0.9 + rng.rfr(-1.5, 1.5),
-            yaw: h.heading,
+            vz: h.body.vel.z * 0.9 + rng.rfr(-1.5, 1.5),
+            yaw: h.heading(),
             ang: 0.0,
             spin: rng.rfr(5.0, 11.0) * if rng.rf() < 0.5 { -1.0 } else { 1.0 },
             t: 0.0,
@@ -117,13 +121,13 @@ impl Corpse {
     /// altitude, spinning harder — the fall to the bounce is the show.
     fn from_flyer(f: &Flyer, rng: &mut pm::Rng) -> Corpse {
         Corpse {
-            x: f.x,
-            y: f.y.max(0.45),
-            z: f.z,
-            vx: f.heading.sin() * f.speed * 0.6 + rng.rfr(-1.5, 1.5),
+            x: f.body.pos.x,
+            y: f.body.pos.y.max(0.45),
+            z: f.body.pos.z,
+            vx: f.body.vel.x * 0.6 + rng.rfr(-1.5, 1.5),
             vy: rng.rfr(-1.0, 2.5),
-            vz: f.heading.cos() * f.speed * 0.6 + rng.rfr(-1.5, 1.5),
-            yaw: f.heading,
+            vz: f.body.vel.z * 0.6 + rng.rfr(-1.5, 1.5),
+            yaw: f.heading(),
             ang: 0.0,
             spin: rng.rfr(7.0, 14.0) * if rng.rf() < 0.5 { -1.0 } else { 1.0 },
             t: 0.0,
@@ -467,6 +471,20 @@ fn session(
             (1.0, 1.0, 1.0),
         ))
         .expect("cube");
+    // Ramp wedges, one mesh per RAMPS entry baked at TRUE size (a unit
+    // wedge under a rotated non-uniform scale would skew the slope's
+    // lighting normal — the scale_xyz caveat; at real size the model
+    // matrix is translate·rot_y, which keeps normals exact).
+    let ramp_meshes: Vec<_> = RAMPS
+        .iter()
+        .map(|&(_, _, _, hw, hl, h)| {
+            r3d.upload_mesh(&bake(
+                &wedge_tris(vec3(-hw, 0.0, -hl), vec3(hw, h, hl)),
+                (1.0, 1.0, 1.0),
+            ))
+            .expect("ramp")
+        })
+        .collect();
     // Small ground marker: aim-line breadcrumbs and impact flashes.
     let marker = r3d
         .upload_mesh(&bake(
@@ -806,6 +824,11 @@ fn session(
         let mut dbg_pools: Vec<(String, usize)> = Vec::new();
         let mut dbg_snaps = 0.0f32;
         let mut dbg_snap_rate = 0.0f32;
+        // Network meter: previous cumulative byte totals and the
+        // per-window rates in KILOBITS/s — the unit `net_kbps` speaks,
+        // so the panel compares like against like.
+        let mut dbg_traffic = (0u64, 0u64);
+        let (mut dbg_up_kbps, mut dbg_down_kbps) = (0.0f32, 0.0f32);
         move |pm| {
             // Per-tick borrows of the shared renderer + window (the
             // redial loop owns them between sessions).
@@ -841,6 +864,10 @@ fn session(
                     let snaps = net.snapshots() as f32;
                     dbg_snap_rate = (snaps - dbg_snaps) / dbg_accum;
                     dbg_snaps = snaps;
+                    let (up, down) = net.traffic();
+                    dbg_up_kbps = (up - dbg_traffic.0) as f32 * 8.0 / 1000.0 / dbg_accum;
+                    dbg_down_kbps = (down - dbg_traffic.1) as f32 * 8.0 / 1000.0 / dbg_accum;
+                    dbg_traffic = (up, down);
                     dbg_accum = 0.0;
                 }
             }
@@ -993,7 +1020,7 @@ fn session(
                 let s = if w.boss.get_id(id).is_some() { w.params.get().boss_scale } else { 1.0 };
                 let model = hog_model(h) * Mat4::scale(s);
                 hog_shadows.push(Instance3::emissive(
-                    Mat4::translate(vec3(h.x, 0.02, h.z)) * Mat4::scale(0.95 * s),
+                    Mat4::translate(vec3(h.body.pos.x, 0.02, h.body.pos.z)) * Mat4::scale(0.95 * s),
                     (0.035, 0.04, 0.035),
                 ));
                 hog_bodies.push(Instance3::new(model, tint));
@@ -1025,7 +1052,7 @@ fn session(
                     0.16 + 0.18 * hp,
                     0.20 + 0.28 * hp,
                 );
-                let model = Mat4::translate(vec3(f.x, f.y, f.z)) * Mat4::rot_y(f.heading);
+                let model = f.body.model();
                 let phase = (id.index() % 16) as f32 * 0.42;
                 let flap = (pm.tick() as f32 * 0.55 + phase).sin() * 0.55;
                 flyer_bodies.push(Instance3::new(model, tint));
@@ -1034,9 +1061,9 @@ fn session(
                     .push(Instance3::new(model * Mat4::rot_axis(vec3(0.0, 0.0, 1.0), flap), tint));
                 flyer_wings_l
                     .push(Instance3::new(model * Mat4::rot_axis(vec3(0.0, 0.0, 1.0), -flap), tint));
-                let s = 0.9 * (1.0 - f.y / (w.params.get().heli_ceil * 1.7)).max(0.2);
+                let s = 0.9 * (1.0 - f.body.pos.y / (w.params.get().heli_ceil * 1.7)).max(0.2);
                 flyer_shadows.push(Instance3::emissive(
-                    Mat4::translate(vec3(f.x, 0.02, f.z)) * Mat4::scale(s),
+                    Mat4::translate(vec3(f.body.pos.x, 0.02, f.body.pos.z)) * Mat4::scale(s),
                     (0.035, 0.04, 0.035),
                 ));
             }
@@ -1077,11 +1104,11 @@ fn session(
                 };
                 let mut hogs = Vec::new();
                 for (_, h) in w.hog_draw.get().iter() {
-                    hogs.push(at(h.x, 0.0, h.z, h.heading));
+                    hogs.push(at(h.body.pos.x, h.body.pos.y, h.body.pos.z, h.heading()));
                 }
                 let mut flyers = Vec::new();
                 for (_, f) in w.flyer_draw.get().iter() {
-                    flyers.push(at(f.x, f.y, f.z, f.heading));
+                    flyers.push(at(f.body.pos.x, f.body.pos.y, f.body.pos.z, f.heading()));
                 }
                 let mut trucks = Vec::new();
                 for (_, t) in w.truck_draw.get().iter() {
@@ -1179,6 +1206,17 @@ fn session(
                         &cube,
                         Mat4::translate(vec3(x, 0.0, z)) * Mat4::scale_xyz(2.0 * hw, h, 2.0 * hd),
                         (g, g * 0.96, g * 1.06),
+                        true,
+                    );
+                }
+                // Ramps: the same terrain the shared step drives
+                // (RAMPS) — takeoff hardware should read as an
+                // invitation.
+                for (m, &(x, z, yaw, ..)) in ramp_meshes.iter().zip(RAMPS.iter()) {
+                    frame.draw(
+                        m,
+                        Mat4::translate(vec3(x, 0.0, z)) * Mat4::rot_y(yaw),
+                        (0.55, 0.42, 0.16),
                         true,
                     );
                 }
@@ -1528,7 +1566,7 @@ fn session(
                     let dim = (150, 160, 150);
                     let x0 = 20.0;
                     let faults = pm.task_faults().len();
-                    let rows1 = 3.6 + dbg_tasks.len().max(1) as f32 + (faults > 0) as u8 as f32;
+                    let rows1 = 4.6 + dbg_tasks.len().max(1) as f32 + (faults > 0) as u8 as f32;
                     frame.rect(x0 - 8.0, 12.0, 380.0, rows1 * lh + 14.0, (6, 8, 6), 0.62);
                     let mut y = 18.0;
                     frame.text(
@@ -1557,6 +1595,25 @@ fn session(
                         txt,
                     );
                     y += lh;
+                    // Wire meter vs the replicated send budget: the
+                    // DOWN direction is what `net_kbps` caps (the
+                    // server's per-peer snapshot flight), so it goes
+                    // red as it presses the ceiling — the "your horde
+                    // is about to starve" light. Up is input traffic.
+                    {
+                        let budget = w.params.get().net_kbps;
+                        let hot = dbg_down_kbps > budget * 0.9;
+                        frame.text(
+                            &format!(
+                                "net   up {dbg_up_kbps:.0} kbps   down {dbg_down_kbps:.0} kbps   budget {budget:.0}"
+                            ),
+                            x0,
+                            y,
+                            px,
+                            if hot { (255, 90, 70) } else { txt },
+                        );
+                        y += lh;
+                    }
                     if faults > 0 {
                         frame.text(
                             &format!("task faults: {faults} (stderr has the story)"),

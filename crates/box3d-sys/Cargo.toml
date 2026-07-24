@@ -1,0 +1,9 @@
+[package]
+name = "box3d-sys"
+version.workspace = true
+edition.workspace = true
+links = "box3d"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"

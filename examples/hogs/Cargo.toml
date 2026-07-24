@@ -15,3 +15,7 @@ pm-control-core = { path = "../../crates/pm-control-core" }
 # pods, params, and shared geometry — everything that must run
 # byte-identical on server and client, re-exported through common.rs.
 hogs-sim = { path = "sim" }
+# THE SERVER'S PHYSICAL WORLD (Box3D adoption, integration slice 1
+# 2026-07-23): hogs jostle, trucks tumble, statics are solver bodies.
+# Server-side only — prediction still runs the hogs-sim shared steps.
+box3d-sys = { path = "../../crates/box3d-sys" }

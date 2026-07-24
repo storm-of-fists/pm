@@ -128,12 +128,16 @@ impl PodLerp for Body {
             pos: self.pos.pod_lerp(&b.pos, t),
             vel: self.vel.pod_lerp(&b.vel, t),
             rot: self.rot.pod_lerp(&b.rot, t),
+            ang: self.ang.pod_lerp(&b.ang, t),
         }
     }
 }
 impl PodErr for Body {
     fn pod_err(&self, b: &Self) -> f32 {
-        self.pos.pod_err(&b.pos) + self.vel.pod_err(&b.vel) + self.rot.pod_err(&b.rot)
+        self.pos.pod_err(&b.pos)
+            + self.vel.pod_err(&b.vel)
+            + self.rot.pod_err(&b.rot)
+            + self.ang.pod_err(&b.ang)
     }
 }
 
@@ -180,6 +184,14 @@ pub const fn schema_hash_str(s: &str) -> u64 {
 /// empty (`impl pm::PodSchema for X {}`) only for pods built outside
 /// the macro (e.g. `pm_params!` pods hash their generated `SCHEMA`
 /// string instead).
+///
+/// TODO(roadmap): nested pod types contribute only their type NAME to
+/// the descriptor (`body:Body`), so a SAME-SIZE relayout of an embedded
+/// type slips the hash (the handshake's size check catches growth, as
+/// when `Body` grew `ang` 2026-07-23, but not a reorder). Fix = the
+/// derive folds each field type's own `SCHEMA_HASH` into the pod's
+/// (needs `PodSchema` impls for primitives — already here — plus
+/// arrays and the engine math types).
 pub trait PodSchema {
     const SCHEMA_HASH: u64 = 0;
 }
@@ -207,11 +219,13 @@ mod tests {
             pos: vec3(1.0, 2.0, 3.0),
             vel: vec3(-1.0, 0.5, 0.0),
             rot: Quat::from_yaw(0.4),
+            ..Default::default()
         };
         let b = Body {
             pos: vec3(2.0, 0.0, 3.0),
             vel: vec3(0.0, 0.5, 2.0),
             rot: Quat::from_yaw(-0.6),
+            ..Default::default()
         };
         // The old body_lerp: linear pos/vel, short-arc nlerp attitude.
         let l = a.pod_lerp(&b, 0.25);
